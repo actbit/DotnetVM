@@ -106,4 +106,11 @@ public sealed class EvaluationStack {
         Array.Clear(_slots, 0, Count);
         Count = 0;
     }
+
+    /// <summary>現在有効なスロットのコピー (GC ルート走査用。下から順)。</summary>
+    public StackSlot[] CopySlots() {
+        var copy = new StackSlot[Count];
+        Array.Copy(_slots, copy, Count);
+        return copy;
+    }
 }

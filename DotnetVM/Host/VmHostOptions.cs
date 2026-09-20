@@ -1,5 +1,7 @@
 namespace DotnetVM.Host;
 
+using DotnetVM.Runtime.Heap;
+
 /// <summary>
 /// メモリ/実行リソースのポリシー。すべてクォータ+拒否方式の上限。
 /// 超過は ResourceExhaustedException 系で拒否され、ゲストの catch には渡らない。
@@ -28,4 +30,7 @@ public sealed class VmHostOptions {
     // Network/Storage ポリシーとブリッジ (既定 = DenyAll) は M7 で接続
     public bool EnableJit { get; init; } = true;
     public int JitPromotionThreshold { get; init; } = 1000;
+
+    /// <summary>GC 戦略 (既定 = 非世代別マーク &amp; スイープ。世代別戦略に差し替え可能)。</summary>
+    public IGcStrategy Gc { get; init; } = new MarkSweepStrategy();
 }

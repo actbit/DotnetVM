@@ -19,17 +19,28 @@ public sealed class VirtualMachine : IDisposable {
     private readonly IntrinsicRegistry _intrinsics = new();
     private readonly VmConsole _console = new();
     private readonly VmHeap _heap;
+    private readonly GcHandleTable _handles = new();
     private readonly List<TypeLoader> _loaders = [];
     private Interpreter? _interpreter;
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
-        _heap = new VmHeap(_options.Memory);
+        _heap = new VmHeap(_options.Memory, _options.Gc);
+        _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
         DefaultIntrinsics.RegisterAll(_intrinsics);
     }
 
     /// <summary>仮想コンソールデバイス (出力購読/入力バインド/実装差し替え)。</summary>
     public VmConsole Console => _console;
+
+    /// <summary>GC ハンドル表 (ホストがゲストオブジェクトを GC をまたいで強参照保持する)。</summary>
+    public GcHandleTable Handles => _handles;
+
+    /// <summary>VM ヒープ (テスト/診断用)。</summary>
+    internal VmHeap Heap => _heap;
+
+    /// <summary>GC を起動し統計を返す (通常はアロケーション間隔で自動起動。明示起動はホスト用)。</summary>
+    public GcStatistics CollectGarbage() => RunGuest(_heap.Collect);
 
     /// <summary>ロード済みアセンブリの型ローダ。</summary>
     public IReadOnlyList<TypeLoader> Loaders => _loaders;

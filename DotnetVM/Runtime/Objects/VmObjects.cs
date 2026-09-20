@@ -133,6 +133,8 @@ public sealed class VmFieldRvaData : VmObject {
 public static class ObjectModel {
     private static readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
     private static readonly ConditionalWeakTable<VmType, StackSlot[]> StaticStorage = new();
+    // CWT は列挙できないため、生成済み静的ストレージの列挙用サイドリスト (GC ルート源)
+    private static readonly List<StackSlot[]> StaticStorageList = [];
 
     /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。
     /// 基底が構築ジェネリック型 (例: Sub`1 : Base`1&lt;!0&gt;) の場合は定義型に解いて収集する。</summary>
@@ -181,8 +183,12 @@ public static class ObjectModel {
             if (field.IsStatic && !field.IsLiteral)
                 storage[index++] = DefaultForType(field.FieldType!, loader);
         StaticStorage.Add(type, storage);
+        StaticStorageList.Add(storage);
         return storage;
     }
+
+    /// <summary>生成済みの全静的ストレージを列挙する (GC ルート源)。</summary>
+    internal static IEnumerable<StackSlot[]> EnumerateStaticStorage() => StaticStorageList;
 
     public static int StaticFieldIndex(VmClassType type, VmField field) {
         var index = 0;

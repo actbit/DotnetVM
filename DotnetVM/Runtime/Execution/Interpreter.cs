@@ -32,6 +32,8 @@ public sealed class Interpreter {
     private long _instructionCount;
     private int _depth;
     private bool _running;
+    // 実行中フレームの一覧 (GC ルート源。Invoke の呼出チェーン = フレームチェーン)
+    private readonly List<InterpreterFrame> _liveFrames = [];
 
     public long InstructionCount => _instructionCount;
 
@@ -42,6 +44,10 @@ public sealed class Interpreter {
         _memory = memory;
         _heap = heap;
         _intrinsicContext = new IntrinsicContext { Console = console, Strings = _strings };
+        // GC ルート源の登録: 実行中フレーム / 静的ストレージ / intrinsic 静的フィールド
+        _heap.AddRootSlotSource(EnumerateFrameRoots);
+        _heap.AddRootSlotSource(ObjectModel.EnumerateStaticStorage);
+        _heap.AddRootSlotSource(() => _intrinsicStaticFields.Values);
     }
 
     /// <summary>文字列プール (VM ファサードから参照用)。</summary>
@@ -95,10 +101,27 @@ public sealed class Interpreter {
             var frame = InterpreterFrame.Create(method, arguments,
                 Prepare(method).LocalTypes, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
-            FixupStructLocals(frame);
-            return RunFrame(frame);
+            _liveFrames.Add(frame);
+            try {
+                FixupStructLocals(frame);
+                return RunFrame(frame);
+            } finally {
+                _liveFrames.RemoveAt(_liveFrames.Count - 1);
+            }
         } finally {
             _depth--;
+        }
+    }
+
+    /// <summary>実行中フレームが保持する全スロット (引数/ローカル/評価スタック/送出中例外) をルートとして列挙する。</summary>
+    private IEnumerable<StackSlot[]> EnumerateFrameRoots() {
+        foreach (var frame in _liveFrames) {
+            yield return frame.Arguments;
+            yield return frame.Locals;
+            if (frame.Stack.Count > 0)
+                yield return frame.Stack.CopySlots();
+            if (frame.CurrentThrow is { } throwing)
+                yield return [StackSlot.OfObject(throwing.ExceptionObject)];
         }
     }
 
@@ -1159,10 +1182,9 @@ public sealed class Interpreter {
             CheckSafepoint();
     }
 
-    /// <summary>セーフポイント。GC 起動 (M6) の掛かり口。現状は計上のみ。</summary>
-    private void CheckSafepoint() {
-        // TODO(M6): 割当中アロケーションが GcTriggerAllocationInterval を超えたら _gcStrategy.Collect を起動
-    }
+    /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
+    /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
+    private void CheckSafepoint() => _heap.CollectIfDue();
 
     // ---- 呼出 ----
 

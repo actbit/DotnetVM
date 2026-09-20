@@ -36,6 +36,11 @@ public static class ObjectGraphWalker {
             case VmArgList argList:
                 CollectFromSlots(argList.Args, visit);
                 break;
+            case VmNativePointer pointer:
+                // ポインタ → localloc ブロック (バイト列の保持者 + 会計対象) を展開。
+                // 参照中ブロックが回収されメモリ会計から消えることを防ぐ
+                visit(pointer.Memory);
+                break;
             // VmExceptionObject: Message は VmString (ヒープ管理外)。将来の InnerException 追加時にここへ
             // VmMethodPointer / VmIntrinsicCarrier: 参照フィールドは VM 型系 / ホストメモリ (走査不要)
         }

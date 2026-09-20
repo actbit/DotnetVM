@@ -286,7 +286,9 @@ public sealed class VmLocallocMemory : VmObject {
 }
 
 /// <summary>
-/// unmanaged ポインタ (int* / byte* 等)。localloc ブロックのバイト列 + バイトオフセットを指す。
+/// unmanaged ポインタ (int* / byte* 等)。localloc ブロック (VmLocallocMemory) + バイトオフセットを指す。
+/// byte[] を直接共有せず VmLocallocMemory を参照して保持する — GC グラフ上でポインタから
+/// ブロックが到達可能であることを保証し、参照中ブロックの回収とメモリ会計の消失を防ぐ。
 /// ポインタ演算 (p + n / p - q) はオフセット演算、ldind/stind はリトルエンディアンの
 /// バイト読み書きとして実現する。実 CLR と異なり初期化は 0 (安全側の上限動作)。
 /// </summary>
@@ -294,9 +296,11 @@ public sealed class VmNativePointer : VmObject {
     public static readonly VmIntrinsicType PointerType =
         new() { Namespace = "DotnetVM", Name = "NativePointer", IsValue = false };
 
-    public required byte[] Bytes { get; init; }
+    public required VmLocallocMemory Memory { get; init; }
 
     public int ByteOffset { get; init; }
+
+    public byte[] Bytes => Memory.Bytes;
 
     public override VmType Type => PointerType;
 
@@ -506,7 +510,11 @@ public sealed class ObjectModel {
         VmClassInstance instance => 24 + 16L * instance.Fields.Length,
         VmBoxedValue boxed => 24 + 16L * boxed.Fields.Length,
         // localloc の仮想メモリブロックは実バイト数を計上する (メモリポリシーの対象)
-        VmLocallocMemory memory => 24 + memory.Bytes.Length,
+        VmLocallocMemory memory => LocallocBlockSize(memory.Bytes.Length),
         _ => 24,
     };
+
+    /// <summary>localloc ブロックの概算サイズ (実バイト数 + オブジェクト ヘッダ概算)。
+    /// Reserve (確保前の事前計上) と EstimateSize (登録時) の両方から使う共有式。</summary>
+    public static long LocallocBlockSize(long byteCount) => 24 + byteCount;
 }

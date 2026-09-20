@@ -28,7 +28,7 @@ var result = vm.Invoke("MyApp.Program", "Compute", 42);
 
 | 面 | 強制点 |
 |---|---|
-| メモリ | `VmHeap.Allocate` 入口で即拒否。GC と連動した生存上限もあり |
+| メモリ | `VmHeap.Allocate` 入口で即拒否 (localloc / newarr はホスト側の実確保**前**に `Reserve` で検査)。GC と連動した生存上限もあり。intrinsic が VM heap 外で確保するバッファ (補間ハンドラ内部の StringBuilder 等) も累計上限に計上 |
 | 命令数 | インタプリタの命令境界。intrinsic 呼出も追加消費 (IL 実行と等価) |
 | ネットワーク | ゲストの通信はすべて `NetworkGateway` (プロキシ) 経由。バイト計上 + クォータのみ VM が担い、**許可の判断はブリッジのホスト実装**が行う |
 | ストレージ | 同構造 (`StorageGateway` + `IStorageBridge`) |
@@ -64,6 +64,54 @@ vm.Console.BindImplementation(customImpl);                       // 完全差し
 - ジェネリック完全対応: TypeSpec/MethodSpec、`constrained.`、変性付き castclass、ジェネリック継承・ネスト型
 - 外部呼出: `Invoke` (静的) / `CreateInstance` + `CallInstance` (インスタンス) / `GcHandleTable` (GC をまたぐ参照保持)
 
+## IL 命令の互換性
+
+ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**すべてデコード対象**で、実装経路のない命令は `NotSupportedException` で fail-closed になります (サイレントな誤動作なし)。ただし「命令を処理する」ことと「意味論が CLR と完全一致」は別で、次の 4 段階で管理しています。
+
+| 状態 | 意味 |
+|---|---|
+| **Full** | CLR 突合テストで意味論を検証済み |
+| **Partial** | 受け入れるが VM の安全側モデルに簡略化 (差分を明記) |
+| **Prefix no-op** | プレフィックス命令として受け入れるが効果なし |
+| **Rejected** | ロード / 実行時に拒否 |
+
+### Full
+
+| 命令群 | 命令 |
+|---|---|
+| スタック / 即値 | `nop` `dup` `pop` `break` `ldnull` `ldc.*` / 引数・ローカル: `ldarg.*` `starg.*` `ldloc.*` `stloc.*` (短形式 / 長形式 / `ldarga` `ldloca` 含む) |
+| 算術 | `add` `sub` `mul` `div(.un)` `rem(.un)` `and` `or` `xor` `shl` `shr(.un)` `neg` `not` `add/sub/mul.ovf(.un)` |
+| 比較 | `ceq` `cgt(.un)` `clt(.un)` `beq/bge/bgt/ble/blt/bne.un` (`.s` 含む、参照比較の cgt.un 規約 = ECMA-335 III.2 含む) |
+| 変換 | `conv.*` 全 29 種 (ovf / un 含む) |
+| 分岐 | `br(.s)` `brtrue/brfalse(.s)` `switch` |
+| 呼出 | `call` `callvirt` (仮想ディスパッチ / インターフェース / デリゲート `Invoke`) `calli` (関数ポインタ経由) `ret` `constrained.` |
+| デリゲート | `ldftn` `ldvirtftn` (+ delegate `.ctor` / `Combine` / `Remove` / `op_Equality` 面) |
+| フィールド | `ldfld` `ldflda` `stfld` `ldsfld` `ldsflda` `stsfld` |
+| 配列 | `newarr` `ldlen` `ldelem.*`(11) `stelem.*`(8) `ldelem` `stelem` `ldelema` (共変書き込み検査含む) |
+| オブジェクト | `newobj` `castclass` `isinst` `box` `unbox` `unbox.any` `ldobj` `stobj` `cpobj` `initobj` `throw` |
+| 間接アクセス | `ldind.*`(11) `stind.*`(8) — マネージポインタ (ByRef) と unmanaged ポインタの両対応 |
+| 例外 | `leave(.s)` `endfinally` `endfilter` `rethrow` |
+| 型情報 | `ldtoken` (FieldRVA / Type / Method) `mkrefany` `refanyval` `refanytype` (`__makeref` 系) `ckfinite` |
+
+### Partial
+
+| 命令 | CLR との差分 |
+|---|---|
+| `localloc` | 初期化は 0 (実 CLR は不定値)。ブロックは GC 管理 (フレーム終了で解放しない = 脱出 stackalloc も安全側に動く)。ブロック外アクセスは境界検査で拒否 (実 CLR は未定義動作 = アドレス空間破壊)。確保は `VmHeap` 会計の対象で、上限検査はホスト実確保より先に実施 |
+| `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度、ByRef 間は 8 バイト切り上げのスロット粒度 |
+| `sizeof` | ゲスト値型は順次レイアウト近似 (プリミティブ整列。明示的パッキングは未対応) |
+| `arglist` | ハンドル生成のみ。varargs 実呼出は fail-closed (C# 産 IL では生成されない) |
+| `jmp` | 尾呼び移行として実装 (残フレームを実行せず呼出先の戻り値を引き継ぐ)。intrinsic 面への移行は拒否 |
+
+### Prefix no-op
+
+`volatile.` `unaligned.` `readonly.` `tail.` — 受け入れて無視します。`tail.` + `call` は通常の呼出に置き換わるため、深い末尾再帰は `MaxRecursionDepth` で拒否されうる点に注意 (実 CLR ではスタック消費なしで回る)。
+
+### Rejected
+
+- **P/Invoke** (`pinvokeimpl`) — `ImplFlags` 検出でロード時拒否
+- **varargs 実呼出** / ネイティブ依存の面全般
+
 ## アーキテクチャ
 
 ```
@@ -88,7 +136,7 @@ VirtualMachine (Host/)          組み込みファサード
 dotnet test DotnetVM.Tests
 ```
 
-137 テスト (2026-09-20 時点)。
+173 テスト (2026-09-20 時点)。
 
 ## 状況
 

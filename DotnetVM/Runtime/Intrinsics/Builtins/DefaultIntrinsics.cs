@@ -266,12 +266,16 @@ public static class DefaultIntrinsics {
 
         I(".ctor", 2, static (_, a) => { SetState(a, new System.Text.StringBuilder()); return null; });
         I(".ctor", 3, static (_, a) => { SetState(a, new System.Text.StringBuilder()); return null; }); // +IFormatProvider (カルチャは CurrentCulture)
-        I("AppendLiteral", 1, static (_, a) => {
-            State(a).Append(new Args(a).String(1).Value);
+        I("AppendLiteral", 1, static (ctx, a) => {
+            var text = new Args(a).String(1).Value;
+            ctx.Heap.ChargeHostBuffer(text.Length); // ホスト側 StringBuilder もメモリ会計の対象
+            State(a).Append(text);
             return null;
         });
         I("AppendFormatted", 1, static (ctx, a) => {
-            State(a).Append(FormatValue(ctx, a[1], ctx.ParamAt(0)));
+            var text = FormatValue(ctx, a[1], ctx.ParamAt(0));
+            ctx.Heap.ChargeHostBuffer(text.Length);
+            State(a).Append(text);
             return null;
         });
         I("AppendFormatted", 2, static (ctx, a) => {
@@ -279,11 +283,13 @@ public static class DefaultIntrinsics {
             var s = State(a);
             var text = FormatValue(ctx, a[1], ctx.ParamAt(0));
             if (ctx.ParamAt(1) == "System.String")
-                s.Append(ApplyFormatSpecifier(text, a[1], new Args(a).String(2).Value ?? ""));
+                text = ApplyFormatSpecifier(text, a[1], new Args(a).String(2).Value ?? "");
             else if (ctx.ParamAt(1) == "System.Int32")
-                s.Append(ApplyAlignment(text, new Args(a).Int32(2)));
+                text = ApplyAlignment(text, new Args(a).Int32(2));
             else
                 throw new InvalidOperationException($"AppendFormatted の第2引数型 {ctx.ParamAt(1)} は未対応です。");
+            ctx.Heap.ChargeHostBuffer(text.Length);
+            s.Append(text);
             return null;
         });
         I("AppendFormatted", 3, static (ctx, a) => {
@@ -291,7 +297,9 @@ public static class DefaultIntrinsics {
             var s = State(a);
             var text = FormatValue(ctx, a[1], ctx.ParamAt(0));
             text = ApplyAlignment(text, new Args(a).Int32(2));
-            s.Append(ApplyFormatSpecifier(text, a[1], new Args(a).String(3).Value ?? ""));
+            text = ApplyFormatSpecifier(text, a[1], new Args(a).String(3).Value ?? "");
+            ctx.Heap.ChargeHostBuffer(text.Length);
+            s.Append(text);
             return null;
         });
         I("ToStringAndClear", 0, static (ctx, a) => {

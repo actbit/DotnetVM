@@ -45,6 +45,45 @@ public sealed class VmHeap {
     public void AddRootSlotSource(Func<IEnumerable<StackSlot[]>> source) =>
         _rootSlotSources.Add(source);
 
+    /// <summary>
+    /// ホスト側の実メモリ確保 (<c>new byte[]</c> 等) の**前に**上限を検査し、計上だけ先に進める。
+    /// localloc / newarr のように実確保がオブジェクト構築より先に起きる箇所で
+    /// 「Reserve(推定サイズ) → 実確保 → Register」の順に使い、巨大確保が上限チェック前に
+    /// ホストメモリを圧迫するのを防ぐ。サイズは Allocate 実行時の EstimateSize と同一の式で。
+    /// </summary>
+    public void Reserve(long size) {
+        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
+            throw new MemoryQuotaExceededException(
+                $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (要求 {size:N0} バイト)。");
+        if (_liveBytes + size > _memory.LiveObjectByteLimit)
+            throw new MemoryQuotaExceededException(
+                $"生存オブジェクト上限 {_memory.LiveObjectByteLimit:N0} バイトを超過しました (生存 {_liveBytes:N0} + 要求 {size:N0} バイト)。GC で回収可能なオブジェクトがない場合はゲストのメモリ使用量を見直してください。");
+        _totalAllocated += size;
+        _liveBytes += size;
+        _allocatedSinceGc += size;
+        if (_allocatedSinceGc >= _memory.GcTriggerAllocationInterval)
+            _collectionDue = true; // 実回収はセーフポイントで (ルート整合のため確保の再入では起動しない)
+    }
+
+    /// <summary>Reserve で計上済みのオブジェクトをヒープに登録する (計上は二重に行わない)。</summary>
+    public T Register<T>(T obj) where T : VmObject {
+        _objects.Add(obj);
+        return obj;
+    }
+
+    /// <summary>
+    /// ホスト側の一時バッファ (DefaultInterpolatedStringHandler 内部の StringBuilder 等、
+    /// VM heap 外のホストメモリ) を概算計上する。GC 管理外で解放されないため
+    /// 累計上限への計上のみ (保守的 = 安全側)。ハンドラ等の append 系 intrinsic で呼ぶ。
+    /// </summary>
+    public void ChargeHostBuffer(int charCount) {
+        var size = 24 + 2L * charCount;
+        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
+            throw new MemoryQuotaExceededException(
+                $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (ホスト バッファ {charCount} 文字)。");
+        _totalAllocated += size;
+    }
+
     /// <summary>オブジェクトをヒープに登録し、サイズを計上する。上限超過は拒否。</summary>
     public T Allocate<T>(T obj) where T : VmObject {
         var size = ObjectModel.EstimateSize(obj);

@@ -97,6 +97,21 @@ public sealed class TypeLoader {
             Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = name, IsValue = false }, [Covariant]);
         foreach (var name in new[] { "ICollection`1", "IList`1", "ISet`1", "IDictionary`2" })
             Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = name, IsValue = false });
+
+        // 注意: ブリッジ経由の I/O 面 (System.IO.File / System.Net.WebClient) はここでは合成しない。
+        // 界面の再現有無はブリッジ設定で制御する (VirtualMachine.LoadAssembly が条件付きで登録)。
+        // ブリッジ未設定ならゲストにその面自体が存在しない = fail-closed
+    }
+
+    /// <summary>ブリッジ設定がある場合のみ呼ばれる I/O ファサード型の登録 (VirtualMachine から)。</summary>
+    internal void AddIoFacade(string name) {
+        VmIntrinsicType type = name switch {
+            "File" => new VmIntrinsicType { Namespace = "System.IO", Name = "File", IsValue = false },
+            "WebClient" => new VmIntrinsicType { Namespace = "System.Net", Name = "WebClient", IsValue = false },
+            _ => throw new ArgumentException($"未知の I/O ファサード型: {name}"),
+        };
+        if (!_intrinsicTypes.TryAdd(type.FullName, type))
+            throw new InvalidOperationException($"intrinsic 型 {type.FullName} は既に登録されています。");
     }
 
     /// <summary>ファサード型を名前で取得 (無ければ null)。</summary>

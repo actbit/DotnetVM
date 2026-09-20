@@ -23,6 +23,9 @@ public static class ObjectGraphWalker {
             case VmBoxedValue boxed:
                 CollectFromSlots(boxed.Fields, visit);
                 break;
+            case VmIntrinsicInstance intrinsicInstance:
+                CollectFromSlots(intrinsicInstance.State, visit);
+                break;
             // VmExceptionObject: Message は VmString (ヒープ管理外)。将来の InnerException 追加時にここへ
         }
     }

@@ -1,5 +1,6 @@
 namespace DotnetVM.Host;
 
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 
 /// <summary>
@@ -27,7 +28,17 @@ public sealed class MemoryPolicy {
 public sealed class VmHostOptions {
     public MemoryPolicy Memory { get; init; } = new();
 
-    // Network/Storage ポリシーとブリッジ (既定 = DenyAll) は M7 で接続
+    /// <summary>ネットワークポリシー (既定 = DenyAll)。</summary>
+    public NetworkPolicy Network { get; init; } = new();
+
+    /// <summary>ストレージポリシー (既定 = DenyAll)。</summary>
+    public StoragePolicy Storage { get; init; } = new();
+
+    /// <summary>ネットワークブリッジ (ホスト実装の通信面。null = 全拒否)。</summary>
+    public INetworkBridge? NetworkBridge { get; init; }
+
+    /// <summary>ストレージブリッジ (ホスト実装のファイル I/O 面。null = 全拒否)。</summary>
+    public IStorageBridge? StorageBridge { get; init; }
     public bool EnableJit { get; init; } = true;
     public int JitPromotionThreshold { get; init; } = 1000;
 

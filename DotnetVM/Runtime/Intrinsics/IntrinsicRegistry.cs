@@ -2,7 +2,9 @@ using System.Runtime.CompilerServices;
 using DotnetVM.Devices;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
+using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Objects;
+using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Intrinsics;
 
@@ -27,11 +29,48 @@ public sealed class IntrinsicContext {
     /// <summary>仮想コンソールデバイス (ホスト物理 I/O ではなくここへ出る)。</summary>
     public required VmConsole Console { get; init; }
 
-    /// <summary>VM の文字列プール (文字列生成は必ずここ経由)。</summary>
+    /// <summary>VM の文字列プール (文字列生成は必ずここ経由。アロケーション計上済み)。</summary>
     public required VmStringPool Strings { get; init; }
+
+    /// <summary>VM ヒープ (intrinsic がオブジェクトを作る場合は必ずここ経由で計上される)。</summary>
+    public required VmHeap Heap { get; init; }
+
+    /// <summary>型解決面 (ファサード型の取得等)。ゲスト型のロードには使わない。</summary>
+    public required TypeLoader Types { get; init; }
+
+    /// <summary>ネットワークゲートウェイ (ポリシー検証済みの通信のみ可。null = 全拒否)。</summary>
+    public NetworkGateway? Network { get; init; }
+
+    /// <summary>ストレージゲートウェイ (ポリシー検証済みの I/O のみ可。null = 全拒否)。</summary>
+    public StorageGateway? Storage { get; init; }
 
     /// <summary>文字列を VM オブジェクトに正規化して作る。</summary>
     public VmString MakeString(string value) => Strings.GetOrNew(value);
+
+    private VmArrayType? _byteArrayType;
+
+    /// <summary>byte 配列を VM オブジェクト (VmArray) に正規化して作る (ヒープ計上済み)。</summary>
+    public VmArray MakeByteArray(ReadOnlySpan<byte> data) {
+        _byteArrayType ??= new VmArrayType { ElementType = Types.FindIntrinsicType("System.Byte")! };
+        var elements = new StackSlot[data.Length];
+        for (var i = 0; i < data.Length; i++)
+            elements[i] = StackSlot.OfInt32(data[i]);
+        return Heap.Allocate(new VmArray(_byteArrayType, elements));
+    }
+
+    /// <summary>VM オブジェクト (VmArray) を byte 配列として読み取る。</summary>
+    public byte[] ReadByteArray(in StackSlot slot) {
+        if (slot.Kind != StackKind.Object || slot.ObjectValue is not VmArray array)
+            throw new InvalidOperationException($"byte[] を期待しましたが {slot.Kind} が来ました。");
+        var data = new byte[array.Length];
+        for (var i = 0; i < array.Length; i++) {
+            var element = array.Elements[i];
+            if (element.Kind != StackKind.Int32 || element.Int64Value is < 0 or > 255)
+                throw new InvalidOperationException($"byte 配列の要素 {i} が不正です (Kind={element.Kind})。");
+            data[i] = (byte)element.Int64Value;
+        }
+        return data;
+    }
 
     /// <summary>オブジェクト同一性ハッシュ (Object.GetHashCode 相当)。生存中は対象を弱参照で保持する。</summary>
     public int IdentityHash(object? value) {

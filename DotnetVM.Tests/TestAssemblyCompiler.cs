@@ -10,13 +10,15 @@ namespace DotnetVM.Tests;
 /// VM の入力生成と、同一アセンブリの CLR 反射実行 (ground truth) の両方に使う。
 /// </summary>
 public static class TestAssemblyCompiler {
-    /// <summary>コンパイルして PE バイト列を返す。診断エラー時は例外。</summary>
-    public static byte[] CompileToBytes(string source, string assemblyName = "TestAsm") {
+    /// <summary>コンパイルして PE バイト列を返す。診断エラー時は例外。
+    /// extraReferences で追加の契約アセンブリ (intrinsic ファサードの C# 側シグネチャ等) を参照できる。</summary>
+    public static byte[] CompileToBytes(string source, string assemblyName = "TestAsm",
+        IReadOnlyList<MetadataReference>? extraReferences = null) {
         var syntaxTree = CSharpSyntaxTree.ParseText(source, path: "Test.cs");
         var compilation = CSharpCompilation.Create(
             assemblyName,
             new[] { syntaxTree },
-            GetReferences(),
+            GetReferences(extraReferences),
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Debug));
         using var peStream = new MemoryStream();
         var result = compilation.Emit(peStream);
@@ -36,7 +38,7 @@ public static class TestAssemblyCompiler {
         return (pe, clrAssembly);
     }
 
-    private static IReadOnlyList<MetadataReference> GetReferences() {
+    private static IReadOnlyList<MetadataReference> GetReferences(IReadOnlyList<MetadataReference>? extraReferences = null) {
         // ランタイムディレクトリから必要な基本アセンブリを参照する
         var runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
         var required = new[] { "System.Private.CoreLib", "System.Runtime", "System.Console", "System.Runtime.Extensions", "System.Linq" };
@@ -46,6 +48,8 @@ public static class TestAssemblyCompiler {
             if (File.Exists(path))
                 references.Add(MetadataReference.CreateFromFile(path));
         }
+        if (extraReferences is not null)
+            references.AddRange(extraReferences);
         return references;
     }
 }

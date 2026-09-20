@@ -50,6 +50,24 @@ public sealed class VmBoxedValue : VmObject {
 }
 
 /// <summary>
+/// intrinsic ファサード型のインスタンス (例: System.Net.WebClient)。例外ファサード以外で
+/// .ctor intrinsic が登録された型の実体。状態は State スロット配列に保持し、
+/// instance メソッドの intrinsic は this (= args[0]) 経由で読み書きする。
+/// </summary>
+public sealed class VmIntrinsicInstance : VmObject {
+    public VmIntrinsicInstance(VmIntrinsicType instanceType, int stateSlots = 4) {
+        ArgumentNullException.ThrowIfNull(instanceType);
+        InstanceType = instanceType;
+        State = new StackSlot[stateSlots];
+    }
+
+    public VmIntrinsicType InstanceType { get; }
+    public readonly StackSlot[] State;
+
+    public override VmType Type => InstanceType;
+}
+
+/// <summary>
 /// 例外ファサード型のインスタンス (VM 内部例外の合成 / `new System.NullReferenceException()` 等)。
 /// ゲストクラスが Exception 派生の例外は VmClassInstance として生成され、メッセージは
 /// IntrinsicContext の例外メッセージ表で保持する。こちらはファサード型そのものの実体。

@@ -24,7 +24,7 @@ public sealed class Interpreter {
     private readonly IntrinsicRegistry _intrinsics;
     private readonly VmConsole _console;
     private readonly VmHeap _heap;
-    private readonly VmStringPool _strings = new();
+    private readonly VmStringPool _strings;
     private readonly IntrinsicContext _intrinsicContext;
     private readonly MemoryPolicy _memory;
     private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
@@ -37,13 +37,22 @@ public sealed class Interpreter {
 
     public long InstructionCount => _instructionCount;
 
-    public Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap) {
+    public Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
+        NetworkGateway? network = null, StorageGateway? storage = null) {
         _loader = loader;
         _intrinsics = intrinsics;
         _console = console;
         _memory = memory;
         _heap = heap;
-        _intrinsicContext = new IntrinsicContext { Console = console, Strings = _strings };
+        _strings = new VmStringPool(heap);
+        _intrinsicContext = new IntrinsicContext {
+            Console = console,
+            Strings = _strings,
+            Heap = heap,
+            Types = loader,
+            Network = network,
+            Storage = storage,
+        };
         // GC ルート源の登録: 実行中フレーム / 静的ストレージ / intrinsic 静的フィールド
         _heap.AddRootSlotSource(EnumerateFrameRoots);
         _heap.AddRootSlotSource(ObjectModel.EnumerateStaticStorage);
@@ -968,26 +977,39 @@ public sealed class Interpreter {
             if (typeName is not null) {
                 var facadeType = _loader.FindIntrinsicType(typeName);
                 if (facadeType is not null) {
-                    // 例外ファサード型のみ newobj を許可 (throw new XxxException(...) 用)。
-                    // それ以外の intrinsic 型の実体化は BCL 不実装の面として拒否し続ける
-                    if (!IsExceptionFacade(facadeType))
-                        throw new NotSupportedException(
-                            $"intrinsic 型 {typeName} のインスタンス生成は未対応です (例外ファサード型のみ)。");
                     var ctorArgs = new StackSlot[facadeParamCount + 1];
                     for (var i = facadeParamCount; i >= 1; i--)
                         ctorArgs[i] = caller.Stack.Pop();
-                    var exception = _heap.Allocate(new VmExceptionObject(facadeType, null));
-                    ctorArgs[0] = StackSlot.OfObject(exception);
-                    // .ctor は基底ファサード連鎖からも解決する (Exception::.ctor を派生型で使う)
-                    if (TryGetIntrinsicThroughHierarchy(typeName, name, facadeParamCount + 1, hasThis: true, out var intrinsicCtor)) {
+                    // .ctor は基底ファサード連鎖からも解決する (Exception::.ctor を派生型で使う等)
+                    var hasCtorIntrinsic = TryGetIntrinsicThroughHierarchy(
+                        typeName, name, facadeParamCount + 1, hasThis: true, out var intrinsicCtor);
+                    if (IsExceptionFacade(facadeType)) {
+                        // 例外ファサード型: VmExceptionObject として実体化 (throw 機構が依存)
+                        var exception = _heap.Allocate(new VmExceptionObject(facadeType, null));
+                        ctorArgs[0] = StackSlot.OfObject(exception);
+                        if (hasCtorIntrinsic) {
+                            ConsumeInstruction();
+                            CheckSafepoint();
+                            intrinsicCtor(_intrinsicContext, ctorArgs);
+                        } else if (facadeParamCount != 0) {
+                            throw new OperationNotAllowedException(
+                                $"intrinsic {typeName}::{name} (引数 {facadeParamCount} 個) は未登録です。");
+                        }
+                        return StackSlot.OfObject(exception);
+                    }
+                    if (hasCtorIntrinsic && name == ".ctor") {
+                        // 例外ファサード以外で .ctor intrinsic が登録された型 (例: System.Net.WebClient):
+                        // VmIntrinsicInstance として実体化し、状態は intrinsic が State に保持する
+                        var facadeInstance = _heap.Allocate(new VmIntrinsicInstance(facadeType));
+                        ctorArgs[0] = StackSlot.OfObject(facadeInstance);
                         ConsumeInstruction();
                         CheckSafepoint();
                         intrinsicCtor(_intrinsicContext, ctorArgs);
-                    } else if (facadeParamCount != 0) {
-                        throw new OperationNotAllowedException(
-                            $"intrinsic {typeName}::{name} (引数 {facadeParamCount} 個) は未登録です。");
+                        return StackSlot.OfObject(facadeInstance);
                     }
-                    return StackSlot.OfObject(exception);
+                    // それ以外の intrinsic 型の実体化は BCL 不実装の面として拒否し続ける
+                    throw new NotSupportedException(
+                        $"intrinsic 型 {typeName} のインスタンス生成は未対応です (例外ファサード型または .ctor intrinsic 登録済み型のみ)。");
                 }
             }
             throw new NotSupportedException(

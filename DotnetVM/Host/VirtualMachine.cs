@@ -20,6 +20,8 @@ public sealed class VirtualMachine : IDisposable {
     private readonly VmConsole _console = new();
     private readonly VmHeap _heap;
     private readonly GcHandleTable _handles = new();
+    private readonly NetworkGateway _network;
+    private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
     private Interpreter? _interpreter;
 
@@ -27,6 +29,8 @@ public sealed class VirtualMachine : IDisposable {
         _options = options ?? new VmHostOptions();
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
+        _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
+        _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
         DefaultIntrinsics.RegisterAll(_intrinsics);
     }
 
@@ -38,6 +42,12 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>VM ヒープ (テスト/診断用)。</summary>
     internal VmHeap Heap => _heap;
+
+    /// <summary>ネットワークゲートウェイ (累計転送バイトの診断用)。</summary>
+    internal NetworkGateway Network => _network;
+
+    /// <summary>ストレージゲートウェイ (累計転送バイトの診断用)。</summary>
+    internal StorageGateway Storage => _storage;
 
     /// <summary>GC を起動し統計を返す (通常はアロケーション間隔で自動起動。明示起動はホスト用)。</summary>
     public GcStatistics CollectGarbage() => RunGuest(_heap.Collect);
@@ -64,6 +74,12 @@ public sealed class VirtualMachine : IDisposable {
         peStream.CopyTo(buffered);
         var image = AssemblyImage.Parse(buffered.ToArray());
         var loader = new TypeLoader(image);
+        // 界面の再現制御: ブリッジが設定されている場合のみ対応する I/O ファサード型を合成する。
+        // 未設定ならゲストはその型を解決できず、ロード/呼出の時点で fail-closed になる
+        if (_options.NetworkBridge is not null)
+            loader.AddIoFacade("WebClient");
+        if (_options.StorageBridge is not null)
+            loader.AddIoFacade("File");
         loader.CompletePendingTypes();
         _loaders.Add(loader);
         return image;
@@ -186,7 +202,8 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     private Interpreter GetInterpreter() =>
-        _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap);
+        _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
+            _network, _storage);
 
     private TypeLoader GetPrimaryLoader() {
         if (_loaders.Count == 0)

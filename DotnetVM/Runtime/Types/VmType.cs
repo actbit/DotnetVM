@@ -93,6 +93,9 @@ public sealed class VmClassType : VmType {
     /// <summary>ネスト型の場合の包含型 (無ければ null)。</summary>
     public VmType? DeclaringType { get; internal set; }
 
+    /// <summary>この型をロードした TypeLoader (ディスパッチ表構築や token 解決の担当ローダ)。</summary>
+    public TypeLoader? Loader { get; internal set; }
+
     public VmClassType(uint flags) {
         Flags = flags;
     }

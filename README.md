@@ -136,7 +136,7 @@ VirtualMachine (Host/)          組み込みファサード
 dotnet test DotnetVM.Tests
 ```
 
-173 テスト (2026-09-20 時点)。
+191 テスト (2026-09-20 時点)。
 
 ## 状況
 

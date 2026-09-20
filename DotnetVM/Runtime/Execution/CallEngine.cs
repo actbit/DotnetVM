@@ -66,6 +66,13 @@ internal sealed class CallEngine(
                     var guestRet = invoker.Invoke(guestOverride, args, context);
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
                 }
+                // ファサード インターフェースの明示的実装 (EII) を実行時型の InterfaceMap で解決する
+                // (明示的実装はメソッド名が規定名と異なるため名前照合では見つからない)
+                if (TryDispatchInterfaceKey(target.DeclaringType, target.Name!, target.ParamTypeNames, args[0]) is { } explicitImpl) {
+                    var context = BuildCallContext(target, explicitImpl, args[0]);
+                    var guestRet = invoker.Invoke(explicitImpl, args, context);
+                    return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? guestRet : null;
+                }
                 // レシーバが VM ランタイムオブジェクト (typeof() 結果等) の場合、その実面
                 // (System.Type / MethodBase) に登録された intrinsic を宣言型より優先する
                 // (例: callvirt Object::ToString → System.Type::ToString)
@@ -134,11 +141,18 @@ internal sealed class CallEngine(
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
     /// 無ければ未登録 intrinsic として拒否する。</summary>
     private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args) {
-        if (isCallvirt && target.HasThis &&
-            TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
-            var context = BuildCallContext(target, guestOverride, args[0]);
-            var ret = invoker.Invoke(guestOverride, args, context);
-            return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
+        if (isCallvirt && target.HasThis) {
+            if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
+                var context = BuildCallContext(target, guestOverride, args[0]);
+                var ret = invoker.Invoke(guestOverride, args, context);
+                return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
+            }
+            // ファサード インターフェースの明示的実装 (EII) もここで救済する
+            if (TryDispatchInterfaceKey(target.DeclaringType, target.Name!, target.ParamTypeNames, args[0]) is { } explicitImpl) {
+                var context = BuildCallContext(target, explicitImpl, args[0]);
+                var ret = invoker.Invoke(explicitImpl, args, context);
+                return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? ret : null;
+            }
         }
         throw new OperationNotAllowedException(
             $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録された intrinsic のみ提供されます。");
@@ -160,30 +174,153 @@ internal sealed class CallEngine(
 
     // ---- 仮想ディスパッチ ----
 
-    /// <summary>callvirt の実行時型ディスパッチ。名前+引数個数+実装本体で基底連鎖を辿る (VTable 相当)。</summary>
+    /// <summary>callvirt の実行時型ディスパッチ。宣言メソッドのスロットキー (名前 + 署名) を
+    /// レシーバの VTable / InterfaceMap で解決し (署名精度)、解決できない場合は
+    /// 名前+引数個数の従来照合にフォールバックする (ファサード系 / 表外メソッドの救済)。</summary>
     public VmMethod DispatchVirtual(VmMethod declared, in StackSlot receiver) =>
-        TryDispatchVirtual(declared.Name, declared.Signature.ParamTypes.Length, receiver) ?? declared;
+        TryDispatchDeclared(declared, receiver) ??
+        TryDispatchVirtual(declared.Name, declared.Signature.ParamTypes.Length, receiver) ??
+        declared;
 
-    /// <summary>実行時型から最派生のゲスト実装を探す。見つからなければ null (intrinsic 宣装にフォールバック)。
-    /// 構築ジェネリック型のインスタンス (VmBoxedValue の VmConstructedType 型 等) も定義側に解いて探索する。</summary>
-    public VmMethod? TryDispatchVirtual(string name, int paramCount, in StackSlot receiver) {
-        // 構造体の instance メソッドは ByRef レシーバで来ることがある
-        var receiverValue = receiver.Kind == StackKind.ByRef && receiver.ObjectValue is VmByRef byRef
+    /// <summary>レシーバスロット (ByRef / 構造体を含む) から実行時型を取り出す。</summary>
+    private static VmType? ReceiverRuntimeType(in StackSlot receiver) {
+        var value = receiver.Kind == StackKind.ByRef && receiver.ObjectValue is VmByRef byRef
             ? byRef.Slot
             : receiver;
-        var runtimeType = receiverValue.Kind switch {
-            StackKind.ValueType => receiverValue.ObjectValue is VmStructValue sv ? (VmType)sv.StructType : null,
-            StackKind.Object => receiverValue.ObjectValue switch {
+        return value.Kind switch {
+            StackKind.ValueType => value.ObjectValue is VmStructValue sv ? (VmType)sv.StructType : null,
+            StackKind.Object => value.ObjectValue switch {
                 VmClassInstance ci => (VmType)ci.ClassType,
                 VmBoxedValue bv => bv.Type,
                 _ => null,
             },
             _ => null,
         };
+    }
 
-        for (VmType? t = runtimeType; t is not null;) {
+    /// <summary>宣言メソッド (仮想 / インターフェース) をレシーバの実行時型のディスパッチ表で解決する。
+    /// 宣言型がレシーバの継承チェーンに属さない (ファサード宣言等) 場合は null。</summary>
+    private VmMethod? TryDispatchDeclared(VmMethod declared, in StackSlot receiver) {
+        var receiverType = ReceiverRuntimeType(receiver);
+        if (receiverType is null || declared.DeclaringType is not VmClassType declaringClass)
+            return null;
+        var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
+        if (definition is not VmClassType receiverClass)
+            return null;
+        var maps = (receiverClass.Loader ?? _loader).EnsureDispatchMaps(receiverClass);
+
+        if (declaringClass.IsInterface) {
+            // インターフェース呼出: 宣言スロットはインターフェース定義文脈のキーでそのまま照合する
+            var parameters = (declared.Loader ?? _loader).TryResolveSlotParams(declared.Signature.ParamTypes);
+            return parameters is null
+                ? null
+                : maps.InterfaceMap.GetValueOrDefault(VmSlotKeys.InterfaceSlotKey(declaringClass.FullName, declared.Name, parameters));
+        }
+
+        // 仮想呼出: 宣言型文脈のスロットキーを継承パスの型引数でレシーバ文脈へ置換して照合する
+        var pathArgs = InheritanceTypeArguments(receiverType, declaringClass);
+        if (pathArgs is null)
+            return null;
+        var declaredParams = (declared.Loader ?? _loader).TryResolveSlotParams(declared.Signature.ParamTypes);
+        if (declaredParams is null)
+            return null;
+        var substitution = pathArgs.Length > 0 ? new GenericContext { ClassArgs = pathArgs } : null;
+        var query = substitution is null ? declaredParams
+            : [.. declaredParams.Select(p => GenericSubstitutor.Substitute(p, substitution))];
+        return maps.VTable.GetValueOrDefault(VmSlotKeys.Of(declared.Name, query))?.Method;
+    }
+
+    /// <summary>receiverType から targetClass (宣言型) までの継承パスで、targetClass の
+    /// ジェネリックパラメータが receiverType 文脈で何に実体化するかを求める
+    /// (例: IntRepo : Repo&lt;int&gt; のレシーバで宣言型 Repo&lt;T&gt; の !0 → System.Int32)。
+    /// チェーンに無い場合は null。</summary>
+    private static VmType[]? InheritanceTypeArguments(VmType receiverType, VmType targetClass) {
+        var current = receiverType;
+        GenericContext? substitution = null;
+        while (current is not null) {
+            VmType definition;
+            VmType[] args;
+            if (current is VmConstructedType constructed) {
+                definition = constructed.Definition;
+                args = [.. constructed.TypeArguments.Select(a => GenericSubstitutor.Substitute(a, substitution))];
+            } else {
+                definition = current;
+                args = [];
+            }
+            if (ReferenceEquals(definition, targetClass) || definition.FullName == targetClass.FullName)
+                return args;
+            substitution = args.Length > 0 ? new GenericContext { ClassArgs = args } : null;
+            current = definition.BaseType;
+        }
+        return null;
+    }
+
+    /// <summary>実行時型から最派生のゲスト実装を探す。見つからなければ null (intrinsic 宣装にフォールバック)。
+    /// ディスパッチ表が構築できる実行時型は VTable から選び (同一 名前+引数個数 のオーバーロードは
+    /// 最派生の宣言を優先)、ファサード系 (表外) は従来どおり基底連鎖の名前照合にフォールバックする。
+    /// 構築ジェネリック型のインスタンス (VmBoxedValue の VmConstructedType 型 等) も定義側に解いて探索する。</summary>
+    public VmMethod? TryDispatchVirtual(string name, int paramCount, in StackSlot receiver) {
+        var receiverType = ReceiverRuntimeType(receiver);
+        if (receiverType is null)
+            return null;
+        var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
+        if (definition is VmClassType receiverClass) {
+            var maps = (receiverClass.Loader ?? _loader).EnsureDispatchMaps(receiverClass);
+            VmMethod? best = null;
+            var bestDepth = -1;
+            foreach (var slot in maps.VTable.Values) {
+                if (slot.Method.Name != name || slot.Method.Signature.ParamTypes.Length != paramCount)
+                    continue;
+                var depth = InheritanceDepth(receiverType, slot.Method.DeclaringType);
+                // 最派生の宣言を優先 (同深度 = 同じクラス内のオーバーロードは宣言順 = rid 順)
+                if (depth > bestDepth || (depth == bestDepth && best is not null && slot.Method.MethodDefRid < best.MethodDefRid)) {
+                    best = slot.Method;
+                    bestDepth = depth;
+                }
+            }
+            if (best is not null)
+                return best;
+        }
+        return FindMethodByScanThroughChain(receiverType, name, paramCount);
+    }
+
+    /// <summary>ファサード インターフェースの明示的実装 (EII) 用: 宣言型名 + パラメータ型名から
+    /// インターフェーススロットキーを組み、レシーバの InterfaceMap で解決する。
+    /// 型名が解決できていないパラメータが混ざる場合は照合を諦める (null)。</summary>
+    private VmMethod? TryDispatchInterfaceKey(string? declaringTypeName, string name, string[]? paramTypeNames, in StackSlot receiver) {
+        if (declaringTypeName is null || paramTypeNames is null || paramTypeNames.Any(string.IsNullOrEmpty))
+            return null;
+        var receiverType = ReceiverRuntimeType(receiver);
+        if (receiverType is null)
+            return null;
+        var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
+        if (definition is not VmClassType receiverClass)
+            return null;
+        var maps = (receiverClass.Loader ?? _loader).EnsureDispatchMaps(receiverClass);
+        return maps.InterfaceMap.GetValueOrDefault(
+            declaringTypeName + "::" + name + "(" + string.Join(",", paramTypeNames) + ")");
+    }
+
+    /// <summary>レシーバ型の継承チェーン上で宣言型 declaring が現れるまでのステップ数
+    /// (最派生 = 0。チェーンに無い場合は -1)。同一型は参照または完全名で判定する
+    /// (ファサード⇔実型の同一視は IsAssignableTo と同じ緩和)。</summary>
+    private static int InheritanceDepth(VmType receiverType, VmType declaring) {
+        var depth = 0;
+        for (VmType? t = receiverType; t is not null; depth++) {
             if (t is VmConstructedType constructed)
-                t = constructed.Definition; // 構築型 → ジェネリック定義に解いて探索を続ける
+                t = constructed.Definition;
+            if (ReferenceEquals(t, declaring) || t.FullName == declaring.FullName)
+                return depth;
+            t = t.BaseType;
+        }
+        return -1;
+    }
+
+    /// <summary>従来照合: 名前+引数個数で基底連鎖を辿る (ファサード系 / ディスパッチ表外の救済)。</summary>
+    private static VmMethod? FindMethodByScanThroughChain(VmType receiverType, string name, int paramCount) {
+        for (VmType? t = receiverType; t is not null;) {
+            if (t is VmConstructedType constructed)
+                t = constructed.Definition;
             if (t is not VmClassType cls)
                 break;
             var found = cls.Methods.FirstOrDefault(m =>
@@ -319,7 +456,7 @@ internal sealed class CallEngine(
                     // そのメソッドを実体として解決する。callvirt でも Call 側でレシーバの
                     // 実行時型による仮想ディスパッチが効くため、宣言解決の直接化は安全
                     if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass) {
-                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes.Length);
+                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes);
                         if (resolved is { Body: not null })
                             return new CallTarget {
                                 Arity = arity,
@@ -345,7 +482,7 @@ internal sealed class CallEngine(
                 }
                 if (parent.Table == TableKind.TypeDef) {
                     var owner = _loader.GetTypeDef(parent.Rid);
-                    var method = owner.Methods.FirstOrDefault(m => m.Name == name)
+                    var method = FindMethodThroughChain(owner, name, signature.ParamTypes)
                         ?? throw new BadImageFormatException($"MemberRef 0x{token:X8} の解決先メソッド {owner.FullName}::{name} が見つかりません。");
                     return new CallTarget {
                         Arity = arity,
@@ -406,7 +543,7 @@ internal sealed class CallEngine(
         }
 
         var definition = (VmClassType)constructed.Definition;
-        var method = FindMethodThroughChain(definition, name, signature.ParamTypes.Length)
+        var method = FindMethodThroughChain(definition, name, signature.ParamTypes)
             ?? throw new BadImageFormatException(
                 $"MemberRef 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
         return new CallTarget {
@@ -480,8 +617,7 @@ internal sealed class CallEngine(
             if (parent.Table == TableKind.TypeDef) {
                 // 同アセンブリのジェネリックメソッド (Roslyn は MethodDef でも MemberRef 形式で出す)
                 var owner = _loader.GetTypeDef(parent.Rid);
-                var method = owner.Methods.FirstOrDefault(m =>
-                        m.Name == name && m.Signature.ParamTypes.Length == signature.ParamTypes.Length)
+                var method = FindMethodThroughChain(owner, name, signature.ParamTypes)
                     ?? throw new BadImageFormatException(
                         $"MethodSpec 0x{token:X8} の解決先メソッド {owner.FullName}::{name} が見つかりません。");
                 return new CallTarget {
@@ -496,7 +632,7 @@ internal sealed class CallEngine(
             if (parent.Table == TableKind.TypeSpec) {
                 var constructed = _objectEngine.ResolveConstructedParent(parent.Rid, context);
                 var definition = (VmClassType)constructed.Definition;
-                var method = FindMethodThroughChain(definition, name, signature.ParamTypes.Length)
+                var method = FindMethodThroughChain(definition, name, signature.ParamTypes)
                     ?? throw new BadImageFormatException(
                         $"MethodSpec 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
                 return new CallTarget {
@@ -515,20 +651,29 @@ internal sealed class CallEngine(
         throw new BadImageFormatException($"MethodSpec 0x{token:X8} の解決先テーブル {underlying.Table} が不正です。");
     }
 
-    /// <summary>名前+パラメータ数でメソッドを探す (継承チェーンを辿る。抽象宣言も解決対象)。</summary>
-    private static VmMethod? FindMethodThroughChain(VmClassType type, string name, int paramCount) {
+    /// <summary>宣言署名 (名前 + パラメータ型) でメソッドを探す (継承チェーンを辿る。抽象宣言も解決対象)。
+    /// スロットキーが一致する候補を署名精度で優先し、無い場合は従来どおり名前+パラメータ数の
+    /// 最初の一致にフォールバックする (ジェネリック変数の文脈差等でキー照合できない呼出の救済)。</summary>
+    private VmMethod? FindMethodThroughChain(VmClassType type, string name, SigType[] paramTypes) {
+        var queryKey = _loader.TryResolveSlotParams(paramTypes) is { } parameters
+            ? VmSlotKeys.Of(name, parameters) : null;
+        VmMethod? byParamCount = null;
         for (VmType? t = type; t is not null;) {
             if (t is VmConstructedType constructed)
                 t = constructed.Definition;
             if (t is not VmClassType cls)
                 break;
-            var found = cls.Methods.FirstOrDefault(m =>
-                m.Name == name && m.Signature.ParamTypes.Length == paramCount);
-            if (found is not null)
-                return found;
+            foreach (var method in cls.Methods) {
+                if (method.Name != name)
+                    continue;
+                if (queryKey is not null && method.SlotKey == queryKey)
+                    return method; // 署名一致 (オーバーロード誤解決の解消)
+                if (byParamCount is null && method.Signature.ParamTypes.Length == paramTypes.Length)
+                    byParamCount = method;
+            }
             t = cls.BaseType;
         }
-        return null;
+        return byParamCount;
     }
 
     // ---- 宣言上のパラメータ型名 (i4 統合面のオーバーロード判別) ----

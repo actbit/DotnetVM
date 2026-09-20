@@ -17,6 +17,19 @@ public sealed class VmMethod {
     /// <summary>このメソッドを定義したアセンブリのローダ (多アセンブリ実行で token 解決先を決める)。</summary>
     public TypeLoader? Loader { get; internal set; }
 
+    private string? _slotKey;
+
+    /// <summary>ディスパッチ用スロットキー (名前 + パラメータ型の正規化形、成功時のみキャッシュ)。
+    /// 署名解決が失敗した場合は都度 null を返す (呼出側はパラメータ数照合にフォールバックする)。</summary>
+    internal string? SlotKey {
+        get {
+            if (_slotKey is null)
+                _slotKey = Loader?.TryResolveSlotParams(Signature.ParamTypes) is { } parameters
+                    ? VmSlotKeys.Of(Name, parameters) : null;
+            return _slotKey;
+        }
+    }
+
     public uint Token => global::DotnetVM.Metadata.Token.From(TableKind.MethodDef, MethodDefRid).Value;
 
     public bool IsStatic => (Flags & 0x0010) != 0;

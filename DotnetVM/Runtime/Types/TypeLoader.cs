@@ -36,6 +36,8 @@ public sealed class TypeLoader {
     /// <summary>型統合辞書 (完全名 → 実型)。Context 配下の画像から解決できた実 TypeDef をキャッシュする
     /// (参照アセンブリ⇔CoreLib のユニフィケーション。否定はキャッシュしない — 遅延ロードで新画像が増えうる)。</summary>
     private readonly Dictionary<string, VmType> _unifiedTypes = [];
+    /// <summary>仮想/インターフェースディスパッチ表の構築担当 (遅延生成)。</summary>
+    private DispatchMapBuilder? _dispatchBuilder;
 
     public TypeLoader(AssemblyImage image) {
         _image = image;
@@ -192,6 +194,7 @@ public sealed class TypeLoader {
             TypeDefRid = typeDefRid,
             Namespace = ns,
             Name = name,
+            Loader = this,
         };
         _typeDefs[typeDefRid] = type;
 
@@ -611,6 +614,33 @@ public sealed class TypeLoader {
     /// CoreLib ロード時は実 TypeDef が優先 (型同一性の統合)、無ければ intrinsic ファサード。</summary>
     private VmType RequiredIntrinsic(string fullName) =>
         TryResolveUnifiedType(fullName) ?? _intrinsicTypes[fullName];
+
+    // ---- 仮想/インターフェースディスパッチ表 (C3) ----
+
+    /// <summary>本画像のディスパッチ表ビルダ (遅延生成)。</summary>
+    internal DispatchMapBuilder DispatchBuilder => _dispatchBuilder ??= new DispatchMapBuilder(this);
+
+    /// <summary>型のディスパッチ表 (VTable + InterfaceMap) を取得する (遅延構築・キャッシュ)。
+    /// 他アセンブリの型はそのローダのビルダに委譲する (索引は画像ごとに分かれる)。</summary>
+    internal DispatchMaps EnsureDispatchMaps(VmClassType type) {
+        var owner = type.Loader;
+        return owner is null || ReferenceEquals(owner, this) ? DispatchBuilder.EnsureMaps(type) : owner.EnsureDispatchMaps(type);
+    }
+
+    /// <summary>スロットキー用にパラメータ型列 (SigType) を VmType 列へ解決する。
+    /// 1 つでも解決できない型があれば null (呼出側はパラメータ数照合にフォールバック)。</summary>
+    internal VmType[]? TryResolveSlotParams(SigType[] paramTypes) {
+        var result = new VmType[paramTypes.Length];
+        for (var i = 0; i < paramTypes.Length; i++) {
+            try {
+                result[i] = ResolveToken(paramTypes[i]);
+            } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+                or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+                return null;
+            }
+        }
+        return result;
+    }
 
     /// <summary>完全名を Context 配下の全画像 (ロード順 = CoreLib 優先) の実 TypeDef に解決する。
     /// 見つからなければ null (ファサード等のフォールバックは呼び出し側)。実体化に失敗する型

@@ -229,6 +229,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         }
     }
 
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
     private static void ThrowNoBody(VmMethod method) {
         // abstract は未実装面、native (P/Invoke) はセキュリティポリシーで拒否
         if (method.IsAbstract)

@@ -92,6 +92,39 @@ public sealed class TypeLoader {
         // 頻出 BCL 列挙型のファサード (署名上の TypeRef 解決に必要。値は i4 スロットとして扱う)
         foreach (var name in new[] { "StringSplitOptions", "StringComparison" })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = true, Parent = valueType });
+
+        // デリゲート機構のファサード。Delegate/MulticastDelegate は継承判定の根で、
+        // Action/Func/Predicate 等はそれらの派生として合成する (newobj デリゲート生成と
+        // callvirt Invoke のデリゲート呼出は Interpreter 側でこの継承関係を判定に使う)
+        var @delegate = new VmIntrinsicType { Namespace = "System", Name = "Delegate", IsValue = false, Parent = @object };
+        Add(@delegate);
+        var multicastDelegate = new VmIntrinsicType { Namespace = "System", Name = "MulticastDelegate", IsValue = false, Parent = @delegate };
+        Add(multicastDelegate);
+        foreach (var arity in Enumerable.Range(0, 17))
+            Add(new VmIntrinsicType { Namespace = "System", Name = arity == 0 ? "Action" : $"Action`{arity}", IsValue = false, Parent = multicastDelegate },
+                Enumerable.Repeat(0u, arity).ToArray());
+        foreach (var arity in Enumerable.Range(1, 16))
+            Add(new VmIntrinsicType { Namespace = "System", Name = $"Func`{arity}", IsValue = false, Parent = multicastDelegate },
+                Enumerable.Repeat(0u, arity).ToArray());
+        foreach (var (name, ns, arity) in new[] {
+            ("Predicate`1", "System", 1),
+            ("Comparison`1", "System", 1),
+            ("EventHandler", "System", 0),
+            ("EventHandler`1", "System", 1),
+            ("Converter`2", "System", 2),
+            ("ResolveEventHandler", "System.Reflection", 0),
+        })
+            Add(new VmIntrinsicType { Namespace = ns, Name = name, IsValue = false, Parent = multicastDelegate },
+                Enumerable.Repeat(0u, arity).ToArray());
+
+        // TypedReference / varargs 周辺の特殊値型 (__makeref / arglist の署名解決に必要)
+        Add(new VmIntrinsicType { Namespace = "System", Name = "TypedReference", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System", Name = "ArgIterator", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System", Name = "RuntimeArgumentHandle", IsValue = true, Parent = valueType });
+        // native int のファサード (ldftn の戻り型 / sizeof 等)。既存登録があれば尊重する
+        _intrinsicTypes.TryAdd("System.IntPtr", new VmIntrinsicType { Namespace = "System", Name = "IntPtr", IsValue = true, Parent = valueType });
+        _intrinsicTypes.TryAdd("System.UIntPtr", new VmIntrinsicType { Namespace = "System", Name = "UIntPtr", IsValue = true, Parent = valueType });
+
         foreach (var name in new[] { "IEnumerable", "IEnumerator", "ICollection", "IList" })
             Add(new VmIntrinsicType { Namespace = "System.Collections", Name = name, IsValue = false });
         // ジェネリックインターフェースは BCL 既知の変性を登録する (castclass/isinst の変性判定に使う)

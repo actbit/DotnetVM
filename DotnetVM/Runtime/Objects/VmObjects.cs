@@ -208,6 +208,167 @@ public sealed class VmIntrinsicCarrier : VmObject {
     public override VmType Type => CarrierType;
 }
 
+/// <summary>デリゲートの 1 呼出エントリ (レシーバ + 束縛先メソッド)。</summary>
+public readonly record struct DelegateInvocation(StackSlot Target, VmMethod Method);
+
+/// <summary>
+/// ldftn / ldvirtftn の結果 (オープンな関数ポインタ)。レシーバは束縛せずメソッドのみ参照する。
+/// newobj デリゲート生成時にレシーバと束ねて VmDelegate になる。Target は VM 型系 (GC 管理外)。
+/// </summary>
+public sealed class VmMethodPointer : VmObject {
+    public static readonly VmIntrinsicType PointerType =
+        new() { Namespace = "DotnetVM", Name = "MethodPointer", IsValue = false };
+
+    public required VmMethod Target { get; init; }
+
+    public override VmType Type => PointerType;
+}
+
+/// <summary>
+/// ゲスト デリゲートインスタンス (System.Delegate / MulticastDelegate ファサード型の実体)。
+/// マルチキャストは呼出エントリのリストで表現する (CLR と同じく Combine/Remove は新しい
+/// インスタンスを返す = 実質イミュータブル)。呼出は Interpreter.InvokeDelegate ゲート経由。
+/// </summary>
+public sealed class VmDelegate : VmObject {
+    private readonly List<DelegateInvocation> _invocations = [];
+
+    /// <summary>デリゲート宣言型 (Func&lt;int&gt; 等の構築型 / ゲストのカスタム delegate 型)。</summary>
+    public required VmType DeclaredType { get; init; }
+
+    public IReadOnlyList<DelegateInvocation> Invocations => _invocations;
+
+    public override VmType Type => DeclaredType;
+
+    public void AddInvocation(in DelegateInvocation invocation) => _invocations.Add(invocation);
+
+    /// <summary>呼出リストの複製を作る (デリゲート→デリゲート生成 / Combine の複製元)。</summary>
+    public DelegateInvocation[] CopyInvocations() => [.. _invocations];
+}
+
+/// <summary>mkrefany の結果 (__makeref / TypedReference の VM 内表現)。</summary>
+public sealed class VmTypedReference : VmObject {
+    public static readonly VmIntrinsicType TypedRefType =
+        new() { Namespace = "System", Name = "TypedReference", IsValue = true };
+
+    /// <summary>参照先スロット (ByRef スロット)。GC 走査は ObjectGraphWalker が Container を展開する。</summary>
+    public required StackSlot Slot { get; init; }
+
+    /// <summary>mkrefany で指定された型。</summary>
+    public required VmType RefType { get; init; }
+
+    public override VmType Type => TypedRefType;
+}
+
+/// <summary>arglist 命令の結果 (varargs の引数リストハンドル)。呼出側の残余引数は保持しない
+/// (varargs 呼出自体は fail-closed。ハンドルの一貫性だけを提供する)。</summary>
+public sealed class VmArgList : VmObject {
+    public static readonly VmIntrinsicType ArgListType =
+        new() { Namespace = "DotnetVM", Name = "ArgList", IsValue = false };
+
+    public required StackSlot[] Args { get; init; }
+
+    public override VmType Type => ArgListType;
+}
+
+/// <summary>
+/// localloc (stackalloc) の仮想メモリブロック。実バイト列を保持し、アロケーションは
+/// 実バイト数で計上する (EstimateSize → MemoryPolicy の対象)。ブロック自体は GC 管理。
+/// ポインタ演算はブロック内のバイトオフセットとして解決され、ブロック外アクセスは境界検査で
+/// 拒否する (実 CLR では未定義動作 = アドレス空間破壊。VM では安全側に置き換える)。
+/// </summary>
+public sealed class VmLocallocMemory : VmObject {
+    public static readonly VmIntrinsicType MemoryType =
+        new() { Namespace = "DotnetVM", Name = "LocallocMemory", IsValue = false };
+
+    public required byte[] Bytes { get; init; }
+
+    public override VmType Type => MemoryType;
+}
+
+/// <summary>
+/// unmanaged ポインタ (int* / byte* 等)。localloc ブロックのバイト列 + バイトオフセットを指す。
+/// ポインタ演算 (p + n / p - q) はオフセット演算、ldind/stind はリトルエンディアンの
+/// バイト読み書きとして実現する。実 CLR と異なり初期化は 0 (安全側の上限動作)。
+/// </summary>
+public sealed class VmNativePointer : VmObject {
+    public static readonly VmIntrinsicType PointerType =
+        new() { Namespace = "DotnetVM", Name = "NativePointer", IsValue = false };
+
+    public required byte[] Bytes { get; init; }
+
+    public int ByteOffset { get; init; }
+
+    public override VmType Type => PointerType;
+
+    // ---- バイト読み書き (境界検査付き) ----
+
+    private void CheckBounds(int byteCount) {
+        if (ByteOffset < 0 || (long)ByteOffset + byteCount > Bytes.Length)
+            throw new InvalidOperationException(
+                $"unmanaged ポインタがブロック外を参照します (offset={ByteOffset}, 要求 {byteCount} バイト, ブロック {Bytes.Length} バイト)。");
+    }
+
+    public int ReadInt8() {
+        CheckBounds(1);
+        return (sbyte)Bytes[ByteOffset];
+    }
+
+    public int ReadUInt8() {
+        CheckBounds(1);
+        return Bytes[ByteOffset];
+    }
+
+    public int ReadInt16() {
+        CheckBounds(2);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2));
+    }
+
+    public int ReadUInt16() {
+        CheckBounds(2);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2));
+    }
+
+    public int ReadInt32() {
+        CheckBounds(4);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(Bytes.AsSpan(ByteOffset, 4));
+    }
+
+    public long ReadInt64() {
+        CheckBounds(8);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(Bytes.AsSpan(ByteOffset, 8));
+    }
+
+    public double ReadDouble() {
+        CheckBounds(8);
+        return System.Buffers.Binary.BinaryPrimitives.ReadDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8));
+    }
+
+    public void WriteInt8(int value) {
+        CheckBounds(1);
+        Bytes[ByteOffset] = (byte)value;
+    }
+
+    public void WriteInt16(int value) {
+        CheckBounds(2);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2), (short)value);
+    }
+
+    public void WriteInt32(int value) {
+        CheckBounds(4);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
+    }
+
+    public void WriteInt64(long value) {
+        CheckBounds(8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
+    }
+
+    public void WriteDouble(double value) {
+        CheckBounds(8);
+        System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
+    }
+}
+
 /// <summary>
 /// オブジェクトモデルの共通処理: インスタンス/静的フィールドのレイアウト (基底型フィールドが先頭)、
 /// 型ごとの既定値生成。
@@ -344,6 +505,8 @@ public sealed class ObjectModel {
         VmArray array => 24 + 16L * array.Elements.Length,
         VmClassInstance instance => 24 + 16L * instance.Fields.Length,
         VmBoxedValue boxed => 24 + 16L * boxed.Fields.Length,
+        // localloc の仮想メモリブロックは実バイト数を計上する (メモリポリシーの対象)
+        VmLocallocMemory memory => 24 + memory.Bytes.Length,
         _ => 24,
     };
 }

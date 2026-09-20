@@ -409,7 +409,8 @@ public sealed class Interpreter {
                     or ILOp.Mul_Ovf or ILOp.Mul_Ovf_Un: {
                     var right = frame.Stack.Pop();
                     var left = frame.Stack.Pop();
-                    frame.Stack.Push(BinaryArithmetic(instruction.Op, left, right));
+                    frame.Stack.Push(TryPointerArithmetic(instruction.Op, left, right)
+                        ?? BinaryArithmetic(instruction.Op, left, right));
                     break;
                 }
                 case ILOp.Neg or ILOp.Not: {
@@ -548,30 +549,16 @@ public sealed class Interpreter {
                     break;
                 }
 
-                // ---- 間接アクセス (ldind/stind) ----
+                // ---- 間接アクセス (ldind/stind。マネージポインタ ByRef と unmanaged ポインタの両対応) ----
                 case ILOp.Ldind_I1 or ILOp.Ldind_U1 or ILOp.Ldind_I2 or ILOp.Ldind_U2
-                    or ILOp.Ldind_I4 or ILOp.Ldind_U4:
-                    frame.Stack.Push(StackSlot.OfInt32((int)((VmByRef)frame.Stack.Pop().ObjectValue!).Slot.Int64Value));
-                    break;
-                case ILOp.Ldind_I8 or ILOp.Ldind_I:
-                    frame.Stack.Push(StackSlot.OfInt64(((VmByRef)frame.Stack.Pop().ObjectValue!).Slot.Int64Value));
-                    break;
-                case ILOp.Ldind_R4 or ILOp.Ldind_R8:
-                    frame.Stack.Push(StackSlot.OfFloat(((VmByRef)frame.Stack.Pop().ObjectValue!).Slot.DoubleValue));
-                    break;
-                case ILOp.Ldind_Ref:
-                    frame.Stack.Push(((VmByRef)frame.Stack.Pop().ObjectValue!).Slot);
+                    or ILOp.Ldind_I4 or ILOp.Ldind_U4 or ILOp.Ldind_I8 or ILOp.Ldind_I
+                    or ILOp.Ldind_R4 or ILOp.Ldind_R8 or ILOp.Ldind_Ref:
+                    frame.Stack.Push(LoadIndirect(instruction.Op, frame.Stack.Pop()));
                     break;
                 case ILOp.Stind_Ref or ILOp.Stind_I or ILOp.Stind_I1 or ILOp.Stind_I2
                     or ILOp.Stind_I4 or ILOp.Stind_I8 or ILOp.Stind_R4 or ILOp.Stind_R8: {
                     var value = frame.Stack.Pop();
-                    var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    byref.Slot = instruction.Op switch {
-                        ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
-                        ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
-                        ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
-                        _ => StackSlot.OfInt32((int)value.Int64Value),
-                    };
+                    StoreIndirect(instruction.Op, frame.Stack.Pop(), value);
                     break;
                 }
 
@@ -704,6 +691,137 @@ public sealed class Interpreter {
                     continue;
                 }
 
+                // ---- 関数ポインタ / デリゲート / 特殊命令 ----
+                case ILOp.Ldftn: {
+                    var target = ResolveCallTarget(instruction.IntOperand, frame.Context);
+                    if (target.Method is null)
+                        throw new OperationNotAllowedException(
+                            $"ldftn: intrinsic 面 {target.DeclaringType}::{target.Name} への関数ポインタ取得は対応していません。");
+                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = target.Method }));
+                    break;
+                }
+                case ILOp.Ldvirtftn: {
+                    // レシーバを実行時型で最派生実装に解決してから関数ポインタ化する (仮想束縛の確定)
+                    var target = ResolveCallTarget(instruction.IntOperand, frame.Context);
+                    var receiver = frame.Stack.Pop();
+                    if (IsNullReference(receiver))
+                        throw new UnhandledGuestException("System.NullReferenceException", null);
+                    var resolved = target.Method is { } method
+                        ? DispatchVirtual(method, receiver)
+                        : TryDispatchVirtual(target.Name!, target.ParamCount, receiver)
+                          ?? throw new OperationNotAllowedException(
+                              $"ldvirtftn: {target.DeclaringType}::{target.Name} への関数ポインタ取得は対応していません。");
+                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = resolved }));
+                    break;
+                }
+                case ILOp.Calli: {
+                    // 間接呼出。スタック: fnptr, argN...arg1。オペランドは StandAloneSig (呼出規約 + 署名)。
+                    // 関数ポインタはゲスト実装のみ (ldftn が intrinsic 面を拒否するため)
+                    var signature = DecodeStandAloneSignature(instruction.IntOperand);
+                    var argCount = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+                    var fnptr = frame.Stack.Pop();
+                    var args = new StackSlot[argCount];
+                    for (var i = argCount - 1; i >= 0; i--)
+                        args[i] = frame.Stack.Pop();
+                    ConsumeInstruction(); // 呼出ゲート: クォータ + セーフポイント
+                    CheckSafepoint();
+                    StackSlot? result = fnptr.ObjectValue switch {
+                        VmMethodPointer pointer => Invoke(pointer.Target, args),
+                        VmDelegate @delegate => InvokeDelegate(@delegate, args),
+                        _ => throw new UnhandledGuestException("System.ArgumentException",
+                            "calli の関数ポインタが無効です (ldftn/ldvirtftn の結果を指定してください)。"),
+                    };
+                    if (SignatureReturnsValue(signature))
+                        frame.Stack.Push(result ?? default);
+                    break;
+                }
+                case ILOp.Ckfinite: {
+                    var value = frame.Stack.Pop();
+                    if (value.Kind == StackKind.Float &&
+                        (double.IsNaN(value.DoubleValue) || double.IsInfinity(value.DoubleValue)))
+                        throw new UnhandledGuestException("System.ArithmeticException", null);
+                    frame.Stack.Push(value);
+                    break;
+                }
+                case ILOp.Jmp: {
+                    // 尾呼び移行: 現フレームの残りを実行せず、呼出先の戻り値をこのメソッドの戻り値とする
+                    var target = ResolveCallTarget(instruction.IntOperand, frame.Context);
+                    if (target.Method is null)
+                        throw new OperationNotAllowedException(
+                            $"jmp: intrinsic 面 {target.DeclaringType}::{target.Name} への尾呼び移行は対応していません。");
+                    var args = new StackSlot[target.Arity];
+                    for (var i = target.Arity - 1; i >= 0; i--)
+                        args[i] = frame.Stack.Pop();
+                    var method = target.Method!;
+                    var context = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
+                    return Invoke(method, args, context);
+                }
+
+                // ---- TypedReference / varargs ----
+                case ILOp.Mkrefany: {
+                    var type = ResolveTypeToken(instruction.IntOperand, frame.Context);
+                    var value = frame.Stack.Pop();
+                    if (value.Kind != StackKind.ByRef)
+                        throw new UnhandledGuestException("System.InvalidCastException",
+                            $"mkrefany はマネージポインタ (&) を要求します: {Describe(value)}");
+                    frame.Stack.Push(StackSlot.OfObject(new VmTypedReference { Slot = value, RefType = type }));
+                    break;
+                }
+                case ILOp.Refanyval: {
+                    var type = ResolveTypeToken(instruction.IntOperand, frame.Context);
+                    var value = frame.Stack.Pop();
+                    if (value.ObjectValue is not VmTypedReference typed || !typed.RefType.IsAssignableTo(type))
+                        throw new UnhandledGuestException("System.InvalidCastException",
+                            $"refanyval: TypedReference の型 {Describe(value)} を {type.FullName} として取り出せません。");
+                    frame.Stack.Push(typed.Slot);
+                    break;
+                }
+                case ILOp.Refanytype: {
+                    var value = frame.Stack.Pop();
+                    if (value.ObjectValue is not VmTypedReference typed)
+                        throw new UnhandledGuestException("System.InvalidCastException",
+                            $"refanytype の被演算子が TypedReference ではありません: {Describe(value)}");
+                    frame.Stack.Push(StackSlot.OfObject(_heap.Allocate(new VmTypeHandle { Target = typed.RefType })));
+                    break;
+                }
+                case ILOp.Arglist:
+                    // varargs 呼出そのものは fail-closed (C# 産の IL では生成されない)。ハンドルの一貫性のみ提供
+                    frame.Stack.Push(StackSlot.OfObject(new VmArgList { Args = [] }));
+                    break;
+
+                // ---- 生メモリ系 ----
+                case ILOp.Localloc: {
+                    var bytes = frame.Stack.Pop().AsInt32;
+                    if (bytes < 0)
+                        throw new UnhandledGuestException("System.OverflowException", null);
+                    // VM 内表現: 実バイト列の仮想メモリブロック (ヒープ確保・実バイト数を計上) を作り、
+                    // 先頭バイトへの unmanaged ポインタを返す。実 CLR と異なり初期化は 0 (安全側の
+                    // 上限動作)、フレーム終了でも解放されない (GC 管理) = 脱出 stackalloc も安全側に動く
+                    var memory = _heap.Allocate(new VmLocallocMemory { Bytes = new byte[bytes] });
+                    frame.Stack.Push(StackSlot.OfObject(new VmNativePointer { Bytes = memory.Bytes, ByteOffset = 0 }));
+                    break;
+                }
+                case ILOp.Cpblk: {
+                    // スタック: dst, src, size (逆順に pop)
+                    var size = frame.Stack.Pop().AsInt32;
+                    var src = frame.Stack.Pop();
+                    var dst = frame.Stack.Pop();
+                    CopyMemoryBlock(dst, src, size);
+                    break;
+                }
+                case ILOp.Initblk: {
+                    var size = frame.Stack.Pop().AsInt32;
+                    var value = frame.Stack.Pop();
+                    var dst = frame.Stack.Pop();
+                    InitMemoryBlock(dst, value, size);
+                    break;
+                }
+                case ILOp.Sizeof:
+                    // ECMA-335 III.4.14: 結果は unsigned int32 として積む (C# の sizeof(T) の結果型は int)
+                    frame.Stack.Push(StackSlot.OfInt32(
+                        SizeOfType(ResolveTypeToken(instruction.IntOperand, frame.Context))));
+                    break;
+
                 // ---- M5 以降の命令 ----
                 case ILOp.Ldtoken: {
                     // ldtoken Field は FieldRVA 初期データのハンドル (RuntimeHelpers::InitializeArray 用)、
@@ -832,6 +950,8 @@ public sealed class Interpreter {
                 or "System.Collections.IList" or "System.Collections.ICollection",
         },
         VmBoxedValue boxed => boxed.Type.IsAssignableTo(target) || target.FullName is "System.Object" or "System.ValueType",
+        VmDelegate @delegate => @delegate.DeclaredType.IsAssignableTo(target) ||
+            target.FullName is "System.Object" or "System.Delegate" or "System.MulticastDelegate",
         _ => false,
     };
 
@@ -843,8 +963,261 @@ public sealed class Interpreter {
         VmArray a => a.ArrayType.FullName,
         VmBoxedValue b => b.Type.FullName,
         VmStructValue sv => sv.StructType.FullName,
+        VmDelegate d => d.DeclaredType.FullName,
         _ => slot.ObjectValue.GetType().Name,
     };
+
+    // ---- デリゲート / 関数ポインタ ----
+
+    /// <summary>型がデリゲートか (System.Delegate / MulticastDelegate 派生。ゲストのカスタム
+    /// delegate 宣言と Action/Func ファサードの構築型の両方を判定する)。</summary>
+    private static bool IsDelegateType(VmType? type) {
+        for (VmType? t = type; t is not null; t = t.BaseType)
+            if (t.FullName is "System.Delegate" or "System.MulticastDelegate")
+                return true;
+        return false;
+    }
+
+    /// <summary>デリゲート生成 (newobj instance void D::.ctor(object, native int))。
+    /// 関数ポインタは ldftn/ldvirtftn の VmMethodPointer、既存デリゲートの複製 (マルチキャスト含む) も可。</summary>
+    private VmDelegate CreateDelegate(VmType delegateType, StackSlot targetSlot, StackSlot pointerSlot) {
+        var invocations = pointerSlot.ObjectValue switch {
+            VmMethodPointer pointer => new[] { new DelegateInvocation(targetSlot, pointer.Target) },
+            VmDelegate source => source.CopyInvocations(),
+            _ => throw new UnhandledGuestException("System.ArgumentException",
+                "デリゲート生成の第 2 引数が関数ポインタ (ldftn/ldvirtftn の結果) ではありません。"),
+        };
+        var @delegate = _heap.Allocate(new VmDelegate { DeclaredType = delegateType });
+        foreach (var invocation in invocations)
+            @delegate.AddInvocation(invocation);
+        return @delegate;
+    }
+
+    /// <summary>デリゲート呼出 (callvirt Invoke/BeginInvoke のデリゲート実体ディスパッチ)。
+    /// マルチキャストは全エントリを順に実行し、最後の戻り値を返す (CLR 規約)。
+    /// 各呼出は通常の Invoke ゲート経由 (クォータ/セーフポイント/EH 機構を共有)。</summary>
+    private StackSlot? InvokeDelegate(VmDelegate @delegate, StackSlot[] args) {
+        var invocations = @delegate.Invocations;
+        if (invocations.Count == 0)
+            throw new UnhandledGuestException("System.ArgumentException",
+                "呼出エントリのないマルチキャスト デリゲートは呼び出せません。");
+        var argCount = args.Length - 1;
+        StackSlot last = default;
+        VmMethod lastMethod = invocations[^1].Method;
+        foreach (var invocation in invocations) {
+            var method = invocation.Method;
+            if (method.Signature.ParamTypes.Length != argCount)
+                throw new UnhandledGuestException("System.ArgumentException",
+                    $"デリゲート {@delegate.DeclaredType.FullName} の呼出 ({method.DeclaringType.FullName}::{method.Name}) に引数個数が一致しません (期待 {method.Signature.ParamTypes.Length}, 実際 {argCount})。");
+            GenericContext? context = null;
+            if (method.Signature.HasThis &&
+                TryGetReceiverTypeArguments(invocation.Target, method.DeclaringType.GenericParamCount, out var classArgs))
+                context = GenericContext.Of(classArgs, null);
+            if (method.Signature.HasThis) {
+                var callArgs = new StackSlot[argCount + 1];
+                callArgs[0] = invocation.Target;
+                for (var i = 0; i < argCount; i++)
+                    callArgs[i + 1] = args[i + 1];
+                last = Invoke(method, callArgs, context);
+            } else {
+                var callArgs = new StackSlot[argCount];
+                for (var i = 0; i < argCount; i++)
+                    callArgs[i] = args[i + 1];
+                last = Invoke(method, callArgs, context);
+            }
+        }
+        return SignatureReturnsValue(lastMethod.Signature) ? last : null;
+    }
+
+    // ---- 生メモリ系 (cpblk / initblk) と sizeof ----
+
+    /// <summary>cpblk/initblk の被演算子が指すメモリ位置。VM 内メモリの実体はスロット配列なので、
+    /// マネージポインタ (ByRef) が指すスロット配列 + インデックスのみを受け付ける。</summary>
+    private static VmByRef MemoryLocation(in StackSlot slot) =>
+        slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef byRef
+            ? byRef
+            : throw new InvalidOperationException($"cpblk/initblk はマネージポインタ (&) を要求します: {Describe(slot)}");
+
+    /// <summary>cpblk: unmanaged ポインタ間は実バイトコピー、マネージポインタ (ByRef) 間は
+    /// スロット粒度コピー (バイト数は 8 バイト単位に切り上げ)。</summary>
+    private static void CopyMemoryBlock(in StackSlot dstSlot, in StackSlot srcSlot, int size) {
+        if (size < 0)
+            throw new UnhandledGuestException("System.OverflowException", null);
+        if (dstSlot.ObjectValue is VmNativePointer dst && srcSlot.ObjectValue is VmNativePointer src) {
+            if ((long)dst.ByteOffset + size > dst.Bytes.Length || (long)src.ByteOffset + size > src.Bytes.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                    $"cpblk が仮想メモリブロックの範囲外です (size={size}, dst offset={dst.ByteOffset}/{dst.Bytes.Length}, src offset={src.ByteOffset}/{src.Bytes.Length})。");
+            Array.Copy(src.Bytes, src.ByteOffset, dst.Bytes, dst.ByteOffset, size);
+            return;
+        }
+        var dstByRef = MemoryLocation(dstSlot);
+        var srcByRef = MemoryLocation(srcSlot);
+        var count = (int)Math.Min((size + 7L) / 8, int.MaxValue);
+        if ((long)dstByRef.Index + count > dstByRef.Container.Length || (long)srcByRef.Index + count > srcByRef.Container.Length)
+            throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                $"cpblk が範囲外です (size={size} → {count} スロット, dst 長 {dstByRef.Container.Length}, src 長 {srcByRef.Container.Length})。");
+        Array.Copy(srcByRef.Container, srcByRef.Index, dstByRef.Container, dstByRef.Index, count);
+    }
+
+    /// <summary>initblk: unmanaged ポインタ先は実バイト充填、マネージポインタ (ByRef) 先は
+    /// スロット粒度 (8 バイト単位に切り上げ) の 0 充填のみ。</summary>
+    private static void InitMemoryBlock(in StackSlot dstSlot, in StackSlot value, int size) {
+        if (size < 0)
+            throw new UnhandledGuestException("System.OverflowException", null);
+        if (dstSlot.ObjectValue is VmNativePointer dst) {
+            var fill = checked((byte)value.Int64Value);
+            if ((long)dst.ByteOffset + size > dst.Bytes.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                    $"initblk が仮想メモリブロックの範囲外です (size={size}, offset={dst.ByteOffset}/{dst.Bytes.Length})。");
+            Array.Fill(dst.Bytes, fill, dst.ByteOffset, size);
+            return;
+        }
+        if (value.Int64Value != 0)
+            throw new NotSupportedException("マネージポインタ (ByRef) 先への initblk は 0 以外の充填値に対応していません (スロット粒度のため)。");
+        var dstByRef = MemoryLocation(dstSlot);
+        var count = (int)Math.Min((size + 7L) / 8, int.MaxValue);
+        if ((long)dstByRef.Index + count > dstByRef.Container.Length)
+            throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                $"initblk が範囲外です (size={size} → {count} スロット, 長 {dstByRef.Container.Length})。");
+        Array.Clear(dstByRef.Container, dstByRef.Index, count);
+    }
+
+    /// <summary>ポインタ演算 (add/sub)。C# の p[i] は「要素バイト数 × i + ポインタ」の mul + add に
+    /// コンパイルされるため、オフセットは既にバイト単位 (スケール不要)。ptr - ptr はバイト距離。</summary>
+    private static StackSlot? TryPointerArithmetic(ILOp op, in StackSlot left, in StackSlot right) {
+        if (op is not (ILOp.Add or ILOp.Sub))
+            return null;
+        VmNativePointer? pointer;
+        StackSlot other;
+        if (left.ObjectValue is VmNativePointer lp) {
+            pointer = lp;
+            other = right;
+        } else if (op == ILOp.Add && right.ObjectValue is VmNativePointer rp) {
+            pointer = rp;
+            other = left;
+        } else {
+            return null;
+        }
+        if (other.Kind is not (StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt)) {
+            if (op == ILOp.Sub && other.ObjectValue is VmNativePointer rhs)
+                return StackSlot.OfNativeInt((long)pointer.ByteOffset - rhs.ByteOffset); // ポインタ差 = バイト距離
+            return null; // 不正な組合せは通常の算術カーネルにフォールバック (そこで fail-closed)
+        }
+        var offset = op == ILOp.Add ? pointer.ByteOffset + other.Int64Value : pointer.ByteOffset - other.Int64Value;
+        if (offset < 0 || offset > int.MaxValue)
+            throw new UnhandledGuestException("System.OverflowException", null);
+        return StackSlot.OfObject(new VmNativePointer { Bytes = pointer.Bytes, ByteOffset = (int)offset });
+    }
+
+    /// <summary>ldind: アドレスの参照先から読み出す。unmanaged ポインタはバイト列からの
+    /// リトルエンディアン読み出し (命令幅どおり)、マネージポインタ (ByRef) はスロット読み出し。</summary>
+    private static StackSlot LoadIndirect(ILOp op, in StackSlot address) {
+        if (address.ObjectValue is VmNativePointer ptr) {
+            return op switch {
+                ILOp.Ldind_I1 => StackSlot.OfInt32(ptr.ReadInt8()),
+                ILOp.Ldind_U1 => StackSlot.OfInt32(ptr.ReadUInt8()),
+                ILOp.Ldind_I2 => StackSlot.OfInt32(ptr.ReadInt16()),
+                ILOp.Ldind_U2 => StackSlot.OfInt32(ptr.ReadUInt16()),
+                ILOp.Ldind_I4 or ILOp.Ldind_U4 => StackSlot.OfInt32(ptr.ReadInt32()),
+                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(ptr.ReadInt64()),
+                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(ptr.ReadDouble()),
+                _ => throw new NotSupportedException(
+                    "unmanaged ポインタからの参照読み出し (ldind.ref) は対応していません。"),
+            };
+        }
+        if (address.ObjectValue is null)
+            throw new UnhandledGuestException("System.NullReferenceException", null);
+        if (address.ObjectValue is VmByRef byRef) {
+            return op switch {
+                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(byRef.Slot.Int64Value),
+                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(byRef.Slot.DoubleValue),
+                ILOp.Ldind_Ref => byRef.Slot,
+                _ => StackSlot.OfInt32((int)byRef.Slot.Int64Value), // I1〜U4 は i4 正規化スロット
+            };
+        }
+        throw new InvalidOperationException($"ldind のアドレスがポインタではありません: {Describe(address)}");
+    }
+
+    /// <summary>stind: アドレスの参照先へ書き込む (LoadIndirect の書き込み版)。</summary>
+    private static void StoreIndirect(ILOp op, in StackSlot address, in StackSlot value) {
+        if (address.ObjectValue is VmNativePointer ptr) {
+            switch (op) {
+                case ILOp.Stind_I1: ptr.WriteInt8((int)value.Int64Value); return;
+                case ILOp.Stind_I2: ptr.WriteInt16((int)value.Int64Value); return;
+                case ILOp.Stind_I4: ptr.WriteInt32((int)value.Int64Value); return;
+                case ILOp.Stind_I8: ptr.WriteInt64(value.Int64Value); return;
+                case ILOp.Stind_R4 or ILOp.Stind_R8: ptr.WriteDouble(value.DoubleValue); return;
+                default: // Stind_Ref / Stind_I
+                    throw new NotSupportedException(
+                        "unmanaged ポインタへの参照書き込み (stind.ref) は対応していません。");
+            }
+        }
+        if (address.ObjectValue is null)
+            throw new UnhandledGuestException("System.NullReferenceException", null);
+        if (address.ObjectValue is VmByRef byRef) {
+            byRef.Slot = op switch {
+                ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
+                ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
+                _ => StackSlot.OfInt32((int)value.Int64Value),
+            };
+            return;
+        }
+        throw new InvalidOperationException($"stind のアドレスがポインタではありません: {Describe(address)}");
+    }
+
+    /// <summary>sizeof の VM 値。プリミティブは CLR と同じ実際のサイズ、ゲスト値型は
+    /// 順次レイアウト近似 (フィールドサイズの和 + アライメント詰め)、参照型は適用不可。</summary>
+    private int SizeOfType(VmType type) => SizeOfTypeCore(type, []);
+
+    private int SizeOfTypeCore(VmType type, HashSet<VmType> visiting) {
+        if (type is VmIntrinsicType intrinsic) {
+            if (!intrinsic.IsValue)
+                throw new InvalidOperationException($"sizeof は値型にのみ適用できます: {type.FullName}");
+            return intrinsic.FullName switch {
+                "System.SByte" or "System.Byte" or "System.Boolean" => 1,
+                "System.Char" or "System.Int16" or "System.UInt16" => 2,
+                "System.Int32" or "System.UInt32" or "System.Single" => 4,
+                "System.Int64" or "System.UInt64" or "System.Double"
+                    or "System.IntPtr" or "System.UIntPtr" => 8,
+                // 列挙ファサード等 (StringSplitOptions 等) は VM 内で i4 スロットに正規化される
+                _ => 4,
+            };
+        }
+        var definition = type is VmConstructedType constructed ? constructed.Definition : type;
+        if (definition is VmClassType cls && cls.IsValueType) {
+            if (!visiting.Add(cls))
+                throw new BadImageFormatException($"sizeof: 相互参照する値型レイアウト {cls.FullName} は不正です。");
+            try {
+                var size = 0;
+                var maxAlign = 1;
+                foreach (var field in cls.Fields) {
+                    if ((field.Flags & 0x0010) != 0)
+                        continue; // FieldAttributes.Static
+                    var fieldSize = field.FieldType is null ? 8 : SizeOfTypeCore(field.FieldType, visiting);
+                    var align = Math.Min(fieldSize, 8);
+                    size = (size + align - 1) / align * align;
+                    size += fieldSize;
+                    maxAlign = Math.Max(maxAlign, align);
+                }
+                size = (size + maxAlign - 1) / maxAlign * maxAlign;
+                return Math.Max(size, 1);
+            } finally {
+                visiting.Remove(cls);
+            }
+        }
+        throw new InvalidOperationException($"sizeof は値型にのみ適用できます: {type.FullName}");
+    }
+
+    /// <summary>calli のオペランド (StandAloneSig トークン) から呼出規約 + 署名をデコードする。</summary>
+    private MethodSignature DecodeStandAloneSignature(int token) {
+        var table = (TableKind)(token >> 24);
+        var rid = (int)(token & 0xFFFFFF);
+        if (table != TableKind.StandAloneSig)
+            throw new BadImageFormatException($"calli のオペランド 0x{token:X8} は StandAloneSig ではありません。");
+        return SignatureDecoder.DecodeMethodSignature(
+            _loader.Image.GetBlob(_loader.Image.Tables.GetRowIndex(TableKind.StandAloneSig, rid, 0)).ToArray());
+    }
 
     // ---- フィールドアクセス ----
 
@@ -1014,6 +1387,12 @@ public sealed class Interpreter {
             if (typeName is not null) {
                 var facadeType = _loader.FindIntrinsicType(typeName);
                 if (facadeType is not null) {
+                    // デリゲートファサード (Action/Func/Predicate 等) の newobj (object, native int)
+                    if (IsDelegateType(facadeType)) {
+                        var pointerSlot = caller.Stack.Pop();
+                        var targetSlot = caller.Stack.Pop();
+                        return StackSlot.OfObject(CreateDelegate(facadeType, targetSlot, pointerSlot));
+                    }
                     var ctorArgs = new StackSlot[facadeParamCount + 1];
                     for (var i = facadeParamCount; i >= 1; i--)
                         ctorArgs[i] = caller.Stack.Pop();
@@ -1056,6 +1435,12 @@ public sealed class Interpreter {
         }
 
         var owner = (VmClassType)ctor.DeclaringType;
+        // ゲストのカスタム delegate 宣言の newobj (object target, native int method)
+        if (IsDelegateType(owner)) {
+            var pointerSlot = caller.Stack.Pop();
+            var targetSlot = caller.Stack.Pop();
+            return StackSlot.OfObject(CreateDelegate(owner, targetSlot, pointerSlot));
+        }
         EnsureInitialized(owner);
         var paramCount = ctor.Signature.ParamTypes.Length;
         var args = new StackSlot[paramCount + 1];
@@ -1088,12 +1473,21 @@ public sealed class Interpreter {
     /// </summary>
     private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
         var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
-        var definition = (VmClassType)constructed.Definition;
         var signature = SignatureDecoder.DecodeMethodSignature(
             _loader.Image.GetMemberRefSignature(memberRefRid).ToArray());
         var paramCount = signature.ParamTypes.Length;
         var ctorName = _loader.GetMemberRefName(memberRefRid);
         var context = new GenericContext { ClassArgs = constructed.TypeArguments };
+
+        // 構築ジェネリック デリゲート (Func<int> 等) の newobj (object, native int)。
+        // 定義は BCL ファサード (VmIntrinsicType) のこともあるため ClassType キャストより先に判定する
+        if (IsDelegateType(constructed.Definition)) {
+            var pointerSlot = caller.Stack.Pop();
+            var targetSlot = caller.Stack.Pop();
+            return StackSlot.OfObject(CreateDelegate(constructed, targetSlot, pointerSlot));
+        }
+
+        var definition = (VmClassType)constructed.Definition;
 
         // .ctor は宣言型 (継承チェーン上の基底ジェネリック定義も含む) から探す
         VmMethod? ctor = null;
@@ -1256,6 +1650,18 @@ public sealed class Interpreter {
         var args = new StackSlot[target.Arity];
         for (var i = target.Arity - 1; i >= 0; i--)
             args[i] = caller.Stack.Pop();
+
+        // デリゲート実体の callvirt Invoke (カスタム delegate 宣言の abstract Invoke / Action・Func
+        // ファサードの未登録面の両方をここで引き受ける)。null レシーバは NRE
+        if (isCallvirt && target.HasThis && target.Name is "Invoke" or "BeginInvoke") {
+            if (IsNullReference(args[0]))
+                throw new UnhandledGuestException("System.NullReferenceException", null);
+            if (args[0].ObjectValue is VmDelegate @delegate) {
+                ConsumeInstruction(); // 呼出ゲート: クォータ + セーフポイント
+                CheckSafepoint();
+                return InvokeDelegate(@delegate, args);
+            }
+        }
 
         if (target.Intrinsic is { } intrinsic) {
             // プリミティブの instance メソッド (int.ToString() 等) は ldloca 経由の
@@ -1751,6 +2157,30 @@ public sealed class Interpreter {
         _ => throw new InvalidOperationException($"分岐条件に使えないスタック型です: {slot.Kind}"),
     };
 
+    private static bool CompareNativePointer(ILOp op, in StackSlot left, in StackSlot right) {
+        var lp = left.ObjectValue as VmNativePointer;
+        var rp = right.ObjectValue as VmNativePointer;
+        if (lp is null && rp is null)
+            return false;
+        // 片側が null (native int 0): VM のポインタは常に有効 → p != null は常に真
+        if (lp is null || rp is null) {
+            var intSide = lp is null ? right : left;
+            if (intSide.Kind is not (StackKind.NativeInt or StackKind.Int32) || intSide.Int64Value != 0)
+                throw new InvalidOperationException("ポインタと null 以外の整数の比較は対応していません。");
+            return op is ILOp.Cgt or ILOp.Cgt_Un; // eq/lt は false (非 null), gt 系は true
+        }
+        if (!ReferenceEquals(lp.Bytes, rp.Bytes))
+            throw new InvalidOperationException("別のメモリブロックを指すポインタ同士の順序比較は未定義動作のため対応していません。");
+        return op switch {
+            ILOp.Ceq => lp.ByteOffset == rp.ByteOffset,
+            ILOp.Cgt or ILOp.Cgt_Un => lp.ByteOffset > rp.ByteOffset,
+            ILOp.Clt or ILOp.Clt_Un => lp.ByteOffset < rp.ByteOffset,
+            Interpreter.CgeShim or Interpreter.CgeUnShim => lp.ByteOffset >= rp.ByteOffset,
+            Interpreter.CleShim or Interpreter.CleUnShim => lp.ByteOffset <= rp.ByteOffset,
+            _ => false,
+        };
+    }
+
     private static bool CompareBranch(ILOp op, in StackSlot left, in StackSlot right) => op switch {
         ILOp.Beq or ILOp.Beq_S => Compare(ILOp.Ceq, left, right),
         ILOp.Bne_Un or ILOp.Bne_Un_S => !Compare(ILOp.Ceq, left, right),
@@ -1773,12 +2203,24 @@ public sealed class Interpreter {
 
     /// <summary>ceq/cgt/clt 系 (shim を含む) の共通比較。数値は統一 (i4/i8/native/float)、オブジェクトは参照比較。</summary>
     private static bool Compare(ILOp op, in StackSlot left, in StackSlot right) {
+        // unmanaged ポインタの比較 (C# の p != null は cgt.un、p == q は ceq にコンパイルされる)
+        if (left.ObjectValue is VmNativePointer || right.ObjectValue is VmNativePointer)
+            return CompareNativePointer(op, left, right);
         if (op == ILOp.Ceq) {
             if (left.Kind is StackKind.Object or StackKind.ByRef || right.Kind is StackKind.Object or StackKind.ByRef)
                 return ReferenceEquals(left.ObjectValue, right.ObjectValue);
             if (left.Kind == StackKind.Float || right.Kind == StackKind.Float)
                 return ToFloat(left) == ToFloat(right);
             return ToLong(left) == ToLong(right);
+        }
+        // 参照系スロットの順序比較: cgt.un は「同一インスタンスでなければ真」を返す
+        // (ECMA-335 III.2。C# の x != null は cgt.un にコンパイルされるため、非 null vs null
+        // が真になる必要がある)。他の順序命令が参照に使われることは検証可能な IL では無いため
+        // 数値比較への誤落下を避けて fail-closed にする
+        if (left.Kind is StackKind.Object or StackKind.ByRef || right.Kind is StackKind.Object or StackKind.ByRef) {
+            if (op == ILOp.Cgt_Un)
+                return !ReferenceEquals(left.ObjectValue, right.ObjectValue);
+            throw new InvalidOperationException($"比較命令 {op} は参照スロットに適用できません。");
         }
         if (left.Kind == StackKind.Float || right.Kind == StackKind.Float) {
             var a = ToFloat(left);
@@ -2035,6 +2477,9 @@ public sealed class Interpreter {
     // ---- 変換 ----
 
     private static StackSlot ConvertValue(ILOp op, in StackSlot value) {
+        // unmanaged ポインタの恒等変換 (p + n の add 前後に出る conv.i / conv.u)
+        if (op is ILOp.Conv_I or ILOp.Conv_U && value.ObjectValue is VmNativePointer)
+            return value;
         // ソース値を i8 (または f8) に統一してから切り詰める
         var isFloatSrc = value.Kind == StackKind.Float;
         var f = isFloatSrc ? value.DoubleValue : 0.0;

@@ -13,7 +13,7 @@ public static class TestAssemblyCompiler {
     /// <summary>コンパイルして PE バイト列を返す。診断エラー時は例外。
     /// extraReferences で追加の契約アセンブリ (intrinsic ファサードの C# 側シグネチャ等) を参照できる。</summary>
     public static byte[] CompileToBytes(string source, string assemblyName = "TestAsm",
-        IReadOnlyList<MetadataReference>? extraReferences = null) {
+        IReadOnlyList<MetadataReference>? extraReferences = null, bool allowUnsafe = false) {
         var syntaxTree = CSharpSyntaxTree.ParseText(source, path: "Test.cs");
         var compilation = CSharpCompilation.Create(
             assemblyName,
@@ -23,7 +23,7 @@ public static class TestAssemblyCompiler {
             // 実在 DLL と同じ unchecked 語彙でコンパイルしないと、checked 固有の
             // rem.ovf 相当の例外等がオラクル側に出てしまい突合できない。
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
-                optimizationLevel: OptimizationLevel.Debug, checkOverflow: false));
+                optimizationLevel: OptimizationLevel.Debug, checkOverflow: false, allowUnsafe: allowUnsafe));
         using var peStream = new MemoryStream();
         var result = compilation.Emit(peStream);
         if (!result.Success) {
@@ -36,8 +36,9 @@ public static class TestAssemblyCompiler {
     }
 
     /// <summary>コンパイルして VM 用にパースし、ついでに CLR 反射用にもロードする。</summary>
-    public static (byte[] Pe, Assembly ClrAssembly) Compile(string source, string assemblyName = "TestAsm") {
-        var pe = CompileToBytes(source, assemblyName);
+    public static (byte[] Pe, Assembly ClrAssembly) Compile(string source, string assemblyName = "TestAsm",
+        bool allowUnsafe = false) {
+        var pe = CompileToBytes(source, assemblyName, allowUnsafe: allowUnsafe);
         var clrAssembly = Assembly.Load(pe);
         return (pe, clrAssembly);
     }

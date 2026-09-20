@@ -26,7 +26,18 @@ public static class ObjectGraphWalker {
             case VmIntrinsicInstance intrinsicInstance:
                 CollectFromSlots(intrinsicInstance.State, visit);
                 break;
+            case VmDelegate @delegate:
+                foreach (var invocation in @delegate.Invocations)
+                    CollectFromSlot(invocation.Target, visit);
+                break;
+            case VmTypedReference typedRef:
+                CollectFromSlot(typedRef.Slot, visit);
+                break;
+            case VmArgList argList:
+                CollectFromSlots(argList.Args, visit);
+                break;
             // VmExceptionObject: Message は VmString (ヒープ管理外)。将来の InnerException 追加時にここへ
+            // VmMethodPointer / VmIntrinsicCarrier: 参照フィールドは VM 型系 / ホストメモリ (走査不要)
         }
     }
 

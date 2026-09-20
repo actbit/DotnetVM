@@ -19,7 +19,11 @@ public static class TestAssemblyCompiler {
             assemblyName,
             new[] { syntaxTree },
             GetReferences(extraReferences),
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Debug));
+            // CheckOverflow の既定値は true (csc コマンドラインの unchecked と異なる)。
+            // 実在 DLL と同じ unchecked 語彙でコンパイルしないと、checked 固有の
+            // rem.ovf 相当の例外等がオラクル側に出てしまい突合できない。
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                optimizationLevel: OptimizationLevel.Debug, checkOverflow: false));
         using var peStream = new MemoryStream();
         var result = compilation.Emit(peStream);
         if (!result.Success) {

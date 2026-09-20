@@ -8,8 +8,15 @@ public abstract class VmType {
     public abstract string FullName { get; }
     public abstract VmType? BaseType { get; }
 
-    /// <summary>名前空間を除いた型名 (FullName の最後の '.' 以降)。</summary>
-    public string Name => FullName[(FullName.LastIndexOf('.') + 1)..];
+    /// <summary>名前空間を除いた型名 (FullName の最後の '.' / '+' 以降)。
+    /// ネスト型の FullName は CLR 規約どおり '+' 区切り (例: Vm.Compat+Box) なので両方を見る。</summary>
+    public string Name {
+        get {
+            var fullName = FullName;
+            var cut = System.Math.Max(fullName.LastIndexOf('.'), fullName.LastIndexOf('+'));
+            return fullName[(cut + 1)..];
+        }
+    }
 
     public IReadOnlyList<VmMethod> Methods { get; internal set; } = [];
     public IReadOnlyList<VmField> Fields { get; internal set; } = [];
@@ -66,13 +73,18 @@ public sealed class VmClassType : VmType {
     public required AssemblyImage Image { get; init; }
     public required int TypeDefRid { get; init; }
     public required string Namespace { get; init; }
-    public required string Name { get; init; }
+    public required new string Name { get; init; }
     public override uint Flags { get; }
 
     private VmType? _baseType;
     private bool _baseTypeResolved;
 
-    public override string FullName => string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
+    public override string FullName =>
+        // CLR 規約: ネスト型の FullName は包含型を '+' で連結する (Type.FullName 互換)。
+        // DeclaringType は TypeLoader の遅延解決なので、未解決間はメタデータ名のみ。
+        DeclaringType is VmClassType declaring
+            ? declaring.FullName + "+" + Name
+            : string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
 
     /// <summary>ネスト型の場合の包含型 (無ければ null)。</summary>
     public VmType? DeclaringType { get; internal set; }
@@ -126,7 +138,7 @@ public sealed class VmClassType : VmType {
 /// <summary>アセンブリに実装が無い型 (System.Object 等) を表すファサード。実体は intrinsic が担う。</summary>
 public sealed class VmIntrinsicType : VmType {
     public required string Namespace { get; init; }
-    public required string Name { get; init; }
+    public required new string Name { get; init; }
     public required bool IsValue { get; init; }
     public VmType? Parent { get; init; }
 

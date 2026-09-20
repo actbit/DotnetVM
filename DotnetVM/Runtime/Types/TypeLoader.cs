@@ -83,6 +83,15 @@ public sealed class TypeLoader {
         // ゲストが実装/参照する頻出外部インターフェースのファサード
         foreach (var name in new[] { "IDisposable", "IComparable", "ICloneable", "IFormatProvider" })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false });
+        // 文字列補間 ($"...") がコンパイルされる DefaultInterpolatedStringHandler (ref struct) の
+        // ファサード。本体は intrinsic 面 (AppendLiteral / AppendFormatted / ToStringAndClear) が担う。
+        Add(new VmIntrinsicType {
+            Namespace = "System.Runtime.CompilerServices",
+            Name = "DefaultInterpolatedStringHandler", IsValue = true, Parent = valueType,
+        });
+        // 頻出 BCL 列挙型のファサード (署名上の TypeRef 解決に必要。値は i4 スロットとして扱う)
+        foreach (var name in new[] { "StringSplitOptions", "StringComparison" })
+            Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = true, Parent = valueType });
         foreach (var name in new[] { "IEnumerable", "IEnumerator", "ICollection", "IList" })
             Add(new VmIntrinsicType { Namespace = "System.Collections", Name = name, IsValue = false });
         // ジェネリックインターフェースは BCL 既知の変性を登録する (castclass/isinst の変性判定に使う)

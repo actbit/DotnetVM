@@ -145,18 +145,88 @@ public sealed class VmFieldRvaData : VmObject {
 }
 
 /// <summary>
+/// ldtoken Type の結果ハンドル (System.RuntimeTypeHandle の VM 内表現)。
+/// System.Type::GetTypeFromHandle intrinsic が System.Type ファサードの実体へ変換する。
+/// </summary>
+public sealed class VmTypeHandle : VmObject {
+    public static readonly VmIntrinsicType HandleType =
+        new() { Namespace = "System", Name = "RuntimeTypeHandle", IsValue = true };
+
+    public required VmType Target { get; init; }
+
+    public override VmType Type => HandleType;
+}
+
+/// <summary>
+/// ldtoken Method の結果ハンドル (System.RuntimeMethodHandle の VM 内表現)。
+/// MethodBase::GetMethodFromHandle / GetCurrentMethod intrinsic が変換する。
+/// </summary>
+public sealed class VmMethodHandle : VmObject {
+    public static readonly VmIntrinsicType HandleType =
+        new() { Namespace = "System", Name = "RuntimeMethodHandle", IsValue = true };
+
+    public required VmMethod Target { get; init; }
+
+    public override VmType Type => HandleType;
+}
+
+/// <summary>
+/// typeof(X) / Object.GetType() の結果 (System.Type ファサードの実体)。
+/// CLR では内部型 System.RuntimeType のインスタンス。ゲストからは get_Name / get_FullName /
+/// ToString / op_Equality intrinsic 面のみ観測できる。Target は VM 型系 (GC 管理外)。
+/// </summary>
+public sealed class VmRuntimeObject : VmObject {
+    public static readonly VmIntrinsicType RuntimeTypeFacade =
+        new() { Namespace = "System", Name = "RuntimeType", IsValue = false };
+
+    public required VmType Target { get; init; }
+
+    public override VmType Type => RuntimeTypeFacade;
+}
+
+/// <summary>MethodBase.GetCurrentMethod() 等の結果 (System.Reflection.MethodBase ファサードの実体)。</summary>
+public sealed class VmRuntimeMethod : VmObject {
+    public static readonly VmIntrinsicType MethodBaseFacade =
+        new() { Namespace = "System.Reflection", Name = "RuntimeMethodInfo", IsValue = false };
+
+    public required VmMethod Target { get; init; }
+
+    public override VmType Type => MethodBaseFacade;
+}
+
+/// <summary>
+/// intrinsic が VM スロット上に内部状態 (ホスト側バッファ等) を保持するための搬送体。
+/// DefaultInterpolatedStringHandler 等の「構造体ファサードのローカルスロットに実体を置く」
+/// intrinsic が使う。ゲストに渡されることはなく、Payload はホストメモリ (GC/クォータ計上外)。
+/// </summary>
+public sealed class VmIntrinsicCarrier : VmObject {
+    public static readonly VmIntrinsicType CarrierType =
+        new() { Namespace = "DotnetVM", Name = "IntrinsicCarrier", IsValue = false };
+
+    public required object? Payload { get; set; }
+
+    public override VmType Type => CarrierType;
+}
+
+/// <summary>
 /// オブジェクトモデルの共通処理: インスタンス/静的フィールドのレイアウト (基底型フィールドが先頭)、
 /// 型ごとの既定値生成。
 /// </summary>
-public static class ObjectModel {
-    private static readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
-    private static readonly ConditionalWeakTable<VmType, StackSlot[]> StaticStorage = new();
-    // CWT は列挙できないため、生成済み静的ストレージの列挙用サイドリスト (GC ルート源)
-    private static readonly List<StackSlot[]> StaticStorageList = [];
+/// <remarks>
+/// 互換性上の重要点: このクラスの状態は <strong>VM インスタンスごと</strong>に保持される
+/// (かつて static だったため、複数 VM が静的フィールドを共有する分離バグだった)。
+/// Interpreter が 1 つ所有する。
+/// </remarks>
+public sealed class ObjectModel {
+    private readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
+    // 静的ストレージは「正準型キー (構築型なら FullName)」で保持する。CLR と同じく
+    // 構築ジェネリック型 (C<int> と C<string> 等) は静的フィールドを共有しない。
+    private readonly Dictionary<string, StackSlot[]> StaticStorage = [];
+    private readonly List<StackSlot[]> StaticStorageList = [];
 
     /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。
     /// 基底が構築ジェネリック型 (例: Sub`1 : Base`1&lt;!0&gt;) の場合は定義型に解いて収集する。</summary>
-    public static Dictionary<VmField, int> GetLayout(VmClassType type) {
+    public Dictionary<VmField, int> GetLayout(VmClassType type) {
         if (Layouts.TryGetValue(type, out var cached))
             return cached;
         var layout = new Dictionary<VmField, int>();
@@ -179,11 +249,11 @@ public static class ObjectModel {
     }
 
     /// <summary>インスタンスフィールド既定値のストレージを生成する。</summary>
-    public static StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader) =>
+    public StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader) =>
         CreateInstanceStorage(type, loader, null);
 
     /// <summary>インスタンスフィールド既定値のストレージを生成する (ジェネリック型は型引数でフィールド型を解決)。</summary>
-    public static StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
+    public StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
         var layout = GetLayout(type);
         var fields = new StackSlot[layout.Values.Count == 0 ? 0 : layout.Values.Max() + 1];
         foreach (var (field, index) in layout)
@@ -191,22 +261,24 @@ public static class ObjectModel {
         return fields;
     }
 
-    /// <summary>静的フィールドのストレージ (型ごとに 1 つ)。</summary>
-    public static StackSlot[] GetOrCreateStaticStorage(VmClassType type, TypeLoader loader) {
-        if (StaticStorage.TryGetValue(type, out var existing))
+    /// <summary>静的フィールドのストレージ。storageKey は非構築型なら FullName、構築型なら
+    /// 構築 FullName (CLR の「実引数ごとに別静的ストレージ」規約のため)。</summary>
+    public StackSlot[] GetOrCreateStaticStorage(string storageKey, VmClassType type, TypeLoader loader,
+        GenericContext? context = null) {
+        if (StaticStorage.TryGetValue(storageKey, out var existing))
             return existing;
         var storage = new StackSlot[type.Fields.Count(f => f.IsStatic && !f.IsLiteral)];
         var index = 0;
         foreach (var field in type.Fields)
             if (field.IsStatic && !field.IsLiteral)
-                storage[index++] = DefaultForType(field.FieldType!, loader);
-        StaticStorage.Add(type, storage);
+                storage[index++] = DefaultForType(GenericSubstitutor.Substitute(field.FieldType!, context), loader);
+        StaticStorage[storageKey] = storage;
         StaticStorageList.Add(storage);
         return storage;
     }
 
     /// <summary>生成済みの全静的ストレージを列挙する (GC ルート源)。</summary>
-    internal static IEnumerable<StackSlot[]> EnumerateStaticStorage() => StaticStorageList;
+    internal IEnumerable<StackSlot[]> EnumerateStaticStorage() => StaticStorageList;
 
     public static int StaticFieldIndex(VmClassType type, VmField field) {
         var index = 0;
@@ -221,10 +293,10 @@ public static class ObjectModel {
     }
 
     /// <summary>型に対するゼロ既定値。</summary>
-    public static StackSlot DefaultForType(VmType? type, TypeLoader loader) => DefaultForType(type, loader, null);
+    public StackSlot DefaultForType(VmType? type, TypeLoader loader) => DefaultForType(type, loader, null);
 
     /// <summary>型に対するゼロ既定値 (ジェネリックパラメータは context の実引数で置換してから判定)。</summary>
-    public static StackSlot DefaultForType(VmType? type, TypeLoader loader, GenericContext? context) {
+    public StackSlot DefaultForType(VmType? type, TypeLoader loader, GenericContext? context) {
         if (type is null)
             return StackSlot.Null;
         var substituted = GenericSubstitutor.Substitute(type, context);
@@ -253,12 +325,12 @@ public static class ObjectModel {
     }
 
     /// <summary>構造体の既定値 (全フィールドを再帰的にゼロ初期化)。</summary>
-    public static VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader) =>
+    public VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader) =>
         DefaultStruct(structType, loader, null, null);
 
     /// <summary>構造体の既定値。context はフィールド型のジェネリックパラメータ解決に使う
     /// (構造体自身の実引数は typeArguments として VmStructValue に記録する)。</summary>
-    public static VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader,
+    public VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader,
         GenericContext? context, VmType[]? typeArguments) {
         var layout = GetLayout(structType);
         var fields = new StackSlot[layout.Count == 0 ? 0 : layout.Values.Max() + 1];

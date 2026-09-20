@@ -44,10 +44,39 @@ public sealed class IntrinsicContext {
     /// <summary>ストレージゲートウェイ (ポリシー検証済みの I/O のみ可。null = 全拒否)。</summary>
     public StorageGateway? Storage { get; init; }
 
+    /// <summary>
+    /// 呼出ゲート (Interpreter.Call) が設定する「今回の呼出の宣言上のパラメータ型名」。
+    /// i4 スロットに統合される char / bool / int 等のオーバーロードを intrinsic 側で
+    /// 判別するために使う (例: Console.Write(char) と Console.Write(int) は同一キー)。
+    /// </summary>
+    public string[] ParameterTypeNames { get; internal set; } = [];
+
+    /// <summary>インデックスのパラメータ型名 (範囲外は空文字列)。</summary>
+    public string ParamAt(int i) =>
+        i >= 0 && i < ParameterTypeNames.Length ? ParameterTypeNames[i] : "";
+
+    /// <summary>ゲストオブジェクトの ToString 仮想呼出 (Interpreter が設定するフック)。
+    /// Console.Write(object) / String.Concat(object) 等、 CLR で暗黙に ToString が走る面で使う。
+    /// ゲスト実装がなければ null (intrinsic 側の既定書式にフォールバック)。</summary>
+    internal Func<StackSlot, VmString?>? ToStringHook { get; set; }
+
+    /// <summary>MethodBase.GetCurrentMethod() 用の現在メソッド取得フック (Interpreter が設定)。</summary>
+    internal Func<VmMethod?>? CurrentMethodHook { get; set; }
+
+    /// <summary>オブジェクトの CLR 互換文字列化 (ゲストの ToString override を仮想ディスパッチ)。</summary>
+    public VmString? InvokeToString(in StackSlot slot) =>
+        ToStringHook is { } hook ? hook(slot) : null;
+
     /// <summary>文字列を VM オブジェクトに正規化して作る。</summary>
     public VmString MakeString(string value) => Strings.GetOrNew(value);
 
     private VmArrayType? _byteArrayType;
+    private VmArrayType? _stringArrayType;
+    private VmArrayType? _objectArrayType;
+
+    private VmArrayType ArrayTypeOf(string intrinsicTypeFullName, ref VmArrayType? cache) =>
+        cache ??= new VmArrayType { ElementType = Types.FindIntrinsicType(intrinsicTypeFullName)
+            ?? throw new InvalidOperationException($"ファサード型 {intrinsicTypeFullName} が未登録です。") };
 
     /// <summary>byte 配列を VM オブジェクト (VmArray) に正規化して作る (ヒープ計上済み)。</summary>
     public VmArray MakeByteArray(ReadOnlySpan<byte> data) {
@@ -56,6 +85,21 @@ public sealed class IntrinsicContext {
         for (var i = 0; i < data.Length; i++)
             elements[i] = StackSlot.OfInt32(data[i]);
         return Heap.Allocate(new VmArray(_byteArrayType, elements));
+    }
+
+    /// <summary>string 配列を VM オブジェクトに正規化して作る (String.Split 等の戻り値用。ヒープ計上済み)。</summary>
+    public VmArray MakeStringArray(IReadOnlyList<string> values) {
+        var arrayType = ArrayTypeOf("System.String", ref _stringArrayType);
+        var elements = new StackSlot[values.Count];
+        for (var i = 0; i < values.Count; i++)
+            elements[i] = StackSlot.OfObject(MakeString(values[i]));
+        return Heap.Allocate(new VmArray(arrayType, elements));
+    }
+
+    /// <summary>object 配列 (params object[]) を VM オブジェクトに正規化して作る (ヒープ計上済み)。</summary>
+    public VmArray MakeObjectArray(IReadOnlyList<StackSlot> values) {
+        var arrayType = ArrayTypeOf("System.Object", ref _objectArrayType);
+        return Heap.Allocate(new VmArray(arrayType, values.ToArray()));
     }
 
     /// <summary>VM オブジェクト (VmArray) を byte 配列として読み取る。</summary>

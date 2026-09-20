@@ -222,7 +222,7 @@ public sealed class VirtualMachine : IDisposable {
         // object パラメータはゲスト側で box されるためプリミティブも許容
         SigKind.Object => value is null or string or VmObject
             or int or uint or byte or sbyte or short or ushort or long or ulong or bool or char or float or double,
-        SigKind.SzArray => value is null or VmObject,
+        SigKind.SzArray => value is null or VmObject or System.Array,
         SigKind.TypeToken or SigKind.GenericInst => value is null or VmObject,
         SigKind.Void => false,
         _ => value is null,
@@ -263,10 +263,23 @@ public sealed class VirtualMachine : IDisposable {
             float f => Prim(type, interpreter, "System.Single", StackSlot.OfFloat(f)),
             double d => Prim(type, interpreter, "System.Double", StackSlot.OfFloat(d)),
             string s => StackSlot.OfObject(interpreter.Strings.GetOrNew(s)),
+            // ホスト配列 → VM 配列 (SzArray パラメータ。要素はホスト境界で再帰変換)
+            System.Array array when type.Kind == SigKind.SzArray => HostArrayToSlot(array, type, interpreter),
             // VM オブジェクト (CreateInstance の戻り値等) はそのまま参照渡し
             VmObject vmObject => StackSlot.OfObject(vmObject),
             _ => throw new ArgumentException($"ホスト値 {value.GetType().Name} は VM 引数に変換できません。"),
         };
+    }
+
+    /// <summary>ホスト配列を SzArray パラメータ用の VmArray に変換する (ヒープ計上済み)。</summary>
+    private static StackSlot HostArrayToSlot(System.Array array, SigType type, Interpreter interpreter) {
+        var elementSig = type.Inner ?? new SigType(SigKind.Object);
+        var elementType = interpreter.Loader.ResolveToken(elementSig);
+        var elements = new StackSlot[array.Length];
+        for (var i = 0; i < array.Length; i++)
+            elements[i] = ToSlot(array.GetValue(i), elementSig, interpreter);
+        return StackSlot.OfObject(interpreter.Heap.Allocate(
+            new VmArray(new VmArrayType { ElementType = elementType }, elements)));
     }
 
     /// <summary>宣言型が object の場合はプリミティブをボックス化する。</summary>

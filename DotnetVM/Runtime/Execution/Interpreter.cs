@@ -27,8 +27,12 @@ public sealed class Interpreter {
     private readonly VmStringPool _strings;
     private readonly IntrinsicContext _intrinsicContext;
     private readonly MemoryPolicy _memory;
+    // オブジェクトモデル (レイアウト/静的ストレージ)。VM インスタンスごとの状態 (VM 間で共有しない)
+    private readonly ObjectModel _objects = new();
     private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
     private readonly HashSet<VmType> _initializedTypes = [];
+    // 構築ジェネリック型の .cctor 起動済み集合 (CLR と同じく実引数ごとに 1 回)
+    private readonly HashSet<string> _initializedConstructedTypes = [];
     private long _instructionCount;
     private int _depth;
     private bool _running;
@@ -53,9 +57,14 @@ public sealed class Interpreter {
             Network = network,
             Storage = storage,
         };
+        // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
+        _intrinsicContext.ToStringHook = InvokeToStringSlot;
+        // MethodBase.GetCurrentMethod() 用の現在メソッドフック
+        _intrinsicContext.CurrentMethodHook = () =>
+            _liveFrames.Count > 0 ? _liveFrames[^1].Method : null;
         // GC ルート源の登録: 実行中フレーム / 静的ストレージ / intrinsic 静的フィールド
         _heap.AddRootSlotSource(EnumerateFrameRoots);
-        _heap.AddRootSlotSource(ObjectModel.EnumerateStaticStorage);
+        _heap.AddRootSlotSource(_objects.EnumerateStaticStorage);
         _heap.AddRootSlotSource(() => _intrinsicStaticFields.Values);
     }
 
@@ -82,7 +91,7 @@ public sealed class Interpreter {
                 m.Signature.ParamTypes.Length == constructorArgs.Length && m.Body is not null)
             ?? throw new ArgumentException($"型 {type.FullName} に引数 {constructorArgs.Length} 個の .ctor がありません。");
         EnsureInitialized(type);
-        var instance = _heap.Allocate(new VmClassInstance(type, ObjectModel.CreateInstanceStorage(type, _loader)));
+        var instance = _heap.Allocate(new VmClassInstance(type, _objects.CreateInstanceStorage(type, _loader)));
         var args = new StackSlot[constructorArgs.Length + 1];
         args[0] = StackSlot.OfObject(instance);
         constructorArgs.CopyTo(args, 1);
@@ -155,7 +164,7 @@ public sealed class Interpreter {
                 continue;
             var type = _loader.ResolveToken(sigType, frame.Context);
             if (type.IsValueType)
-                slot = ObjectModel.DefaultForType(type, _loader);
+                slot = _objects.DefaultForType(type, _loader);
         }
     }
 
@@ -457,7 +466,7 @@ public sealed class Interpreter {
                     var elementType = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var elements = new StackSlot[count];
                     for (var i = 0; i < count; i++)
-                        elements[i] = ObjectModel.DefaultForType(elementType, _loader);
+                        elements[i] = _objects.DefaultForType(elementType, _loader);
                     frame.Stack.Push(StackSlot.OfObject(_heap.Allocate(
                         new VmArray(new VmArrayType { ElementType = elementType }, elements))));
                     break;
@@ -586,7 +595,7 @@ public sealed class Interpreter {
                 }
                 case ILOp.Initobj: {
                     var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    byref.Slot = ObjectModel.DefaultForType(ResolveTypeToken(instruction.IntOperand, frame.Context), _loader);
+                    byref.Slot = _objects.DefaultForType(ResolveTypeToken(instruction.IntOperand, frame.Context), _loader);
                     break;
                 }
 
@@ -697,19 +706,36 @@ public sealed class Interpreter {
 
                 // ---- M5 以降の命令 ----
                 case ILOp.Ldtoken: {
-                    // ldtoken Field は FieldRVA 初期データのハンドルを積む
-                    // (RuntimeHelpers::InitializeArray 専用の消費を想定)。
-                    // Type/Method トークン (typeof 等) は未対応
+                    // ldtoken Field は FieldRVA 初期データのハンドル (RuntimeHelpers::InitializeArray 用)、
+                    // Type は typeof() 用の RuntimeTypeHandle、Method は MethodBase::GetMethodFromHandle 用
                     var tokenTable = (TableKind)((uint)instruction.IntOperand >> 24);
                     var tokenRid = (int)((uint)instruction.IntOperand & 0xFFFFFF);
-                    if (tokenTable != TableKind.Field)
-                        throw new NotSupportedException(
-                            $"ldtoken は Field トークンのみ対応しています (要求: {tokenTable})。");
-                    var rva = _loader.Image.GetFieldRva(tokenRid);
-                    if (rva == 0)
-                        throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
-                    var handle = _heap.Allocate(new VmFieldRvaData { Data = _loader.Image.GetRvaDataToEnd(rva) });
-                    frame.Stack.Push(StackSlot.OfObject(handle));
+                    switch (tokenTable) {
+                        case TableKind.Field: {
+                            var rva = _loader.Image.GetFieldRva(tokenRid);
+                            if (rva == 0)
+                                throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
+                            var handle = _heap.Allocate(new VmFieldRvaData { Data = _loader.Image.GetRvaDataToEnd(rva) });
+                            frame.Stack.Push(StackSlot.OfObject(handle));
+                            break;
+                        }
+                        case TableKind.TypeDef or TableKind.TypeRef or TableKind.TypeSpec: {
+                            var type = ResolveTypeToken(instruction.IntOperand, frame.Context);
+                            frame.Stack.Push(StackSlot.OfObject(
+                                _heap.Allocate(new VmTypeHandle { Target = type })));
+                            break;
+                        }
+                        case TableKind.MethodDef: {
+                            var method = _loader.GetMethodByToken((uint)instruction.IntOperand)
+                                ?? throw new BadImageFormatException($"MethodDef rid {tokenRid} を解決できません。");
+                            frame.Stack.Push(StackSlot.OfObject(
+                                _heap.Allocate(new VmMethodHandle { Target = method })));
+                            break;
+                        }
+                        default:
+                            throw new NotSupportedException(
+                                $"ldtoken は Field/Type/Method トークンのみ対応しています (要求: {tokenTable})。");
+                    }
                     break;
                 }
                 default:
@@ -895,8 +921,8 @@ public sealed class Interpreter {
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {Describe(objSlot)}");
     }
 
-    private static int GetInstanceFieldIndex(VmClassType type, VmField field) {
-        var layout = ObjectModel.GetLayout(type);
+    private int GetInstanceFieldIndex(VmClassType type, VmField field) {
+        var layout = _objects.GetLayout(type);
         if (layout.TryGetValue(field, out var index))
             return index;
         // 継承チェーン上の基底型で宣言されたフィールド (GetLayout は既に基底を含むが、
@@ -930,12 +956,13 @@ public sealed class Interpreter {
                 return new VmByRef(storage, 0);
             }
             if (parent.Table == TableKind.TypeSpec) {
-                // 構築型の静的フィールド。ストレージは定義型に紐付く
-                // (CLR では値型実引数ごとに別ストレージだが、VM は共有する — BCL 面では等価)
+                // 構築型の静的フィールド。CLR と同じく値型実引数ごとに別ストレージを持ち、
+                // .cctor も実引数ごとに 1 回走る (参照型実引数でもストレージは共有しない)
                 var constructed = ResolveConstructedParent(parent.Rid, context);
                 var definition = (VmClassType)constructed.Definition;
-                EnsureInitialized(definition);
-                var storage = ObjectModel.GetOrCreateStaticStorage(definition, _loader);
+                EnsureConstructedInitialized(constructed);
+                var storage = _objects.GetOrCreateStaticStorage(constructed.FullName, definition, _loader,
+                    new GenericContext { ClassArgs = constructed.TypeArguments });
                 return new VmByRef(storage, ObjectModel.StaticFieldIndex(definition,
                     ResolveFieldToken(token, context)));
             }
@@ -943,7 +970,7 @@ public sealed class Interpreter {
         var field = ResolveFieldToken(token);
         var owner = (VmClassType)field.DeclaringType;
         EnsureInitialized(owner);
-        var staticStorage = ObjectModel.GetOrCreateStaticStorage(owner, _loader);
+        var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader);
         return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));
     }
 
@@ -954,6 +981,16 @@ public sealed class Interpreter {
         var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
         if (cctor?.Body is not null)
             Invoke(cctor, []);
+    }
+
+    /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回)。</summary>
+    private void EnsureConstructedInitialized(VmConstructedType type) {
+        if (!_initializedConstructedTypes.Add(type.FullName))
+            return;
+        var definition = (VmClassType)type.Definition;
+        var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
+        if (cctor?.Body is not null)
+            Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
     }
 
     // ---- オブジェクト生成 ----
@@ -1027,14 +1064,14 @@ public sealed class Interpreter {
 
         if (owner.IsValueType) {
             // 構造体の newobj: this (既定値) を作り、.ctor があればミューテートして this を返す
-            var structValue = ObjectModel.DefaultStruct(owner, _loader);
+            var structValue = _objects.DefaultStruct(owner, _loader);
             args[0] = StackSlot.OfValueType(structValue);
             if (ctor.Body is not null)
                 Invoke(ctor, args);
             return StackSlot.OfValueType(structValue);
         }
 
-        var instance = _heap.Allocate(new VmClassInstance(owner, ObjectModel.CreateInstanceStorage(owner, _loader)));
+        var instance = _heap.Allocate(new VmClassInstance(owner, _objects.CreateInstanceStorage(owner, _loader)));
         args[0] = StackSlot.OfObject(instance);
         if (ctor.Body is not null)
             Invoke(ctor, args);
@@ -1078,7 +1115,7 @@ public sealed class Interpreter {
             args[i] = caller.Stack.Pop();
 
         if (definition.IsValueType) {
-            var structValue = ObjectModel.DefaultStruct(definition, _loader, context, constructed.TypeArguments);
+            var structValue = _objects.DefaultStruct(definition, _loader, context, constructed.TypeArguments);
             args[0] = StackSlot.OfValueType(structValue);
             if (ctor?.Body is not null)
                 Invoke(ctor, args, context);
@@ -1086,7 +1123,7 @@ public sealed class Interpreter {
         }
 
         var instance = _heap.Allocate(new VmClassInstance(definition,
-            ObjectModel.CreateInstanceStorage(definition, _loader, context), constructed.TypeArguments));
+            _objects.CreateInstanceStorage(definition, _loader, context), constructed.TypeArguments));
         args[0] = StackSlot.OfObject(instance);
         if (ctor?.Body is not null)
             Invoke(ctor, args, context);
@@ -1222,8 +1259,11 @@ public sealed class Interpreter {
 
         if (target.Intrinsic is { } intrinsic) {
             // プリミティブの instance メソッド (int.ToString() 等) は ldloca 経由の
-            // ByRef レシーバで来るため、値に読み替えてから渡す (constrained. 値型レシーバも同様)
-            if (target.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef)
+            // ByRef レシーバで来るため、値に読み替えてから渡す (constrained. 値型レシーバも同様)。
+            // ただし可変状態をローカルスロットに保持する構造体ファサード (補間ハンドラ等) は
+            // ByRef のまま渡す (状態の読み書きが参照先スロットに対して行われる必要がある)。
+            if (target.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef &&
+                !PreservesByRefReceiver(target.DeclaringType))
                 args[0] = thisByRef.Slot;
             // callvirt で intrinsic 宣言型 (System.Object 等) をターゲットにする場合、
             // レシーバの実行時型にゲスト側 override があればそちらを優先する (仮想ディスパッチ)
@@ -1253,6 +1293,8 @@ public sealed class Interpreter {
             // ③ I/O はデバイス経由・値は VM オブジェクトモデル正規化 (実装側契約)
             ConsumeInstruction();
             CheckSafepoint();
+            // 宣言上のパラメータ型名を渡す (char/bool/int 等、i4 統合面のオーバーロード判別用)
+            _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
             return intrinsic(_intrinsicContext, args);
         }
 
@@ -1273,6 +1315,11 @@ public sealed class Interpreter {
         var ret = Invoke(method, args, context2);
         return SignatureReturnsValue(method.Signature) ? ret : null;
     }
+
+    /// <summary>ByRef レシーバを値に読み替えずにそのまま渡す intrinsic 宣言型
+    /// (ローカルスロットに可変状態を保持する構造体ファサード)。</summary>
+    private static bool PreservesByRefReceiver(string? declaringType) =>
+        declaringType == "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler";
 
     /// <summary>解決未了の呼出 (未登録 intrinsic) の最終処理。callvirt ならレシーバの実行時型に
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
@@ -1366,6 +1413,59 @@ public sealed class Interpreter {
         return null;
     }
 
+    /// <summary>ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)。
+    /// レシーバの実行時型にゲスト実装 (override) があればそれを仮想ディスパッチし、
+    /// 無ければ null を返して intrinsic 側の既定書式にフォールバックする。</summary>
+    private VmString? InvokeToStringSlot(StackSlot slot) {
+        if (slot.Kind == StackKind.Object && slot.ObjectValue is VmString str)
+            return str;
+        var guest = TryDispatchVirtual("ToString", 0, slot);
+        if (guest is null)
+            return null;
+        var ret = Invoke(guest, [slot], GenericContext.Of(
+            TryGetReceiverTypeArguments(slot, guest.DeclaringType.GenericParamCount, out var args) ? args : [], null));
+        return ret.ObjectValue as VmString;
+    }
+
+    /// <summary>署名上のパラメータ型名を得る (intrinsic ゲートが IntrinsicContext に渡し、
+    /// char / bool 等の i4 統合面のオーバーロード判別に使われる)。</summary>
+    private string ParamTypeName(SigType type, GenericContext? context) => type.Kind switch {
+        SigKind.Boolean => "System.Boolean",
+        SigKind.Char => "System.Char",
+        SigKind.I1 => "System.SByte",
+        SigKind.U1 => "System.Byte",
+        SigKind.I2 => "System.Int16",
+        SigKind.U2 => "System.UInt16",
+        SigKind.I4 => "System.Int32",
+        SigKind.U4 => "System.UInt32",
+        SigKind.I8 => "System.Int64",
+        SigKind.U8 => "System.UInt64",
+        SigKind.R4 => "System.Single",
+        SigKind.R8 => "System.Double",
+        SigKind.String => "System.String",
+        SigKind.Object => "System.Object",
+        SigKind.SzArray => ParamTypeName(type.Inner!, context) + "[]",
+        SigKind.TypeToken => TryResolveTypeName(type.Token, context),
+        _ => "",
+    };
+
+    /// <summary>MethodSpec の宣言パラメータ型名を、メソッド型引数 (!!n) を実引数で置換してから求める
+    /// (AppendFormatted&lt;char&gt; と AppendFormatted&lt;int&gt; 等 i4 統合面の intrinsic 判別に使う)。</summary>
+    private string SubstitutedParamTypeName(SigType type, VmType[] methodArgs) => type.Kind switch {
+        SigKind.GenericMethodVar when type.VarNumber < methodArgs.Length => methodArgs[type.VarNumber].FullName,
+        SigKind.SzArray => SubstitutedParamTypeName(type.Inner!, methodArgs) + "[]",
+        _ => ParamTypeName(type, null),
+    };
+
+    /// <summary>トークン型の名前解決 (未対応のアセンブリ外参照は型名不要のため空文字列にフォールバック)。</summary>
+    private string TryResolveTypeName(uint token, GenericContext? context) {
+        try {
+            return ResolveTypeToken((int)token, context)?.FullName ?? "";
+        } catch (NotSupportedException) {
+            return "";
+        }
+    }
+
     private sealed class CallTarget {
         public int Arity;
         public VmMethod? Method;
@@ -1379,6 +1479,8 @@ public sealed class Interpreter {
         public VmType[]? ClassArgs;
         /// <summary>MethodSpec の Instantiation (ジェネリックメソッドの !!0 置換に使う)。</summary>
         public VmType[]? MethodArgs;
+        /// <summary>宣言上のパラメータ型名 (i4 統合面のオーバーロード判別用。intrinsic 経路のみ)。</summary>
+        public string[]? ParamTypeNames;
     }
 
     /// <summary>呼出トークンを解決する (Arity = 引数個数、インスタンスは this 込み)。
@@ -1409,6 +1511,7 @@ public sealed class Interpreter {
 
                 var parent = _loader.Image.Tables.DecodeCoded(
                     TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
+                var paramNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
                 if (parent.Table == TableKind.TypeRef) {
                     var typeName = _loader.GetMemberRefParentTypeName(rid)!;
                     if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
@@ -1419,6 +1522,7 @@ public sealed class Interpreter {
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
                             HasThis = signature.HasThis,
+                            ParamTypeNames = paramNames,
                         };
                     // 継承面のフォールバック: 派生ファサード型から基底連鎖を辿って解決する
                     // (例: InvalidOperationException::get_Message → System.Exception に登録された面)
@@ -1430,6 +1534,7 @@ public sealed class Interpreter {
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
                             HasThis = signature.HasThis,
+                            ParamTypeNames = paramNames,
                         };
                     }
                     // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
@@ -1479,6 +1584,7 @@ public sealed class Interpreter {
 
         // 構築ファサード型 (BCL 汎用インターフェース等) → intrinsic 面のみ
         if (constructed.Definition is VmIntrinsicType facade) {
+            var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
             if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
                 TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl)) {
                 return new CallTarget {
@@ -1488,6 +1594,7 @@ public sealed class Interpreter {
                     Name = name,
                     ParamCount = signature.ParamTypes.Length,
                     HasThis = signature.HasThis,
+                    ParamTypeNames = facadeParamNames,
                 };
             }
             // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
@@ -1556,6 +1663,28 @@ public sealed class Interpreter {
             if (signature.GenericParamCount != methodArgs.Length)
                 throw new BadImageFormatException(
                     $"MethodSpec 0x{token:X8} の型引数は {methodArgs.Length} 個ですが、{name} は {signature.GenericParamCount} 個を要求します。");
+            if (parent.Table == TableKind.TypeRef) {
+                // intrinsic ジェネリックメソッド (例: DefaultInterpolatedStringHandler::AppendFormatted<T>)。
+                // intrinsic キーはジェネリック引数を含まない (CLR の実体化も本体を共有するため)。
+                var typeName = _loader.GetMemberRefParentTypeName(memberRefRid)!;
+                var specArity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+                if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, specArity, signature.HasThis), out var impl) ||
+                    TryGetIntrinsicThroughHierarchy(typeName, name, specArity, signature.HasThis, out impl)) {
+                    return new CallTarget {
+                        Arity = specArity,
+                        Intrinsic = impl,
+                        DeclaringType = typeName,
+                        Name = name,
+                        ParamCount = signature.ParamTypes.Length,
+                        HasThis = signature.HasThis,
+                        // !!n を MethodSpec の実引数で置換した宣言型名 (char/bool 等 i4 統合面の判別に必要)
+                        ParamTypeNames = signature.ParamTypes
+                            .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
+                    };
+                }
+                throw new OperationNotAllowedException(
+                    $"intrinsic {typeName}::{name} (引数 {specArity} 個) は未登録です (MethodSpec 経由)。");
+            }
             if (parent.Table == TableKind.TypeDef) {
                 // 同アセンブリのジェネリックメソッド (Roslyn は MethodDef でも MemberRef 形式で出す)
                 var owner = _loader.GetTypeDef(parent.Rid);
@@ -1773,7 +1902,8 @@ public sealed class Interpreter {
                 return a / b;
             case ILOp.Rem:
                 if (b == 0) ThrowDivideByZero();
-                if (a == int.MinValue && b == -1) return 0;
+                // 実在 CLR と同じく min % -1 も OverflowException (ECMA の「0 を返す」と異なる点に注意)
+                if (a == int.MinValue && b == -1) ThrowOverflow();
                 return a % b;
             case ILOp.And: return a & b;
             case ILOp.Or: return a | b;
@@ -1834,7 +1964,7 @@ public sealed class Interpreter {
                 return a / b;
             case ILOp.Rem:
                 if (b == 0) ThrowDivideByZero();
-                if (a == long.MinValue && b == -1) return 0;
+                if (a == long.MinValue && b == -1) ThrowOverflow();
                 return a % b;
             case ILOp.And: return a & b;
             case ILOp.Or: return a | b;

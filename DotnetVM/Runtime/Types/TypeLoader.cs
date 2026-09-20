@@ -33,6 +33,9 @@ public sealed class TypeLoader {
     private readonly HashSet<int> _completedTypeDefs = [];
     /// <summary>完全名 → TypeDef rid の索引 (遅延構築。CoreLib 規模の画像で線形走査を避ける)。</summary>
     private Dictionary<string, int>? _typeDefByFullName;
+    /// <summary>型統合辞書 (完全名 → 実型)。Context 配下の画像から解決できた実 TypeDef をキャッシュする
+    /// (参照アセンブリ⇔CoreLib のユニフィケーション。否定はキャッシュしない — 遅延ロードで新画像が増えうる)。</summary>
+    private readonly Dictionary<string, VmType> _unifiedTypes = [];
 
     public TypeLoader(AssemblyImage image) {
         _image = image;
@@ -309,7 +312,14 @@ public sealed class TypeLoader {
             var baseToken = Token.From(extendsTag.Table, extendsTag.Rid).Value;
             type.SetBaseType(ResolveToken(new SigType(SigKind.TypeToken, Token: baseToken)));
         } else {
-            type.SetBaseType(FindIntrinsicType("System.Object")); // <module> 型等 (Extends = null)
+            // <module> 型等 (Extends = null)。System.Object 自身は基底を持たない
+            // (実型に統合した場合の自己参照循環を断つ)
+            if (type.FullName != "System.Object") {
+                type.SetBaseType(TryResolveUnifiedType("System.Object")
+                    ?? FindIntrinsicType("System.Object"));
+            } else {
+                type.SetBaseType(null);
+            }
         }
 
         // インターフェース (InterfaceImpl)
@@ -342,8 +352,8 @@ public sealed class TypeLoader {
             Definition = ResolveTypeDefOrRefToken(sigType.Token),
             TypeArguments = sigType.Args!.Select(ResolveToken).ToArray(),
         },
-        SigKind.SzArray => new VmArrayType { ElementType = ResolveToken(sigType.Inner!) },
-        SigKind.Array => new VmMultiDimArrayType { ElementType = ResolveToken(sigType.Inner!), Rank = sigType.Rank },
+        SigKind.SzArray => ArrayWithBase(new VmArrayType { ElementType = ResolveToken(sigType.Inner!) }),
+        SigKind.Array => ArrayWithBase(new VmMultiDimArrayType { ElementType = ResolveToken(sigType.Inner!), Rank = sigType.Rank }),
         SigKind.ByRef => new VmByRefType { ElementType = ResolveToken(sigType.Inner!) },
         SigKind.Pointer => new VmByRefType { ElementType = ResolveToken(sigType.Inner!) }, // ポインタは ByRef と同様に扱う (未対応扱い)
         SigKind.GenericVar => new VmGenericParameterType { IsMethodParameter = false, Number = sigType.VarNumber },
@@ -368,6 +378,20 @@ public sealed class TypeLoader {
         SigKind.Void => RequiredIntrinsic("System.Void"),
         _ => throw new NotSupportedException($"未対応の署名型です: {sigType}"),
     };
+
+    /// <summary>配列型に System.Array (実型またはファサード) を基底として接続する。</summary>
+    private VmType ArrayWithBase(VmType arrayType) {
+        var baseType = ResolveWellKnownType("System.Array");
+        switch (arrayType) {
+            case VmArrayType szArray:
+                szArray.SetBaseType(baseType);
+                break;
+            case VmMultiDimArrayType multiDim:
+                multiDim.SetBaseType(baseType);
+                break;
+        }
+        return arrayType;
+    }
 
     private VmType ResolveTypeDefOrRefToken(uint token) {
         var table = (TableKind)(token >> 24);
@@ -430,13 +454,19 @@ public sealed class TypeLoader {
         throw new NotSupportedException($"型参照 '{fullName}' を解決できません (スコープ {scopeTable})。");
     }
 
-    /// <summary>AssemblyRef スコープの TypeRef を依存アセンブリの TypeDef に解決する。
-    /// アセンブリが解決できない場合や型が見つからない場合は null (呼び出し側で fail-closed する)。</summary>
+    /// <summary>AssemblyRef スコープの TypeRef を解決する。優先順: ①Context 配下の実 TypeDef
+    /// (ユニフィケーション: CoreLib 実装が正。参照アセンブリ経由の BCL 型をここで統合する) →
+    /// ②自分自身への参照は自己画像 → ③依存アセンブリの TypeDef。
+    /// 解決できない場合は null (呼び出し側で fail-closed する)。</summary>
     private VmType? ResolveViaAssemblyRef(string fullName, int assemblyRefRid) {
+        // ① 型統合: 同名の実 TypeDef が Context 配下 (CoreLib 等) にあればそれが正
+        if (TryResolveUnifiedType(fullName) is { } unified)
+            return unified;
         var refName = GetAssemblyRefName(assemblyRefRid);
-        // 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)
+        // ② 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)
         if (string.Equals(refName, _image.Name, StringComparison.OrdinalIgnoreCase))
             return FindTypeByFullName(fullName);
+        // ③ 依存アセンブリ
         var target = Context!.TryResolveAssembly(refName, _image);
         return target?.FindTypeByFullName(fullName);
     }
@@ -577,6 +607,37 @@ public sealed class TypeLoader {
     public string GetMemberRefName(int memberRefRid) =>
         _image.GetString(_image.Tables.GetRowIndex(TableKind.MemberRef, memberRefRid, 1));
 
-    private VmIntrinsicType RequiredIntrinsic(string fullName) =>
-        _intrinsicTypes[fullName];
+    /// <summary>SigKind 直引きの既知型 (プリミティブ/Object/String 等) を解決する。
+    /// CoreLib ロード時は実 TypeDef が優先 (型同一性の統合)、無ければ intrinsic ファサード。</summary>
+    private VmType RequiredIntrinsic(string fullName) =>
+        TryResolveUnifiedType(fullName) ?? _intrinsicTypes[fullName];
+
+    /// <summary>完全名を Context 配下の全画像 (ロード順 = CoreLib 優先) の実 TypeDef に解決する。
+    /// 見つからなければ null (ファサード等のフォールバックは呼び出し側)。実体化に失敗する型
+    /// (未対応の署角度を含む画像固有の型) はその画像をスキップする。</summary>
+    public VmType? TryResolveUnifiedType(string fullName) {
+        if (_unifiedTypes.TryGetValue(fullName, out var cached))
+            return cached;
+        if (Context is not { } context)
+            return null;
+        foreach (var loader in context.Loaders) {
+            VmClassType? real;
+            try {
+                real = loader.FindTypeByFullName(fullName);
+            } catch (Exception ex) when (ex is VmExecutionException or NotSupportedException
+                or BadImageFormatException or InvalidOperationException) {
+                continue; // この画像では実体化できない型 (未対応面)。ファサードに委ねる
+            }
+            if (real is not null) {
+                _unifiedTypes[fullName] = real;
+                return real;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>既知型 (プリミティブ/String/Object/Array 等) を実型またはファサードで解決する
+    /// (ホスト境界のボックス化や配列基底型の接続に使う)。</summary>
+    public VmType ResolveWellKnownType(string fullName) =>
+        TryResolveUnifiedType(fullName) ?? _intrinsicTypes[fullName];
 }

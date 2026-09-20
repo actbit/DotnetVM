@@ -50,9 +50,13 @@ public abstract class VmType {
     /// <summary>
     /// この型が target に代入可能か (同一、基底チェーン、実装インターフェース)。
     /// 構築型同士は型引数の一致 + 変性 (共変/反変) を考慮する (M5)。
+    /// 末尾の完全名一致は「参照アセンブリ⇔実装アセンブリの型統合」のための緩和:
+    /// CoreLib 実型化 (C2) 前後で同一 BCL 名のファサード/実型が混在しても同一視する。
     /// </summary>
     public bool IsAssignableTo(VmType target) {
         if (ReferenceEquals(this, target))
+            return true;
+        if (FullName == target.FullName)
             return true;
         if (this is VmConstructedType constructed && target is VmConstructedType targetConstructed)
             return constructed.IsConstructedAssignableTo(targetConstructed);
@@ -158,7 +162,14 @@ public sealed class VmIntrinsicType : VmType {
 public sealed class VmArrayType : VmType {
     public required VmType ElementType { get; init; }
     public override string FullName => ElementType.FullName + "[]";
-    public override VmType? BaseType { get; } = null; // System.Array ファサードは M6 で接続
+
+    private VmType? _baseType;
+
+    /// <summary>System.Array (実型またはファサード)。TypeLoader が解決時に接続する。</summary>
+    public override VmType? BaseType => _baseType;
+
+    internal void SetBaseType(VmType baseType) => _baseType = baseType;
+
     public override bool IsValueType => false;
     public override uint[] GenericParamFlags => [];
 }
@@ -168,7 +179,13 @@ public sealed class VmMultiDimArrayType : VmType {
     public required VmType ElementType { get; init; }
     public required int Rank { get; init; }
     public override string FullName => $"{ElementType.FullName}[{Rank}]";
-    public override VmType? BaseType => null;
+
+    private VmType? _baseType;
+
+    /// <summary>System.Array (実型またはファサード)。TypeLoader が解決時に接続する。</summary>
+    public override VmType? BaseType => _baseType;
+
+    internal void SetBaseType(VmType baseType) => _baseType = baseType;
     public override bool IsValueType => false;
     public override uint[] GenericParamFlags => [];
 }
@@ -268,4 +285,22 @@ public sealed class VmConstructedType : VmType {
 
     internal const uint CovariantFlag = 0x0001;
     internal const uint ContravariantFlag = 0x0002;
+}
+
+/// <summary>
+/// VM が「単一スロット」表現で保持するプリミティブ値型の集合。
+/// 型同一性は CoreLib 実型化 (C2) 後もこの判定で保たれる: 実型 (CoreLib TypeDef) と
+/// intrinsic ファサードのどちらで解決されても、ストレージ表現はスロットのまま変わらない。
+/// </summary>
+public static class VmPrimitiveTypes {
+    /// <summary>単一スロット表現のプリミティブ完全名 (i4 統合面 + i8 + fp + native int)。</summary>
+    private static readonly HashSet<string> SlotPrimitives = new(StringComparer.Ordinal) {
+        "System.Boolean", "System.Char", "System.SByte", "System.Byte",
+        "System.Int16", "System.UInt16", "System.Int32", "System.UInt32",
+        "System.Int64", "System.UInt64", "System.Single", "System.Double",
+        "System.IntPtr", "System.UIntPtr",
+    };
+
+    /// <summary>型が単一スロット表現のプリミティブか (実型/ファサード両方で true)。</summary>
+    public static bool IsSlotPrimitive(string fullName) => SlotPrimitives.Contains(fullName);
 }

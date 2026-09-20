@@ -608,13 +608,16 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                         if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
                             throw new UnhandledGuestException("System.InvalidCastException",
                                 $"{SlotOps.Describe(value)} を {target.FullName} に unbox.any できません。");
-                        if (target is VmClassType or VmConstructedType) {
+                        if (VmPrimitiveTypes.IsSlotPrimitive(target.FullName)) {
+                            // プリミティブ (実型 / intrinsic ファサードとも) はスロットをそのまま取り出す
+                            frame.Stack.Push(boxed.Fields[0]);
+                        } else if (target is VmClassType or VmConstructedType) {
                             // 構造体 (構築ジェネリック構造体を含む) は実体をコピーして取り出す
                             var args = boxed.Type is VmConstructedType ct ? ct.TypeArguments : null;
                             var sv = new VmStructValue(boxed.Type, (StackSlot[])boxed.Fields.Clone(), args);
                             frame.Stack.Push(StackSlot.OfValueType(sv));
                         } else {
-                            // プリミティブ (intrinsic 値型) はスロットをそのまま取り出す
+                            // その他の intrinsic 値型 (TypedReference 等) もスロットで保持される
                             frame.Stack.Push(boxed.Fields[0]);
                         }
                     } else {

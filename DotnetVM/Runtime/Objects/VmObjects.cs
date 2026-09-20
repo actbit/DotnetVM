@@ -460,12 +460,23 @@ public sealed class ObjectModel {
     /// <summary>型に対するゼロ既定値。</summary>
     public StackSlot DefaultForType(VmType? type, TypeLoader loader) => DefaultForType(type, loader, null);
 
-    /// <summary>型に対するゼロ既定値 (ジェネリックパラメータは context の実引数で置換してから判定)。</summary>
+    /// <summary>型に対するゼロ既定値 (ジェネリックパラメータは context の実引数で置換してから判定)。
+    /// プリミティブは CoreLib 実型 / intrinsic ファサードのどちらで解決されても単一スロット表現を維持する。</summary>
     public StackSlot DefaultForType(VmType? type, TypeLoader loader, GenericContext? context) {
         if (type is null)
             return StackSlot.Null;
         var substituted = GenericSubstitutor.Substitute(type, context);
-        if (substituted.IsValueType && substituted is not VmIntrinsicType) {
+        if (substituted is VmIntrinsicType intrinsic) {
+            return intrinsic.FullName switch {
+                "System.Boolean" or "System.Char" or "System.SByte" or "System.Byte"
+                    or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" => StackSlot.OfInt32(0),
+                "System.Int64" or "System.UInt64" => StackSlot.OfInt64(0),
+                "System.Single" or "System.Double" => StackSlot.OfFloat(0),
+                "System.IntPtr" or "System.UIntPtr" => StackSlot.OfNativeInt(0),
+                _ => StackSlot.Null, // String/Object 等の参照型
+            };
+        }
+        if (substituted.IsValueType && !VmPrimitiveTypes.IsSlotPrimitive(substituted.FullName)) {
             var structType = substituted switch {
                 VmClassType cls => cls,
                 VmConstructedType constructed => (VmClassType)constructed.Definition,
@@ -476,14 +487,16 @@ public sealed class ObjectModel {
             var fieldContext = args is null ? null : new GenericContext { ClassArgs = args };
             return StackSlot.OfValueType(DefaultStruct(structType, loader, fieldContext, args));
         }
-        if (substituted is VmIntrinsicType intrinsic) {
-            return intrinsic.FullName switch {
+        if (substituted.IsValueType) {
+            // CoreLib 実型に解決されたプリミティブ (System.Int32 等の TypeDef)。ファサードと
+            // 同一の単一スロット表現で既定値を与える (型同一性は統合済み、表現は変わらない)
+            return substituted.FullName switch {
                 "System.Boolean" or "System.Char" or "System.SByte" or "System.Byte"
                     or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" => StackSlot.OfInt32(0),
                 "System.Int64" or "System.UInt64" => StackSlot.OfInt64(0),
                 "System.Single" or "System.Double" => StackSlot.OfFloat(0),
                 "System.IntPtr" or "System.UIntPtr" => StackSlot.OfNativeInt(0),
-                _ => StackSlot.Null, // String/Object 等の参照型
+                _ => throw new InvalidOperationException($"値型 {substituted.FullName} の既定値を生成できません。"),
             };
         }
         return StackSlot.Null;

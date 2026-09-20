@@ -307,10 +307,11 @@ public sealed class VirtualMachine : IDisposable {
             new VmArray(new VmArrayType { ElementType = elementType }, elements)));
     }
 
-    /// <summary>宣言型が object の場合はプリミティブをボックス化する。</summary>
+    /// <summary>宣言型が object の場合はプリミティブをボックス化する。
+    /// 型は CoreLib ロード時は実型に統一する (ゲスト側の typeof/キャストと同一視される)。</summary>
     private static StackSlot Prim(SigType declared, Interpreter interpreter, string intrinsicTypeName, StackSlot slot) =>
         declared.Kind is SigKind.Object or SigKind.TypeToken
-            ? interpreter.Box(interpreter.Loader.FindIntrinsicType(intrinsicTypeName)!, slot)
+            ? interpreter.Box(interpreter.Loader.ResolveWellKnownType(intrinsicTypeName), slot)
             : slot;
 
     /// <summary>戻り値スロットをホスト値へ変換する (宣言型があれば正確な .NET 型へ)。</summary>

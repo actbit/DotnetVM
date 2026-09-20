@@ -66,6 +66,17 @@ internal sealed class CallEngine(
                     var guestRet = invoker.Invoke(guestOverride, args, context);
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
                 }
+                // レシーバが VM ランタイムオブジェクト (typeof() 結果等) の場合、その実面
+                // (System.Type / MethodBase) に登録された intrinsic を宣言型より優先する
+                // (例: callvirt Object::ToString → System.Type::ToString)
+                if (RuntimeReceiverSurfaceType(args[0].ObjectValue) is { } surfaceType &&
+                    _objectEngine.TryGetIntrinsicThroughHierarchy(surfaceType, target.Name!, target.Arity,
+                        target.HasThis, out var surfaceImpl)) {
+                    gate.ConsumeInstruction();
+                    gate.CheckSafepoint();
+                    _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
+                    return surfaceImpl(_intrinsicContext, args);
+                }
             }
             // constrained. 値型レシーバが intrinsic 宣言型 (System.Object 等) に着地した場合、
             // ECMA-335 規約に従い値をボックス化してから渡す (ゲスト実装は上の仮想ディスパッチで優先済み)
@@ -110,6 +121,14 @@ internal sealed class CallEngine(
     /// (ローカルスロットに可変状態を保持する構造体ファサード)。</summary>
     private static bool PreservesByRefReceiver(string? declaringType) =>
         declaringType == "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler";
+
+    /// <summary>VM ランタイムオブジェクトのレシーバが属する intrinsic 面 (仮想ディスパッチの
+    /// 実行時型相当)。ランタイムオブジェクトは対応する intrinsic ファサード型の実体として振る舞う。</summary>
+    private static string? RuntimeReceiverSurfaceType(object? receiver) => receiver switch {
+        VmRuntimeObject => "System.Type",
+        VmRuntimeMethod => "System.Reflection.MethodBase",
+        _ => null,
+    };
 
     /// <summary>解決未了の呼出 (未登録 intrinsic) の最終処理。callvirt ならレシーバの実行時型に
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、

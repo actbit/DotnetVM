@@ -1,0 +1,109 @@
+namespace DotnetVM.Runtime.Execution;
+
+/// <summary>評価スタックのスロット型 (ECMA-335 III.1.1 の検証可能スタック型に対応)。</summary>
+public enum StackKind : byte {
+    /// <summary>参照なし (未使用スロット)。</summary>
+    Empty,
+    /// <summary>int32 (bool/char/ I1〜U4 はここに正規化)。</summary>
+    Int32,
+    /// <summary>int64。</summary>
+    Int64,
+    /// <summary>native int。</summary>
+    NativeInt,
+    /// <summary>float (F / F64。F32 は読み込み時に double へ正規化)。</summary>
+    Float,
+    /// <summary>オブジェクト参照 / マネージ参照以外の O。</summary>
+    Object,
+    /// <summary>マネージポインタ (&amp;、配列要素/フィールド/ローカルへの参照)。</summary>
+    ByRef,
+    /// <summary>内部ポインタ (native int と同義だが検証区別用)。</summary>
+    IntPtr,
+    /// <summary>TypedByRef。</summary>
+    TypedByRef,
+    /// <summary>値型の値 (VmStructValue)。</summary>
+    ValueType,
+}
+
+/// <summary>
+/// 評価スタック上の 1 スロット。IL 実行中の全ての値はここを通る。
+/// プリミティブは生のフィールドに、オブジェクトは VM オブジェクトモデル (VmObject) 経由で保持する。
+/// </summary>
+public struct StackSlot {
+    public StackKind Kind;
+
+    // プリミティブ共用体 (Kind で解釈を決定)
+    public long Int64Value;
+    public double DoubleValue;
+    public object? ObjectValue;
+
+    public static StackSlot OfInt32(int value) => new() { Kind = StackKind.Int32, Int64Value = value };
+    public static StackSlot OfInt64(long value) => new() { Kind = StackKind.Int64, Int64Value = value };
+    public static StackSlot OfNativeInt(long value) => new() { Kind = StackKind.NativeInt, Int64Value = value };
+    public static StackSlot OfFloat(double value) => new() { Kind = StackKind.Float, DoubleValue = value };
+    public static StackSlot OfObject(object? value) => new() { Kind = StackKind.Object, ObjectValue = value };
+    public static StackSlot OfByRef(object reference) => new() { Kind = StackKind.ByRef, ObjectValue = reference };
+    public static StackSlot OfValueType(object structValue) => new() { Kind = StackKind.ValueType, ObjectValue = structValue };
+    public static StackSlot Null => new() { Kind = StackKind.Object, ObjectValue = null };
+
+    public int AsInt32 => (int)Int64Value;
+
+    public override string ToString() => Kind switch {
+        StackKind.Int32 => $"i4({Int64Value})",
+        StackKind.Int64 => $"i8({Int64Value})",
+        StackKind.NativeInt or StackKind.IntPtr => $"i({Int64Value})",
+        StackKind.Float => $"f({DoubleValue})",
+        StackKind.Object => $"obj({ObjectValue?.ToString() ?? "null"})",
+        StackKind.ByRef => $"byref({ObjectValue})",
+        StackKind.ValueType => $"val({ObjectValue})",
+        StackKind.TypedByRef => "typedref",
+        _ => "empty",
+    };
+}
+
+/// <summary>
+/// メソッド実行 1 フレーム分の評価スタック。
+/// 深いゲスト再帰でもホストスタックを消費しないようヒープ確保とする。
+/// </summary>
+public sealed class EvaluationStack {
+    private StackSlot[] _slots;
+    public int Count { get; private set; }
+    public readonly int MaxStack;
+
+    public EvaluationStack(int maxStack) {
+        MaxStack = Math.Max(maxStack, 8);
+        _slots = new StackSlot[this.MaxStack];
+    }
+
+    public void Push(in StackSlot slot) {
+        if (Count == _slots.Length)
+            throw new InvalidOperationException("評価スタックがオーバーフローしました (maxstack 超過)。");
+        _slots[Count++] = slot;
+    }
+
+    public StackSlot Pop() {
+        if (Count == 0)
+            throw new InvalidOperationException("評価スタックが空です (pop できません)。");
+        var slot = _slots[--Count];
+        _slots[Count] = default;
+        return slot;
+    }
+
+    /// <summary>peek (取り出さない)。</summary>
+    public ref StackSlot Peek() {
+        if (Count == 0)
+            throw new InvalidOperationException("評価スタックが空です (peek できません)。");
+        return ref _slots[Count - 1];
+    }
+
+    /// <summary>上から depth 番目を参照 (dup や二項演算の両辺参照用)。</summary>
+    public ref StackSlot PeekAt(int depth) {
+        if (depth < 0 || depth >= Count)
+            throw new InvalidOperationException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
+        return ref _slots[Count - 1 - depth];
+    }
+
+    public void Clear() {
+        Array.Clear(_slots, 0, Count);
+        Count = 0;
+    }
+}

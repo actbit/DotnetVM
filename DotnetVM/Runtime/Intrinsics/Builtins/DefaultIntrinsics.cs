@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
@@ -104,6 +105,99 @@ public static class DefaultIntrinsics {
         RegisterConsole(registry);
         RegisterConvert(registry);
         RegisterExceptions(registry);
+        RegisterDisposable(registry);
+        RegisterRuntimeHelpers(registry);
+    }
+
+    /// <summary>
+    /// IDisposable::Dispose の面。using/foreach の leave 時に呼ばれる。
+    /// ゲスト実装があれば Call の仮想ディスパッチが優先されるため、この intrinsic は
+    /// 「レシーバにゲスト実装が無かった場合の面」(リソースを持たない 既定 = no-op) となる。
+    /// </summary>
+    private static void RegisterDisposable(IntrinsicRegistry registry) {
+        registry.Register(IntrinsicKey.Instance("System.IDisposable", "Dispose", 0),
+            (ctx, a) => null);
+    }
+
+    // ---- System.Runtime.CompilerServices.RuntimeHelpers ----
+
+    /// <summary>配列初期化子 (ldtoken Field + InitializeArray) の面。FieldRVA データを要素に展開する。</summary>
+    private static void RegisterRuntimeHelpers(IntrinsicRegistry registry) {
+        registry.Register(IntrinsicKey.Static(
+                "System.Runtime.CompilerServices.RuntimeHelpers", "InitializeArray", 2),
+            static (_, a) => {
+                if (a[0].ObjectValue is not VmArray array)
+                    throw new InvalidOperationException("InitializeArray の第1引数が配列ではありません。");
+                if (a[1].ObjectValue is not VmFieldRvaData handle)
+                    throw new InvalidOperationException("InitializeArray の第2引数がフィールドハンドルではありません。");
+                CopyInitializerData(array, handle.Data.Span);
+                return null;
+            });
+    }
+
+    /// <summary>FieldRVA 初期データを配列要素へリトルエンディアンで展開する。</summary>
+    private static void CopyInitializerData(VmArray array, ReadOnlySpan<byte> data) {
+        var offset = 0;
+        for (var i = 0; i < array.Length; i++) {
+            var size = 0;
+            switch (array.ArrayType.ElementType.FullName) {
+                case "System.Byte":
+                    array.Elements[i] = StackSlot.OfInt32(data[offset]);
+                    size = 1;
+                    break;
+                case "System.SByte":
+                    array.Elements[i] = StackSlot.OfInt32((sbyte)data[offset]);
+                    size = 1;
+                    break;
+                case "System.Boolean":
+                    array.Elements[i] = StackSlot.OfInt32(data[offset] != 0 ? 1 : 0);
+                    size = 1;
+                    break;
+                case "System.Char":
+                    array.Elements[i] = StackSlot.OfInt32(BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]));
+                    size = 2;
+                    break;
+                case "System.Int16":
+                    array.Elements[i] = StackSlot.OfInt32(BinaryPrimitives.ReadInt16LittleEndian(data[offset..]));
+                    size = 2;
+                    break;
+                case "System.UInt16":
+                    array.Elements[i] = StackSlot.OfInt32(BinaryPrimitives.ReadUInt16LittleEndian(data[offset..]));
+                    size = 2;
+                    break;
+                case "System.Int32":
+                    array.Elements[i] = StackSlot.OfInt32(BinaryPrimitives.ReadInt32LittleEndian(data[offset..]));
+                    size = 4;
+                    break;
+                case "System.UInt32":
+                    array.Elements[i] = StackSlot.OfInt32(unchecked((int)BinaryPrimitives.ReadUInt32LittleEndian(data[offset..])));
+                    size = 4;
+                    break;
+                case "System.Int64":
+                    array.Elements[i] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(data[offset..]));
+                    size = 8;
+                    break;
+                case "System.UInt64":
+                    array.Elements[i] = StackSlot.OfInt64(unchecked((long)BinaryPrimitives.ReadUInt64LittleEndian(data[offset..])));
+                    size = 8;
+                    break;
+                case "System.Single":
+                    array.Elements[i] = StackSlot.OfFloat(BinaryPrimitives.ReadSingleLittleEndian(data[offset..]));
+                    size = 4;
+                    break;
+                case "System.Double":
+                    array.Elements[i] = StackSlot.OfFloat(BinaryPrimitives.ReadDoubleLittleEndian(data[offset..]));
+                    size = 8;
+                    break;
+                default:
+                    throw new NotSupportedException(
+                        $"InitializeArray はプリミティブ要素配列のみ対応しています ({array.ArrayType.ElementType.FullName})。");
+            }
+            offset += size;
+        }
+        if (offset > data.Length)
+            throw new BadImageFormatException(
+                $"FieldRVA 初期データが不足しています (必要 {offset} バイト, 実際 {data.Length} バイト)。");
     }
 
     /// <summary>プリミティブ型の instance ToString() (int.ToString() 等の直接呼出用)。</summary>

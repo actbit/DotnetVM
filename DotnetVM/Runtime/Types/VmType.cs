@@ -13,7 +13,16 @@ public abstract class VmType {
 
     public IReadOnlyList<VmMethod> Methods { get; internal set; } = [];
     public IReadOnlyList<VmField> Fields { get; internal set; } = [];
-    public IReadOnlyList<VmType> Interfaces { get; internal set; } = [];
+
+    /// <summary>実装するインターフェース (構築型は型引数を置換したものを返す)。</summary>
+    public virtual IReadOnlyList<VmType> Interfaces { get; internal set; } = [];
+
+    /// <summary>ジェネリックパラメータの変性/制約フラグ (ECMA-335 GenericParam.Flags)。
+    /// 0x0001 = Covariant (out)、0x0002 = Contravariant (in)。非ジェネリック型は空。</summary>
+    public virtual uint[] GenericParamFlags => [];
+
+    /// <summary>ジェネリックパラメータの個数 (非ジェネリック型は 0)。</summary>
+    public virtual int GenericParamCount => GenericParamFlags.Length;
 
     public bool IsEnum => BaseType?.FullName == "System.Enum";
     public bool IsInterface => (Flags & 0x20) != 0;
@@ -31,10 +40,15 @@ public abstract class VmType {
         }
     }
 
-    /// <summary>この型が target に代入可能か (同一、基底チェーン、実装インターフェース)。</summary>
+    /// <summary>
+    /// この型が target に代入可能か (同一、基底チェーン、実装インターフェース)。
+    /// 構築型同士は型引数の一致 + 変性 (共変/反変) を考慮する (M5)。
+    /// </summary>
     public bool IsAssignableTo(VmType target) {
         if (ReferenceEquals(this, target))
             return true;
+        if (this is VmConstructedType constructed && target is VmConstructedType targetConstructed)
+            return constructed.IsConstructedAssignableTo(targetConstructed);
         for (var current = BaseType; current is not null; current = current.BaseType)
             if (ReferenceEquals(current, target))
                 return true;
@@ -66,6 +80,13 @@ public sealed class VmClassType : VmType {
     public VmClassType(uint flags) {
         Flags = flags;
     }
+
+    private uint[] _genericParamFlags = [];
+
+    /// <summary>GenericParam テーブル (Owner = 本型) の Flags。TypeLoader が補完する。</summary>
+    public override uint[] GenericParamFlags => _genericParamFlags;
+
+    internal void SetGenericParamFlags(uint[] flags) => _genericParamFlags = flags;
 
     /// <summary>基底型。TypeLoader が Extends を遅延解決する。</summary>
     public override VmType? BaseType {
@@ -109,6 +130,13 @@ public sealed class VmIntrinsicType : VmType {
     public required bool IsValue { get; init; }
     public VmType? Parent { get; init; }
 
+    private uint[] _genericParamFlags = [];
+
+    /// <summary>BCL 既知の変性 (IEnumerable`1 = 共変、IComparable`1 = 反変 等)。</summary>
+    public override uint[] GenericParamFlags => _genericParamFlags;
+
+    internal void SetGenericParamFlags(uint[] flags) => _genericParamFlags = flags;
+
     public override string FullName => string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
     public override VmType? BaseType => Parent;
     public override bool IsValueType => IsValue;
@@ -120,6 +148,7 @@ public sealed class VmArrayType : VmType {
     public override string FullName => ElementType.FullName + "[]";
     public override VmType? BaseType { get; } = null; // System.Array ファサードは M6 で接続
     public override bool IsValueType => false;
+    public override uint[] GenericParamFlags => [];
 }
 
 /// <summary>多次元配列。</summary>
@@ -129,6 +158,7 @@ public sealed class VmMultiDimArrayType : VmType {
     public override string FullName => $"{ElementType.FullName}[{Rank}]";
     public override VmType? BaseType => null;
     public override bool IsValueType => false;
+    public override uint[] GenericParamFlags => [];
 }
 
 /// <summary>ByRef 型 (ref T)。</summary>
@@ -137,6 +167,7 @@ public sealed class VmByRefType : VmType {
     public override string FullName => ElementType.FullName + "&";
     public override VmType? BaseType => null;
     public override bool IsValueType => false;
+    public override uint[] GenericParamFlags => [];
 }
 
 /// <summary>ジェネリックパラメータ (!n / !!n)。</summary>
@@ -146,6 +177,7 @@ public sealed class VmGenericParameterType : VmType {
     public override string FullName => (IsMethodParameter ? "!!" : "!") + Number;
     public override VmType? BaseType => null;
     public override bool IsValueType => false;
+    public override uint[] GenericParamFlags => [];
 }
 
 /// <summary>構築ジェネリック型 (GenericInst)。</summary>
@@ -154,9 +186,74 @@ public sealed class VmConstructedType : VmType {
     public required VmType Definition { get; init; }
     public required VmType[] TypeArguments { get; init; }
 
+    private VmType? _baseType;
+
     public override string FullName =>
         $"{Definition.FullName}<{string.Join(", ", TypeArguments.Select(t => t.FullName))}>";
-    public override VmType? BaseType => Definition.BaseType; // TODO(M5): 型引数を置換した基底型
+
+    /// <summary>定義の基底型に型引数を適用したもの (例: Sub`1&lt;int&gt; → Base`1&lt;!0&gt; → Base`1&lt;int&gt;)。</summary>
+    public override VmType? BaseType {
+        get {
+            if (_baseType is null && !_baseResolved) {
+                _baseType = Definition.BaseType is { } raw ? SubstituteOwn(raw) : null;
+                _baseResolved = true;
+            }
+            return _baseType;
+        }
+    }
+
+    private bool _baseResolved;
+
+    /// <summary>定義の実装インターフェースに型引数を適用したもの。</summary>
+    public override IReadOnlyList<VmType> Interfaces => Definition.Interfaces
+        .Select(i => SubstituteOwn(i))
+        .ToArray();
+
     public override bool IsValueType => Definition.IsValueType;
     public override uint Flags => Definition.Flags;
+    public override uint[] GenericParamFlags => Definition.GenericParamFlags;
+
+    private VmType SubstituteOwn(VmType type) =>
+        GenericSubstitutor.Substitute(type, new GenericContext { ClassArgs = TypeArguments });
+
+    /// <summary>構築型同士の代入可能性 (同一定義なら型引数の変性込み比較、異なるなら置換済み基底/インターフェースを辿る)。</summary>
+    public bool IsConstructedAssignableTo(VmConstructedType target) {
+        if (ReferenceEquals(Definition, target.Definition))
+            return TypeArgumentsMatch(TypeArguments, target.TypeArguments, Definition.GenericParamFlags);
+
+        var baseType = BaseType; // 型引数置換済み (構築型なら再帰的に変性判定される)
+        if (baseType?.IsAssignableTo(target) == true)
+            return true;
+        foreach (var iface in Interfaces)
+            if (iface.IsAssignableTo(target))
+                return true;
+        return false;
+    }
+
+    /// <summary>変性を考慮した型引数比較 (flags は定義側の GenericParam.Flags)。</summary>
+    internal static bool TypeArgumentsMatch(VmType[] actual, VmType[] target, uint[] flags) {
+        if (actual.Length != target.Length)
+            return false;
+        for (var i = 0; i < actual.Length; i++) {
+            if (ReferenceEquals(actual[i], target[i]))
+                continue;
+            // 参照が異なっても同一型名なら同一視 (ファサード型の再合成に備えた緩和)
+            if (actual[i].FullName == target[i].FullName)
+                continue;
+            var variance = i < flags.Length ? flags[i] : 0;
+            if ((variance & CovariantFlag) != 0) {
+                if (!actual[i].IsAssignableTo(target[i]))
+                    return false;
+            } else if ((variance & ContravariantFlag) != 0) {
+                if (!target[i].IsAssignableTo(actual[i]))
+                    return false;
+            } else {
+                return false; // 不変 (invariant)
+            }
+        }
+        return true;
+    }
+
+    internal const uint CovariantFlag = 0x0001;
+    internal const uint ContravariantFlag = 0x0002;
 }

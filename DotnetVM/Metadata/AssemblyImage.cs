@@ -115,6 +115,19 @@ public sealed class AssemblyImage {
         return 0;
     }
 
+    /// <summary>FieldRVA テーブルからフィールドの初期データ RVA を取得する (未登録なら 0)。</summary>
+    public int GetFieldRva(int fieldDefRid) {
+        var count = Tables.GetRowCount(TableKind.FieldRVA);
+        for (var rid = 1; rid <= count; rid++) {
+            if (Tables.GetRowIndex(TableKind.FieldRVA, rid, 1) == fieldDefRid)
+                return (int)Tables.GetCell(TableKind.FieldRVA, rid, 0);
+        }
+        return 0;
+    }
+
+    /// <summary>RVA から所属セクション終端までの生バイト (FieldRVA 初期データの取得用)。</summary>
+    public ReadOnlyMemory<byte> GetRvaDataToEnd(int rva) => PE.GetSegmentToEnd(rva);
+
     /// <summary>TypeDef rid からトークンを作る。</summary>
     public static Token TypeDefToken(int rid) => Token.From(TableKind.TypeDef, rid);
 }

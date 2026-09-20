@@ -10,6 +10,10 @@ namespace DotnetVM.Runtime.Types;
 /// ファサード型 (VmIntrinsicType) として合成する。
 /// </summary>
 public sealed class TypeLoader {
+    /// <summary>GenericParam.Flags の変性ビット (ECMA-335 II.22.20)。</summary>
+    internal const uint Covariant = 0x0001;
+    internal const uint Contravariant = 0x0002;
+
     private readonly AssemblyImage _image;
 
     /// <summary>ロード対象のアセンブリ。</summary>
@@ -33,7 +37,11 @@ public sealed class TypeLoader {
         var valueType = new VmIntrinsicType { Namespace = "System", Name = "ValueType", IsValue = false, Parent = @object };
         var @enum = new VmIntrinsicType { Namespace = "System", Name = "Enum", IsValue = false, Parent = valueType };
 
-        void Add(VmIntrinsicType type) => _intrinsicTypes[type.FullName] = type;
+        void Add(VmIntrinsicType type, uint[]? genericParamFlags = null) {
+            if (genericParamFlags is not null)
+                type.SetGenericParamFlags(genericParamFlags);
+            _intrinsicTypes[type.FullName] = type;
+        }
         Add(@object);
         Add(valueType);
         Add(@enum);
@@ -73,13 +81,22 @@ public sealed class TypeLoader {
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = isValue, Parent = valueType });
 
         // ゲストが実装/参照する頻出外部インターフェースのファサード
-        foreach (var name in new[] {
-            "IDisposable", "IComparable", "ICloneable", "IEnumerable", "IEnumerator",
-            "ICollection", "IList", "IEquatable`1", "IComparable`1",
-            "IEnumerable`1", "IEnumerator`1", "ICollection`1", "IList`1",
-            "IReadOnlyList`1", "IReadOnlyCollection`1", "IEqualityComparer`1", "IFormatProvider",
-        })
+        foreach (var name in new[] { "IDisposable", "IComparable", "ICloneable", "IFormatProvider" })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false });
+        foreach (var name in new[] { "IEnumerable", "IEnumerator", "ICollection", "IList" })
+            Add(new VmIntrinsicType { Namespace = "System.Collections", Name = name, IsValue = false });
+        // ジェネリックインターフェースは BCL 既知の変性を登録する (castclass/isinst の変性判定に使う)
+        foreach (var name in new[] { "IEquatable`1", "IComparable`1" })
+            Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false }, [Contravariant]);
+        foreach (var name in new[] { "IComparer`1", "IEqualityComparer`1" })
+            Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = name, IsValue = false }, [Contravariant]);
+        foreach (var name in new[] {
+            "IEnumerable`1", "IEnumerator`1", "IReadOnlyList`1", "IReadOnlyCollection`1",
+            "IReadOnlySet`1", "IAsyncEnumerable`1", "IAsyncEnumerator`1",
+        })
+            Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = name, IsValue = false }, [Covariant]);
+        foreach (var name in new[] { "ICollection`1", "IList`1", "ISet`1", "IDictionary`2" })
+            Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = name, IsValue = false });
     }
 
     /// <summary>ファサード型を名前で取得 (無ければ null)。</summary>
@@ -110,10 +127,33 @@ public sealed class TypeLoader {
         _typeDefs[typeDefRid] = type;
 
         LoadMembers(type);
+        LoadGenericParams(type);
         ResolveNesting(type);
         _pendingCompletion.Add(type); // 基底型/インターフェースの解決はメンバ後に行う
         CompletePendingTypes();       // 依存型の連鎖ロードも含めて即時に完了させる
         return type;
+    }
+
+    /// <summary>GenericParam テーブルから本型の変性フラグを取り込む (ジェネリック定義のみ)。</summary>
+    private void LoadGenericParams(VmClassType type) {
+        var count = _image.Tables.GetRowCount(TableKind.GenericParam);
+        var flags = new List<uint>();
+        for (var rid = 1; rid <= count; rid++) {
+            var owner = _image.Tables.DecodeCoded(TableKind.GenericParam, rid, 2, CodedIndexKind.TypeOrMethodDef);
+            if (owner.Table != TableKind.TypeDef || owner.Rid != type.TypeDefRid)
+                continue;
+            // 行は Owner 順にソートされている規約だが、Number 順に並べ替えてから採用する
+            var number = (int)_image.Tables.GetCell(TableKind.GenericParam, rid, 0);
+            var paramFlags = _image.Tables.GetCell(TableKind.GenericParam, rid, 1);
+            if (number < flags.Count)
+                flags.Insert(number, paramFlags);
+            else {
+                while (flags.Count < number)
+                    flags.Add(0);
+                flags.Add(paramFlags);
+            }
+        }
+        type.SetGenericParamFlags([.. flags]);
     }
 
     private void LoadMembers(VmClassType type) {
@@ -223,8 +263,12 @@ public sealed class TypeLoader {
 
     // ---- SigType → VmType 解決 ----
 
+    /// <summary>署名中の型を VmType に解決し、ジェネリックパラメータを context の実引数で置換する。</summary>
+    public VmType ResolveToken(SigType sigType, GenericContext? context) =>
+        GenericSubstitutor.Substitute(ResolveToken(sigType), context);
+
     /// <summary>署名中の型を VmType に解決する。ジェネリックパラメータは置換コンテキストがないため
-    /// VmGenericParameterType をそのまま返す (構築時に M5 の GenericContext で置換)。</summary>
+    /// VmGenericParameterType をそのまま返す (インタプリタは ResolveToken(sigType, context) を使う)。</summary>
     public VmType ResolveToken(SigType sigType) => sigType.Kind switch {
         SigKind.TypeToken => ResolveTypeDefOrRefToken(sigType.Token),
         SigKind.GenericInst => new VmConstructedType {
@@ -269,10 +313,11 @@ public sealed class TypeLoader {
         };
     }
 
-    private VmType ResolveTypeSpec(int typeSpecRid) {
+    /// <summary>TypeSpec rid を解決する (ジェネリックパラメータは context の実引数で置換)。</summary>
+    public VmType ResolveTypeSpec(int typeSpecRid, GenericContext? context = null) {
         var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
         var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray()).Type;
-        return ResolveToken(sigType);
+        return GenericSubstitutor.Substitute(ResolveToken(sigType), context);
     }
 
     private VmType ResolveTypeRef(int typeRefRid) {
@@ -281,13 +326,49 @@ public sealed class TypeLoader {
         if (_intrinsicTypes.TryGetValue(fullName, out var intrinsic))
             return intrinsic;
 
-        // ネスト型 TypeRef (ResolutionScope = TypeRef) は包含型から探索する (簡易実装)
+        // ネスト型 TypeRef (ResolutionScope = TypeRef) は包含チェーンごとゲスト TypeDef と照合する
         var (scopeTable, scopeRid) = scope;
-        if (scopeTable == TableKind.TypeRef)
-            return ResolveTypeRef(scopeRid); // TODO(M5): ネスト型の正確な解決
+        if (scopeTable == TableKind.TypeRef && ResolveNestedTypeRef(typeRefRid) is { } nested)
+            return nested;
 
         throw new NotSupportedException(
             $"アセンブリ外の型参照 '{fullName}' は未対応です (アセンブリ参照の解決は今後のフェーズで実装)。");
+    }
+
+    /// <summary>ネスト型 TypeRef を TypeDef のネスト構造 (NestedClass) と名前照合で解決する。</summary>
+    private VmClassType? ResolveNestedTypeRef(int typeRefRid) {
+        // TypeRef のスコープチェーン (内側 → 外側) を名前として集める
+        var names = new List<string>();
+        var current = typeRefRid;
+        while (true) {
+            var (_, nestedName, nestedScope) = _image.GetTypeRefName(current);
+            names.Insert(0, nestedName);
+            var (scopeTable, scopeRid) = nestedScope;
+            if (scopeTable != TableKind.TypeRef)
+                break;
+            current = scopeRid;
+        }
+
+        var owner = FindTypeByName(names[0]);
+        if (owner is null)
+            return null;
+        for (var i = 1; i < names.Count; i++) {
+            VmClassType? child = null;
+            var typeDefs = _image.Tables.GetRowCount(TableKind.TypeDef);
+            for (var rid = 1; rid <= typeDefs; rid++) {
+                if (_image.GetEnclosingTypeDef(rid) != owner.TypeDefRid)
+                    continue;
+                var (_, childName) = _image.GetTypeDefName(rid);
+                if (childName == names[i]) {
+                    child = GetTypeDef(rid);
+                    break;
+                }
+            }
+            if (child is null)
+                return null;
+            owner = child;
+        }
+        return owner;
     }
 
     // ---- 検索 API ----

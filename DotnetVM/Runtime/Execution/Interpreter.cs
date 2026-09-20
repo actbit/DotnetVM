@@ -76,7 +76,10 @@ public sealed class Interpreter {
     }
 
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。</summary>
-    public StackSlot Invoke(VmMethod method, StackSlot[] arguments) {
+    public StackSlot Invoke(VmMethod method, StackSlot[] arguments) => Invoke(method, arguments, null);
+
+    /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
+    public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
         if (!_running) {
             _running = true;
             _intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
@@ -91,6 +94,7 @@ public sealed class Interpreter {
             CloneStructArgs(method, arguments);
             var frame = InterpreterFrame.Create(method, arguments,
                 Prepare(method).LocalTypes, method.Body.MaxStack);
+            frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             FixupStructLocals(frame);
             return RunFrame(frame);
         } finally {
@@ -106,16 +110,18 @@ public sealed class Interpreter {
                 arguments[i] = StackSlot.OfValueType(sv.Clone());
     }
 
-    /// <summary>値型ローカルの既定値を VmStructValue で実体化する (InterpreterFrame はローダ無しで null を置くため)。</summary>
+    /// <summary>値型ローカルの既定値を VmStructValue で実体化する (InterpreterFrame はローダ無しで null を置くため)。
+    /// !n / !!n ローカルは frame.Context の実引数で置換してから判定する。</summary>
     private void FixupStructLocals(InterpreterFrame frame) {
         for (var i = 0; i < frame.Locals.Length; i++) {
             ref var slot = ref frame.Locals[i];
             if (slot.Kind != StackKind.Object || slot.ObjectValue is not null)
                 continue;
             var sigType = frame.LocalTypes[i];
-            if (sigType.Kind is not (SigKind.TypeToken or SigKind.GenericInst))
+            if (sigType.Kind is not (SigKind.TypeToken or SigKind.GenericInst
+                or SigKind.GenericVar or SigKind.GenericMethodVar))
                 continue;
-            var type = _loader.ResolveToken(sigType);
+            var type = _loader.ResolveToken(sigType, frame.Context);
             if (type.IsValueType)
                 slot = ObjectModel.DefaultForType(type, _loader);
         }
@@ -204,7 +210,7 @@ public sealed class Interpreter {
                     frame.Ip = clause.HandlerStart;
                     return true;
                 case ExceptionClauseKind.Catch: {
-                    var targetType = ResolveTypeToken(clause.ClassToken);
+                    var targetType = ResolveTypeToken(clause.ClassToken, frame.Context);
                     if (!carrier.ExceptionType.IsAssignableTo(targetType))
                         continue; // 型不一致 → 外側の句へ
                     frame.CurrentThrow = carrier;
@@ -239,8 +245,10 @@ public sealed class Interpreter {
                 case ILOp.Volatile or ILOp.Unaligned or ILOp.Readonly or ILOp.Tail: // プレフィックス (効果なし)
                     break;
                 case ILOp.Constrained:
-                    // constrained. の本格処理はジェネリック (M5)。値型レシーバは ValueType スロットで
-                    // そのまま callvirt できるため、現段階ではプレフィックスとして無視する
+                    // constrained. <type> は次の call/callvirt で解決する。値型レシーバは
+                    // ValueType/ByRef スロットでそのまま仮想ディスパッチでき、参照型レシーバは
+                    // 通常の callvirt と等価なため、トークンを記録して次の呼出に渡すだけでよい
+                    frame.PendingConstrained = instruction.IntOperand;
                     break;
 
                 // ---- 引数 ----
@@ -393,7 +401,9 @@ public sealed class Interpreter {
 
                 // ---- 呼出 ----
                 case ILOp.Call or ILOp.Callvirt: {
-                    var result = Call(instruction.IntOperand, frame, instruction.Op == ILOp.Callvirt);
+                    var result = Call(instruction.IntOperand, frame,
+                        instruction.Op == ILOp.Callvirt, frame.PendingConstrained);
+                    frame.PendingConstrained = 0; // constrained. は直後の 1 呼出でのみ有効
                     if (result is { } value)
                         frame.Stack.Push(value);
                     break;
@@ -412,7 +422,7 @@ public sealed class Interpreter {
                     var count = frame.Stack.Pop().AsInt32;
                     if (count < 0)
                         throw new UnhandledGuestException("System.OverflowException", null);
-                    var elementType = ResolveTypeToken(instruction.IntOperand);
+                    var elementType = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var elements = new StackSlot[count];
                     for (var i = 0; i < count; i++)
                         elements[i] = ObjectModel.DefaultForType(elementType, _loader);
@@ -439,7 +449,7 @@ public sealed class Interpreter {
                     frame.Stack.Push(ArrayLoad(frame, ArrayElementKind.Object));
                     break;
                 case ILOp.Ldelem:
-                    frame.Stack.Push(ArrayLoad(frame, ElementKindFromType(ResolveTypeToken(instruction.IntOperand))));
+                    frame.Stack.Push(ArrayLoad(frame, ElementKindFromType(ResolveTypeToken(instruction.IntOperand, frame.Context))));
                     break;
                 case ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2 or ILOp.Stelem_I4:
                     ArrayStore(frame, ArrayElementKind.Int32);
@@ -454,7 +464,7 @@ public sealed class Interpreter {
                     ArrayStore(frame, ArrayElementKind.Object);
                     break;
                 case ILOp.Stelem:
-                    ArrayStore(frame, ElementKindFromType(ResolveTypeToken(instruction.IntOperand)));
+                    ArrayStore(frame, ElementKindFromType(ResolveTypeToken(instruction.IntOperand, frame.Context)));
                     break;
                 case ILOp.Ldelema: {
                     var index = frame.Stack.Pop().AsInt32;
@@ -466,7 +476,7 @@ public sealed class Interpreter {
 
                 // ---- フィールド ----
                 case ILOp.Ldfld or ILOp.Ldflda: {
-                    var field = ResolveFieldToken(instruction.IntOperand);
+                    var field = ResolveFieldToken(instruction.IntOperand, frame.Context);
                     var objSlot = frame.Stack.Pop();
                     var location = FieldLocation(objSlot, field);
                     if (instruction.Op == ILOp.Ldflda) {
@@ -477,23 +487,23 @@ public sealed class Interpreter {
                     break;
                 }
                 case ILOp.Stfld: {
-                    var field = ResolveFieldToken(instruction.IntOperand);
+                    var field = ResolveFieldToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     var objSlot = frame.Stack.Pop();
                     FieldLocation(objSlot, field).Slot = StoreCopyOfValue(value);
                     break;
                 }
                 case ILOp.Ldsfld: {
-                    var slot = StaticFieldLocation(instruction.IntOperand);
+                    var slot = StaticFieldLocation(instruction.IntOperand, frame.Context);
                     frame.Stack.Push(PushCopyOfValue(slot.Slot));
                     break;
                 }
                 case ILOp.Ldsflda:
-                    frame.Stack.Push(StackSlot.OfByRef(StaticFieldLocation(instruction.IntOperand)));
+                    frame.Stack.Push(StackSlot.OfByRef(StaticFieldLocation(instruction.IntOperand, frame.Context)));
                     break;
                 case ILOp.Stsfld: {
                     var value = frame.Stack.Pop();
-                    StaticFieldLocation(instruction.IntOperand).Slot = value;
+                    StaticFieldLocation(instruction.IntOperand, frame.Context).Slot = value;
                     break;
                 }
 
@@ -544,13 +554,13 @@ public sealed class Interpreter {
                 }
                 case ILOp.Initobj: {
                     var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    byref.Slot = ObjectModel.DefaultForType(ResolveTypeToken(instruction.IntOperand), _loader);
+                    byref.Slot = ObjectModel.DefaultForType(ResolveTypeToken(instruction.IntOperand, frame.Context), _loader);
                     break;
                 }
 
                 // ---- ボックス化 ----
                 case ILOp.Box: {
-                    var type = ResolveTypeToken(instruction.IntOperand);
+                    var type = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     var fields = value.Kind == StackKind.ValueType
                         ? ((VmStructValue)value.ObjectValue!).Clone().Fields
@@ -559,7 +569,7 @@ public sealed class Interpreter {
                     break;
                 }
                 case ILOp.Unbox: {
-                    var target = ResolveTypeToken(instruction.IntOperand);
+                    var target = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
                         throw new UnhandledGuestException("System.InvalidCastException",
@@ -568,15 +578,17 @@ public sealed class Interpreter {
                     break;
                 }
                 case ILOp.Unbox_Any: {
-                    var target = ResolveTypeToken(instruction.IntOperand);
+                    var target = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     if (target.IsValueType) {
                         // 値型への unbox.any はボックス化実体からコピーを取り出す
                         if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
                             throw new UnhandledGuestException("System.InvalidCastException",
                                 $"{Describe(value)} を {target.FullName} に unbox.any できません。");
-                        if (target is VmClassType) {
-                            var sv = new VmStructValue(boxed.Type, (StackSlot[])boxed.Fields.Clone());
+                        if (target is VmClassType or VmConstructedType) {
+                            // 構造体 (構築ジェネリック構造体を含む) は実体をコピーして取り出す
+                            var args = boxed.Type is VmConstructedType ct ? ct.TypeArguments : null;
+                            var sv = new VmStructValue(boxed.Type, (StackSlot[])boxed.Fields.Clone(), args);
                             frame.Stack.Push(StackSlot.OfValueType(sv));
                         } else {
                             // プリミティブ (intrinsic 値型) はスロットをそのまま取り出す
@@ -595,7 +607,7 @@ public sealed class Interpreter {
 
                 // ---- キャスト ----
                 case ILOp.Castclass or ILOp.Isinst: {
-                    var target = ResolveTypeToken(instruction.IntOperand);
+                    var target = ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     var ok = value.ObjectValue is null || IsAssignableToType(value.ObjectValue, target);
                     if (!ok && instruction.Op == ILOp.Castclass)
@@ -652,6 +664,22 @@ public sealed class Interpreter {
                 }
 
                 // ---- M5 以降の命令 ----
+                case ILOp.Ldtoken: {
+                    // ldtoken Field は FieldRVA 初期データのハンドルを積む
+                    // (RuntimeHelpers::InitializeArray 専用の消費を想定)。
+                    // Type/Method トークン (typeof 等) は未対応
+                    var tokenTable = (TableKind)((uint)instruction.IntOperand >> 24);
+                    var tokenRid = (int)((uint)instruction.IntOperand & 0xFFFFFF);
+                    if (tokenTable != TableKind.Field)
+                        throw new NotSupportedException(
+                            $"ldtoken は Field トークンのみ対応しています (要求: {tokenTable})。");
+                    var rva = _loader.Image.GetFieldRva(tokenRid);
+                    if (rva == 0)
+                        throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
+                    var handle = _heap.Allocate(new VmFieldRvaData { Data = _loader.Image.GetRvaDataToEnd(rva) });
+                    frame.Stack.Push(StackSlot.OfObject(handle));
+                    break;
+                }
                 default:
                     throw new NotSupportedException(
                         $"IL 命令 {IlOpcodeTable.Get(instruction.Op)?.Name ?? instruction.Op.ToString()} は未対応です (ジェネリック/JIT は今後のフェーズで実装)。");
@@ -664,6 +692,9 @@ public sealed class Interpreter {
 
     private static ArrayElementKind ElementKindFromType(VmType type) {
         if (type.IsValueType) {
+            // プリミティブ以外の値型 (構造体/構築ジェネリック構造体) は VmStructValue スロットのまま扱う
+            if (type is not VmIntrinsicType)
+                return ArrayElementKind.Object;
             return type.FullName switch {
                 "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr" => ArrayElementKind.Int64,
                 "System.Single" or "System.Double" => ArrayElementKind.Float,
@@ -696,7 +727,8 @@ public sealed class Interpreter {
             ArrayElementKind.Int32 => StackSlot.OfInt32((int)slot.Int64Value),
             ArrayElementKind.Int64 => StackSlot.OfInt64(slot.Int64Value),
             ArrayElementKind.Float => StackSlot.OfFloat(slot.DoubleValue),
-            _ => slot,
+            // 構造体要素は読み出し時にコピーする (値型コピー意味論)
+            _ => slot.ObjectValue is VmStructValue sv ? StackSlot.OfValueType(sv.Clone()) : slot,
         };
     }
 
@@ -729,9 +761,11 @@ public sealed class Interpreter {
 
     private static StackSlot StoreCopyOfValue(in StackSlot value) => PushCopyOfValue(value);
 
-    /// <summary>VM オブジェクトがターゲット型に代入可能か (castclass/isinst/配列共変/例外 catch の共通判定)。</summary>
+    /// <summary>VM オブジェクトがターゲット型に代入可能か (castclass/isinst/配列共変/例外 catch の共通判定)。
+    /// ジェネリック型のインスタンスは実引数を記録した構築型を作って判定する (変性込み・M5)。</summary>
     private bool IsAssignableToType(object vmValue, VmType target) => vmValue switch {
-        VmClassInstance ci => ci.ClassType.IsAssignableTo(target),
+        VmClassInstance ci => ci.RuntimeType.IsAssignableTo(target),
+        VmStructValue sv => sv.RuntimeType.IsAssignableTo(target),
         VmExceptionObject e => e.ExceptionType.IsAssignableTo(target),
         VmString => target.FullName is "System.String" or "System.Object",
         VmArray array => target switch {
@@ -756,8 +790,8 @@ public sealed class Interpreter {
 
     // ---- フィールドアクセス ----
 
-    /// <summary>フィールドトークン (Field / MemberRef) を解決する。</summary>
-    private VmField ResolveFieldToken(int token) {
+    /// <summary>フィールドトークン (Field / MemberRef) を解決する。TypeSpec 親 (構築型のフィールド) も解決する。</summary>
+    private VmField ResolveFieldToken(int token, GenericContext? context = null) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         switch (table) {
@@ -766,12 +800,21 @@ public sealed class Interpreter {
                     ?? throw new BadImageFormatException($"Field トークン 0x{token:X8} を解決できません。");
             case TableKind.MemberRef: {
                 var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
+                var fieldName = _loader.GetMemberRefFieldName(rid);
                 if (parent.Table == TableKind.TypeDef) {
                     var owner = _loader.GetTypeDef(parent.Rid);
-                    var fieldName = _loader.GetMemberRefFieldName(rid);
                     return owner.Fields.FirstOrDefault(f => f.Name == fieldName)
                         ?? throw new BadImageFormatException(
                             $"MemberRef 0x{token:X8} の解決先フィールド {owner.FullName}::{fieldName} が見つかりません。");
+                }
+                if (parent.Table == TableKind.TypeSpec) {
+                    // 構築型のフィールド参照 (例: ldfld !0 class List`1<int32>::_items)
+                    // 親 TypeSpec が呼出元のパラメータ (!0) を含む場合は context で置換する
+                    var constructed = ResolveConstructedParent(parent.Rid, context);
+                    var definition = (VmClassType)constructed.Definition;
+                    return definition.Fields.FirstOrDefault(f => f.Name == fieldName)
+                        ?? throw new BadImageFormatException(
+                            $"MemberRef 0x{token:X8} の解決先フィールド {definition.FullName}::{fieldName} が見つかりません。");
                 }
                 throw new NotSupportedException($"フィールド MemberRef 親テーブル {parent.Table} は未対応です。");
             }
@@ -780,6 +823,11 @@ public sealed class Interpreter {
         }
     }
 
+    /// <summary>MemberRef の TypeSpec 親を構築型として解決する。VAR/MVAR を含む場合は context で置換する。</summary>
+    private VmConstructedType ResolveConstructedParent(int typeSpecRid, GenericContext? context) =>
+        _loader.ResolveTypeSpec(typeSpecRid, context) as VmConstructedType
+            ?? throw new BadImageFormatException($"TypeSpec 0x02{typeSpecRid:X6} は構築ジェネリック型ではありません。");
+
     /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。</summary>
     private VmByRef FieldLocation(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
@@ -787,10 +835,17 @@ public sealed class Interpreter {
                 throw new UnhandledGuestException("System.NullReferenceException", null);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
                 return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field));
-            case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
-                return boxed.Type is VmClassType bt
+            case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed: {
+                // ボックス化ジェネリック構造体 (構築型) は定義型に解いてレイアウトを取る
+                VmClassType? bt = boxed.Type switch {
+                    VmClassType cls => cls,
+                    VmConstructedType constructed => constructed.Definition as VmClassType,
+                    _ => null,
+                };
+                return bt is not null
                     ? new VmByRef(boxed.Fields, GetInstanceFieldIndex(bt, field))
                     : new VmByRef(boxed.Fields, 0);
+            }
             case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
                 // 構造体ローカル/引数へのフィールド書込 (ldloca → ldfld/stfld)
                 var target = outer.Slot;
@@ -825,7 +880,7 @@ public sealed class Interpreter {
     private readonly Dictionary<int, StackSlot[]> _intrinsicStaticFields = [];
 
     /// <summary>静的フィールドの位置を解決する (.cctor 起動を含む)。intrinsic 型 (TypeRef 親) の静的フィールドも解決する。</summary>
-    private VmByRef StaticFieldLocation(int token) {
+    private VmByRef StaticFieldLocation(int token, GenericContext? context = null) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table == TableKind.MemberRef) {
@@ -841,6 +896,16 @@ public sealed class Interpreter {
                     _intrinsicStaticFields[token] = storage;
                 }
                 return new VmByRef(storage, 0);
+            }
+            if (parent.Table == TableKind.TypeSpec) {
+                // 構築型の静的フィールド。ストレージは定義型に紐付く
+                // (CLR では値型実引数ごとに別ストレージだが、VM は共有する — BCL 面では等価)
+                var constructed = ResolveConstructedParent(parent.Rid, context);
+                var definition = (VmClassType)constructed.Definition;
+                EnsureInitialized(definition);
+                var storage = ObjectModel.GetOrCreateStaticStorage(definition, _loader);
+                return new VmByRef(storage, ObjectModel.StaticFieldIndex(definition,
+                    ResolveFieldToken(token, context)));
             }
         }
         var field = ResolveFieldToken(token);
@@ -869,6 +934,9 @@ public sealed class Interpreter {
             ctor = _loader.GetMethodByToken((uint)token)
                 ?? throw new BadImageFormatException($"newobj トークン 0x{token:X8} を解決できません。");
         } else if (table == TableKind.MemberRef) {
+            var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
+            if (parent.Table == TableKind.TypeSpec)
+                return NewConstructedObject(token, rid, parent.Rid, caller);
             var signature = SignatureDecoder.DecodeMethodSignature(
                 _loader.Image.GetMemberRefSignature(rid).ToArray());
             var facadeParamCount = signature.ParamTypes.Length;
@@ -928,8 +996,57 @@ public sealed class Interpreter {
         return StackSlot.OfObject(instance);
     }
 
-    private VmType ResolveTypeToken(int token) =>
-        _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token));
+    private VmType ResolveTypeToken(int token, GenericContext? context = null) =>
+        _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token), context);
+
+    /// <summary>
+    /// 構築ジェネリック型 (TypeSpec 親の MemberRef) の newobj。
+    /// 例: newobj instance void class List`1&lt;int32&gt;::.ctor() — 実引数を VmClassInstance/VmStructValue に
+    /// 記録し、.ctor はその型引数の GenericContext で実行する (フィールドの !0 等が正しく解決される)。
+    /// </summary>
+    private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
+        var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
+        var definition = (VmClassType)constructed.Definition;
+        var signature = SignatureDecoder.DecodeMethodSignature(
+            _loader.Image.GetMemberRefSignature(memberRefRid).ToArray());
+        var paramCount = signature.ParamTypes.Length;
+        var ctorName = _loader.GetMemberRefName(memberRefRid);
+        var context = new GenericContext { ClassArgs = constructed.TypeArguments };
+
+        // .ctor は宣言型 (継承チェーン上の基底ジェネリック定義も含む) から探す
+        VmMethod? ctor = null;
+        for (VmType? t = definition; t is not null && ctor is null; t = t.BaseType) {
+            if (t is VmConstructedType ct)
+                t = ct.Definition;
+            if (t is not VmClassType cls)
+                break;
+            ctor = cls.Methods.FirstOrDefault(m =>
+                m.Name == ctorName && !m.IsStatic && m.Signature.ParamTypes.Length == paramCount);
+        }
+        EnsureInitialized(definition);
+        if (ctor is null)
+            throw new BadImageFormatException(
+                $"構築型 {constructed.FullName} に引数 {paramCount} 個の .ctor ({ctorName}) が見つかりません。");
+
+        var args = new StackSlot[paramCount + 1];
+        for (var i = paramCount; i >= 1; i--)
+            args[i] = caller.Stack.Pop();
+
+        if (definition.IsValueType) {
+            var structValue = ObjectModel.DefaultStruct(definition, _loader, context, constructed.TypeArguments);
+            args[0] = StackSlot.OfValueType(structValue);
+            if (ctor?.Body is not null)
+                Invoke(ctor, args, context);
+            return StackSlot.OfValueType(structValue);
+        }
+
+        var instance = _heap.Allocate(new VmClassInstance(definition,
+            ObjectModel.CreateInstanceStorage(definition, _loader, context), constructed.TypeArguments));
+        args[0] = StackSlot.OfObject(instance);
+        if (ctor?.Body is not null)
+            Invoke(ctor, args, context);
+        return StackSlot.OfObject(instance);
+    }
 
     /// <summary>例外ファサード型か (System.Exception 自身と XxxException)。</summary>
     private static bool IsExceptionFacade(VmType type) =>
@@ -1049,8 +1166,10 @@ public sealed class Interpreter {
 
     // ---- 呼出 ----
 
-    private StackSlot? Call(int token, InterpreterFrame caller, bool isCallvirt) {
-        var target = ResolveCallTarget(token);
+    private StackSlot? Call(int token, InterpreterFrame caller, bool isCallvirt, int constrainedToken) {
+        // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
+        // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
+        var target = ResolveCallTarget(token, caller.Context, throwOnMissingIntrinsic: false);
 
         // 引数はスタック上では逆順
         var args = new StackSlot[target.Arity];
@@ -1059,7 +1178,7 @@ public sealed class Interpreter {
 
         if (target.Intrinsic is { } intrinsic) {
             // プリミティブの instance メソッド (int.ToString() 等) は ldloca 経由の
-            // ByRef レシーバで来るため、値に読み替えてから渡す
+            // ByRef レシーバで来るため、値に読み替えてから渡す (constrained. 値型レシーバも同様)
             if (target.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef)
                 args[0] = thisByRef.Slot;
             // callvirt で intrinsic 宣言型 (System.Object 等) をターゲットにする場合、
@@ -1069,8 +1188,21 @@ public sealed class Interpreter {
                     throw new UnhandledGuestException("System.NullReferenceException",
                         $"null レシーバで {target.DeclaringType}::{target.Name} を呼び出しました。");
                 if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
-                    var guestRet = Invoke(guestOverride, args);
+                    var context = BuildCallContext(target, guestOverride, args[0]);
+                    var guestRet = Invoke(guestOverride, args, context);
                     return SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
+                }
+            }
+            // constrained. 値型レシーバが intrinsic 宣言型 (System.Object 等) に着地した場合、
+            // ECMA-335 規約に従い値をボックス化してから渡す (ゲスト実装は上の仮想ディスパッチで優先済み)
+            if (constrainedToken != 0 && target.HasThis &&
+                args[0].Kind is not (StackKind.Object or StackKind.ByRef)) {
+                var constrainedType = ResolveTypeToken(constrainedToken, caller.Context);
+                if (constrainedType.IsValueType) {
+                    var fields = args[0].Kind == StackKind.ValueType
+                        ? ((VmStructValue)args[0].ObjectValue!).Clone().Fields
+                        : [args[0]];
+                    args[0] = StackSlot.OfObject(_heap.Allocate(new VmBoxedValue(constrainedType, fields)));
                 }
             }
             // intrinsic 呼出ゲート: ① 追加クォータ消費 ② セーフポイント検査
@@ -1080,7 +1212,12 @@ public sealed class Interpreter {
             return intrinsic(_intrinsicContext, args);
         }
 
-        // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)
+        // 解決未了 (未登録 intrinsic): レシーバへの仮想ディスパッチを最終試行してから拒否
+        if (target.Method is null)
+            return FailOrDispatchLate(target, caller, isCallvirt, args);
+
+        // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)。
+        // constrained. 値型レシーバは ByRef/ValueType スロットで来るためディスパッチがそのまま適用される
         var method = target.Method!;
         if (isCallvirt && method.Signature.HasThis) {
             if (IsNullReference(args[0]))
@@ -1088,8 +1225,61 @@ public sealed class Interpreter {
                     $"null レシーバで {method.DeclaringType.FullName}::{method.Name} を呼び出しました。");
             method = DispatchVirtual(method, args[0]);
         }
-        var ret = Invoke(method, args);
+        var context2 = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
+        var ret = Invoke(method, args, context2);
         return SignatureReturnsValue(method.Signature) ? ret : null;
+    }
+
+    /// <summary>解決未了の呼出 (未登録 intrinsic) の最終処理。callvirt ならレシーバの実行時型に
+    /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
+    /// 無ければ未登録 intrinsic として拒否する。</summary>
+    private StackSlot? FailOrDispatchLate(CallTarget target, InterpreterFrame caller, bool isCallvirt, StackSlot[] args) {
+        if (isCallvirt && target.HasThis &&
+            TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
+            var context = BuildCallContext(target, guestOverride, args[0]);
+            var ret = Invoke(guestOverride, args, context);
+            return SignatureReturnsValue(guestOverride.Signature) ? ret : null;
+        }
+        throw new OperationNotAllowedException(
+            $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録された intrinsic のみ提供されます。");
+    }
+
+    /// <summary>
+    /// 呼出先メソッド用の GenericContext を構築する。クラス型引数は MemberRef/TypeSpec 親の構築型引数だが、
+    /// レシーバの実行時型が実引数を持つ場合はそちらを優先する (仮想ディスパッチで派生/実装側の
+    /// ジェネリック定義に着地した場合、その !0 はレシーバ自身の実引数を指すため)。
+    /// </summary>
+    private GenericContext? BuildCallContext(CallTarget target, VmMethod method, in StackSlot receiver) {
+        var classArgs = target.ClassArgs;
+        var declaringParamCount = method.DeclaringType.GenericParamCount;
+        if (declaringParamCount > 0 &&
+            TryGetReceiverTypeArguments(receiver, declaringParamCount, out var receiverArgs))
+            classArgs = receiverArgs;
+        return GenericContext.Of(classArgs, target.MethodArgs);
+    }
+
+    /// <summary>レシーバ (インスタンス/ボックス/構造体値、ByRef レシーバも可) が持つジェネリック実引数を得る。</summary>
+    private static bool TryGetReceiverTypeArguments(in StackSlot receiver, int count, out VmType[] args) {
+        args = [];
+        if (count == 0)
+            return false;
+        var value = receiver.Kind == StackKind.ByRef && receiver.ObjectValue is VmByRef byRef
+            ? byRef.Slot
+            : receiver;
+        VmType[]? found = value.Kind switch {
+            StackKind.Object => value.ObjectValue switch {
+                VmClassInstance ci => ci.TypeArguments,
+                VmBoxedValue bv => bv.Type is VmConstructedType boxedCt ? boxedCt.TypeArguments : null,
+                _ => null,
+            },
+            StackKind.ValueType => value.ObjectValue is VmStructValue sv ? sv.TypeArguments : null,
+            _ => null,
+        };
+        if (found is { Length: > 0 } && found.Length == count) {
+            args = found;
+            return true;
+        }
+        return false;
     }
 
     private static bool IsNullReference(in StackSlot slot) =>
@@ -1099,14 +1289,15 @@ public sealed class Interpreter {
     private VmMethod DispatchVirtual(VmMethod declared, in StackSlot receiver) =>
         TryDispatchVirtual(declared.Name, declared.Signature.ParamTypes.Length, receiver) ?? declared;
 
-    /// <summary>実行時型から最派生のゲスト実装を探す。見つからなければ null (intrinsic 宣装にフォールバック)。</summary>
+    /// <summary>実行時型から最派生のゲスト実装を探す。見つからなければ null (intrinsic 宣装にフォールバック)。
+    /// 構築ジェネリック型のインスタンス (VmBoxedValue の VmConstructedType 型 等) も定義側に解いて探索する。</summary>
     private VmMethod? TryDispatchVirtual(string name, int paramCount, in StackSlot receiver) {
         // 構造体の instance メソッドは ByRef レシーバで来ることがある
         var receiverValue = receiver.Kind == StackKind.ByRef && receiver.ObjectValue is VmByRef byRef
             ? byRef.Slot
             : receiver;
         var runtimeType = receiverValue.Kind switch {
-            StackKind.ValueType => receiverValue.ObjectValue is VmStructValue sv ? sv.StructType : null,
+            StackKind.ValueType => receiverValue.ObjectValue is VmStructValue sv ? (VmType)sv.StructType : null,
             StackKind.Object => receiverValue.ObjectValue switch {
                 VmClassInstance ci => (VmType)ci.ClassType,
                 VmBoxedValue bv => bv.Type,
@@ -1115,15 +1306,18 @@ public sealed class Interpreter {
             _ => null,
         };
 
-        for (var t = runtimeType; t is not null; t = t.BaseType) {
+        for (VmType? t = runtimeType; t is not null;) {
+            if (t is VmConstructedType constructed)
+                t = constructed.Definition; // 構築型 → ジェネリック定義に解いて探索を続ける
             if (t is not VmClassType cls)
-                continue;
+                break;
             var found = cls.Methods.FirstOrDefault(m =>
                 m.Name == name &&
                 m.Signature.ParamTypes.Length == paramCount &&
                 !m.IsAbstract && m.Body is not null);
             if (found is not null)
                 return found;
+            t = cls.BaseType;
         }
         return null;
     }
@@ -1137,10 +1331,17 @@ public sealed class Interpreter {
         public string? Name;
         public int ParamCount;
         public bool HasThis;
+        /// <summary>構築型経由 (TypeSpec 親) で解決された場合の型引数 (MemberRef の !0 置換に使う)。</summary>
+        public VmType[]? ClassArgs;
+        /// <summary>MethodSpec の Instantiation (ジェネリックメソッドの !!0 置換に使う)。</summary>
+        public VmType[]? MethodArgs;
     }
 
-    /// <summary>呼出トークンを解決する (Arity = 引数個数、インスタンスは this 込み)。</summary>
-    private CallTarget ResolveCallTarget(int token) {
+    /// <summary>呼出トークンを解決する (Arity = 引数個数、インスタンスは this 込み)。
+    /// context は呼出元メソッドのジェネリック実引数 (MemberRef の TypeSpec 親が !0 を含む場合の置換に使う)。
+    /// throwOnMissingIntrinsic = false の場合、TypeRef 親の未登録 intrinsic は即例外にせず
+    /// Intrinsic = null の CallTarget を返す (Call 側でレシーバの仮想ディスパッチを試してから判定する)。</summary>
+    private CallTarget ResolveCallTarget(int token, GenericContext? context, bool throwOnMissingIntrinsic = true) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         switch (table) {
@@ -1187,6 +1388,17 @@ public sealed class Interpreter {
                             HasThis = signature.HasThis,
                         };
                     }
+                    // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
+                    // (constrained callvirt ではレシーバの実行時型にゲスト実装があるため。
+                    //  Call 側で最終ディスパッチが失敗した時点で改めて例外にする)
+                    if (!throwOnMissingIntrinsic)
+                        return new CallTarget {
+                            Arity = arity,
+                            DeclaringType = typeName,
+                            Name = name,
+                            ParamCount = signature.ParamTypes.Length,
+                            HasThis = signature.HasThis,
+                        };
                     throw new OperationNotAllowedException(
                         $"intrinsic {typeName}::{name} (引数 {arity} 個) は未登録です。BCL 面は VM 起動時に登録された intrinsic のみ提供されます。");
                 }
@@ -1202,13 +1414,156 @@ public sealed class Interpreter {
                         HasThis = method.Signature.HasThis,
                     };
                 }
-                throw new NotSupportedException($"MemberRef 親テーブル {parent.Table} は未対応です (ジェネリックは M5 以降)。");
+                if (parent.Table == TableKind.TypeSpec)
+                    return ResolveConstructedMethodTarget(token, rid, parent.Rid, signature, name, context, throwOnMissingIntrinsic);
+                throw new NotSupportedException($"MemberRef 親テーブル {parent.Table} は未対応です。");
             }
             case TableKind.MethodSpec:
-                throw new NotSupportedException("ジェネリックメソッド呼出 (MethodSpec) は M5 (ジェネリック) で実装します。");
+                return ResolveMethodSpecTarget(token, rid, context);
             default:
                 throw new BadImageFormatException($"呼出トークン 0x{token:X8} のテーブル 0x{(int)table:X2} が不正です。");
         }
+    }
+
+    /// <summary>TypeSpec 親 (構築型) の MemberRef を解決する。例: callvirt int32 class List`1&lt;int32&gt;::get_Item(int32)。
+    /// 定義がファサード型 (IEnumerator`1&lt;int&gt; 等の BCL インターフェース) なら intrinsic 面を解決し、
+    /// 実呼出は Call でレシーバの実行時型に仮想ディスパッチされる。</summary>
+    private CallTarget ResolveConstructedMethodTarget(int token, int memberRefRid, int typeSpecRid,
+        MethodSignature signature, string name, GenericContext? context, bool throwOnMissingIntrinsic = true) {
+        var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+        var constructed = ResolveConstructedParent(typeSpecRid, context);
+
+        // 構築ファサード型 (BCL 汎用インターフェース等) → intrinsic 面のみ
+        if (constructed.Definition is VmIntrinsicType facade) {
+            if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
+                TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl)) {
+                return new CallTarget {
+                    Arity = arity,
+                    Intrinsic = impl,
+                    DeclaringType = facade.FullName,
+                    Name = name,
+                    ParamCount = signature.ParamTypes.Length,
+                    HasThis = signature.HasThis,
+                };
+            }
+            // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
+            // (constrained callvirt ではレシーバの実行時型にゲスト実装があるため)
+            if (!throwOnMissingIntrinsic)
+                return new CallTarget {
+                    Arity = arity,
+                    DeclaringType = facade.FullName,
+                    Name = name,
+                    ParamCount = signature.ParamTypes.Length,
+                    HasThis = signature.HasThis,
+                    ClassArgs = constructed.TypeArguments,
+                };
+            throw new OperationNotAllowedException(
+                $"intrinsic {facade.FullName}::{name} (引数 {arity} 個) は未登録です。" +
+                "構築ファサード型のメソッドは intrinsic に登録された面のみ解決できます。");
+        }
+
+        var definition = (VmClassType)constructed.Definition;
+        var method = FindMethodThroughChain(definition, name, signature.ParamTypes.Length)
+            ?? throw new BadImageFormatException(
+                $"MemberRef 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
+        return new CallTarget {
+            Arity = arity,
+            Method = method,
+            Name = method.Name,
+            ParamCount = method.Signature.ParamTypes.Length,
+            HasThis = method.Signature.HasThis,
+            ClassArgs = constructed.TypeArguments,
+        };
+    }
+
+    /// <summary>ジェネリックメソッド (MethodSpec) を解決する。Instantiation blob からメソッド型引数を取り出す。
+    /// 例: call !!0 class Generics::First&lt;!!0&gt;(!!0[])</summary>
+    private CallTarget ResolveMethodSpecTarget(int token, int methodSpecRid, GenericContext? context) {
+        var underlying = _loader.Image.Tables.DecodeCoded(
+            TableKind.MethodSpec, methodSpecRid, 0, CodedIndexKind.MethodDefOrRef);
+        var instantiationBlobIndex = _loader.Image.Tables.GetRowIndex(TableKind.MethodSpec, methodSpecRid, 1);
+        var methodArgs = SignatureDecoder.DecodeMethodSpecInstantiation(
+            _loader.Image.GetBlob(instantiationBlobIndex).ToArray())
+            .Select(t => _loader.ResolveToken(t, context))
+            .ToArray();
+
+        if (underlying.Table == TableKind.MethodDef) {
+            var method = _loader.GetMethodByToken(Token.From(underlying.Table, underlying.Rid).Value)
+                ?? throw new BadImageFormatException($"MethodSpec 0x{token:X8} の解決先メソッドが見つかりません。");
+            if (method.Signature.GenericParamCount != methodArgs.Length)
+                throw new BadImageFormatException(
+                    $"MethodSpec 0x{token:X8} の型引数は {methodArgs.Length} 個ですが、{method} は {method.Signature.GenericParamCount} 個を要求します。");
+            return new CallTarget {
+                Arity = method.Signature.ParamTypes.Length + (method.Signature.HasThis ? 1 : 0),
+                Method = method,
+                Name = method.Name,
+                ParamCount = method.Signature.ParamTypes.Length,
+                HasThis = method.Signature.HasThis,
+                MethodArgs = methodArgs,
+            };
+        }
+        if (underlying.Table == TableKind.MemberRef) {
+            var memberRefRid = underlying.Rid;
+            var signature = SignatureDecoder.DecodeMethodSignature(
+                _loader.Image.GetMemberRefSignature(memberRefRid).ToArray());
+            var name = _loader.GetMemberRefName(memberRefRid);
+            var parent = _loader.Image.Tables.DecodeCoded(
+                TableKind.MemberRef, memberRefRid, 0, CodedIndexKind.MemberRefParent);
+            if (signature.GenericParamCount != methodArgs.Length)
+                throw new BadImageFormatException(
+                    $"MethodSpec 0x{token:X8} の型引数は {methodArgs.Length} 個ですが、{name} は {signature.GenericParamCount} 個を要求します。");
+            if (parent.Table == TableKind.TypeDef) {
+                // 同アセンブリのジェネリックメソッド (Roslyn は MethodDef でも MemberRef 形式で出す)
+                var owner = _loader.GetTypeDef(parent.Rid);
+                var method = owner.Methods.FirstOrDefault(m =>
+                        m.Name == name && m.Signature.ParamTypes.Length == signature.ParamTypes.Length)
+                    ?? throw new BadImageFormatException(
+                        $"MethodSpec 0x{token:X8} の解決先メソッド {owner.FullName}::{name} が見つかりません。");
+                return new CallTarget {
+                    Arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0),
+                    Method = method,
+                    Name = method.Name,
+                    ParamCount = method.Signature.ParamTypes.Length,
+                    HasThis = method.Signature.HasThis,
+                    MethodArgs = methodArgs,
+                };
+            }
+            if (parent.Table == TableKind.TypeSpec) {
+                var constructed = ResolveConstructedParent(parent.Rid, context);
+                var definition = (VmClassType)constructed.Definition;
+                var method = FindMethodThroughChain(definition, name, signature.ParamTypes.Length)
+                    ?? throw new BadImageFormatException(
+                        $"MethodSpec 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
+                return new CallTarget {
+                    Arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0),
+                    Method = method,
+                    Name = method.Name,
+                    ParamCount = method.Signature.ParamTypes.Length,
+                    HasThis = method.Signature.HasThis,
+                    ClassArgs = constructed.TypeArguments,
+                    MethodArgs = methodArgs,
+                };
+            }
+            throw new NotSupportedException(
+                $"MethodSpec の解決先 MemberRef の親テーブル {parent.Table} は未対応です (intrinsic ジェネリックメソッドは今後のフェーズ)。");
+        }
+        throw new BadImageFormatException($"MethodSpec 0x{token:X8} の解決先テーブル {underlying.Table} が不正です。");
+    }
+
+    /// <summary>名前+パラメータ数でメソッドを探す (継承チェーンを辿る。抽象宣言も解決対象)。</summary>
+    private static VmMethod? FindMethodThroughChain(VmClassType type, string name, int paramCount) {
+        for (VmType? t = type; t is not null;) {
+            if (t is VmConstructedType constructed)
+                t = constructed.Definition;
+            if (t is not VmClassType cls)
+                break;
+            var found = cls.Methods.FirstOrDefault(m =>
+                m.Name == name && m.Signature.ParamTypes.Length == paramCount);
+            if (found is not null)
+                return found;
+            t = cls.BaseType;
+        }
+        return null;
     }
 
     private static bool SignatureReturnsValue(MethodSignature signature) =>

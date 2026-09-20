@@ -70,6 +70,20 @@ public static class SignatureDecoder {
         return new TypeSpecSignature(DecodeType(ref reader));
     }
 
+    /// <summary>MethodSpec の Instantiation (II.23.2.15) をデコードする。
+    /// 形式: GENERICINST (0x0A) &lt;argCount&gt; &lt;type...&gt;。</summary>
+    public static SigType[] DecodeMethodSpecInstantiation(ReadOnlySpan<byte> blob) {
+        var reader = new SpanReader(blob);
+        var kind = reader.ReadByte();
+        if (kind != 0x0A)
+            throw new BadImageFormatException($"MethodSpec Instantiation の先頭バイトが不正です (0x{kind:X2})。");
+        var count = (int)reader.ReadCompressedUInt32();
+        var args = new SigType[count];
+        for (var i = 0; i < count; i++)
+            args[i] = DecodeType(ref reader);
+        return args;
+    }
+
     /// <summary>ローカル変数署名 (StandAloneSig、II.23.2.10) をデコードする。</summary>
     public static SigType[] DecodeLocalsSignature(ReadOnlySpan<byte> blob) {
         var reader = new SpanReader(blob);

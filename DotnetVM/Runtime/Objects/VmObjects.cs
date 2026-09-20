@@ -17,13 +17,23 @@ public sealed class VmClassInstance : VmObject {
     private readonly VmClassType _classType;
     public readonly StackSlot[] Fields;
 
-    public VmClassInstance(VmClassType classType, StackSlot[] fields) {
+    public VmClassInstance(VmClassType classType, StackSlot[] fields, VmType[]? typeArguments = null) {
         _classType = classType;
         Fields = fields;
+        TypeArguments = typeArguments ?? [];
     }
 
     public override VmType Type => _classType;
     public VmClassType ClassType => _classType;
+
+    /// <summary>ジェネリック型の実引数 (非ジェネリック型は空)。実行時型の構築型を再構成するのに使う。</summary>
+    public VmType[] TypeArguments { get; }
+
+    /// <summary>実行時型 (ジェネリック型なら構築型、それ以外は ClassType)。</summary>
+    public VmType RuntimeType =>
+        TypeArguments.Length > 0
+            ? new VmConstructedType { Definition = _classType, TypeArguments = TypeArguments }
+            : _classType;
 }
 
 /// <summary>ボックス化された値 (ヒープオブジェクト)。Fields[0] に値を保持 (構造体は展開済みフィールド列)。</summary>
@@ -79,9 +89,13 @@ public sealed class VmStructValue {
     public VmType StructType { get; }
     public readonly StackSlot[] Fields;
 
-    public VmStructValue(VmType structType, StackSlot[] fields) {
+    /// <summary>ジェネリック構造体の実引数 (非ジェネリック型は空)。Clone 時に引き継ぐ。</summary>
+    public VmType[] TypeArguments { get; }
+
+    public VmStructValue(VmType structType, StackSlot[] fields, VmType[]? typeArguments = null) {
         StructType = structType;
         Fields = fields;
+        TypeArguments = typeArguments ?? [];
     }
 
     /// <summary>値型コピー意味論: フィールドを深コピーする (ネストした構造体は再帰コピー、参照は共有)。</summary>
@@ -89,8 +103,27 @@ public sealed class VmStructValue {
         var copy = new StackSlot[Fields.Length];
         for (var i = 0; i < Fields.Length; i++)
             copy[i] = Fields[i].ObjectValue is VmStructValue nested ? StackSlot.OfValueType(nested.Clone()) : Fields[i];
-        return new VmStructValue(StructType, copy);
+        return new VmStructValue(StructType, copy, TypeArguments);
     }
+
+    /// <summary>実行時型 (ジェネリック構造体なら構築型、それ以外は StructType)。</summary>
+    public VmType RuntimeType =>
+        TypeArguments.Length > 0
+            ? new VmConstructedType { Definition = StructType, TypeArguments = TypeArguments }
+            : StructType;
+}
+
+/// <summary>
+/// ldtoken Field の結果 (FieldRVA 初期データのハンドル)。System.RuntimeFieldHandle の VM 内表現で、
+/// RuntimeHelpers::InitializeArray 専用。ハンドル自体はゲストから観測可能な状態を持たない。
+/// </summary>
+public sealed class VmFieldRvaData : VmObject {
+    public static readonly VmIntrinsicType HandleType =
+        new() { Namespace = "System", Name = "RuntimeFieldHandle", IsValue = true };
+
+    public required ReadOnlyMemory<byte> Data { get; init; }
+
+    public override VmType Type => HandleType;
 }
 
 /// <summary>
@@ -101,28 +134,40 @@ public static class ObjectModel {
     private static readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
     private static readonly ConditionalWeakTable<VmType, StackSlot[]> StaticStorage = new();
 
-    /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。</summary>
+    /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。
+    /// 基底が構築ジェネリック型 (例: Sub`1 : Base`1&lt;!0&gt;) の場合は定義型に解いて収集する。</summary>
     public static Dictionary<VmField, int> GetLayout(VmClassType type) {
         if (Layouts.TryGetValue(type, out var cached))
             return cached;
         var layout = new Dictionary<VmField, int>();
         var index = 0;
-        for (var t = (VmType?)type; t is VmClassType cls; t = cls.BaseType) {
+        for (VmType? t = type; t is not null;) {
+            if (t is VmConstructedType constructed) {
+                t = constructed.Definition;
+                continue;
+            }
+            if (t is not VmClassType cls)
+                break;
             foreach (var field in cls.Fields) {
                 if (!field.IsStatic && !field.IsLiteral)
                     layout[field] = index++;
             }
+            t = cls.BaseType;
         }
         Layouts.Add(type, layout);
         return layout;
     }
 
     /// <summary>インスタンスフィールド既定値のストレージを生成する。</summary>
-    public static StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader) {
+    public static StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader) =>
+        CreateInstanceStorage(type, loader, null);
+
+    /// <summary>インスタンスフィールド既定値のストレージを生成する (ジェネリック型は型引数でフィールド型を解決)。</summary>
+    public static StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
         var layout = GetLayout(type);
         var fields = new StackSlot[layout.Values.Count == 0 ? 0 : layout.Values.Max() + 1];
         foreach (var (field, index) in layout)
-            fields[index] = DefaultForType(field.FieldType!, loader);
+            fields[index] = DefaultForType(GenericSubstitutor.Substitute(field.FieldType!, context), loader);
         return fields;
     }
 
@@ -152,12 +197,25 @@ public static class ObjectModel {
     }
 
     /// <summary>型に対するゼロ既定値。</summary>
-    public static StackSlot DefaultForType(VmType? type, TypeLoader loader) {
+    public static StackSlot DefaultForType(VmType? type, TypeLoader loader) => DefaultForType(type, loader, null);
+
+    /// <summary>型に対するゼロ既定値 (ジェネリックパラメータは context の実引数で置換してから判定)。</summary>
+    public static StackSlot DefaultForType(VmType? type, TypeLoader loader, GenericContext? context) {
         if (type is null)
             return StackSlot.Null;
-        if (type.IsValueType && type is not VmIntrinsicType)
-            return StackSlot.OfValueType(DefaultStruct((VmClassType)type, loader));
-        if (type is VmIntrinsicType intrinsic) {
+        var substituted = GenericSubstitutor.Substitute(type, context);
+        if (substituted.IsValueType && substituted is not VmIntrinsicType) {
+            var structType = substituted switch {
+                VmClassType cls => cls,
+                VmConstructedType constructed => (VmClassType)constructed.Definition,
+                _ => throw new InvalidOperationException($"値型 {substituted.FullName} の実体を生成できません。"),
+            };
+            var args = substituted is VmConstructedType ct ? ct.TypeArguments : null;
+            // フィールド型の !n は構造体自身の実引数で解決する
+            var fieldContext = args is null ? null : new GenericContext { ClassArgs = args };
+            return StackSlot.OfValueType(DefaultStruct(structType, loader, fieldContext, args));
+        }
+        if (substituted is VmIntrinsicType intrinsic) {
             return intrinsic.FullName switch {
                 "System.Boolean" or "System.Char" or "System.SByte" or "System.Byte"
                     or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" => StackSlot.OfInt32(0),
@@ -171,12 +229,18 @@ public static class ObjectModel {
     }
 
     /// <summary>構造体の既定値 (全フィールドを再帰的にゼロ初期化)。</summary>
-    public static VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader) {
+    public static VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader) =>
+        DefaultStruct(structType, loader, null, null);
+
+    /// <summary>構造体の既定値。context はフィールド型のジェネリックパラメータ解決に使う
+    /// (構造体自身の実引数は typeArguments として VmStructValue に記録する)。</summary>
+    public static VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader,
+        GenericContext? context, VmType[]? typeArguments) {
         var layout = GetLayout(structType);
         var fields = new StackSlot[layout.Count == 0 ? 0 : layout.Values.Max() + 1];
         foreach (var (field, index) in layout)
-            fields[index] = DefaultForType(field.FieldType!, loader);
-        return new VmStructValue(structType, fields);
+            fields[index] = DefaultForType(GenericSubstitutor.Substitute(field.FieldType!, context), loader);
+        return new VmStructValue(structType, fields, typeArguments);
     }
 
     /// <summary>アロケーションサイズの概算 (バイト)。クォータ計上用。</summary>

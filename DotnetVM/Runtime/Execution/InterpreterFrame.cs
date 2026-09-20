@@ -59,6 +59,17 @@ public sealed class InterpreterFrame {
     /// <summary>このフレームで現在処理中の例外 (rethrow / finally 連鎖の伝播再開に使用)。</summary>
     internal VmGuestThrow? CurrentThrow;
 
+    // ---- ジェネリック (M5) 状態 ----
+
+    /// <summary>
+    /// ジェネリックパラメータの置換コンテキスト (!n / !!n → 実引数)。
+    /// 呼出ごとに Call で構築され、ローカル変数初期化・トークン解決 (TypeSpec/constrained. 等) で使う。
+    /// </summary>
+    public GenericContext? Context;
+
+    /// <summary>直前の constrained. プレフィックスの型トークン (0 = なし)。次の call/callvirt で消費する。</summary>
+    public int PendingConstrained;
+
     public static InterpreterFrame Create(VmMethod method, StackSlot[] arguments, SigType[] localTypes, int maxStack) {
         var code = method.DecodeIl();
         var offsetMap = new Dictionary<int, int>(code.Length * 2);

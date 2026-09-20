@@ -34,6 +34,7 @@ public sealed class VirtualMachine : IDisposable {
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
         _context = new VmAssemblyContext(LoadDependencyAssembly);
         DefaultIntrinsics.RegisterAll(_intrinsics);
+        CoreLibBindings.RegisterAll(_intrinsics); // ランタイムバインド (InternalCall / デバイス / 代替面)
         if (_options.LoadHostCoreLib)
             LoadHostCoreLib();
     }
@@ -83,6 +84,13 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>intrinsic を起動前に追加登録する (実行開始後は不可)。</summary>
     public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) =>
         _intrinsics.Register(key, impl);
+
+    /// <summary>ランタイムバインドを起動前に追加登録する (実行開始後は不可。P/Invoke 代替等)。</summary>
+    public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) =>
+        _intrinsics.RegisterBinding(key, impl, origin);
+
+    /// <summary>登録済みランタイムバインドの監査面 (キーと由来。監査テスト / 診断用)。</summary>
+    public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings => _intrinsics.Bindings;
 
     /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
     /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>

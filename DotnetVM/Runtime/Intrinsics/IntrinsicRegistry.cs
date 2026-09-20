@@ -170,6 +170,7 @@ public delegate StackSlot? IntrinsicImpl(IntrinsicContext context, StackSlot[] a
 /// </summary>
 public sealed class IntrinsicRegistry {
     private readonly Dictionary<IntrinsicKey, IntrinsicImpl> _impls = [];
+    private readonly Dictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)> _bindings = [];
     private readonly Dictionary<(string TypeFullName, string FieldName), Func<IntrinsicContext, StackSlot>> _staticFields = [];
     private bool _sealed;
 
@@ -179,6 +180,18 @@ public sealed class IntrinsicRegistry {
             throw new OperationNotAllowedException("VM 実行開始後の intrinsic 登録は許可されていません。");
         if (!_impls.TryAdd(key, impl))
             throw new InvalidOperationException($"intrinsic {key.TypeFullName}::{key.MethodName} (arity {key.Arity}) は既に登録されています。");
+    }
+
+    /// <summary>
+    /// ランタイムバインドを署名キー + 由来付きで登録する (起動時のみ。Seal 後は拒否)。重複登録は例外。
+    /// 実装デリゲート形状は IntrinsicImpl と同じで、呼出は必ず Interpreter の intrinsic 呼出ゲート
+    /// (命令クォータ消費・セーフポイント・VM オブジェクトモデル正規化) を経由する。
+    /// </summary>
+    public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
+        if (_sealed)
+            throw new OperationNotAllowedException("VM 実行開始後のランタイムバインド登録は許可されていません。");
+        if (!_bindings.TryAdd(key, (impl, origin)))
+            throw new InvalidOperationException($"ランタイムバインド {key} は既に登録されています。");
     }
 
     /// <summary>intrinsic 型の静的フィールド値を登録する (例: String.Empty)。遅延評価 (実行時に文字列プールから実体化等)。起動時のみ。</summary>
@@ -196,6 +209,25 @@ public sealed class IntrinsicRegistry {
 
     public bool TryGet(IntrinsicKey key, out IntrinsicImpl impl) =>
         _impls.TryGetValue(key, out impl!);
+
+    /// <summary>
+    /// 署名キーでランタイムバインドを解決する (完全一致 → 全引数一致面の順)。由来も返す。
+    /// </summary>
+    public bool TryGetBinding(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin) {
+        if (_bindings.TryGetValue(key, out var entry) ||
+            (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParams(), out entry))) {
+            impl = entry.Impl;
+            origin = entry.Origin;
+            return true;
+        }
+        impl = null!;
+        origin = default;
+        return false;
+    }
+
+    /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。</summary>
+    public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings =>
+        [.. _bindings.Select(kv => (kv.Key, kv.Value.Origin))];
 
     /// <summary>intrinsic 型の静的フィールド値を取得する (ldsfld の TypeRef 親用)。</summary>
     public bool TryGetStaticField(string typeFullName, string fieldName, out Func<IntrinsicContext, StackSlot> value) =>

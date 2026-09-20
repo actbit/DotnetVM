@@ -230,15 +230,19 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     }
 
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    private static void ThrowNoBody(VmMethod method) {
-        // abstract は未実装面、native (P/Invoke) はセキュリティポリシーで拒否
+    internal static void ThrowNoBody(VmMethod method) {
+        // abstract は未実装面、native (P/Invoke) はセキュリティポリシーで拒否。
+        // ランタイムバインド (CallEngine) の照合漏れの最終拒否点でもある (InternalCall と
+        // P/Invoke の区別は監査性のため例外型を分ける)
         if (method.IsAbstract)
             throw new NotSupportedException(
                 $"抽象メソッド {method} には実装がありません (継承解決は M3 以降)。");
-        if ((method.ImplFlags & 0x0003) == 0x0003)
+        // pinvokeimpl (MethodAttributes 0x2000) または native (ImplFlags) の両方を検出する
+        // (P/Invoke の宣言方法によってビットの付き方が異なるため)
+        if ((method.Flags & 0x2000) != 0 || (method.ImplFlags & 0x0003) == 0x0003)
             throw new OperationNotAllowedException(
                 $"メソッド {method} はネイティブ実行 (P/Invoke) を要求しますが、VM はネイティブ依存を許可しません。");
-        throw new NotSupportedException($"メソッド {method} には実行可能な本体がありません。");
+        throw new NotSupportedException($"メソッド {method} には実行可能な本体がありません (InternalCall 面はランタイムバインドの登録が必要です)。");
     }
 
     // ---- クォータ/セーフポイント ----

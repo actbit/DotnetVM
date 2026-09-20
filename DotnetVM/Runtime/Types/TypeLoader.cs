@@ -235,8 +235,15 @@ public sealed class TypeLoader {
         for (var rid = fieldStart; rid < fieldEnd; rid++) {
             var fieldFlags = _image.Tables.GetCell(TableKind.Field, rid, 0);
             var name = _image.GetString(_image.Tables.GetRowIndex(TableKind.Field, rid, 1));
-            var signature = SignatureDecoder.DecodeFieldSignature(
-                _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)).ToArray());
+            // CoreLib 等の実画像には VM が解釈できない署名要素 (関数ポインタ等) を含むメンバが
+            // ある。メンバ単位でスキップし (当該面は呼出時に fail-closed)、型全体のロードは継続する
+            FieldSignature signature;
+            try {
+                signature = SignatureDecoder.DecodeFieldSignature(
+                    _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)).ToArray());
+            } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {
+                continue;
+            }
             var field = new VmField {
                 DeclaringType = type,
                 FieldRid = rid,
@@ -254,8 +261,14 @@ public sealed class TypeLoader {
             var implFlags = _image.Tables.GetCell(TableKind.MethodDef, rid, 1);
             var methodFlags = _image.Tables.GetCell(TableKind.MethodDef, rid, 2);
             var name = _image.GetMethodName(rid);
-            var signature = SignatureDecoder.DecodeMethodSignature(
-                _image.GetMethodSignature(rid).ToArray());
+            // 同上: 解釈不能な署名のメソッドはスキップする (呼出時に未解決として fail-closed)
+            MethodSignature signature;
+            try {
+                signature = SignatureDecoder.DecodeMethodSignature(
+                    _image.GetMethodSignature(rid).ToArray());
+            } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {
+                continue;
+            }
             var method = new VmMethod {
                 DeclaringType = type,
                 MethodDefRid = rid,

@@ -82,6 +82,10 @@ public static class DefaultIntrinsics {
     /// <summary>スタックスロットの CLR 互換文字列化 (String.Concat(object,...) の引数用)。</summary>
     private static string FormatSlot(IntrinsicContext ctx, in StackSlot slot) => FormatValue(ctx, slot, "");
 
+    /// <summary>String.Concat の配列面 (CoreLibBindings と共有) の要素フォーマット。
+    /// CLR 規約どおり null は空文字列化する。</summary>
+    internal static string ConcatFormat(IntrinsicContext ctx, in StackSlot slot) => FormatSlot(ctx, slot);
+
     /// <summary>
     /// スロットの CLR 互換文字列化。declaredType は宣言上のパラメータ型名
     /// (i4 スロットに統合される char / bool のオーバーロード判別に使用。未知なら空文字列)。
@@ -226,7 +230,7 @@ public static class DefaultIntrinsics {
     // ---- System.Type / System.Reflection.MethodBase (typeof / GetType / GetCurrentMethod 面) ----
 
     /// <summary>レシーバの実行時型を得る (Object.GetType() 用)。</summary>
-    private static VmType RuntimeTypeOf(IntrinsicContext ctx, in StackSlot slot) =>
+    internal static VmType RuntimeTypeOf(IntrinsicContext ctx, in StackSlot slot) =>
         slot.ObjectValue switch {
             VmClassInstance ci => ci.TypeArguments.Length > 0
                 ? new VmConstructedType { Definition = ci.ClassType, TypeArguments = ci.TypeArguments }
@@ -318,6 +322,11 @@ public static class DefaultIntrinsics {
     /// <summary>System.Type ファサードの実体を生成する (typeof(X) / GetType() の戻り値)。</summary>
     private static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) =>
         StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeObject { Target = type }));
+
+    /// <summary>オブジェクトの実行時型ファサードをスロットで返す (Object.GetType() /
+    /// RuntimeHelpers::GetMethodTable 等の共通面)。</summary>
+    internal static StackSlot TypeFacadeOf(IntrinsicContext ctx, in StackSlot slot) =>
+        MakeRuntimeObject(ctx, RuntimeTypeOf(ctx, slot));
 
     private static void RegisterType(IntrinsicRegistry r) {
         const string T = "System.Type";
@@ -1188,20 +1197,38 @@ public static class DefaultIntrinsics {
 
     private static void RegisterConsole(IntrinsicRegistry r) {
         const string T = "System.Console";
-        void S(string name, int ps, IntrinsicImpl impl) =>
-            r.Register(IntrinsicKey.Static(T, name, ps), impl);
+        // legacy intrinsic (名前 + 引数個数) とランタイムバインド (Origin = Device) の両方に登録する。
+        // 解決はランタイムバインド (優先順位 ①) が先に当たり、監査面にデバイス由来が現れる。
+        // 仮想コンソールデバイス (VmConsole) がシンクであり続ける点は不変。
+        // バインド側はメソッド名ごとに 1 件の全引数一致面とし、オーバーロード判別は
+        // 実行時の宣言パラメータ型名 (ctx.ParameterTypeNames) で行う
+        void DeviceBinding(string name, IntrinsicImpl impl) =>
+            r.RegisterBinding(BindingKey.StaticAnyParams(T, name), impl, BindingOrigin.Device);
 
         // Write/WriteLine の全オーバーロードを同一キーに統合し、宣言パラメータ型
         // (ctx.ParameterTypeNames) で char / bool / object / params object[] 等を判別する
         foreach (var arity in new[] { 1, 2, 3, 4, 5 }) {
-            S("Write", arity, WriteImpl(newline: false));
-            S("WriteLine", arity, WriteImpl(newline: true));
+            r.Register(IntrinsicKey.Static(T, "Write", arity), WriteImpl(newline: false));
+            r.Register(IntrinsicKey.Static(T, "WriteLine", arity), WriteImpl(newline: true));
         }
-        S("WriteLine", 0, static (ctx, _) => {
+        r.Register(IntrinsicKey.Static(T, "WriteLine", 0), static (ctx, _) => {
             ctx.Console.Write(false, "\n");
             return null;
         });
-        S("ReadLine", 0, static (ctx, _) => {
+        r.Register(IntrinsicKey.Static(T, "ReadLine", 0), static (ctx, _) => {
+            var line = ctx.Console.ReadLine();
+            return line is null ? StackSlot.Null : StackSlot.OfObject(ctx.MakeString(line));
+        });
+
+        DeviceBinding("Write", WriteImpl(newline: false));
+        DeviceBinding("WriteLine", static (ctx, a) => {
+            if (a.Length == 0) {
+                ctx.Console.Write(false, "\n");
+                return null;
+            }
+            return WriteImpl(newline: true)(ctx, a);
+        });
+        DeviceBinding("ReadLine", static (ctx, _) => {
             var line = ctx.Console.ReadLine();
             return line is null ? StackSlot.Null : StackSlot.OfObject(ctx.MakeString(line));
         });

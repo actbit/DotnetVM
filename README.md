@@ -41,12 +41,23 @@ var result = vm.Invoke("MyApp.Program", "Compute", 42);
 - ルート源: 実行中フレーム (引数/ローカル/評価スタック/送出中例外)、静的フィールド、`GcHandleTable` (ホスト保持参照)、intrinsic 静的フィールド
 - 循環参照も回収。ByRef は参照先コンテナを展開して走査 (`ObjectGraphWalker` 共通基盤)
 
-### intrinsic 機構 (BCL 不実装との両立)
-BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Convert` / 例外ファサード等の**最小面を intrinsic として合成**します。
+### intrinsic 機構 + ランタイムバインド層 (BCL 不実装との両立)
+BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Convert` / 例外ファサード等の**面を intrinsic / ランタイムバインドとして合成**します。
 
-セキュリティ上の核心: intrinsic はホストの任意コードへの自由な脱出ハッチではありません。**必ずインタプリタの呼出ゲートを経由**し、IL 実行と完全に等価な制約 (① 命令クォータ消費 ② セーフポイント検査 ③ メモリは `VmHeap.Allocate` 経由で計上 ④ I/O は仮想デバイス/ブリッジ経由のみ ⑤ 値は VM オブジェクトモデルに正規化) を受けます。登録は VM 起動時のみ (`Seal` 以降は拒否)。
+セキュリティ上の核心: intrinsic とバインドはホストの任意コードへの自由な脱出ハッチではありません。**必ずインタプリタの呼出ゲートを経由**し、IL 実行と完全に等価な制約 (① 命令クォータ消費 ② セーフポイント検査 ③ メモリは `VmHeap.Allocate` 経由で計上 ④ I/O は仮想デバイス/ブリッジ経由のみ ⑤ 値は VM オブジェクトモデルに正規化) を受けます。登録は VM 起動時のみ (`Seal` 以降は拒否)。
 
 ホストは自前の intrinsic 契約アセンブリ (ファサードの C# 側シグネチャ) を持ち込めます (`VirtualMachine.RegisterIntrinsic`)。
+
+**メソッド解決の優先順位** (C4 ランタイムバインド層):
+1. **ランタイムバインド** — `BindingKey(型完全名, メソッド名, パラメータ型名, this 有無)` の署名照合
+2. **IL 本体実行** — CoreLib を含む全アセンブリの managed IL
+3. **legacy intrinsic** — 名前 + 引数個数のレガシー照合 (既存面との互換)
+4. **fail-closed** — 未登録の InternalCall は `NotSupportedException`、未登録の P/Invoke は `OperationNotAllowedException` (ネイティブ実行は構造的に禁止。代替実装が登録済みの面のみ `PInvokeReplacement` として委譲)
+
+バインドには由来 (`BindingOrigin` = Managed / InternalCall / PInvokeReplacement / Device) が付与され、`vm.Bindings` で監査できます。CoreLib 画像 (`LoadHostCoreLib = true`) の InternalCall 面 / JIT intrinsic 面 (`RuntimeHelpers.GetMethodTable` のダミー再帰 IL、`Enum.HasFlag` の生データビット演算等) は `CoreLibBindings` が同等意味論の実装で握ります。
+
+### CoreLib ロード (実在 System.Private.CoreLib の実行)
+`VmHostOptions.LoadHostCoreLib = true` でホスト自身の System.Private.CoreLib.dll をロードし、CoreLib の managed IL を VM インタプリタで実行します。参照アセンブリ (System.Runtime 等) との型ユニフィケーション、署名精度の VTable / InterfaceMap ディスパッチ (EII 含む)、依存 DLL の同一ディレクトリ自動解決を備えます。
 
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
@@ -59,7 +70,7 @@ vm.Console.BindImplementation(customImpl);                       // 完全差し
 
 ### その他
 - **DLL のみ対応** (.NET 5 〜 .NET 10)。EXE 固有の考慮 (エントリポイント探索等) はなし。ホストからメソッド明示指定で実行
-- **Win32 API / P/Invoke / ネイティブ依存は非対応** (`ImplFlags` で検出して拒否)
+- **Win32 API / P/Invoke / ネイティブ依存は非対応** — ネイティブ実行は構造的に禁止。P/Invoke 面は代替バインド (`PInvokeReplacement`) 未登録なら `OperationNotAllowedException` で fail-closed 拒否
 - 例外は ECMA-335 準拠の EH (try / catch / finally / fault / filter)。VM 内部例外もゲスト例外化され、ゲストで捕捉可能
 - ジェネリック完全対応: TypeSpec/MethodSpec、`constrained.`、変性付き castclass、ジェネリック継承・ネスト型
 - 外部呼出: `Invoke` (静的) / `CreateInstance` + `CallInstance` (インスタンス) / `GcHandleTable` (GC をまたぐ参照保持)
@@ -136,7 +147,7 @@ VirtualMachine (Host/)          組み込みファサード
 dotnet test DotnetVM.Tests
 ```
 
-191 テスト (2026-09-20 時点)。
+197 テスト (2026-09-20 時点)。
 
 ## 状況
 
@@ -146,6 +157,12 @@ dotnet test DotnetVM.Tests
 - [x] M5: ジェネリック
 - [x] M6: GC + メモリポリシー
 - [x] M7: リソース拒否 + ブリッジ + 仮想コンソール + intrinsic ゲート
+- [x] C1: 多アセンブリ解決 (AssemblyContext / 依存 DLL 自動探索)
+- [x] C2: 参照アセンブリ⇔CoreLib 型ユニフィケーション + 実型置換
+- [x] C3: 署名精度の仮想/インターフェースディスパッチ (VTable / InterfaceMap / EII)
+- [x] C4: ランタイムバインド層 (BindingKey + BindingOrigin / 優先順位 ①〜④ / CoreLib InternalCall・JIT intrinsic 面のバインド)
+- [ ] C5: CoreLib IL 実行の全面化 + 差分テスト (String 表現境界の撤去、ExecutionTracer で IL 実行証明)
+- [ ] C6: ゲストスレッド対応 (スレッドモデル + Monitor の真の競合・ブロッキング。現行の Monitor バインドは単一スレッド前提の暫定ファサード)
 - [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
 - [ ] M9: デバッガ / 実行トレース
 

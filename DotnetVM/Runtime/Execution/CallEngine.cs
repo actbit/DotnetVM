@@ -119,6 +119,35 @@ internal sealed class CallEngine(
                     $"null レシーバで {method.DeclaringType.FullName}::{method.Name} を呼び出しました。");
             method = DispatchVirtual(method, args[0]);
         }
+
+        // 優先順位 ①: ランタイムバインド (署名照合) を最優先で解決する
+        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound))
+            return bound;
+
+        if (method.Body is null) {
+            // 本体の無い面 (InternalCall / P/Invoke / 抽象宣言) はバインドが無い限り IL 実行できない。
+            // callvirt の場合のみレシーバ実行時型への最終救済 (EII) を試してから legacy intrinsic へ
+            if (isCallvirt && method.Signature.HasThis &&
+                TryDispatchInterfaceKey(method.DeclaringType.FullName, method.Name,
+                    ParamTypeNamesOf(method, target.MethodArgs), args[0]) is { } explicitImpl) {
+                var implContext = BuildCallContext(target, explicitImpl, args[0]);
+                var implRet = invoker.Invoke(explicitImpl, args, implContext);
+                return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? implRet : null;
+            }
+            // 優先順位 ③: legacy intrinsic (名前 + 引数個数) の救済
+            if (TryInvokeLegacyIntrinsic(method, args, out var legacy))
+                return legacy;
+            Interpreter.ThrowNoBody(method); // P/Invoke は OperationNotAllowed、抽象宣言は NotSupportedException (監査性)
+        }
+
+        // 表現境界 (設計原則 3): 委譲継続面の IL は実行しない (① バインド → ③ legacy → ④ 拒否 のみ)
+        if (DelegateContinuingSurfaces.Contains(method.DeclaringType.FullName)) {
+            if (TryInvokeLegacyIntrinsic(method, args, out var delegated))
+                return delegated;
+            throw new OperationNotAllowedException(
+                $"面 {method.DeclaringType.FullName}::{method.Name} は表現境界 (DelegateContinuingSurfaces) により IL 実行が禁止されており、登録済みのランタイムバインド / intrinsic もありません。");
+        }
+
         var context2 = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
         var ret = invoker.Invoke(method, args, context2);
         return SlotOps.SignatureReturnsValue(method.Signature) ? ret : null;
@@ -155,7 +184,7 @@ internal sealed class CallEngine(
             }
         }
         throw new OperationNotAllowedException(
-            $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録された intrinsic のみ提供されます。");
+            $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録されたランタイムバインド / intrinsic のみ提供されます。");
     }
 
     /// <summary>
@@ -386,6 +415,132 @@ internal sealed class CallEngine(
         return SlotOps.SignatureReturnsValue(lastMethod.Signature) ? last : null;
     }
 
+    // ---- ランタイムバインド (優先順位 ① / legacy 救済 ③) ----
+
+    /// <summary>呼出解決地点 (TypeRef / 構築ファサード親) でのランタイムバインド照合。
+    /// 型名 + 宣言パラメータ型名から署名キーを組み、完全一致 → 全引数一致面の順で解決する。
+    /// 型名が解決できていないパラメータ (空文字列) が混ざる場合は照合しない。</summary>
+    private bool TryGetResolvedBinding(string typeName, string name, bool hasThis, string[] paramTypeNames, out IntrinsicImpl impl) {
+        impl = null!;
+        if (paramTypeNames.Any(string.IsNullOrEmpty))
+            return false;
+        var key = hasThis ? BindingKey.Instance(typeName, name, paramTypeNames)
+                          : BindingKey.Static(typeName, name, paramTypeNames);
+        return _intrinsics.TryGetBinding(key, out impl, out _);
+    }
+
+    /// <summary>解決済みメソッドをランタイムバインド (署名キー) で呼び出す (優先順位 ①)。
+    /// パラメータ型名は「そのメソッドを定義したローダ」で解決する (TypeToken は自画像の
+    /// TypeDef rid を指すため)。ジェネリック変数は MethodSpec の実引数で置換し、実引数が無い
+    /// 場合は開いた名 (!n / !!n) のままキー化する (登録側の開いたキーと一致)。</summary>
+    private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result) {
+        result = null;
+        var names = ParamTypeNamesOf(method, methodArgs);
+        if (names is null || names.Any(string.IsNullOrEmpty))
+            return false;
+        var declaringName = method.DeclaringType.FullName;
+        var key = method.Signature.HasThis
+            ? BindingKey.Instance(declaringName, method.Name, names)
+            : BindingKey.Static(declaringName, method.Name, names);
+        if (!_intrinsics.TryGetBinding(key, out var impl, out _))
+            return false;
+        NormalizeByRefReceiver(method, args);
+        result = InvokeDelegated(impl, names, args);
+        return true;
+    }
+
+    /// <summary>解決済みメソッドを legacy intrinsic (名前 + 引数個数キー) で呼び出す (優先順位 ③)。
+    /// 基底面からの継承解決 (TryGetIntrinsicThroughHierarchy) も含む。</summary>
+    private bool TryInvokeLegacyIntrinsic(VmMethod method, StackSlot[] args, out StackSlot? result) {
+        result = null;
+        var declaringName = method.DeclaringType.FullName;
+        var arity = method.Signature.ParamTypes.Length + (method.Signature.HasThis ? 1 : 0);
+        if (!_intrinsics.TryGet(new IntrinsicKey(declaringName, method.Name, arity, method.Signature.HasThis), out var impl) &&
+            !_objectEngine.TryGetIntrinsicThroughHierarchy(declaringName, method.Name, arity, method.Signature.HasThis, out impl))
+            return false;
+        NormalizeByRefReceiver(method, args);
+        result = InvokeDelegated(impl, ParamTypeNamesOf(method, null) ?? [], args);
+        return true;
+    }
+
+    /// <summary>委譲実装 (ランタイムバインド / legacy intrinsic) を intrinsic 呼出ゲート経由で実行する。
+    /// IL 実行と完全に等価な制約 (① 追加クォータ消費 ② セーフポイント検査 ③ 値は VM オブジェクト
+    /// モデルに正規化) を受ける。</summary>
+    private StackSlot? InvokeDelegated(IntrinsicImpl impl, string[] paramNames, StackSlot[] args) {
+        gate.ConsumeInstruction();
+        gate.CheckSafepoint();
+        _intrinsicContext.ParameterTypeNames = paramNames;
+        return impl(_intrinsicContext, args);
+    }
+
+    /// <summary>プリミティブ等の instance 面 (ByRef レシーバ) を値に読み替える。可変状態を
+    /// ローカルスロットに保持する構造体ファサード (補間ハンドラ等) は除く。既存 intrinsic
+    /// 経路と同じ規約。実行が確定した後でのみ呼ぶ (失敗経路で引数を壊さない)。</summary>
+    private void NormalizeByRefReceiver(VmMethod method, StackSlot[] args) {
+        if (method.Signature.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef &&
+            !PreservesByRefReceiver(method.DeclaringType.FullName))
+            args[0] = thisByRef.Slot;
+    }
+
+    /// <summary>解決済みメソッドの宣言パラメータ型名 (i4 統合面の判別 / バインドキー構築用)。
+    /// 呼出トークン解決で確定済みならそれを使い、無い場合は定義ローダで署名を解決する。</summary>
+    private string[]? ParamTypeNamesOf(VmMethod method, VmType[]? methodArgs) {
+        var loader = method.Loader;
+        if (loader is null)
+            return null;
+        var names = new string[method.Signature.ParamTypes.Length];
+        for (var i = 0; i < names.Length; i++) {
+            var name = DescribeBindingType(method.Signature.ParamTypes[i], methodArgs, loader);
+            if (name is null)
+                return null;
+            names[i] = name;
+        }
+        return names;
+    }
+
+    /// <summary>バインドキー用のパラメータ型名 (完全名)。ジェネリック変数は実引数 (MethodSpec) で
+    /// 置換し、実引数が無い場合は開いた名 (!!n / !n) のまま返す。トークンは「そのメソッドを定義した
+    /// ローダ」で解決する (署名の解決は定義ローダの原則)。</summary>
+    private static string? DescribeBindingType(SigType type, VmType[]? methodArgs, TypeLoader loader) => type.Kind switch {
+        SigKind.Boolean => "System.Boolean",
+        SigKind.Char => "System.Char",
+        SigKind.I1 => "System.SByte",
+        SigKind.U1 => "System.Byte",
+        SigKind.I2 => "System.Int16",
+        SigKind.U2 => "System.UInt16",
+        SigKind.I4 => "System.Int32",
+        SigKind.U4 => "System.UInt32",
+        SigKind.I8 => "System.Int64",
+        SigKind.U8 => "System.UInt64",
+        SigKind.R4 => "System.Single",
+        SigKind.R8 => "System.Double",
+        SigKind.I => "System.IntPtr",
+        SigKind.U => "System.UIntPtr",
+        SigKind.String => "System.String",
+        SigKind.Object => "System.Object",
+        SigKind.TypedByRef => "System.TypedReference",
+        SigKind.SzArray => DescribeBindingType(type.Inner!, methodArgs, loader) is { } inner ? inner + "[]" : null,
+        SigKind.ByRef => DescribeBindingType(type.Inner!, methodArgs, loader) is { } element ? element + "&" : null,
+        SigKind.Pointer => DescribeBindingType(type.Inner!, methodArgs, loader) is { } pointee ? pointee + "*" : null,
+        SigKind.Array => DescribeBindingType(type.Inner!, methodArgs, loader) is { } multi ? $"{multi}[{type.Rank}]" : null,
+        SigKind.GenericMethodVar => type.VarNumber < (methodArgs?.Length ?? 0)
+            ? methodArgs![type.VarNumber].FullName
+            : $"!!{type.VarNumber}",
+        SigKind.GenericVar => $"!{type.VarNumber}",
+        SigKind.GenericInst or SigKind.TypeToken => TryDescribeToken(type, loader),
+        _ => null,
+    };
+
+    /// <summary>トークン型の完全名 (定義ローダで解決。解決不能な面はバインド照合を諦める → fail-closed)。</summary>
+    private static string? TryDescribeToken(SigType type, TypeLoader loader) {
+        try {
+            return loader.ResolveToken(type)?.FullName;
+        } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+            or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+            return null;
+        }
+    }
+
     // ---- 呼出トークン解決 ----
 
     /// <summary>calli のオペランド (StandAloneSig トークン) から呼出規約 + 署名をデコードする。</summary>
@@ -429,6 +584,18 @@ internal sealed class CallEngine(
                 var paramNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
                 if (parent.Table == TableKind.TypeRef) {
                     var typeName = _loader.GetMemberRefParentTypeName(rid)!;
+                    // 優先順位 ①: ランタイムバインド (署名照合)
+                    if (TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, out var bound)) {
+                        return new CallTarget {
+                            Arity = arity,
+                            Intrinsic = bound,
+                            DeclaringType = typeName,
+                            Name = name,
+                            ParamCount = signature.ParamTypes.Length,
+                            HasThis = signature.HasThis,
+                            ParamTypeNames = paramNames,
+                        };
+                    }
                     if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
                         return new CallTarget {
                             Arity = arity,
@@ -454,8 +621,10 @@ internal sealed class CallEngine(
                     }
                     // 実 TypeDef に解決できる TypeRef 親 (依存アセンブリの型 / ネスト型) は
                     // そのメソッドを実体として解決する。callvirt でも Call 側でレシーバの
-                    // 実行時型による仮想ディスパッチが効くため、宣言解決の直接化は安全
-                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass) {
+                    // 実行時型による仮想ディスパッチが効くため、宣言解決の直接化は安全。
+                    // ただし表現境界 (委譲継続面) の実型 IL には落ちない (① → ③ → ④ のみ)
+                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass &&
+                        !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
                         var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes);
                         if (resolved is { Body: not null })
                             return new CallTarget {
@@ -511,9 +680,21 @@ internal sealed class CallEngine(
         var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
         var constructed = _objectEngine.ResolveConstructedParent(typeSpecRid, context);
 
-        // 構築ファサード型 (BCL 汎用インターフェース等) → intrinsic 面のみ
+        // 構築ファサード型 (BCL 汎用インターフェース等) → ランタイムバインド / intrinsic 面
         if (constructed.Definition is VmIntrinsicType facade) {
             var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
+            // 優先順位 ①: ランタイムバインド (署名照合)
+            if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, out var boundImpl)) {
+                return new CallTarget {
+                    Arity = arity,
+                    Intrinsic = boundImpl,
+                    DeclaringType = facade.FullName,
+                    Name = name,
+                    ParamCount = signature.ParamTypes.Length,
+                    HasThis = signature.HasThis,
+                    ParamTypeNames = facadeParamNames,
+                };
+            }
             if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
                 _objectEngine.TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl)) {
                 return new CallTarget {
@@ -597,6 +778,25 @@ internal sealed class CallEngine(
                 // intrinsic キーはジェネリック引数を含まない (CLR の実体化も本体を共有するため)。
                 var typeName = _loader.GetMemberRefParentTypeName(memberRefRid)!;
                 var specArity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+                // 優先順位 ①: ランタイムバインド (署名照合)。実引数を置換したキー → 開いたキー (!!n / !n)
+                // の順に照合する (登録側は開いたキーで 1 件、実引数は実行時の宣言型名で判別)
+                var concreteParams = signature.ParamTypes
+                    .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray();
+                var openParams = signature.ParamTypes
+                    .Select(t => DescribeBindingType(t, null, _loader) ?? "").ToArray();
+                if (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, out var boundImpl) ||
+                    TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, out boundImpl)) {
+                    return new CallTarget {
+                        Arity = specArity,
+                        Intrinsic = boundImpl,
+                        DeclaringType = typeName,
+                        Name = name,
+                        ParamCount = signature.ParamTypes.Length,
+                        HasThis = signature.HasThis,
+                        // !!n を MethodSpec の実引数で置換した宣言型名 (char/bool 等 i4 統合面の判別に必要)
+                        ParamTypeNames = concreteParams,
+                    };
+                }
                 if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, specArity, signature.HasThis), out var impl) ||
                     _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, specArity, signature.HasThis, out impl)) {
                     return new CallTarget {

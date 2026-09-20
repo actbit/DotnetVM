@@ -29,12 +29,19 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     private const int SafepointInterval = 1024;
 
-    private readonly InterpreterServices _services;
     private readonly MemoryPolicy _memory;
+    private readonly IntrinsicRegistry _intrinsics;
+    private readonly VmConsole _console;
+    private readonly VmHeap _heap;
+    private readonly NetworkGateway? _network;
+    private readonly StorageGateway? _storage;
+    private readonly InterpreterServices _services;
     private readonly MethodPreparer _preparer;
     private readonly ObjectEngine _objectEngine;
     private readonly CallEngine _callEngine;
     private readonly ExceptionDispatcher _exceptionDispatcher;
+    /// <summary>loader ごとのエンジンセット (多アセンブリ実行: メソッドの所属画像で token 解決する)。</summary>
+    private readonly Dictionary<TypeLoader, LoaderEngines> _engines = [];
     // 実行中フレームの一覧 (GC ルート源。Invoke の呼出チェーン = フレームチェーン)
     private readonly List<InterpreterFrame> _liveFrames = [];
     private long _instructionCount;
@@ -43,32 +50,69 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     public long InstructionCount => _instructionCount;
 
+    /// <summary>1 アセンブリ (TypeLoader) 分の実行エンジン。token 解決はすべてこの loader の画像に対して行う。</summary>
+    private sealed class LoaderEngines {
+        public required InterpreterServices Services { get; init; }
+        public required MethodPreparer Preparer { get; init; }
+        public required ObjectEngine Objects { get; init; }
+        public required CallEngine Calls { get; init; }
+        public required ExceptionDispatcher Exceptions { get; init; }
+    }
+
     public Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
         NetworkGateway? network = null, StorageGateway? storage = null) {
         _memory = memory;
+        _intrinsics = intrinsics;
+        _console = console;
+        _heap = heap;
+        _network = network;
+        _storage = storage;
         var strings = new VmStringPool(heap);
+        var primary = CreateEngines(loader, strings);
+        _services = primary.Services;
+        _preparer = primary.Preparer;
+        _objectEngine = primary.Objects;
+        _callEngine = primary.Calls;
+        _exceptionDispatcher = primary.Exceptions;
+        _engines[loader] = primary;
+        // 実行中フレームのルート源は Interpreter 単位で 1 回登録する
+        heap.AddRootSlotSource(EnumerateFrameRoots);
+    }
+
+    /// <summary>指定 loader のエンジンセットを取得 (無ければ遅延生成して GC ルート源も登録する)。</summary>
+    private LoaderEngines EnginesFor(VmMethod method) {
+        var loader = method.Loader;
+        if (loader is null || ReferenceEquals(loader, _services.Loader))
+            return _engines[_services.Loader];
+        return _engines.TryGetValue(loader, out var engines)
+            ? engines
+            : _engines[loader] = CreateEngines(loader, _services.Strings);
+    }
+
+    /// <summary>loader のエンジンセットを構築する (文字列プールは VM 単位で共有)。</summary>
+    private LoaderEngines CreateEngines(TypeLoader loader, VmStringPool strings) {
         var intrinsicContext = new IntrinsicContext {
-            Console = console,
+            Console = _console,
             Strings = strings,
-            Heap = heap,
+            Heap = _heap,
             Types = loader,
-            Network = network,
-            Storage = storage,
+            Network = _network,
+            Storage = _storage,
         };
-        _services = new InterpreterServices(loader, intrinsics, console, memory, heap, strings, intrinsicContext);
-        _preparer = new MethodPreparer(loader);
-        _objectEngine = new ObjectEngine(_services, this, this);
-        _callEngine = new CallEngine(_services, this, this, _objectEngine);
-        _exceptionDispatcher = new ExceptionDispatcher(_services, _preparer, _objectEngine, this);
+        var services = new InterpreterServices(loader, _intrinsics, _console, _memory, _heap, strings, intrinsicContext);
+        var preparer = new MethodPreparer(loader);
+        var objects = new ObjectEngine(services, this, this);
+        var calls = new CallEngine(services, this, this, objects);
+        var exceptions = new ExceptionDispatcher(services, preparer, objects, this);
         // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
-        intrinsicContext.ToStringHook = _callEngine.InvokeToStringSlot;
+        intrinsicContext.ToStringHook = calls.InvokeToStringSlot;
         // MethodBase.GetCurrentMethod() 用の現在メソッドフック
         intrinsicContext.CurrentMethodHook = () =>
             _liveFrames.Count > 0 ? _liveFrames[^1].Method : null;
-        // GC ルート源の登録: 実行中フレーム / 静的ストレージ / intrinsic 静的フィールド
-        heap.AddRootSlotSource(EnumerateFrameRoots);
-        heap.AddRootSlotSource(_services.Objects.EnumerateStaticStorage);
-        heap.AddRootSlotSource(() => _objectEngine.IntrinsicStaticFields.ToArray());
+        // GC ルート源の登録: 静的ストレージ / intrinsic 静的フィールド (フレームは Interpreter 単位で登録済み)
+        _heap.AddRootSlotSource(services.Objects.EnumerateStaticStorage);
+        _heap.AddRootSlotSource(() => objects.IntrinsicStaticFields.ToArray());
+        return new LoaderEngines { Services = services, Preparer = preparer, Objects = objects, Calls = calls, Exceptions = exceptions };
     }
 
     /// <summary>文字列プール (VM ファサードから参照用)。</summary>
@@ -119,14 +163,15 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
         _depth++;
         try {
+            var engines = EnginesFor(method);
             CloneStructArgs(method, arguments);
             var frame = InterpreterFrame.Create(method, arguments,
-                _preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
+                engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             _liveFrames.Add(frame);
             try {
                 FixupStructLocals(frame);
-                return _exceptionDispatcher.RunFrame(frame);
+                return engines.Exceptions.RunFrame(frame);
             } finally {
                 _liveFrames.RemoveAt(_liveFrames.Count - 1);
             }
@@ -169,6 +214,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     /// <summary>値型ローカルの既定値を VmStructValue で実体化する (InterpreterFrame はローダ無しで null を置くため)。
     /// !n / !!n ローカルは frame.Context の実引数で置換してから判定する。</summary>
     private void FixupStructLocals(InterpreterFrame frame) {
+        var engines = EnginesFor(frame.Method);
         for (var i = 0; i < frame.Locals.Length; i++) {
             ref var slot = ref frame.Locals[i];
             if (slot.Kind != StackKind.Object || slot.ObjectValue is not null)
@@ -177,9 +223,9 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             if (sigType.Kind is not (SigKind.TypeToken or SigKind.GenericInst
                 or SigKind.GenericVar or SigKind.GenericMethodVar))
                 continue;
-            var type = _services.Loader.ResolveToken(sigType, frame.Context);
+            var type = engines.Services.Loader.ResolveToken(sigType, frame.Context);
             if (type.IsValueType)
-                slot = _services.Objects.DefaultForType(type, _services.Loader);
+                slot = engines.Services.Objects.DefaultForType(type, engines.Services.Loader);
         }
     }
 
@@ -212,10 +258,14 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     // ---- 命令ディスパッチ ループ ----
 
     private StackSlot RunFrameCore(InterpreterFrame frame) {
-        var prepared = _preparer.Prepare(frame.Method);
-        var eh = _exceptionDispatcher;
-        var calls = _callEngine;
-        var objects = _objectEngine;
+        // メソッドの所属画像に対応するエンジンセットで実行する (多アセンブリ: dep の IL は
+        // dep の loader で ldstr/ldtoken/呼出を解決する)
+        var engines = EnginesFor(frame.Method);
+        var loader = engines.Services.Loader;
+        var prepared = engines.Preparer.Prepare(frame.Method);
+        var eh = engines.Exceptions;
+        var calls = engines.Calls;
+        var objects = engines.Objects;
         while (true) {
             ConsumeInstruction();
             var instruction = frame.Code[frame.Ip];
@@ -378,7 +428,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 // ---- 文字列 ----
                 case ILOp.Ldstr:
                     frame.Stack.Push(StackSlot.OfObject(
-                        _services.Strings.GetOrNew(_services.Loader.Image.GetUserString(instruction.IntOperand & 0xFFFFFF))));
+                        _services.Strings.GetOrNew(loader.Image.GetUserString(instruction.IntOperand & 0xFFFFFF))));
                     break;
 
                 // ---- 呼出 ----
@@ -409,7 +459,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     using var reservation = _services.Heap.ReserveArray(count);
                     var elements = new StackSlot[count];
                     for (var i = 0; i < count; i++)
-                        elements[i] = _services.Objects.DefaultForType(elementType, _services.Loader);
+                        elements[i] = engines.Services.Objects.DefaultForType(elementType, loader);
                     frame.Stack.Push(StackSlot.OfObject(reservation.Commit(
                         new VmArray(new VmArrayType { ElementType = elementType }, elements))));
                     break;
@@ -526,8 +576,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 }
                 case ILOp.Initobj: {
                     var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    byref.Slot = _services.Objects.DefaultForType(
-                        objects.ResolveTypeToken(instruction.IntOperand, frame.Context), _services.Loader);
+                    byref.Slot = engines.Services.Objects.DefaultForType(
+                        objects.ResolveTypeToken(instruction.IntOperand, frame.Context), loader);
                     break;
                 }
 
@@ -779,10 +829,10 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     var tokenRid = (int)((uint)instruction.IntOperand & 0xFFFFFF);
                     switch (tokenTable) {
                         case TableKind.Field: {
-                            var rva = _services.Loader.Image.GetFieldRva(tokenRid);
+                            var rva = loader.Image.GetFieldRva(tokenRid);
                             if (rva == 0)
                                 throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
-                            var handle = _services.Heap.Allocate(new VmFieldRvaData { Data = _services.Loader.Image.GetRvaDataToEnd(rva) });
+                            var handle = _services.Heap.Allocate(new VmFieldRvaData { Data = loader.Image.GetRvaDataToEnd(rva) });
                             frame.Stack.Push(StackSlot.OfObject(handle));
                             break;
                         }
@@ -793,7 +843,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                             break;
                         }
                         case TableKind.MethodDef: {
-                            var method = _services.Loader.GetMethodByToken((uint)instruction.IntOperand)
+                            var method = loader.GetMethodByToken((uint)instruction.IntOperand)
                                 ?? throw new BadImageFormatException($"MethodDef rid {tokenRid} を解決できません。");
                             frame.Stack.Push(StackSlot.OfObject(
                                 _services.Heap.Allocate(new VmMethodHandle { Target = method })));

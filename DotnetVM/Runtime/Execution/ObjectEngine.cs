@@ -80,6 +80,26 @@ internal sealed class ObjectEngine(
                         ?? throw new BadImageFormatException(
                             $"MemberRef 0x{token:X8} の解決先フィールド {definition.FullName}::{fieldName} が見つかりません。");
                 }
+                if (parent.Table == TableKind.TypeRef) {
+                    // 依存アセンブリの型 / ネスト型のフィールド参照 (intrinsic ファサードの
+                    // 静的フィールドは StaticFieldLocation 側で処理する)
+                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType ownerClass) {
+                        for (VmType? t = ownerClass; t is not null;) {
+                            if (t is VmConstructedType ct)
+                                t = ct.Definition;
+                            if (t is not VmClassType cls)
+                                break;
+                            var field = cls.Fields.FirstOrDefault(f => f.Name == fieldName);
+                            if (field is not null)
+                                return field;
+                            t = cls.BaseType;
+                        }
+                        throw new BadImageFormatException(
+                            $"MemberRef 0x{token:X8} の解決先フィールド {ownerClass.FullName}::{fieldName} が見つかりません。");
+                    }
+                    throw new NotSupportedException(
+                        $"intrinsic ファサード型のフィールド参照 (MemberRef 0x{token:X8}) はインスタンス面として未対応です。");
+                }
                 throw new NotSupportedException($"フィールド MemberRef 親テーブル {parent.Table} は未対応です。");
             }
             default:
@@ -144,14 +164,18 @@ internal sealed class ObjectEngine(
             if (parent.Table == TableKind.TypeRef) {
                 var typeName = _loader.GetMemberRefParentTypeName(rid)!;
                 var fieldName = _loader.GetMemberRefFieldName(rid);
-                if (!_intrinsics.TryGetStaticField(typeName, fieldName, out var value))
+                if (_intrinsics.TryGetStaticField(typeName, fieldName, out var value)) {
+                    if (!_intrinsicStaticFields.TryGetValue(token, out var storage)) {
+                        storage = [value(_intrinsicContext)];
+                        _intrinsicStaticFields[token] = storage;
+                    }
+                    return new VmByRef(storage, 0);
+                }
+                // intrinsic 静的フィールド未登録の TypeRef 親は実 TypeDef に解決できる場合、
+                // 共通の静的ストレージ経路 (直下の ResolveFieldToken フロー) へ流す
+                if (_loader.ResolveTypeRefType(parent.Rid) is not VmClassType)
                     throw new OperationNotAllowedException(
                         $"intrinsic 型 {typeName} の静的フィールド {fieldName} は未登録です。");
-                if (!_intrinsicStaticFields.TryGetValue(token, out var storage)) {
-                    storage = [value(_intrinsicContext)];
-                    _intrinsicStaticFields[token] = storage;
-                }
-                return new VmByRef(storage, 0);
             }
             if (parent.Table == TableKind.TypeSpec) {
                 // 構築型の静的フィールド。CLR と同じく値型実引数ごとに別ストレージを持ち、
@@ -208,6 +232,22 @@ internal sealed class ObjectEngine(
         foreach (var invocation in invocations)
             @delegate.AddInvocation(invocation);
         return @delegate;
+    }
+
+    /// <summary>.ctor を基底連鎖 (ジェネリック定義へ解いて) から探す。</summary>
+    private static VmMethod? FindCtorThroughChain(VmClassType type, string name, int paramCount) {
+        for (VmType? t = type; t is not null;) {
+            if (t is VmConstructedType ct)
+                t = ct.Definition;
+            if (t is not VmClassType cls)
+                break;
+            var ctor = cls.Methods.FirstOrDefault(m =>
+                m.Name == name && !m.IsStatic && m.Signature.ParamTypes.Length == paramCount);
+            if (ctor is not null)
+                return ctor;
+            t = cls.BaseType;
+        }
+        return null;
     }
 
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
@@ -270,8 +310,16 @@ internal sealed class ObjectEngine(
                         $"intrinsic 型 {typeName} のインスタンス生成は未対応です (例外ファサード型または .ctor intrinsic 登録済み型のみ)。");
                 }
             }
-            throw new NotSupportedException(
-                $"newobj の MemberRef 0x{token:X8} ({typeName ?? "?"}::{name}) を解決できません。");
+            // intrinsic ファサードでない TypeRef 親 (依存アセンブリの型 / ネスト型) は
+            // 実 TypeDef の .ctor として解決し、MethodDef と共通の生成経路へ流す
+            if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass) {
+                ctor = FindCtorThroughChain(realClass, name, facadeParamCount)
+                    ?? throw new BadImageFormatException(
+                        $"newobj の MemberRef 0x{token:X8} の解決先 .ctor {realClass.FullName}::{name} (引数 {facadeParamCount} 個) が見つかりません。");
+            } else {
+                throw new NotSupportedException(
+                    $"newobj の MemberRef 0x{token:X8} ({typeName ?? "?"}::{name}) を解決できません。");
+            }
         } else {
             throw new BadImageFormatException($"newobj トークン 0x{token:X8} のテーブルが不正です。");
         }

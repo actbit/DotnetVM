@@ -14,6 +14,8 @@ public sealed class VmMethod {
     public required uint ImplFlags { get; init; }
     /// <summary>メソッド本体 (abstract / pinvoke は null)。</summary>
     public required MethodBodyBlock? Body { get; init; }
+    /// <summary>このメソッドを定義したアセンブリのローダ (多アセンブリ実行で token 解決先を決める)。</summary>
+    public TypeLoader? Loader { get; internal set; }
 
     public uint Token => global::DotnetVM.Metadata.Token.From(TableKind.MethodDef, MethodDefRid).Value;
 

@@ -19,6 +19,12 @@ public sealed class AssemblyImage {
     /// <summary>アセンブリの単純名 (Assembly テーブル、なければ Module 名)。</summary>
     public string Name { get; }
 
+    /// <summary>ファイルからロードした場合の元パス (依存アセンブリの同一ディレクトリ探索に使う。ストリームロードは null)。</summary>
+    public string? SourcePath { get; internal set; }
+
+    /// <summary>NestedClass テーブルの逆引き索引 (Nested rid → Enclosing rid。遅延構築)。</summary>
+    private Dictionary<int, int>? _nestedToEnclosing;
+
     private AssemblyImage(PEImage pe, CliHeader cli, MetadataRoot root, MetadataTables tables,
                           StringHeap strings, UserStringHeap userStrings, BlobHeap blobs, GuidHeap guids,
                           string name) {
@@ -105,14 +111,17 @@ public sealed class AssemblyImage {
     public ReadOnlySpan<byte> GetMemberRefSignature(int memberRefRid) =>
         GetBlob(Tables.GetRowIndex(TableKind.MemberRef, memberRefRid, 2));
 
-    /// <summary>ネスト型の包含型 TypeDef rid を取得。存在しなければ 0。</summary>
+    /// <summary>ネスト型の包含型 TypeDef rid を取得。存在しなければ 0 (逆引き索引を遅延構築して O(1) 参照)。</summary>
     public int GetEnclosingTypeDef(int typeDefRid) {
-        var count = Tables.GetRowCount(TableKind.NestedClass);
-        for (var rid = 1; rid <= count; rid++) {
-            if (Tables.GetRowIndex(TableKind.NestedClass, rid, 0) == typeDefRid)
-                return Tables.GetRowIndex(TableKind.NestedClass, rid, 1);
+        if (_nestedToEnclosing is null) {
+            var index = new Dictionary<int, int>();
+            var count = Tables.GetRowCount(TableKind.NestedClass);
+            for (var rid = 1; rid <= count; rid++)
+                index[(int)Tables.GetRowIndex(TableKind.NestedClass, rid, 0)] =
+                    (int)Tables.GetRowIndex(TableKind.NestedClass, rid, 1);
+            _nestedToEnclosing = index;
         }
-        return 0;
+        return _nestedToEnclosing.GetValueOrDefault(typeDefRid);
     }
 
     /// <summary>FieldRVA テーブルからフィールドの初期データ RVA を取得する (未登録なら 0)。</summary>

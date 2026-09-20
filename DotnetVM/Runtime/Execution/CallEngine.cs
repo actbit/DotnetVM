@@ -296,6 +296,20 @@ internal sealed class CallEngine(
                             ParamTypeNames = paramNames,
                         };
                     }
+                    // 実 TypeDef に解決できる TypeRef 親 (依存アセンブリの型 / ネスト型) は
+                    // そのメソッドを実体として解決する。callvirt でも Call 側でレシーバの
+                    // 実行時型による仮想ディスパッチが効くため、宣言解決の直接化は安全
+                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass) {
+                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes.Length);
+                        if (resolved is { Body: not null })
+                            return new CallTarget {
+                                Arity = arity,
+                                Method = resolved,
+                                Name = resolved.Name,
+                                ParamCount = resolved.Signature.ParamTypes.Length,
+                                HasThis = resolved.Signature.HasThis,
+                            };
+                    }
                     // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
                     // (constrained callvirt ではレシーバの実行時型にゲスト実装があるため。
                     //  Call 側で最終ディスパッチが失敗した時点で改めて例外にする)
@@ -530,11 +544,16 @@ internal sealed class CallEngine(
         _ => ParamTypeName(type, null),
     };
 
-    /// <summary>トークン型の名前解決 (未対応のアセンブリ外参照は型名不要のため空文字列にフォールバック)。</summary>
+    /// <summary>トークン型の名前解決 (未対応のアセンブリ外参照 / 依存アセンブリ欠落は
+    /// 型名不要のため空文字列にフォールバック。fail-closed は実際の呼出解決が担う)。</summary>
     private string TryResolveTypeName(uint token, GenericContext? context) {
         try {
             return _objectEngine.ResolveTypeToken((int)token, context)?.FullName ?? "";
         } catch (NotSupportedException) {
+            return "";
+        } catch (AssemblyDependencyNotFoundException) {
+            // intrinsic ファサード面での呼出がまだあり得るため、ここでは即拒否しない
+            // (解決順 ①実アセンブリ → ③intrinsic → ④fail-closed の ③ を生かす)
             return "";
         }
     }

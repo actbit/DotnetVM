@@ -145,8 +145,9 @@ public class ResourcePolicyTests {
     [Fact]
     public void WebClientSurface_ExistsOnlyWhenNetworkBridgeConfigured() {
         using var vm = CreateVm();
-        // newobj の解決自体が失敗する (型が合成されていない)
-        Assert.Throws<NotSupportedException>(() => vm.Invoke("Vm.Policy", "Download", "https://example.com/"));
+        // newobj の解決自体が失敗する (ブリッジ未設定 → ファサード型が合成されず、
+        // 依存アセンブリも同一ディレクトリに無いため fail-closed)
+        Assert.Throws<AssemblyDependencyNotFoundException>(() => vm.Invoke("Vm.Policy", "Download", "https://example.com/"));
 
         var bridge = new FakeNetworkBridge { Handler = _ => "body"u8.ToArray() };
         using var vmWithBridge = CreateVm(network: bridge);

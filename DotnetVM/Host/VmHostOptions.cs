@@ -44,4 +44,11 @@ public sealed class VmHostOptions {
 
     /// <summary>GC 戦略 (既定 = 非世代別マーク &amp; スイープ。世代別戦略に差し替え可能)。</summary>
     public IGcStrategy Gc { get; init; } = new MarkSweepStrategy();
+
+    /// <summary>
+    /// ホスト実行環境の本物の System.Private.CoreLib.dll を VM にロードする (既定 = false)。
+    /// true にするとゲストの BCL 型参照が実 TypeDef に解決され、CoreLib の managed IL の
+    /// 実行が可能になる (段階的に有効化)。false では従来どおり intrinsic ファサード面で動く。
+    /// </summary>
+    public bool LoadHostCoreLib { get; init; }
 }

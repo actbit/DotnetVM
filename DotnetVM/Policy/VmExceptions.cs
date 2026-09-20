@@ -39,6 +39,17 @@ public sealed class OperationNotAllowedException : VmExecutionException {
     public OperationNotAllowedException(string message) : base(message) { }
 }
 
+/// <summary>AssemblyRef で参照された依存アセンブリが解決できない (ロード済みでも参照元と
+/// 同一ディレクトリにも存在しない)。fail-closed: ゲストの catch には渡らず VM の最上位まで伝播する。</summary>
+public sealed class AssemblyDependencyNotFoundException : VmExecutionException {
+    /// <summary>解決できなかったアセンブリの単純名。</summary>
+    public string AssemblyName { get; }
+
+    public AssemblyDependencyNotFoundException(string assemblyName, string message) : base(message) {
+        AssemblyName = assemblyName;
+    }
+}
+
 /// <summary>ゲスト側で処理されずに VM 外へ出てきた例外 (ゲストオブジェクトの型名を保持)。</summary>
 public sealed class UnhandledGuestException : VmExecutionException {
     /// <summary>ゲスト例外オブジェクトの型フルネーム (例: System.DivideByZeroException 相当のファサード型)。</summary>

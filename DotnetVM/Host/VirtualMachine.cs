@@ -23,6 +23,7 @@ public sealed class VirtualMachine : IDisposable {
     private readonly NetworkGateway _network;
     private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
+    private readonly VmAssemblyContext _context;
     private Interpreter? _interpreter;
 
     public VirtualMachine(VmHostOptions? options = null) {
@@ -31,7 +32,25 @@ public sealed class VirtualMachine : IDisposable {
         _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
         _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
+        _context = new VmAssemblyContext(LoadDependencyAssembly);
         DefaultIntrinsics.RegisterAll(_intrinsics);
+        if (_options.LoadHostCoreLib)
+            LoadHostCoreLib();
+    }
+
+    /// <summary>ホスト実行環境の本物の System.Private.CoreLib.dll をロードする
+    /// (VmHostOptions.LoadHostCoreLib = true 時に VM 構築時に呼ぶ)。</summary>
+    private void LoadHostCoreLib() {
+        var coreLibPath = typeof(object).Assembly.Location;
+        if (string.IsNullOrEmpty(coreLibPath))
+            throw new InvalidOperationException("ホストの System.Private.CoreLib.dll の場所を特定できません (Single-file 発行等)。");
+        LoadAssembly(coreLibPath);
+    }
+
+    /// <summary>VmAssemblyContext が依存アセンブリの同一ディレクトリ探索で見つけた DLL をロードする。</summary>
+    private TypeLoader LoadDependencyAssembly(string path) {
+        LoadAssembly(path);
+        return _loaders[^1];
     }
 
     /// <summary>仮想コンソールデバイス (出力購読/入力バインド/実装差し替え)。</summary>
@@ -55,6 +74,9 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>ロード済みアセンブリの型ローダ。</summary>
     public IReadOnlyList<TypeLoader> Loaders => _loaders;
 
+    /// <summary>多アセンブリ ロード コンテキスト (AssemblyRef 依存解決)。</summary>
+    public VmAssemblyContext Context => _context;
+
     /// <summary>累積実行命令数。</summary>
     public long InstructionCount => _interpreter?.InstructionCount ?? 0;
 
@@ -62,17 +84,19 @@ public sealed class VirtualMachine : IDisposable {
     public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) =>
         _intrinsics.Register(key, impl);
 
-    /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。</summary>
+    /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
+    /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>
     public AssemblyImage LoadAssembly(string path) {
         using var stream = File.OpenRead(path);
-        return LoadAssembly(stream);
+        return LoadAssembly(stream, Path.GetFullPath(path));
     }
 
     /// <summary>DLL アセンブリをストリームからロードする。</summary>
-    public AssemblyImage LoadAssembly(Stream peStream) {
+    public AssemblyImage LoadAssembly(Stream peStream, string? sourcePath = null) {
         using var buffered = new MemoryStream();
         peStream.CopyTo(buffered);
         var image = AssemblyImage.Parse(buffered.ToArray());
+        image.SourcePath = sourcePath;
         var loader = new TypeLoader(image);
         // 界面の再現制御: ブリッジが設定されている場合のみ対応する I/O ファサード型を合成する。
         // 未設定ならゲストはその型を解決できず、ロード/呼出の時点で fail-closed になる
@@ -81,6 +105,7 @@ public sealed class VirtualMachine : IDisposable {
         if (_options.StorageBridge is not null)
             loader.AddIoFacade("File");
         loader.CompletePendingTypes();
+        _context.Register(loader);
         _loaders.Add(loader);
         return image;
     }

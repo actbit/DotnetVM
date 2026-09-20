@@ -1,5 +1,6 @@
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.Policy;
 
 namespace DotnetVM.Runtime.Types;
 
@@ -8,6 +9,8 @@ namespace DotnetVM.Runtime.Types;
 /// 1 つの TypeDef は必ず 1 つの VmClassType インスタンスに対応 (キャッシュで保証)。
 /// アセンブリに存在しない型のうち VM が面を提供するもの (System.Object 等) は
 /// ファサード型 (VmIntrinsicType) として合成する。
+/// 他アセンブリの型参照 (TypeRef の ResolutionScope = AssemblyRef) は
+/// <see cref="Context"/> (VmAssemblyContext) 経由で依存アセンブリに解決する。
 /// </summary>
 public sealed class TypeLoader {
     /// <summary>GenericParam.Flags の変性ビット (ECMA-335 II.22.20)。</summary>
@@ -18,12 +21,18 @@ public sealed class TypeLoader {
 
     /// <summary>ロード対象のアセンブリ。</summary>
     public AssemblyImage Image => _image;
+
+    /// <summary>所属する多アセンブリ コンテキスト (依存解決に使用。未所属 = null)。</summary>
+    public VmAssemblyContext? Context { get; internal set; }
+
     private readonly Dictionary<int, VmClassType> _typeDefs = [];
     private readonly Dictionary<string, VmIntrinsicType> _intrinsicTypes = [];
     private readonly Dictionary<int, VmMethod> _methods = [];
     private readonly Dictionary<int, VmField> _fields = [];
     private readonly List<VmClassType> _pendingCompletion = [];
     private readonly HashSet<int> _completedTypeDefs = [];
+    /// <summary>完全名 → TypeDef rid の索引 (遅延構築。CoreLib 規模の画像で線形走査を避ける)。</summary>
+    private Dictionary<string, int>? _typeDefByFullName;
 
     public TypeLoader(AssemblyImage image) {
         _image = image;
@@ -251,6 +260,7 @@ public sealed class TypeLoader {
                 Body = rva == 0 ? null : _image.GetMethodBody(rid),
             };
             _methods[rid] = method;
+            method.Loader = this; // 実行時の token 解決 (ldstr/ldtoken/呼出) を自画像に固定する
             methods.Add(method);
         }
 
@@ -377,20 +387,67 @@ public sealed class TypeLoader {
         return GenericSubstitutor.Substitute(ResolveToken(sigType), context);
     }
 
+    /// <summary>TypeRef rid を解決する。解決順:
+    /// ① Context 登録済みの実アセンブリ (AssemblyRef スコープの依存解決 / Module スコープの自己参照 /
+    ///    TypeRef スコープのネスト型) → ② intrinsic ファサード → ③ ファサード無し時のネスト/自己解決 →
+    /// ④ fail-closed (AssemblyDependencyNotFoundException / NotSupportedException)。</summary>
     private VmType ResolveTypeRef(int typeRefRid) {
         var (ns, name, scope) = _image.GetTypeRefName(typeRefRid);
         var fullName = string.IsNullOrEmpty(ns) ? name : ns + "." + name;
+        var (scopeTable, scopeRid) = scope;
+
+        // ① 実アセンブリからの解決 (Context に登録された画像が優先。CoreLib ロード時は
+        //    ファサードより実 TypeDef が勝つ)
+        var context = Context;
+        if (context is not null) {
+            var real = scopeTable switch {
+                TableKind.Module => (VmType?)FindTypeByFullName(fullName),
+                TableKind.AssemblyRef => ResolveViaAssemblyRef(fullName, scopeRid),
+                TableKind.TypeRef => ResolveNestedTypeRef(typeRefRid),
+                _ => null,
+            };
+            if (real is not null)
+                return real;
+        }
+
+        // ② intrinsic ファサード (CoreLib 未ロード時の既定面)
         if (_intrinsicTypes.TryGetValue(fullName, out var intrinsic))
             return intrinsic;
 
-        // ネスト型 TypeRef (ResolutionScope = TypeRef) は包含チェーンごとゲスト TypeDef と照合する
-        var (scopeTable, scopeRid) = scope;
-        if (scopeTable == TableKind.TypeRef && ResolveNestedTypeRef(typeRefRid) is { } nested)
+        // ③ Context 未所属時の従来解決 (ネスト型 TypeRef は包含チェーンごと TypeDef と照合)
+        if (context is null && scopeTable == TableKind.TypeRef &&
+            ResolveNestedTypeRef(typeRefRid) is { } nested)
             return nested;
 
-        throw new NotSupportedException(
-            $"アセンブリ外の型参照 '{fullName}' は未対応です (アセンブリ参照の解決は今後のフェーズで実装)。");
+        // ④ fail-closed
+        if (scopeTable == TableKind.AssemblyRef) {
+            var refName = GetAssemblyRefName(scopeRid);
+            if (context?.TryResolveAssembly(refName, _image) is null)
+                throw new AssemblyDependencyNotFoundException(refName,
+                    $"参照アセンブリ '{refName}' (型 '{fullName}' の解決に必要) がロード済みでも" +
+                    $"同一ディレクトリ ({Path.GetDirectoryName(Path.GetFullPath(_image.SourcePath ?? "."))}) にも見つかりません。");
+        }
+        throw new NotSupportedException($"型参照 '{fullName}' を解決できません (スコープ {scopeTable})。");
     }
+
+    /// <summary>AssemblyRef スコープの TypeRef を依存アセンブリの TypeDef に解決する。
+    /// アセンブリが解決できない場合や型が見つからない場合は null (呼び出し側で fail-closed する)。</summary>
+    private VmType? ResolveViaAssemblyRef(string fullName, int assemblyRefRid) {
+        var refName = GetAssemblyRefName(assemblyRefRid);
+        // 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)
+        if (string.Equals(refName, _image.Name, StringComparison.OrdinalIgnoreCase))
+            return FindTypeByFullName(fullName);
+        var target = Context!.TryResolveAssembly(refName, _image);
+        return target?.FindTypeByFullName(fullName);
+    }
+
+    /// <summary>TypeRef rid を解決した結果を返す (intrinsic ファサードまたは実 VmClassType)。
+    /// 呼出/オブジェクト生成/フィールド解決が MemberRef の TypeRef 親を実体に解決するのに使う。</summary>
+    public VmType ResolveTypeRefType(int typeRefRid) => ResolveTypeRef(typeRefRid);
+
+    /// <summary>AssemblyRef rid の参照先アセンブリの単純名。</summary>
+    public string GetAssemblyRefName(int assemblyRefRid) =>
+        _image.GetString(_image.Tables.GetRowIndex(TableKind.AssemblyRef, assemblyRefRid, 6));
 
     /// <summary>ネスト型 TypeRef を TypeDef のネスト構造 (NestedClass) と名前照合で解決する。</summary>
     private VmClassType? ResolveNestedTypeRef(int typeRefRid) {
@@ -450,23 +507,28 @@ public sealed class TypeLoader {
         return null;
     }
 
-    /// <summary>TypeDef のフルネームで型を検索する (ネスト型は "Outer/Inner"、独自表記は "Outer.Inner")。</summary>
+    /// <summary>TypeDef のフルネームで型を検索する (ネスト型は "Outer/Inner"、独自表記は "Outer.Inner")。
+    /// 最初の呼び出しで完全名索引を 1 回だけ構築する (CoreLib 規模の画像での線形走査を避ける)。</summary>
     public VmClassType? FindTypeByFullName(string fullName) {
-        var count = _image.Tables.GetRowCount(TableKind.TypeDef);
-        for (var rid = 1; rid <= count; rid++) {
-            var (ns, name) = _image.GetTypeDefName(rid);
-            var full = string.IsNullOrEmpty(ns) ? name : ns + "." + name;
-            // ネスト型は包含チェーンを辿って FullName を構成する
-            var enclosing = _image.GetEnclosingTypeDef(rid);
-            while (enclosing != 0) {
-                var (ens, ename) = _image.GetTypeDefName(enclosing);
-                full = (string.IsNullOrEmpty(ens) ? ename : ens + "." + ename) + "/" + full;
-                enclosing = _image.GetEnclosingTypeDef(enclosing);
+        if (_typeDefByFullName is null) {
+            var index = new Dictionary<string, int>(StringComparer.Ordinal);
+            var count = _image.Tables.GetRowCount(TableKind.TypeDef);
+            for (var rid = 1; rid <= count; rid++) {
+                var (ns, name) = _image.GetTypeDefName(rid);
+                var full = string.IsNullOrEmpty(ns) ? name : ns + "." + name;
+                // ネスト型は包含チェーンを辿って FullName を構成する
+                var enclosing = _image.GetEnclosingTypeDef(rid);
+                while (enclosing != 0) {
+                    var (ens, ename) = _image.GetTypeDefName(enclosing);
+                    full = (string.IsNullOrEmpty(ens) ? ename : ens + "." + ename) + "/" + full;
+                    enclosing = _image.GetEnclosingTypeDef(enclosing);
+                }
+                index.TryAdd(full, rid);
+                index.TryAdd(full.Replace('/', '+'), rid);
             }
-            if (full == fullName || full.Replace('/', '+') == fullName)
-                return GetTypeDef(rid);
+            _typeDefByFullName = index;
         }
-        return null;
+        return _typeDefByFullName.TryGetValue(fullName, out var ridMatch) ? GetTypeDef(ridMatch) : null;
     }
 
     /// <summary>名前 (末尾要素) で TypeDef を検索する。</summary>

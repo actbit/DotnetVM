@@ -465,12 +465,12 @@ public sealed class Interpreter {
                     if (count < 0)
                         throw new UnhandledGuestException("System.OverflowException", null);
                     var elementType = ResolveTypeToken(instruction.IntOperand, frame.Context);
-                    // localloc と同じく Reserve → 実確保 → Register の順 (EstimateSize(VmArray) と同一式)
-                    _heap.Reserve(24 + 16L * count);
+                    // localloc と同じく予約トランザクション (Reserve → 実確保 → Commit、失敗時は自動巻き戻し)
+                    using var reservation = _heap.ReserveArray(count);
                     var elements = new StackSlot[count];
                     for (var i = 0; i < count; i++)
                         elements[i] = _objects.DefaultForType(elementType, _loader);
-                    frame.Stack.Push(StackSlot.OfObject(_heap.Register(
+                    frame.Stack.Push(StackSlot.OfObject(reservation.Commit(
                         new VmArray(new VmArrayType { ElementType = elementType }, elements))));
                     break;
                 }
@@ -800,9 +800,10 @@ public sealed class Interpreter {
                     // 先頭バイトへの unmanaged ポインタを返す。実 CLR と異なり初期化は 0 (安全側の
                     // 上限動作)、フレーム終了でも解放されない (GC 管理) = 脱出 stackalloc も安全側に動く
                     // 上限検査と計上はホスト側の実確保 (new byte[]) より先に行う — 巨大確保が
-                    // チェック前にホストメモリを圧迫しないよう Reserve → 実確保 → Register の順
-                    _heap.Reserve(ObjectModel.LocallocBlockSize(bytes));
-                    var memory = _heap.Register(new VmLocallocMemory { Bytes = new byte[bytes] });
+                    // チェック前にホストメモリを圧迫しないよう Reserve → 実確保 → Commit の順。
+                    // 実確保が失敗したら予約トランザクションの Dispose が計上を巻き戻す
+                    using var reservation = _heap.ReserveLocalloc(bytes);
+                    var memory = reservation.Commit(new VmLocallocMemory { Bytes = new byte[bytes] });
                     frame.Stack.Push(StackSlot.OfObject(new VmNativePointer { Memory = memory, ByteOffset = 0 }));
                     break;
                 }

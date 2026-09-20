@@ -129,4 +129,62 @@ public class MemoryAccountingTests {
         // 同じ上限でも回数が少なければ通る (計上は使用量に比例)
         Assert.Equal(50L, vm.Invoke("Vm.Account", "BurnInterpolations", 42, 50));
     }
+
+    // ---- 予約トランザクション (Reserve → 実確保 → Commit、失敗時は自動巻き戻し) ----
+
+    [Fact]
+    public void Reservation_RollsBackAccountingWhenNotCommitted() {
+        // 実確保 (new byte[] 等) が予約と登録の間で失敗した場合を模擬:
+        // using 抜け (Dispose) で予約分の計上が巻き戻され、会計に取り残しがないこと
+        var heap = new DotnetVM.Runtime.Heap.VmHeap(new MemoryPolicy());
+        var before = heap.Snapshot();
+        try {
+            using var reservation = heap.ReserveLocalloc(1_000);
+            throw new OutOfMemoryException(); // ホスト側実確保の失敗を模擬
+        } catch (OutOfMemoryException) {
+            // using の Dispose が先に走ってから catch に抜ける
+        }
+        Assert.Equal(before, heap.Snapshot());
+    }
+
+    [Fact]
+    public void Reservation_CommitRegistersOnceWithoutDoubleCharging() {
+        var heap = new DotnetVM.Runtime.Heap.VmHeap(new MemoryPolicy());
+        var expectedSize = DotnetVM.Runtime.Objects.ObjectModel.EstimateArraySize(10);
+        using var vmHeapReservation = heap.ReserveArray(10);
+        var array = vmHeapReservation.Commit(new DotnetVM.Runtime.Objects.VmArray(
+            new DotnetVM.Runtime.Types.VmArrayType {
+                ElementType = new DotnetVM.Runtime.Types.VmIntrinsicType {
+                    Namespace = "System", Name = "Int32", IsValue = true,
+                },
+            },
+            new DotnetVM.Runtime.Execution.StackSlot[10]));
+        // 計上は 1 回だけ (予約 + 登録の二重計上がないこと)
+        Assert.Equal(expectedSize, heap.Snapshot().TotalAllocatedBytes);
+        Assert.Contains(array, heap.TrackedObjects);
+        // 確定済み予約の再 Commit は拒否 (取り消し済み予約の確定も拒否)
+        Assert.Throws<InvalidOperationException>(
+            () => vmHeapReservation.Commit(array));
+    }
+
+    [Fact]
+    public void Reservation_RollbackFreesQuotaForLaterAllocations() {
+        // 巻き戻しで上限が回復し、後続の確保が同じ上限内で通ること
+        var heap = new DotnetVM.Runtime.Heap.VmHeap(new MemoryPolicy {
+            TotalAllocationByteLimit = 4_096,
+        });
+        try {
+            using var reservation = heap.ReserveLocalloc(8_000); // 上限超過なら予約時点で拒否のはず
+            reservation.Commit(new DotnetVM.Runtime.Objects.VmLocallocMemory {
+                Bytes = new byte[8_000],
+            });
+        } catch (DotnetVM.Policy.MemoryQuotaExceededException) {
+            // 巻き戻しではなく予約時点の拒否 (Reserve がチェックを先に行うことの確認)
+        }
+        // 上限未満の確保なら通る (失敗した予約が上限を食いつぶしていないこと)
+        using var ok = heap.ReserveLocalloc(1_000);
+        ok.Commit(new DotnetVM.Runtime.Objects.VmLocallocMemory { Bytes = new byte[1_000] });
+        Assert.Equal(DotnetVM.Runtime.Objects.ObjectModel.EstimateLocallocSize(1_000),
+            heap.Snapshot().TotalAllocatedBytes);
+    }
 }

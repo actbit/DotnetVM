@@ -506,15 +506,23 @@ public sealed class ObjectModel {
 
     /// <summary>アロケーションサイズの概算 (バイト)。クォータ計上用。</summary>
     public static long EstimateSize(VmObject obj) => obj switch {
-        VmArray array => 24 + 16L * array.Elements.Length,
-        VmClassInstance instance => 24 + 16L * instance.Fields.Length,
-        VmBoxedValue boxed => 24 + 16L * boxed.Fields.Length,
+        VmArray array => EstimateArraySize(array.Elements.Length),
+        VmClassInstance instance => EstimateFieldStorageSize(instance.Fields.Length),
+        VmBoxedValue boxed => EstimateFieldStorageSize(boxed.Fields.Length),
         // localloc の仮想メモリブロックは実バイト数を計上する (メモリポリシーの対象)
-        VmLocallocMemory memory => LocallocBlockSize(memory.Bytes.Length),
+        VmLocallocMemory memory => EstimateLocallocSize(memory.Bytes.Length),
         _ => 24,
     };
 
-    /// <summary>localloc ブロックの概算サイズ (実バイト数 + オブジェクト ヘッダ概算)。
-    /// Reserve (確保前の事前計上) と EstimateSize (登録時) の両方から使う共有式。</summary>
-    public static long LocallocBlockSize(long byteCount) => 24 + byteCount;
+    // ---- 概算サイズの共有式 (確保前の事前計上 = Reserve 系と EstimateSize の両方から使う。
+    //      呼び出し側にサイズ式を散らさず、ここに集約する) ----
+
+    /// <summary>配列の概算サイズ (オブジェクト ヘッダ概算 + 要素 16 バイト)。</summary>
+    public static long EstimateArraySize(long elementCount) => 24 + 16L * elementCount;
+
+    /// <summary>クラス実体 / ボックス化実体の概算サイズ (オブジェクト ヘッダ概算 + フィールド 16 バイト)。</summary>
+    public static long EstimateFieldStorageSize(long fieldCount) => 24 + 16L * fieldCount;
+
+    /// <summary>localloc ブロックの概算サイズ (実バイト数 + オブジェクト ヘッダ概算)。</summary>
+    public static long EstimateLocallocSize(long byteCount) => 24 + byteCount;
 }

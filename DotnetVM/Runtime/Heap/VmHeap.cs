@@ -46,29 +46,89 @@ public sealed class VmHeap {
         _rootSlotSources.Add(source);
 
     /// <summary>
-    /// ホスト側の実メモリ確保 (<c>new byte[]</c> 等) の**前に**上限を検査し、計上だけ先に進める。
-    /// localloc / newarr のように実確保がオブジェクト構築より先に起きる箇所で
-    /// 「Reserve(推定サイズ) → 実確保 → Register」の順に使い、巨大確保が上限チェック前に
-    /// ホストメモリを圧迫するのを防ぐ。サイズは Allocate 実行時の EstimateSize と同一の式で。
+    /// アロケーション予約 (トランザクション)。生成時 (Reserve) に上限検査と計上を先に済ませ、
+    /// <see cref="Commit"/> でオブジェクトの登録を確定する。localloc / newarr のように
+    /// 「上限検査 → ホスト側の実確保 (new byte[] 等) → ヒープ登録」の順で進めたい箇所で使い、
+    /// 実確保が途中で失敗した場合も using 抜けの <see cref="Dispose"/> が予約分の計上を
+    /// 自動的に巻き戻す (予約済み会計の取り残しを構造的に防ぐ)。サイズ式は
+    /// ObjectModel の概算式と共有されるため、Reserve 経由なら二重計上・計上漏れが起きない。
     /// </summary>
-    public void Reserve(long size) {
+    public sealed class VmReservation : IDisposable {
+        private VmHeap? _heap;
+        private readonly long _size;
+        private bool _committed;
+
+        internal VmReservation(VmHeap heap, long size) {
+            _heap = heap;
+            _size = size;
+        }
+
+        /// <summary>予約を確定してオブジェクトをヒープに登録する (計上は予約時のまま = 二重計上しない)。</summary>
+        public T Commit<T>(T obj) where T : VmObject {
+            if (_committed || _heap is null)
+                throw new InvalidOperationException("アロケーション予約は確定済みか解放済みです (Commit は 1 回だけ呼べます)。");
+            _committed = true;
+            var heap = _heap;
+            _heap = null;
+            heap.Register(obj);
+            return obj;
+        }
+
+        /// <summary>未確定なら予約分の計上を巻き戻す (実確保の途中失敗 → using 抜けで自動実行)。</summary>
+        public void Dispose() {
+            if (!_committed && _heap is not null) {
+                _heap.Rollback(_size);
+                _heap = null;
+            }
+        }
+    }
+
+    /// <summary>確保予約を開始する (サイズは概算式を直接指定)。Commit で確定、未確定のまま Dispose すると巻き戻し。</summary>
+    public VmReservation Reserve(long size) {
+        CheckQuota(size);
+        Charge(size);
+        return new VmReservation(this, size);
+    }
+
+    /// <summary>localloc ブロックの確保予約 (概算式は ObjectModel.EstimateLocallocSize と共有)。</summary>
+    public VmReservation ReserveLocalloc(int byteCount) =>
+        Reserve(ObjectModel.EstimateLocallocSize(byteCount));
+
+    /// <summary>配列の確保予約 (概算式は ObjectModel.EstimateArraySize と共有)。</summary>
+    public VmReservation ReserveArray(int elementCount) =>
+        Reserve(ObjectModel.EstimateArraySize(elementCount));
+
+    /// <summary>予約分の計上を巻き戻す (VmReservation.Dispose 専用)。</summary>
+    private void Rollback(long size) {
+        _totalAllocated -= size;
+        _liveBytes -= size;
+        _allocatedSinceGc -= size;
+        // _collectionDue は据え置き (巻き戻しで GC 要求を取り消さない = 保守的に早めの回収)
+    }
+
+    /// <summary>Reserve で計上済みのオブジェクトをヒープに登録する (計上は二重に行わない)。</summary>
+    private T Register<T>(T obj) where T : VmObject {
+        _objects.Add(obj);
+        return obj;
+    }
+
+    /// <summary>上限検査のみ (超過は拒否)。</summary>
+    private void CheckQuota(long size) {
         if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
             throw new MemoryQuotaExceededException(
                 $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (要求 {size:N0} バイト)。");
         if (_liveBytes + size > _memory.LiveObjectByteLimit)
             throw new MemoryQuotaExceededException(
                 $"生存オブジェクト上限 {_memory.LiveObjectByteLimit:N0} バイトを超過しました (生存 {_liveBytes:N0} + 要求 {size:N0} バイト)。GC で回収可能なオブジェクトがない場合はゲストのメモリ使用量を見直してください。");
+    }
+
+    /// <summary>上限検査後の計上 (4 カウンタ + GC 要求)。</summary>
+    private void Charge(long size) {
         _totalAllocated += size;
         _liveBytes += size;
         _allocatedSinceGc += size;
         if (_allocatedSinceGc >= _memory.GcTriggerAllocationInterval)
             _collectionDue = true; // 実回収はセーフポイントで (ルート整合のため確保の再入では起動しない)
-    }
-
-    /// <summary>Reserve で計上済みのオブジェクトをヒープに登録する (計上は二重に行わない)。</summary>
-    public T Register<T>(T obj) where T : VmObject {
-        _objects.Add(obj);
-        return obj;
     }
 
     /// <summary>
@@ -78,26 +138,15 @@ public sealed class VmHeap {
     /// </summary>
     public void ChargeHostBuffer(int charCount) {
         var size = 24 + 2L * charCount;
-        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
-            throw new MemoryQuotaExceededException(
-                $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (ホスト バッファ {charCount} 文字)。");
+        CheckQuota(size);
         _totalAllocated += size;
     }
 
     /// <summary>オブジェクトをヒープに登録し、サイズを計上する。上限超過は拒否。</summary>
     public T Allocate<T>(T obj) where T : VmObject {
         var size = ObjectModel.EstimateSize(obj);
-        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
-            throw new MemoryQuotaExceededException(
-                $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (要求 {size:N0} バイト)。");
-        if (_liveBytes + size > _memory.LiveObjectByteLimit)
-            throw new MemoryQuotaExceededException(
-                $"生存オブジェクト上限 {_memory.LiveObjectByteLimit:N0} バイトを超過しました (生存 {_liveBytes:N0} + 要求 {size:N0} バイト)。GC で回収可能なオブジェクトがない場合はゲストのメモリ使用量を見直してください。");
-        _totalAllocated += size;
-        _liveBytes += size;
-        _allocatedSinceGc += size;
-        if (_allocatedSinceGc >= _memory.GcTriggerAllocationInterval)
-            _collectionDue = true; // 実回収はセーフポイントで (ルート整合のため確保の再入では起動しない)
+        CheckQuota(size);
+        Charge(size);
         _objects.Add(obj);
         return obj;
     }

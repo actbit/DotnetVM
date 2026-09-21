@@ -354,7 +354,7 @@ public static class DefaultIntrinsics {
         alignment > 0 ? text.PadLeft(alignment) : alignment < 0 ? text.PadRight(-alignment) : text;
 
     /// <summary>System.Type ファサードの実体を生成する (typeof(X) / GetType() の戻り値)。</summary>
-    private static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) =>
+    internal static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) =>
         StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeObject { Target = type }));
 
     /// <summary>オブジェクトの実行時型ファサードをスロットで返す (Object.GetType() /

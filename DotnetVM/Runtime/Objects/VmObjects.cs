@@ -427,18 +427,28 @@ public sealed class ObjectModel {
     }
 
     /// <summary>静的フィールドのストレージ。storageKey は非構築型なら FullName、構築型なら
-    /// 構築 FullName (CLR の「実引数ごとに別静的ストレージ」規約のため)。</summary>
+    /// 構築 FullName (CLR の「実引数ごとに別静的ストレージ」規約のため)。
+    /// world が指定された場合は VM 単位の共有テーブルに置く (ユニフィケーションされた
+    /// 実型の静的ストレージは CLR と同じく画像をまたいで 1 つ。CoreLib の .cctor が書いた
+    /// 値を他画像の ldsfld から読むために必須)。</summary>
     public StackSlot[] GetOrCreateStaticStorage(string storageKey, VmClassType type, TypeLoader loader,
-        GenericContext? context = null) {
+        GenericContext? context = null, UnifiedStaticStorage? world = null) {
+        if (world is not null)
+            return world.GetOrCreate(storageKey, () => BuildStaticStorage(type, loader, context));
         if (StaticStorage.TryGetValue(storageKey, out var existing))
             return existing;
+        var storage = BuildStaticStorage(type, loader, context);
+        StaticStorage[storageKey] = storage;
+        StaticStorageList.Add(storage);
+        return storage;
+    }
+
+    private StackSlot[] BuildStaticStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
         var storage = new StackSlot[type.Fields.Count(f => f.IsStatic && !f.IsLiteral)];
         var index = 0;
         foreach (var field in type.Fields)
             if (field.IsStatic && !field.IsLiteral)
                 storage[index++] = DefaultForType(GenericSubstitutor.Substitute(field.FieldType!, context), loader);
-        StaticStorage[storageKey] = storage;
-        StaticStorageList.Add(storage);
         return storage;
     }
 

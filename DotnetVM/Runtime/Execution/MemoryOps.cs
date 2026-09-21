@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using DotnetVM.IL;
 using DotnetVM.Metadata;
 using DotnetVM.Policy;
@@ -296,4 +297,78 @@ internal static class MemoryOps {
         }
         throw new InvalidOperationException($"sizeof は値型にのみ適用できます: {type.FullName}");
     }
+
+    /// <summary>IL 値列 (LE バイト) → VM スロットへ展開する補助面。
+    /// typeof から構成を取り出し, VM 表現を使って "ldobj 型", "cpobj 型" も走る</summary>
+    public static StackSlot ValueFromBytes(byte[] bytes, VmType type, int size)
+    {
+        // プリミティブ値は VM の統合スロットで表す (int/char/bool 等は i4 スロット)
+        var typeName = type.FullName;
+        if (bytes.Length == 1)
+        {
+            return typeName switch
+            {
+                "System.Byte" => StackSlot.OfInt32(bytes[0]),
+                "System.SByte" => StackSlot.OfInt32((sbyte)bytes[0]),
+                "System.Boolean" => StackSlot.OfInt32(bytes[0] != 0 ? 1 : 0),
+                _ => StackSlot.OfInt32(bytes[0]),
+            };
+        }
+        if (bytes.Length == 2)
+        {
+            var v = BinaryPrimitives.ReadUInt16LittleEndian(bytes);
+            return StackSlot.OfInt32(v);
+        }
+
+        if (bytes.Length == 4)
+        {
+            var v32 = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+            if (typeName == "System.Single")
+                return StackSlot.OfFloat(BitConverter.Int32BitsToSingle(v32));
+            return StackSlot.OfInt32(v32);
+        }
+        if (bytes.Length == 8)
+        {
+            if (typeName == "System.Double") return StackSlot.OfFloat(BinaryPrimitives.ReadDoubleLittleEndian(bytes));
+            return StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
+        }
+        throw new InvalidOperationException($"unmanaged ポインタから {typeName} (要素幅 {size} バイト) の読み取りに対応していません。");
+    }
+
+    /// <summary>VM スロット値を LE バイト列へ展開する (stobj/unmanaged ポインタ書き込み用)。</summary>
+    public static byte[] BytesOfValue(in StackSlot value, VmType type, int size)
+    {
+        var bytes = new byte[size];
+        var typeName = type.FullName;
+        if (size == 1)
+        {
+            bytes[0] = (byte)value.AsInt32;
+            return bytes;
+        }
+        if (size == 2)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(bytes, (ushort)value.AsInt32);
+            return bytes;
+        }
+        if (size == 4)
+        {
+            var v = typeName == "System.Single"
+                ? BitConverter.ToInt32(BitConverter.GetBytes((float)value.DoubleValue), 0)
+                : value.AsInt32;
+            BinaryPrimitives.WriteInt32LittleEndian(bytes, v);
+            return bytes;
+        }
+        if (size == 8)
+        {
+            if (typeName == "System.Double")
+            {
+                BinaryPrimitives.WriteDoubleLittleEndian(bytes, value.DoubleValue);
+                return bytes;
+            }
+            BinaryPrimitives.WriteInt64LittleEndian(bytes, value.Int64Value);
+            return bytes;
+        }
+        throw new InvalidOperationException($"unmanaged ポインタへの {typeName} (要素幅 {size} バイト) の書き込みに対応していません。");
+    }
 }
+

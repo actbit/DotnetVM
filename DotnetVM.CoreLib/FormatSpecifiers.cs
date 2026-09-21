@@ -68,6 +68,9 @@ public static class FormatSpecifiers {
 
     // ---- 共通核 ----
 
+    /// <summary>不変カルチャの負号 (decimal 書式エンジン (DecimalFormatting) からも共用)。</summary>
+    internal const string NegativeSignString = "-";
+
     /// <summary>符号付き整数の書式。magnitude は絶対値、raw は型幅マスク済みの生ビット
     /// (X/B 書式が負数の 2 の補数表現をそのまま 16/2 進化する CLR 規約のため)。</summary>
     private static string FormatSigned(long value, ulong mask, string? format) {
@@ -154,9 +157,11 @@ public static class FormatSpecifiers {
 
     private static bool IsAsciiDigit(char c) => c >= '0' && c <= '9';
 
-    // ---- 標準書式 (本家 NumberToString の移植。整数のみのサブセット) ----
+    // ---- 標準書式 (本家 NumberToString の移植。整数と decimal (DecimalFormatting から
+    // internal 共用) のサブセット。D/X/B は整数の高速経路で処理されるため case 自体が無い) ----
 
-    private static void NumberToString(Out output, NumberBuffer number, char fmt, int digits) {
+    internal static void NumberToString(Out output, NumberBuffer number, char fmt, int digits,
+        bool isDecimalKind = false) {
         switch (fmt) {
             case 'C':
             case 'c':
@@ -191,6 +196,19 @@ public static class FormatSpecifiers {
                 break;
             case 'G':
             case 'g': {
+                // 本家 'G' case: decimal (NumberBufferKind.Decimal) で精度 -1 のときは
+                // noRounding (ECMA 規約: 小数末尾の 0 を有効数字として出力) で丸めを飛ばし、
+                // 値 0 (Digits[0]==0) なら符号も出さずに固定表記へ (本家 goto SkipSign)
+                if (isDecimalKind && digits < 1) {
+                    if (number.Count == 0) {
+                        FormatGeneral(output, number, digits, (char)(fmt - 2), suppressScientific: true);
+                        return;
+                    }
+                    if (number.Negative)
+                        output.Append(NegativeSign);
+                    FormatGeneral(output, number, digits, (char)(fmt - 2), suppressScientific: true);
+                    return;
+                }
                 // 整数の G は精度があれば有効数字 (桁あふれは指数表記)。無ければ全桁 10 進
                 var maxDigits = digits < 1 ? number.Count : digits;
                 RoundNumber(number, maxDigits);
@@ -202,7 +220,7 @@ public static class FormatSpecifiers {
             case 'R':
             case 'r':
                 // R は整数では G と同一 (本家: format - 11)
-                NumberToString(output, number, (char)(fmt - 11), digits);
+                NumberToString(output, number, (char)(fmt - 11), digits, isDecimalKind);
                 break;
             case 'P':
             case 'p':
@@ -236,10 +254,16 @@ public static class FormatSpecifiers {
         }
     }
 
-    // ---- 数値バッファ (本家 NumberBuffer の配列表現) ----
+    // ---- 数値バッファ (本家 NumberBuffer の配列表現。decimal 書式エンジン
+    // (DecimalFormatting) からも internal 共用する) ----
 
-    private sealed class NumberBuffer {
-        public readonly char[] Digits = new char[DigitBufferSize];
+    internal sealed class NumberBuffer {
+        public readonly char[] Digits;
+
+        /// <summary>整数用の既定サイズ (ulong 20 桁 + 丸め余裕)。decimal は 96 ビット
+        /// 最大 29 桁 + 丸め・パーセントスケールの余裕が必要なためコンストラクタで拡張する。</summary>
+        public NumberBuffer(int digitBufferSize = DigitBufferSize) =>
+            Digits = new char[digitBufferSize];
         /// <summary>有効数字の個数 (0 = 値 0)。</summary>
         public int Count;
         /// <summary>小数点位置 (値 = 0.数字列 × 10^Scale)。</summary>
@@ -410,10 +434,13 @@ public static class FormatSpecifiers {
         FormatExponent(output, number.Count != 0 ? number.Scale - 1 : 0, expChar, 3, true);
     }
 
-    private static void FormatGeneral(Out output, NumberBuffer number, int maxDigits, char expChar) {
+    internal static void FormatGeneral(Out output, NumberBuffer number, int maxDigits, char expChar,
+        bool suppressScientific = false) {
         var i = number.Scale;
         var scientific = false;
-        if (i > maxDigits || i < -3) {
+        // 本家: !suppressScientific のときのみ指数表記へ切替 (decimal G 精度 -1 は
+        // ECMA 規約で指数表記に切り替えない)
+        if (!suppressScientific && (i > maxDigits || i < -3)) {
             i = 1;
             scientific = true;
         }
@@ -456,9 +483,10 @@ public static class FormatSpecifiers {
         output.Append(buffer, t, 10 - t);
     }
 
-    // ---- カスタム書式 (本家 NumberToStringFormat / FindSection の移植) ----
+    // ---- カスタム書式 (本家 NumberToStringFormat / FindSection の移植。
+    // decimal (DecimalFormatting) からも internal 共用する) ----
 
-    private static void NumberToStringFormat(Out output, NumberBuffer number, string format) {
+    internal static void NumberToStringFormat(Out output, NumberBuffer number, string format) {
         var sectionStart = FindSection(format, number.Count == 0 ? 2 : number.Negative ? 1 : 0);
 
         // 第 1 パスの走査結果 (ゼロセクション再走査で書き直るためループ外で宣言)

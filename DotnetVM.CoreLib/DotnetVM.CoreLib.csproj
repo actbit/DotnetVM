@@ -4,8 +4,14 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- 外部依存なし (BCL の使用も最小面に限定)。VM が IL を直接実行するため
-         span / pointer / ref 戻り値等の表現境界面は使わない -->
+    <!-- 外部依存なし (BCL の使用を最小限に絞る)。VM が IL を直接実行するため
+         span / pointer / ref 戻り値等の表現面は使わない -->
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- CLR 突合テストから内部移植面 (Mul64x64 等の下請け) を検査できるようにする -->
+    <InternalsVisibleTo Include="DotnetVM.Tests" />
+  </ItemGroup>
+
 </Project>
+

@@ -45,6 +45,9 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     private readonly ExceptionDispatcher _exceptionDispatcher;
     /// <summary>loader ごとのエンジンセット (多アセンブリ実行: メソッドの所属画像で token 解決する)。</summary>
     private readonly Dictionary<TypeLoader, LoaderEngines> _engines = [];
+    /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは 1 つ)。</summary>
+    private readonly UnifiedStaticStorage _unifiedStaticStorage = new();
+    private bool? _enginesRegisteredRootKey;
     // 実行中フレームの一覧 (GC ルート源。Invoke の呼出チェーン = フレームチェーン)
     private readonly List<InterpreterFrame> _liveFrames = [];
     private long _instructionCount;
@@ -96,7 +99,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             : _engines[loader] = CreateEngines(loader, _services.Strings);
     }
 
-    /// <summary>loader のエンジンセットを構築する (文字列プールは VM 単位で共有)。</summary>
+    /// <summary>loader のエンジンセットを構築する (文字列プール・静的ストレージは VM 単位で共有)。</summary>
     private LoaderEngines CreateEngines(TypeLoader loader, VmStringPool strings) {
         var intrinsicContext = new IntrinsicContext {
             Console = _console,
@@ -112,7 +115,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             StringType = _stringType,
         };
         var preparer = new MethodPreparer(loader);
-        var objects = new ObjectEngine(services, this, this);
+        var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);
         // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
@@ -121,11 +124,15 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         intrinsicContext.CurrentMethodHook = () =>
             _liveFrames.Count > 0 ? _liveFrames[^1].Method : null;
         // GC ルート源の登録: 静的ストレージ / intrinsic 静的フィールド (フレームは Interpreter 単位で登録済み)
+        // 共有静的ストレージ (UnifiedStaticStorage) は全画像で共通の 1 件として VM 単位で 1 回登録する
+        if (ReferenceEquals(_enginesRegisteredRootKey, null)) {
+            _heap.AddRootSlotSource(() => _unifiedStaticStorage?.EnumerateRoots().ToArray() ?? []);
+            _enginesRegisteredRootKey = true;
+        }
         _heap.AddRootSlotSource(services.Objects.EnumerateStaticStorage);
         _heap.AddRootSlotSource(() => objects.IntrinsicStaticFields.ToArray());
         return new LoaderEngines { Services = services, Preparer = preparer, Objects = objects, Calls = calls, Exceptions = exceptions };
     }
-
     /// <summary>文字列プール (VM ファサードから参照用)。</summary>
     public VmStringPool Strings => _services.Strings;
 

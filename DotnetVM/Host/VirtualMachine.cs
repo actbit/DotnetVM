@@ -282,7 +282,7 @@ public sealed class VirtualMachine : IDisposable {
         SigKind.Object => value is null or string or VmObject
             or int or uint or byte or sbyte or short or ushort or long or ulong or bool or char or float or double,
         SigKind.SzArray => value is null or VmObject or System.Array,
-        SigKind.TypeToken or SigKind.GenericInst => value is null or VmObject,
+        SigKind.TypeToken or SigKind.GenericInst => value is null or VmObject or decimal,
         SigKind.Void => false,
         _ => value is null,
     };
@@ -295,6 +295,7 @@ public sealed class VirtualMachine : IDisposable {
             (SigKind.I8, long) or (SigKind.R8, double) => 2,
             (SigKind.R4, float) => 2,
             (SigKind.String, string) => 2,
+            (SigKind.TypeToken, decimal) => 3,
             (SigKind.Object, string) => 1,
             _ => 0,
         };
@@ -321,6 +322,10 @@ public sealed class VirtualMachine : IDisposable {
             ulong ul => Prim(type, interpreter, "System.UInt64", StackSlot.OfInt64((long)ul)),
             float f => Prim(type, interpreter, "System.Single", StackSlot.OfFloat(f)),
             double d => Prim(type, interpreter, "System.Double", StackSlot.OfFloat(d)),
+            // decimal は VM 側一般为構造体値 (System.Decimal 統合型) で表現されるため、
+            // フィールドスロット (_flags / _hi32 / _lo64。.NET 10 CoreLib レイアウト) を
+            // 構築する (相互の型同一性は C2 統合辞書の実型 = CoreLib TypeDef)
+            decimal d => VMDecimalToSlot(d, type, interpreter),
             string s => StackSlot.OfObject(interpreter.Strings.GetOrNew(s)),
             // ホスト配列 → VM 配列 (SzArray パラメータ。要素はホスト境界で再帰変換)
             System.Array array when type.Kind == SigKind.SzArray => HostArrayToSlot(array, type, interpreter),
@@ -375,10 +380,73 @@ public sealed class VirtualMachine : IDisposable {
         StackKind.Object => slot.ObjectValue switch {
             null => null,
             VmString s => s.Value,
+            // System.Decimal box (object 経由の戻り値) → ホスト decimal
+            VmBoxedValue boxed when boxed.Type.FullName == "System.Decimal" =>
+                DecodeDecimal(new VmStructValue(boxed.Type, boxed.Fields)),
             var other => other, // VmClassInstance/VmArray/VmBoxedValue は VM オブジェクトのまま返す
         },
+        // System.Decimal (統合実型) 構造体値 → ホスト decimal
+        StackKind.ValueType when slot.ObjectValue is VmStructValue sv && sv.StructType.FullName == "System.Decimal" =>
+            DecodeDecimal(sv),
+        StackKind.ValueType => slot.ObjectValue, // その他の構造体値は VM オブジェクトのまま返す
         _ => throw new InvalidOperationException($"戻り値スロット {slot.Kind} はホスト値に変換できません。"),
     };
+
+    /// <summary>ホスト decimal → VM 構造体値 (System.Decimal 実型。CoreLib ロード時に統合される)。
+    /// フィールドは .NET 10 CoreLib の宣言順 (_flags int32 / _hi32 uint32 / _lo64 uint64)。</summary>
+    private static StackSlot VMDecimalToSlot(decimal value, SigType declared, Interpreter interpreter) {
+        if (declared.Kind != SigKind.TypeToken)
+            throw new ArgumentException("decimal 引数は ValueType 署名 (TypeToken) での渡しのみ対応しています。");
+        var cls = FindDecimalType(interpreter.Loader)
+            ?? throw new InvalidOperationException("System.Decimal (CoreLib 実型) がロードされていません。");
+        var bits = decimal.GetBits(value);
+        var lo64 = (ulong)(uint)bits[0] | ((ulong)(uint)bits[1] << 32);
+        var fields = new StackSlot[cls.Fields.Count(f => !f.IsStatic && !f.IsLiteral)];
+        var index = 0;
+        foreach (var field in cls.Fields) {
+            if (field.IsStatic || field.IsLiteral)
+                continue;
+            fields[index++] = field.Name switch {
+                "_flags" => StackSlot.OfInt32(bits[3]),
+                "_hi32" => StackSlot.OfInt32(bits[2]),
+                "_lo64" => StackSlot.OfInt64((long)lo64),
+                _ => StackSlot.OfInt32(0),
+            };
+        }
+        return StackSlot.OfValueType(new VmStructValue(cls, fields));
+    }
+
+    /// <summary>CoreLib 実型の System.Decimal (統合された VmClassType) を探す。
+    /// Context に登録された画像から CoreLib の TypeDef / System.Decimal を解決
+    /// (CoreLib の画像を優先。C2 型ユニフィケーションの統一規約と同一)。</summary>
+    private static VmClassType? FindDecimalType(TypeLoader loader) {
+        foreach (var candidate in loader.Context?.Loaders ?? []) {
+            if (candidate.FindTypeByFullName("System.Decimal") is not VmClassType cls)
+                continue;
+            if (candidate.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true)
+                return cls;
+        }
+        return null;
+    }
+
+    private static decimal DecodeDecimal(VmStructValue sv) {
+        int iFlags = -1, iHi = -1, iLo = -1, index = 0;
+        foreach (var field in ((VmClassType)sv.StructType).Fields) {
+            if (field.IsStatic || field.IsLiteral) continue;
+            switch (field.Name) {
+                case "_flags": iFlags = index; break;
+                case "_hi32": iHi = index; break;
+                case "_lo64": iLo = index; break;
+            }
+            index++;
+        }
+        if (iFlags < 0 || iHi < 0 || iLo < 0)
+            throw new InvalidOperationException("System.Decimal 構造体のフィールドレイアウトを解決できません。");
+        var flags = (int)sv.Fields[iFlags].Int64Value;
+        var hi = (uint)sv.Fields[iHi].Int64Value;
+        var lo64 = (ulong)sv.Fields[iLo].Int64Value;
+        return new decimal((int)(uint)lo64, (int)(uint)(lo64 >> 32), (int)hi, flags < 0, (byte)((flags >> 16) & 0xFF));
+    }
 
     public void Dispose() {
         _loaders.Clear();

@@ -109,6 +109,129 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Object", "GetType", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (CoreLib IL は GetMethodTable → MethodTable 内部表現へ直接アクセス)", hasThis: true, paramCount: 0);
 
+        // ---- CoreLibBindings: System.Decimal (C5.5 探査継続) ----
+        // 本家 IL 本体は Decimal ↔ DecCalc の Unsafe.As 参照再解釈 (同一ビット列の型視点差し替え) で
+        // 構成されるため VM のオブジェクト表現 (VmStructValue スロット列) では IL 実行にできない。
+        // 実 CLR も JIT intrinsic / ランタイム内部で処理する面と同型のため、同一意味論の
+        // ホスト BCL 実装へ委譲し、戻り値は VM の System.Decimal 構造体値に正規化
+        var decJ = RuntimeRepresentation +
+            " (本家 IL は Decimal ↔ DecCalc の Unsafe.As 参照再解釈で構成され VM のオブジェクト表現では IL 実行にできない。実 CLR も JIT intrinsic / 内部面として処理。ホスト同一意味論へ委譲、結果は VM 構造体値に正規化。ToString 書式面は (b) DecimalFormatting)";
+        Add("System.Decimal", "Parse", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "TryParse", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Addition", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Subtraction", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Multiply", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Division", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Remainder", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_UnaryNegation", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Add", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Subtract", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Multiply", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Divide", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Equality", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Inequality", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_GreaterThan", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_LessThan", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_GreaterThanOrEqual", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_LessThanOrEqual", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Compare", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Implicit", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "op_Explicit", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Round", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Truncate", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Floor", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+        Add("System.Decimal", "Ceiling", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
+
+        // ---- CoreLibBindings: System.Math (拡張 overload / JIT intrinsic 面) ----
+        // 本家 IL は double 丸め機構 (ModF InternalCall / fixed バッファ) と JIT intrinsic で
+        // 構成されるため VM の表現境界。ホスト同一意味論へ委譲し結果は VM スロットに正規化。
+        // 基本算術面 (Abs / Sqrt 等) は既存の一般経路 (② IL 実行 / ③ legacy) のまま
+        var mathJ = RuntimeRepresentation +
+            " (本家 IL は ModF InternalCall / fixed バッファの丸め核と JIT intrinsic で構成 = VM 表現境界。ホスト同一意味論へ委譲)";
+        Add("System.Math", "ModF", CoreLibSurfaceKind.RuntimeInternal,
+            InternalCall + " (CoreLib IL の double 丸め核が呼ぶ InternalCall 面。本家筐体は QCall 相当の double* 署名で呼ぶため両形状を登録。戻り = 整数部 / out 参照先 = 小数部)", hasThis: false);
+        Add("System.Math", "Round", CoreLibSurfaceKind.RuntimeInternal, mathJ, hasThis: false);
+        Add("System.Math", "Truncate", CoreLibSurfaceKind.RuntimeInternal, mathJ, hasThis: false);
+        Add("System.Math", "BigMul", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + "。ホスト同一面 (64bit 積) で提供", hasThis: false);
+        Add("System.Math", "ILogB", CoreLibSurfaceKind.RuntimeInternal, mathJ, hasThis: false);
+        Add("System.Math", "ScaleB", CoreLibSurfaceKind.RuntimeInternal, mathJ, hasThis: false);
+        Add("System.Math", "Sign", CoreLibSurfaceKind.RuntimeInternal, mathJ, hasThis: false);
+        Add("System.Math", "CopySign", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + "。ホスト同一面で提供", hasThis: false);
+        Add("System.Math", "MaxMagnitude", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + "。ホスト同一面で提供", hasThis: false);
+        Add("System.Math", "FusedMultiplyAdd", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + "。ホスト同一面 (IEEE 754 FMA) で提供", hasThis: false);
+        Add("System.Math", "DivRem", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " ( managed 戻り ValueTuple 面。VM は ValueTuple`2 構造体値を構築して返す)", hasThis: false);
+
+        // ---- CoreLibBindings: string 整形 / SCI overload 面 (C5.5 探査継続) ----
+        // 本家 IL は Span / fixed char* 内部 (PadLeft/PadRight の SpanFill、Remove の
+        // Substring+InnerAlloc 連鎖) と SCI 抽象化面 (SIMD ignore-case = ISimdVector static
+        // abstract = VM 表現境界) で構成される。整形面はホスト ordinal 同意味論、SCI overload 群は
+        // culture 面 (下記) と同じ不変カルチャ写像で提供する
+        var cultureFaceJ = CultureOutOfScope +
+            "。本家 IL は CompareInfo (culture 機構) で構成され IL 移植対象外のため、不変カルチャ固定のホスト BCL 委譲を継続する (C5.5 Wave 5 で CurrentCulture から不変へ修正)";
+        var stringFill = RuntimeRepresentation +
+            " (本家 IL は SpanFill / InnerAlloc の fixed char* 内部 = VM 表現境界。ホスト ordinal 同意味論へ委譲)";
+        Add("System.String", "Remove", CoreLibSurfaceKind.RuntimeInternal, stringFill, hasThis: true);
+        Add("System.String", "PadLeft", CoreLibSurfaceKind.RuntimeInternal, stringFill, hasThis: true);
+        Add("System.String", "PadRight", CoreLibSurfaceKind.RuntimeInternal, stringFill, hasThis: true);
+        Add("System.String", "StartsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true);
+        Add("System.String", "EndsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true);
+        Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true);
+        Add("System.String", "Join", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (連結本体は wstrcpy 生ポインタコピー面。要素の ToString は VM の暗黙 ToString フック経由で正規化)", hasThis: false);
+
+        // ---- CoreLibBindings: System.TimeSpan / System.DateTime 面 (C5.5 探査テスト継続) ----
+        // culture 依存 IL 面の不変カルチャ委譲 (TimeSpan.Parse/ToString, DateTime.Parse/ToString/
+        // AddDays/AddYears/DateToTicks/DayOfWeek.ToString): 本家 IL は CultureInfo /
+        // DateTimeFormatInfo / CompareInfo / Calendar (DaysToMonth365/366 FieldRVA static array +
+        // RuntimeHelpers.CreateSpan + RuntimeFieldHandle.m_ptr) の culture 機構全面を辿るため
+        // VM 表現境界。VM 規約 (文化は不変カルチャ固定) と CLR の統合文化構成 (文化面の
+        // InvariantCulture 委譲) でクラッチ均衡する
+        var timeCultureJ = CultureOutOfScope +
+            "。本家 IL は CultureInfo / DateTimeFormatInfo / Calendar (DaysToMonth365/366 の FieldRVA static array + RuntimeHelpers.CreateSpan 面 +" +
+            "RuntimeFieldHandle.m_ptr ByRef 読み) の culture 機構全面を辿るため、不変カルチャ固定のホスト BCL 委譲を継続する";
+        Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 0);
+        Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 1);
+        Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 2);
+        Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
+        Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
+        Add("System.DateTime", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
+        Add("System.DateTime", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
+        Add("System.DateTime", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 0);
+        Add("System.DateTime", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 1);
+        Add("System.DateTime", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 2);
+        Add("System.DateTime", "AddDays", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 1);
+        Add("System.DateTime", "AddYears", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 1);
+        Add("System.DateTime", "DateToTicks", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 3);
+
+        // ---- CoreLibBindings: System.Type / Enum / Unsafe / RuntimeHelpers runtime-representation 面 ----
+        // Type 面 (culture 機構 IL が辿る RuntimeType 判定群): 本家 IL は RuntimeType 内部表現 (IL なし = ランタイム intrinsic) を辿るため VM 型モデル
+        var typeRuntimeJ = RuntimeRepresentation +
+            " (本家 IL は RuntimeType 内部表現へ直接アクセス (culture 機構 / Dictionary cache IL から依存))。VM 型モデル (VmType) から同一要素を提示する";
+        Add("System.Type", "get_BaseType", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "get_TypeHandle", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "IsValueTypeImpl", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "get_IsValueType", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "IsSubclassOf", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        // Enum ToString (culture-dependent type-face IL): enum Face文化 CultureData文化 culture IL CultureCulture文化 representation
+        Add("System.Enum", "ToString", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (本家 IL は FormatFeatures / CultureInfo 面を辿る culture 機構 depende の G 書式面。VM enum box の value__ 基底型生値をホストの同名 enum (CoreLib typedef 同名照合) で文字列化)", hasThis: true, paramCount: 0);
+        // Unsafe.CopyBlockUnaligned 群: jit intrinsic (byte copy 裏の memmove 面)
+        Add("System.Runtime.CompilerServices.Unsafe", "CopyBlockUnaligned", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。String / Span IL が バイト実体コピー (byteCount) に Talent → Buffer.Memmove 相当の memmove で同等提供)", hasThis: false);
+        // RuntimeHelpers の判別面 (SpanHelpers / DateToTicks IL が辿る generic 判定面)
+        Add("System.Runtime.CompilerServices.RuntimeHelpers", "IsBitwiseEquatable", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。T を メソッド型実引数で判別: 数値 / char / bool 系 true)", hasThis: false);
+        Add("System.Runtime.CompilerServices.RuntimeHelpers", "IsKnownConstant", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。VM は JIT 定数畳み込みを持たないため false を返し恒常経路へ誘導)", hasThis: false);
+        // IUtfChar<T> の jit intrinsic 面 (string/span char genericIL が辿る T(char) 再解釈面)
+        Add("System.IUtfChar`1", "CastFrom", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。T(char) 系の i4 スロット再解釈で透過)", hasThis: false);
+
         // ---- CoreLibBindings: System.SR (CoreLib 内部リソース文字列) ----
         // 実 IL が例外生成時に SR.Overflow_Int32 等を辿る先。culture 機構 (ResourceManager) 依存
         var srJ = CultureOutOfScope + "。CoreLib の例外既定文言は ResourceManager (culture 機構) 依存のためホスト CoreLib から同一キー資源を取得";
@@ -134,17 +257,28 @@ internal static class CoreLibSurfaceAudit {
         // Contains / Replace) と Format / Split は (b) 置換面 (VmCoreLibSurfaces.Faces →
         // DotnetVM.CoreLib.StringOrdinalOps / StringFormatting) に移行済み。
         // 各エントリは「ロード時 (b) 置換面 / 未ロード時 ③ legacy キー」の代替経路を併記する
-        var cultureFaceJ = CultureOutOfScope +
-            "。本家 IL は CompareInfo (culture 機構) で構成され IL 移植対象外のため、不変カルチャ固定のホスト BCL 委譲を継続する (C5.5 Wave 5 で CurrentCulture から不変へ修正)";
         Add("System.String", "Concat", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (連結本体は実 IL の wstrcpy 生ポインタコピー / 正確な容量計算面。要素の ToString 面は Wave 4 で実 IL 化済み)", hasThis: false, paramCount: 1);
         Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: false, paramCount: 2);
+        // StringComparison overload 群: 本家 IL は ordinal 面と CompareInfo / SpanHelpers SIMD
+        // 抽象化面 (EqualsIgnoreCase_Vector は ISimdVector static abstract = VM 表現境界) に
+        // 分かれるため culture 面と同じホスト BCL 委譲。CurrentCulture 系 SCI は不変へ写像
+        Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ +
+            "。StringComparison 分岐後 ordinal 面は String.CompareOrdinal 直呼びに置換されるが SIMD ignore-case 面が culture / GSJA 抽象化に依存するため委譲に統一", hasThis: false, paramCount: 3);
+        Add("System.String", "Equals", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ +
+            "。OrdinalIgnoreCase は SpanHelpers SIMD 抽象化 (ISimdVector static abstract) を辿るため委譲に統一", hasThis: false, paramCount: 3);
+        Add("System.String", "Equals", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ +
+            "。OrdinalIgnoreCase は SpanHelpers SIMD 抽象化 (ISimdVector static abstract) を辿るため委譲に統一", hasThis: true, paramCount: 2);
         Add("System.String", "CompareOrdinal", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (実 IL は fixed byte* 比較。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: false, paramCount: 2);
         Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
             cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
+        Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
+            cultureFaceJ + "。IndexOf(string, StringComparison) overload (SCI 面を不変カルチャ写像)。本家 IL は SpanHelpers SIMD ignore-case 抽象化を辿るため委譲", hasThis: true, paramCount: 2);
         Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
             cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
+        Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
+            cultureFaceJ + "。LastIndexOf(string, StringComparison) overload (SCI 面を不変カルチャ写Map)。SIMD 抽象化のため委譲", hasThis: true, paramCount: 2);
         Add("System.String", "Contains", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true, paramCount: 1);
         Add("System.String", "StartsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true, paramCount: 1);
@@ -155,6 +289,14 @@ internal static class CoreLibSurfaceAudit {
             RuntimeRepresentation + " (実 IL は StringBuilder チャンク + Span 解析。ロード時は (b) 置換面 StringFormatting、未ロード時この legacy キー)", hasThis: false);
         Add("System.String", "Split", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (SpanHelpers 依存の表現境界面。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true);
+
+        // ---- CoreLibBindings: System.Char culture 面 (C5.5 Wave 5 継続) ----
+        var charCultureJ = CultureOutOfScope +
+            "。本家 IL は CultureInfo.CurrentCulture.TextInfo (culture 機構) を辿るため不変カルチャ規約どおりホストの不変面へ委譲";
+        Add("System.Char", "ToUpper", CoreLibSurfaceKind.RuntimeInternal, charCultureJ, hasThis: false, paramCount: 1);
+        Add("System.Char", "ToLower", CoreLibSurfaceKind.RuntimeInternal, charCultureJ, hasThis: false, paramCount: 1);
+        Add("System.Char", "GetNumericValue", CoreLibSurfaceKind.RuntimeInternal,
+            InternalCall + "。Unicode 数字値 (ネイティブ Unicode テーブル)。ホスト同一面で提供", hasThis: false, paramCount: 1);
 
         // ---- CoreLibBindings: String 内部 / Buffer / Unsafe / MemoryMarshal ----
         Add("System.String", "FastAllocateString", CoreLibSurfaceKind.RuntimeInternal,
@@ -181,6 +323,30 @@ internal static class CoreLibSurfaceAudit {
             RuntimeRepresentation + " (VM 型モデルで参照含有を再帰判定)", hasThis: false, paramCount: 1);
         Add("System.Runtime.CompilerServices.RuntimeHelpers", "IsReferenceOrContainsReferences", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (ジェネリック ラッパー面。メソッド型実引数から判定)", hasThis: false);
+
+        // ---- CoreLibBindings: Vector64/128/256/512 ----
+        // VM は SIMD 値型の inline 表現を持たないため true にすると SpanHelpers 等が
+        // SIMD 面で fail-closed に落ちる。false を返して scalar フォールバック IL へ誘導
+        // (string SCI overload 群は同一結果を得る)。直接観測時の実 x64 CLR (true) との
+        // 既知差異 = SIMD 表現境界
+        var vectorJ = RuntimeRepresentation +
+            " (実 IL はダミー自己再帰、実 CLR も JIT がハードウェア判定へ置換。VM は SIMD 値型表現を持たないため false を返し scalar フォールバックへ誘導)";
+        foreach (var t in new[] { "System.Runtime.Intrinsics.Vector64", "System.Runtime.Intrinsics.Vector128", "System.Runtime.Intrinsics.Vector256", "System.Runtime.Intrinsics.Vector512" }) {
+            Add(t, "get_IsHardwareAccelerated", CoreLibSurfaceKind.RuntimeInternal, vectorJ, hasThis: false, paramCount: 0);
+        }
+
+        // ---- CoreLibBindings: 環境 / Marshal lastError / GlobalizationMode (C5.5 探査テスト継続) ----
+        var marshalLastErrorJ = InternalCall +
+            "。実 CLR も last-error TLS スロットの取得/設定 (ECall 面)。VM はネイティブ呼びを持たないため同一スロットの set/get 対として成立";
+        Add("System.Runtime.InteropServices.Marshal", "SetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
+        Add("System.Runtime.InteropServices.Marshal", "GetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        // SystemError/PInvokeError は実 CLR でも同一スロットの alias 面
+        Add("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
+        Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
+            "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
+        Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
+            InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 
         // ---- DefaultIntrinsics: DefaultInterpolatedStringHandler ----
         var dishJ = RuntimeRepresentation +
@@ -241,6 +407,20 @@ internal static class CoreLibSurfaceAudit {
 
         // ---- DefaultIntrinsics: Interlocked (計算 + バリア) ----
         var interlockedJ = JitIntrinsic + " (単一スレッド逐次実行で計算面は CLR 同一、バリアは no-op)";
+        // ① バインド (CoreLibBindings.RegisterInterlockedBindings) は統合面 (AnyParams)。
+        // 本家 IL 本体が JIT intrinsic ダミー (typeof(T); throw) のため ② IL 実行に落ちないよう
+        // ① で受ける必要がある (探査テストで発掘: CultureInfo::get_InvariantCulture 経路)
+        Add("System.Threading.Interlocked", "CompareExchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "Exchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "Add", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "Increment", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "Decrement", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "And", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "Or", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "MemoryBarrier", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "ReadMemoryBarrier", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        Add("System.Threading.Interlocked", "WriteMemoryBarrier", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);
+        // 以下は legacy intrinsic (③) 残置の特定エントリ (IL 本体なし経路)
         Add("System.Threading.Interlocked", "CompareExchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: 3);
         Add("System.Threading.Interlocked", "CompareExchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: 4);
         Add("System.Threading.Interlocked", "Exchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: 2);

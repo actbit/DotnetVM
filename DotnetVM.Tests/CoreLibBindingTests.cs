@@ -137,7 +137,13 @@ public class CoreLibBindingTests {
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "Write"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "WriteLine"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "ReadLine"));
-        // P/Invoke 代替バインドは既定で登録されていない (未登録 P/Invoke は fail-closed)
-        Assert.DoesNotContain(vm.Bindings, b => b.Origin == BindingOrigin.PInvokeReplacement);
+        // P/Invoke 代替バインドは監査表に載った例外面のみ (未登録 P/Invoke は fail-closed のまま、
+        // PInvoke_Is_Rejected_As_OperationNotAllowed が検査)。既定登録の PInvokeReplacement は
+        // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現) に限る
+        var pinvokeFaces = vm.Bindings
+            .Where(b => b.Origin == BindingOrigin.PInvokeReplacement)
+            .Select(b => $"{b.Key.TypeFullName}::{b.Key.MethodName}")
+            .ToList();
+        Assert.Equal(new[] { "Interop+Kernel32::GetEnvironmentVariable" }, pinvokeFaces);
     }
 }

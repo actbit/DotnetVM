@@ -125,6 +125,16 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Double", "Parse", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String", "System.Object"]),
         ("System.Single", "Parse", ["System.String", "System.Globalization.NumberStyles", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String", "System.Int32", "System.Object"]),
         ("System.Double", "Parse", ["System.String", "System.Globalization.NumberStyles", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String", "System.Int32", "System.Object"]),
+        // ---- C5.5 Wave 3 続き: decimal 書式 overload (DecimalFormatting)。実在側は
+        // Number.FormatDecimal (byte* 生ポインタ + NumberBuffer + DecCalc 96 ビット除算)
+        // で構成され VM の表現モデルに落ちないため、DotnetVM.CoreLib.DecimalFormatting
+        // (dotnet/runtime MIT ソースのポインタなし移植・不変カルチャ固定) へ差し替える。
+        // 96 ビット分解は実在 GetBits (managed IL) を VM の IL 実行で辿る
+        ("System.Decimal", "ToString", [], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
+        ("System.Decimal", "ToString", ["System.String"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String"]),
+        ("System.Decimal", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
+        ("System.Decimal", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String"]),
+        ("System.Convert", "ToString", ["System.Decimal"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
         // Convert の文字列⇔浮動小数点変換 (Convert.ToDouble/ToSingle(string[, provider]) は
         // NumberStyles.Float | AllowThousands の不変カルチャ解析。ToString(Double/Single) は
         // 実 IL が value.ToString(provider) を直接呼ぶが、面自体も置換面で受ける

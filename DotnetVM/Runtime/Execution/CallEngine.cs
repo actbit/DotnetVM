@@ -37,6 +37,22 @@ internal sealed class CallEngine(
         for (var i = target.Arity - 1; i >= 0; i--)
             args[i] = caller.Stack.Pop();
 
+        // constrained. 付けた値型レシーバの前処理 (ECMA III.2.2): 値型レシーバ (生 i4/i8 スロット,
+        // null/ByRef 以外) を同値型でボックス化しておく。仮想ディスパッチ (レシーバ実行時型)
+        // と constrained. 多重面の intrinsic 受けの両方で同じ形状を用いる
+        // (例: constrained. DayOfWeek + callvirt Object::ToString → enum box の ToString 面へ
+        // 仮想ディスパッチが実行時型 (DayOfWeek) で解決される)
+        if (constrainedToken != 0 && isCallvirt && target.HasThis &&
+            args[0].Kind is not (StackKind.Object or StackKind.ByRef)) {
+            var constrainedType = _objectEngine.ResolveTypeToken(constrainedToken, caller.Context);
+            if (constrainedType.IsValueType) {
+                var fields = args[0].Kind == StackKind.ValueType
+                    ? ((VmStructValue)args[0].ObjectValue!).Clone().Fields
+                    : [args[0]];
+                args[0] = StackSlot.OfObject(_heap.Allocate(new VmBoxedValue(constrainedType, fields)));
+            }
+        }
+
         // デリゲート実体の callvirt Invoke (カスタム delegate 宣言の abstract Invoke / Action・Func
         // ファサードの未登録面の両方をここで引き受ける)。null レシーバは NRE
         if (isCallvirt && target.HasThis && target.Name is "Invoke" or "BeginInvoke") {
@@ -481,13 +497,30 @@ internal sealed class CallEngine(
         VmType[]? classArgs = null) {
         result = null;
         var names = ParamTypeNamesOf(method, methodArgs, classArgs);
-        if (names is null || names.Any(string.IsNullOrEmpty))
-            return false;
+        if (names is null || names.Any(string.IsNullOrEmpty)) {
+            // ジェネリック未解決 (!!) 等で正確キーが構築できない場合でも、全引数一致面
+            // (AnyParams バインド) は引数型名なしで受けられる (Interlocked.CompareExchange<T>
+            // 等、JIT intrinsic ダミー IL を持つ面を ② IL 実行に落とさないための救済)
+            var anyKey = method.Signature.HasThis
+                ? BindingKey.InstanceAnyParams(method.DeclaringType.FullName, method.Name)
+                : BindingKey.StaticAnyParams(method.DeclaringType.FullName, method.Name);
+            if (!_intrinsics.TryGetBinding(anyKey, out var anyImpl, out _))
+                return false;
+            NormalizeByRefReceiver(method, args);
+            _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
+            result = InvokeDelegated(anyImpl, [], args);
+            return true;
+        }
         var declaringName = method.DeclaringType.FullName;
+        // 戻り型名をキーに含める (op_Implicit / op_Explicit 群のように同一パラメータ列で
+        // 戻り型のみ異なる面を区別する)。既存の全登録面は戻り型ワイルドカードなので、
+        // 実引数キー (精密) → 戻り型ワイルドカードキーの順に照合して後方互換を保つ
+        var returnName = DescribeBindingType(method.Signature.ReturnType, methodArgs, classArgs, method.Loader) ?? "";
         var key = method.Signature.HasThis
-            ? BindingKey.Instance(declaringName, method.Name, names)
-            : BindingKey.Static(declaringName, method.Name, names);
-        if (!_intrinsics.TryGetBinding(key, out var impl, out _))
+            ? BindingKey.InstanceWithReturn(declaringName, method.Name, returnName, names)
+            : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);
+        if (!_intrinsics.TryGetBinding(key, out var impl, out _) &&
+            (returnName.Length == 0 || !_intrinsics.TryGetBinding(key.WithAnyReturn(), out impl, out _)))
             return false;
         NormalizeByRefReceiver(method, args);
         // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の
@@ -710,7 +743,7 @@ internal sealed class CallEngine(
                     // ただし表現境界 (委譲継続面) の実型 IL には落ちない (① → ③ → ④ のみ)
                     if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass &&
                         !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
-                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes);
+                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes, signature.ReturnType);
                         if (resolved is { Body: not null })
                             return new CallTarget {
                                 Arity = arity,
@@ -939,10 +972,15 @@ internal sealed class CallEngine(
     /// <summary>宣言署名 (名前 + パラメータ型) でメソッドを探す (継承チェーンを辿る。抽象宣言も解決対象)。
     /// スロットキーが一致する候補を署名精度で優先し、無い場合は従来どおり名前+パラメータ数の
     /// 最初の一致にフォールバックする (ジェネリック変数の文脈差等でキー照合できない呼出の救済)。</summary>
-    private VmMethod? FindMethodThroughChain(VmClassType type, string name, SigType[] paramTypes) {
+    private VmMethod? FindMethodThroughChain(VmClassType type, string name, SigType[] paramTypes, SigType? returnType = null) {
         var queryKey = _loader.TryResolveSlotParams(paramTypes) is { } parameters
             ? VmSlotKeys.Of(name, parameters) : null;
+        // 戻り型で区別される面 (decimal の op_Implicit / op_Explicit 群) は戻り型名も照合する。
+        // 戻り型名は候補メソッドの宣言ローダで解決する (トークンは自画像の TypeDef rid を指すため)。
+        // どちらかが解決できない場合はワイルドカード (従来動作) に倒す
+        var returnName = SafeDescribeReturn(returnType);
         VmMethod? byParamCount = null;
+        VmMethod? byParamCountAndReturn = null;
         for (VmType? t = type; t is not null;) {
             if (t is VmConstructedType constructed)
                 t = constructed.Definition;
@@ -951,17 +989,41 @@ internal sealed class CallEngine(
             foreach (var method in cls.Methods) {
                 if (method.Name != name)
                     continue;
-                if (queryKey is not null && method.SlotKey == queryKey)
-                    return method; // 署名一致 (オーバーロード誤解決の解消)
+                var matchedReturn = true;
+                if (returnName is not null)
+                    matchedReturn = string.Equals(SafeDescribeReturn(method.Signature.ReturnType, method.Loader), returnName, StringComparison.Ordinal);
+                if (matchedReturn) {
+                    if (queryKey is not null && method.SlotKey == queryKey)
+                        return method; // 署名一致 (オーバーロード誤解決の解消)
+                    if (byParamCountAndReturn is null && method.Signature.ParamTypes.Length == paramTypes.Length)
+                        byParamCountAndReturn = method;
+                }
                 if (byParamCount is null && method.Signature.ParamTypes.Length == paramTypes.Length)
                     byParamCount = method;
             }
             t = cls.BaseType;
         }
-        return byParamCount;
+        return byParamCountAndReturn ?? byParamCount;
     }
 
     // ---- 宣言上のパラメータ型名 (i4 統合面のオーバーロード判別) ----
+
+    /// <summary>戻り型の完全名 (FindMethodThroughChain の戻り型照合用)。candidate のトークン解決は
+    /// 候補メソッドの宣言ローダで行う (トークンは自画像の TypeDef rid を指すため)。解決不能 /
+    /// 例外時は null (照合をワイルドカードに倒す)。</summary>
+    private string? SafeDescribeReturn(SigType? type, TypeLoader? loader = null) {
+        if (type is null)
+            return null;
+        try {
+            if (type.Kind == SigKind.Void)
+                return "";
+            return type.Kind == SigKind.TypeToken || type.Kind == SigKind.GenericInst
+                ? (loader ?? _loader).ResolveToken(type)?.FullName
+                : DescribeBindingType(type, null, null, loader ?? _loader);
+        } catch (Exception) {
+            return null;
+        }
+    }
 
     /// <summary>署名上のパラメータ型名を得る (intrinsic ゲートが IntrinsicContext に渡し、
     /// char / bool 等の i4 統合面のオーバーロード判別に使われる)。</summary>

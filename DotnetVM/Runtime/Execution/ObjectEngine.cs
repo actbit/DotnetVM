@@ -16,12 +16,16 @@ namespace DotnetVM.Runtime.Execution;
 internal sealed class ObjectEngine(
     InterpreterServices services,
     IExecutionGate gate,
-    IGuestInvoker invoker) {
+    IGuestInvoker invoker,
+    UnifiedStaticStorage? unifiedStaticStorage = null) {
     private readonly TypeLoader _loader = services.Loader;
     private readonly IntrinsicRegistry _intrinsics = services.Intrinsics;
     private readonly VmHeap _heap = services.Heap;
     private readonly IntrinsicContext _intrinsicContext = services.IntrinsicContext;
     private readonly ObjectModel _objects = services.Objects;
+    /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは CLR と同じく 1 つ)。
+    /// null = 単一画像実行 (既定動作の ObjectModel ローカル辞書に統一)。</summary>
+    private readonly UnifiedStaticStorage? _unifiedStaticStorage = unifiedStaticStorage;
 
     private readonly HashSet<VmType> _initializedTypes = [];
     // 構築ジェネリック型の .cctor 起動済み集合 (CLR と同じく実引数ごとに 1 回)
@@ -260,7 +264,7 @@ internal sealed class ObjectEngine(
                 var definition = (VmClassType)constructed.Definition;
                 EnsureConstructedInitialized(constructed);
                 var storage = _objects.GetOrCreateStaticStorage(constructed.FullName, definition, _loader,
-                    new GenericContext { ClassArgs = constructed.TypeArguments });
+                    new GenericContext { ClassArgs = constructed.TypeArguments }, _unifiedStaticStorage);
                 return new VmByRef(storage, ObjectModel.StaticFieldIndex(definition,
                     ResolveFieldToken(token, context)));
             }
@@ -280,7 +284,7 @@ internal sealed class ObjectEngine(
             return new VmByRef(storage, 0);
         }
         EnsureInitialized(owner);
-        var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader);
+        var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader, null, _unifiedStaticStorage);
         return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));
     }
 
@@ -502,12 +506,18 @@ internal sealed class ObjectEngine(
             args[i] = caller.Stack.Pop();
 
         if (owner.IsValueType) {
-            // 構造体の newobj: this (既定値) を作り、.ctor があればミューテートして this を返す
-            var structValue = _objects.DefaultStruct(owner, _loader);
-            args[0] = StackSlot.OfValueType(structValue);
+            // 構造体の newobj: this (既定値) を作り、.ctor があればミューテートして this を返す。
+            // this は書き込み可能スロット (VmByRef) で渡す — CoreLib の構造体 ctor は
+            // this = default の IL (initobj this) を持つことがあり (ReadOnlySpan 等)、
+            // this が値スロットだと initobj/ldobj/stobj のアドレス要求に落ちる。
+            // ctor 完了後のスロット値を戻り値とする
+            var thisStorage = new[] { StackSlot.OfValueType(_objects.DefaultStruct(owner, _loader)) };
+            args[0] = StackSlot.OfByRef(new VmByRef(thisStorage, 0));
             if (ctor.Body is not null)
                 invoker.Invoke(ctor, args, null);
-            return StackSlot.OfValueType(structValue);
+            return thisStorage[0].Kind == StackKind.ValueType
+                ? thisStorage[0]
+                : StackSlot.OfValueType(thisStorage[0]);
         }
 
         var instance = _heap.Allocate(new VmClassInstance(owner, _objects.CreateInstanceStorage(owner, _loader)));
@@ -553,11 +563,15 @@ internal sealed class ObjectEngine(
             args[i] = caller.Stack.Pop();
 
         if (definition.IsValueType) {
-            var structValue = _objects.DefaultStruct(definition, _loader, context, constructed.TypeArguments);
-            args[0] = StackSlot.OfValueType(structValue);
+            // 構造体 newobj も this を書き込み可能スロット (VmByRef) で渡す (上記非ジェネリック
+            // パスと同一規約 — initobj this を持つ CoreLib 構造体 ctor を受けるため)
+            var thisStorage = new[] { StackSlot.OfValueType(_objects.DefaultStruct(definition, _loader, context, constructed.TypeArguments)) };
+            args[0] = StackSlot.OfByRef(new VmByRef(thisStorage, 0));
             if (ctor?.Body is not null)
                 invoker.Invoke(ctor, args, context);
-            return StackSlot.OfValueType(structValue);
+            return thisStorage[0].Kind == StackKind.ValueType
+                ? thisStorage[0]
+                : StackSlot.OfValueType(thisStorage[0]);
         }
 
         var instance = _heap.Allocate(new VmClassInstance(definition,

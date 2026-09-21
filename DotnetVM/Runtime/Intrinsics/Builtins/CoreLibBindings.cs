@@ -22,14 +22,343 @@ internal static class CoreLibBindings {
         RegisterString(r);
         RegisterStringInternals(r);
         RegisterRuntimeHelpers(r);
+        RegisterVectorIntrinsics(r);
+        RegisterEnvironmentAndMarshal(r);
+        RegisterInterlockedBindings(r);
         RegisterObject(r);
         RegisterEnum(r);
         RegisterThreading(r);
         RegisterComparableInterfaces(r);
         RegisterPrimitiveToString(r);
+        RegisterDecimalBindings(r);
+        RegisterTimeCultureFaces(r);
+        RegisterMathBindings(r);
         RegisterSystemSr(r);
     }
 
+    // ---- System.Decimal (演算・変換・解析面) ----
+
+    /// <summary>decimal の演算 / 変換 / 解析面。
+    /// 本家 IL 本体は Decimal 構造体と内部 DecCalc 構造体の Unsafe.As 参照再解釈
+    /// (同一ビット列の型視点差し替え) で構成されるため、VM のオブジェクト表現
+    /// (VmStructValue のフィールドスロット列) では IL 実行にできない。
+    /// 実 CLR もこれらの面を JIT intrinsic / ランタイム内部として処理することと同型であるため、
+    /// 同一意味論のホスト BCL 実装へ委譲し、戻り値は VM の System.Decimal 構造体値に正規化する。
+    /// ToString 書式面は VmCoreLibSurfaces 経由の DotnetVM.CoreLib.DecimalFormatting
+    /// (不変カルチャ固定) が担当 (Faces 置換面が先に解決されるため共存は競合しない)。</summary>
+    private static void RegisterDecimalBindings(IntrinsicRegistry r) {
+        const string T = "System.Decimal";
+        const string Ret = "System.Decimal";
+        const string Styles = "System.Globalization.NumberStyles";
+        const string Midpoint = "System.MidpointRounding";
+
+        static string? S(StackSlot[] a, int i) => (a[i].ObjectValue as VmString)?.Value;
+
+        // ---- 解析面 (Parse / TryParse): 不変カルチャ規約固定 (VM 規約)。
+        //      Parse 失敗は本家と同じ FormatException / OverflowException (ゲスト例外化) を投げる
+        static StackSlot ParseImpl(IntrinsicContext ctx, StackSlot[] a, int styles) {
+            try {
+                return StackSlot.OfValueType(MakeDecimalStruct(ctx,
+                    decimal.Parse(S(a, 0) ?? "", (System.Globalization.NumberStyles)styles,
+                        System.Globalization.CultureInfo.InvariantCulture)));
+            } catch (FormatException) {
+                throw new UnhandledGuestException("System.FormatException", null);
+            } catch (OverflowException) {
+                throw new UnhandledGuestException("System.OverflowException", null);
+            }
+        }
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", Ret, ["System.String"]),
+            static (ctx, a) => ParseImpl(ctx, a, (int)System.Globalization.NumberStyles.Number),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", Ret, ["System.String", "System.IFormatProvider"]),
+            static (ctx, a) => ParseImpl(ctx, a, (int)System.Globalization.NumberStyles.Number),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", Ret, ["System.String", Styles]),
+            static (ctx, a) => ParseImpl(ctx, a, a[1].AsInt32),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", Ret, ["System.String", Styles, "System.IFormatProvider"]),
+            static (ctx, a) => ParseImpl(ctx, a, a[1].AsInt32),
+            BindingOrigin.Managed);
+        // TryParse (out decimal& を VmByRef 経由で書き込む)
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "TryParse", "System.Boolean", ["System.String", "System.Decimal&"]),
+            static (ctx, a) => {
+                decimal value = 0m;
+                bool ok;
+                try {
+                    value = decimal.Parse(S(a, 0) ?? "", System.Globalization.CultureInfo.InvariantCulture);
+                    ok = true;
+                } catch (FormatException) {
+                    ok = false;
+                } catch (OverflowException) {
+                    ok = false;
+                }
+                if (a[1].ObjectValue is VmByRef byref)
+                    byref.Slot = StackSlot.OfValueType(MakeDecimalStruct(ctx, ok ? value : 0m));
+                return StackSlot.OfInt32(ok ? 1 : 0);
+            },
+            BindingOrigin.Managed);
+
+        // ---- 96 ビット演算面 (ホスト BCL 委譲、結果は VM 構造体値に正規化)。
+        //      0 除算 = DivideByZeroException / 上限超過 = OverflowException (本家 DecCalc と同一)
+        static StackSlot BinOp(IntrinsicContext ctx, StackSlot[] a, char op) {
+            try {
+                var x = ToDecimalValue(a[0]);
+                var y = ToDecimalValue(a[1]);
+                var value = op switch {
+                    '+' => x + y,
+                    '-' => x - y,
+                    '*' => x * y,
+                    '/' => x / y,
+                    _ => x % y,
+                };
+                return StackSlot.OfValueType(MakeDecimalStruct(ctx, value));
+            } catch (DivideByZeroException) {
+                throw new UnhandledGuestException("System.DivideByZeroException", null);
+            } catch (OverflowException) {
+                throw new UnhandledGuestException("System.OverflowException", null);
+            }
+        }
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Addition", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '+'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Subtraction", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '-'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Multiply", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '*'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Division", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '/'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Remainder", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '%'), BindingOrigin.Managed);
+        // 公開ヘルパー面 (decimal.Add 等は本家 IL が op_* を呼ぶ形のため同一実装で受ける)
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Add", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '+'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Subtract", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '-'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Multiply", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '*'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Divide", Ret, ["System.Decimal", "System.Decimal"]),
+            static (ctx, a) => BinOp(ctx, a, '/'), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_UnaryNegation", Ret, ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, -ToDecimalValue(a[0]))), BindingOrigin.Managed);
+
+        // ---- 比較群 (戻り System.Boolean / パラメータ (dec, dec))。戻り型はワイルドカードで統一
+        r.RegisterBinding(BindingKey.Static(T, "op_Equality", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) == ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "op_Inequality", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) != ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "op_GreaterThan", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) > ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "op_LessThan", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) < ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "op_GreaterThanOrEqual", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) >= ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "op_LessThanOrEqual", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]) <= ToDecimalValue(a[1]) ? 1 : 0), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Compare", ["System.Decimal", "System.Decimal"]),
+            static (_, a) => StackSlot.OfInt32(ToDecimalValue(a[0]).CompareTo(ToDecimalValue(a[1]))), BindingOrigin.Managed);
+
+        // ---- 変換群: パラメータ列が同一で戻り型のみ異なる面 (op_Implicit / op_Explicit) は
+        //      BindingKey の戻り型名 (C5.5 継続で追加) で区別する
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.Int32"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.Int64"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, a[0].Int64Value)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.UInt32"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (uint)a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.Byte"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (byte)a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.SByte"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (sbyte)a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.Int16"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (short)a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.UInt16"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (ushort)a[0].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Implicit", Ret, ["System.UInt64"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, (ulong)a[0].Int64Value)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Int32", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32(decimal.ToInt32(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Double", ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfFloat(decimal.ToDouble(ToDecimalValue(a[0]))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Single", ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfFloat(decimal.ToSingle(ToDecimalValue(a[0]))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Byte", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32(decimal.ToByte(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.SByte", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32(decimal.ToSByte(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Int16", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32(decimal.ToInt16(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.UInt16", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32(decimal.ToUInt16(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.UInt32", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt32((int)decimal.ToUInt32(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.UInt64", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt64((long)decimal.ToUInt64(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "op_Explicit", "System.Int64", ["System.Decimal"]),
+            static (ctx, a) => OverflowToGuest("System.OverflowException",
+                () => StackSlot.OfInt64(decimal.ToInt64(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+
+        // ---- 丸め系 (Truncate / Round / Floor / Ceiling)。本家 IL は
+        //      DecCalc::InternalRound / VarDec* (Decimal と DecCalc の Unsafe.As 参照再解釈)
+        //      を辿るため IL 実行にできず、ホスト同一意味論 (中点規約 = 5 丸めの away-from-zero
+        //      (Decimal.Round(decimal) / (_, digits) の CLR 契約)) を委譲する
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", Ret, ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Round(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", Ret, ["System.Decimal", "System.Int32"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Round(ToDecimalValue(a[0]), a[1].AsInt32))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", Ret, ["System.Decimal", Midpoint]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx,
+                decimal.Round(ToDecimalValue(a[0]), (System.MidpointRounding)a[1].AsInt32))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", Ret, ["System.Decimal", "System.Int32", Midpoint]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx,
+                decimal.Round(ToDecimalValue(a[0]), a[1].AsInt32, (System.MidpointRounding)a[2].AsInt32))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Truncate", Ret, ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Truncate(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Floor", Ret, ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Floor(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Ceiling", Ret, ["System.Decimal"]),
+            static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Ceiling(ToDecimalValue(a[0])))), BindingOrigin.Managed);
+    }
+
+    /// <summary>decimal の解析面 (不変カルチャ固定)。Parse 失敗は本家と同じ FormatException /
+    /// OverflowException (ゲスト例外化) を投げる。</summary>
+    private static StackSlot DecimalParse(IntrinsicContext ctx, string? s, int styles) {
+        try {
+            return StackSlot.OfValueType(MakeDecimalStruct(ctx,
+                decimal.Parse(s ?? "", (System.Globalization.NumberStyles)styles,
+                    System.Globalization.CultureInfo.InvariantCulture)));
+        } catch (FormatException) {
+            throw new UnhandledGuestException("System.FormatException", null);
+        } catch (OverflowException) {
+            throw new UnhandledGuestException("System.OverflowException", null);
+        }
+    }
+
+    /// <summary>Divide / Remainder の例外ラップ (0 除算 = DivideByZeroException、
+    /// 上限超過 = OverflowException。本家 DecCalc と同一)。</summary>
+    private static StackSlot DecimalWrap(IntrinsicContext ctx, Func<decimal> op) {
+        try {
+            return StackSlot.OfValueType(MakeDecimalStruct(ctx, op()));
+        } catch (DivideByZeroException) {
+            throw new UnhandledGuestException("System.DivideByZeroException", null);
+        } catch (OverflowException) {
+            throw new UnhandledGuestException("System.OverflowException", null);
+        }
+    }
+
+    /// <summary>ホスト演算の OverflowException をゲスト例外に変換する共通部。</summary>
+    private static StackSlot OverflowToGuest(string typeName, Func<StackSlot> op) {
+        try {
+            return op();
+        } catch (OverflowException) {
+            throw new UnhandledGuestException(typeName, null);
+        }
+    }
+
+    /// <summary>VM の System.Decimal 構造体値 (VmStructValue) を構築する。
+    /// ホスト decimal.GetBits のビット列を CoreLib (宣言ローダ) の System.Decimal 構造体の
+    /// フィールドスロット (_flags int32 / _hi32 uint32 / _lo64 uint64 本家 .NET 10 レイアウト) に
+    /// 配置する。スロットの Kind は VM のフィールド署名型 (i4 / i8 スロット) に合わせる。</summary>
+    private static VmStructValue MakeDecimalStruct(IntrinsicContext ctx, decimal value) {
+        var cls = FindCoreLibDecimalType(ctx)
+            ?? throw new InvalidOperationException("System.Decimal (CoreLib 実型) がロードされていません。");
+        var bits = decimal.GetBits(value);
+        var lo64 = (ulong)(uint)bits[0] | ((ulong)(uint)bits[1] << 32);
+        // bits[3] = CLR flags ビット列 (sign<<31 | scale<<16) がそのまま i4 スロット値
+        var fields = new StackSlot[InstanceFieldCount(cls)];
+        var index = 0;
+        foreach (var field in cls.Fields) {
+            if (field.IsStatic || field.IsLiteral)
+                continue;
+            fields[index++] = field.Name switch {
+                "_flags" => StackSlot.OfInt32(bits[3]),
+                "_hi32" => StackSlot.OfInt32(bits[2]),
+                "_lo64" => StackSlot.OfInt64((long)lo64),
+                // CoreLib レイアウトの未知フィールドはゼロ埋め (現行ホスト CoreLib には無い)
+                _ => SlotDefaultZero(field),
+            };
+        }
+        return new VmStructValue(cls, fields);
+    }
+
+    /// <summary>unknown フィールドのゼロスロット (フィールド型が i8/u8 なら i8 スロット)。</summary>
+    private static StackSlot SlotDefaultZero(VmField field) {
+        var typeName = field.FieldType?.FullName ?? "";
+        return typeName is "System.UInt64" or "System.Int64" ? StackSlot.OfInt64(0) : StackSlot.OfInt32(0);
+    }
+
+    /// <summary>宣言ローダ (CoreLib) の System.Decimal 実型を探す。バインド呼出側の
+    /// ctx.Types は「呼出フレームのローダ」 (ゲスト画像等 CoreLib でないことがある) のため、
+    /// Context に登録された全画像から CoreLib の TypeDef/System.Decimal を探す。
+    /// 複数画像に同名型がある場合は System.Private.CoreLib を優先する (C2 型ユニフィケーション
+    /// の実型統一規約と同じ優先順)。</summary>
+    private static VmClassType? FindCoreLibDecimalType(IntrinsicContext ctx) =>
+        FindCoreLibType(ctx, "System.Decimal");
+
+    /// <summary>CoreLib (System.Private.CoreLib.dll 実装側) の TypeDef を探す一般化面。</summary>
+    private static VmClassType? FindCoreLibType(IntrinsicContext ctx, string fullName) {
+        VmClassType? fromContext = null;
+        foreach (var loader in ctx.Types.Context?.Loaders ?? [ctx.Types]) {
+            if (loader.FindTypeByFullName(fullName) is not VmClassType cls)
+                continue;
+            if (loader.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true)
+                return cls;
+            fromContext ??= cls;
+        }
+        // Context 未接続/接続画像に無い場合のフォールバック (呼出ローダ自体の検索)
+        return fromContext ?? ctx.Types.FindTypeByFullName(fullName);
+    }
+
+    /// <summary>CoreLib (宣言ローダ) 値型のインスタンスフィールド数 (this を含まないスロット幅)。</summary>
+    private static int InstanceFieldCount(VmClassType cls) {
+        var count = 0;
+        foreach (var f in cls.Fields)
+            if (!f.IsStatic && !f.IsLiteral)
+                count++;
+        return count;
+    }
+
+    /// <summary>VM 構造体値 / box スロット (System.Decimal) → ホスト decimal。
+    /// "new decimal(...)" の IL が入れたフィールドレイアウト (_flags / _hi32 / _lo64) を読む。
+    /// u8 フィールドのスロットは Int64 ビット列で生ビットを保持するため符号は無関係。</summary>
+    private static decimal ToDecimalValue(in StackSlot slot) {
+        var sv = slot.ObjectValue switch {
+            VmStructValue direct => direct,
+            VmBoxedValue boxed => new VmStructValue(boxed.Type, boxed.Fields, boxed.Type is VmConstructedType ct ? ct.TypeArguments : null),
+            _ => throw new InvalidOperationException($"decimal のスロットを期待しましたが {SlotOps.Describe(slot)} が来ました。"),
+        };
+        var cls = (VmClassType)sv.StructType;
+        var iFlags = InstanceFieldSlotIndex(cls, "_flags");
+        var iHi = InstanceFieldSlotIndex(cls, "_hi32");
+        var iLo = InstanceFieldSlotIndex(cls, "_lo64");
+        if (iFlags < 0 || iHi < 0 || iLo < 0)
+            throw new InvalidOperationException($"decimal 構造体のフィールドレイアウト (_flags/_hi32/_lo64) を解決できません: {cls.FullName}");
+        var flags = (int)sv.Fields[iFlags].Int64Value;
+        var hi = (uint)sv.Fields[iHi].Int64Value;
+        var lo64 = (ulong)sv.Fields[iLo].Int64Value;
+        var scale = (byte)((flags >> 16) & 0xFF);
+        var isNegative = flags < 0;
+        return new decimal((int)(uint)lo64, (int)(uint)(lo64 >> 32), (int)hi, isNegative, scale);
+    }
+
+    /// <summary>宣言順のインスタンスフィールドスロットインデ克斯を名前で解決する (VmField 解決辞書無しで済む補助)。
+    /// 既存の ObjectModel.GetLayout と同一の走査規約 (継承チェーン / 静的除去)。</summary>
+    private static int InstanceFieldSlotIndex(VmClassType cls, string fieldName) {
+        var index = 0;
+        foreach (var field in cls.Fields) {
+            if (field.IsStatic || field.IsLiteral)
+                continue;
+            if (field.Name == fieldName)
+                return index;
+            index++;
+        }
+        return -1;
+    }
     // ---- プリミティブ instance ToString (ボックス化仮想呼出面) ----
 
     /// <summary>プリミティブの instance ToString バインド。String.Concat(object, object)
@@ -117,6 +446,26 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.Instance("System.Enum", "GetValue"),
             static (ctx, a) => GetEnumValueImpl(ctx, a[0]),
             BindingOrigin.InternalCall);
+        // public override string Enum.ToString()
+        // CoreLib の IL は to 内 Culture 太字異 (FormatFeatures / CultureInfo) を辿り culture 機構
+        // 全面に落ちるため表現境界。VM enum box 型 (value__ 基底型生値) をホストの同名 enum
+        // (typeof(object).Assembly 同一名照合) で再構成し、G 書式名をホスト文化自立の文字列化で返す
+        // (DayOfWeek.ToString 等の F10 / Enum 書式 IL が依存するリーフ、culture-out-of-scope)
+        r.RegisterBinding(BindingKey.Instance("System.Enum", "ToString"),
+            static (ctx, a) => {
+                var box = a[0].ObjectValue as VmBoxedValue
+                    ?? throw new UnhandledGuestException("System.InvalidCastException", null);
+                var raw = box.Fields[0];
+                object hostValue = box.Type.FullName switch {
+                    "System.DayOfWeek" => (System.DayOfWeek)raw.AsInt32,
+                    "System.Boolean" => (bool)(raw.AsInt32 != 0),
+                    _ => raw.Kind == StackKind.Int64
+                        ? (box.Type.FullName == "System.Int64" ? (object)(long)raw.Int64Value : (object)(ulong)raw.Int64Value)
+                        : raw.AsInt32,
+                };
+                return StackSlot.OfObject(ctx.MakeString(hostValue.ToString()!));
+            },
+            BindingOrigin.InternalCall);
     }
 
     /// <summary>ECMA-335 の CorElementType コード (enum の許容基底型のみ)。</summary>
@@ -166,6 +515,109 @@ internal static class CoreLibBindings {
                 return fieldType;
         }
         return null;
+    }
+    // ---- System.Math (拡張 overload / JIT intrinsic 面) ----
+
+    /// <summary>Math の拡張 overload 面。
+    /// 本家 IL は double 丸め機構 (ModF InternalCall / fixed バッファ) と JIT intrinsic
+    /// (BigMul / FusedMultiplyAdd 等) で構成されるため VM の表現境界。ホストの同一意味論
+    /// へ委譲し、結果は VM スロットに正規化する。基本算術面 (Abs / Sqrt 等) は既存の
+    /// 一般経路 (② IL 実行 / ③ legacy) のまま。</summary>
+    private static void RegisterMathBindings(IntrinsicRegistry r) {
+        const string T = "System.Math";
+        const string Double = "System.Double";
+        const string Midpoint = "System.MidpointRounding";
+
+        // ModF(double, out double&): 丸め核 (RoundNumber 内部 IL が呼ぶ InternalCall 面)。
+        // 戻り = 整数部、out 参照先 = 小数部 (本家と同一の呼び出し規約)。
+        // 本家筐体は QCall 相当の double* 署名で呼ぶため両形状を登録する
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "ModF", "System.Double", ["System.Double", "System.Double&"]),
+            static (_, a) => ModFImpl(a), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "ModF", "System.Double", ["System.Double", "System.Double*"]),
+            static (_, a) => ModFImpl(a), BindingOrigin.InternalCall);
+
+        // Round 系 overload (4 形状)。Math.Round(double, int) の既定中点規約 = AwayFromZero。
+        // 第 2 引数が MidpointRounding か digits かはバインドキーのパラメータ型名 (IntrinsicContext) で判別
+        static StackSlot RoundFaces(IntrinsicContext ctx, StackSlot[] a) => a.Length switch {
+            1 => StackSlot.OfFloat(Math.Round(a[0].DoubleValue)),
+            2 when ctx.ParamAt(1) == "System.MidpointRounding" =>
+                StackSlot.OfFloat(Math.Round(a[0].DoubleValue, (System.MidpointRounding)a[1].AsInt32)),
+            2 => StackSlot.OfFloat(Math.Round(a[0].DoubleValue, a[1].AsInt32)),
+            _ => StackSlot.OfFloat(Math.Round(a[0].DoubleValue, a[1].AsInt32,
+                (System.MidpointRounding)a[2].AsInt32)),
+        };
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", "System.Double", ["System.Double"]),
+            static (ctx, a) => RoundFaces(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", "System.Double", ["System.Double", "System.Int32"]),
+            static (ctx, a) => RoundFaces(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", "System.Double", ["System.Double", Midpoint]),
+            static (ctx, a) => RoundFaces(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Round", "System.Double", ["System.Double", "System.Int32", Midpoint]),
+            static (ctx, a) => RoundFaces(ctx, a), BindingOrigin.Managed);
+        // Truncate は managed IL が TruncateNative (InternalCall) を辿るため直接ホスト面で受ける
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Truncate", "System.Double", ["System.Double"]),
+            static (_, a) => StackSlot.OfFloat(Math.Truncate(a[0].DoubleValue)), BindingOrigin.Managed);
+
+        // JIT intrinsic / 内部面の残り (ホスト同一意味論)
+        r.RegisterBinding(BindingKey.Static(T, "BigMul", ["System.Int32", "System.Int32"]),
+            static (_, a) => StackSlot.OfInt64(Math.BigMul(a[0].AsInt32, a[1].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "ILogB", ["System.Double"]),
+            static (_, a) => StackSlot.OfInt32(Math.ILogB(a[0].DoubleValue)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "ScaleB", ["System.Double", "System.Int32"]),
+            static (_, a) => StackSlot.OfFloat(Math.ScaleB(a[0].DoubleValue, a[1].AsInt32)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Sign", ["System.Double"]),
+            static (_, a) => StackSlot.OfInt32(Math.Sign(a[0].DoubleValue)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "CopySign", ["System.Double", "System.Double"]),
+            static (_, a) => StackSlot.OfFloat(Math.CopySign(a[0].DoubleValue, a[1].DoubleValue)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "MaxMagnitude", ["System.Double", "System.Double"]),
+            static (_, a) => StackSlot.OfFloat(Math.MaxMagnitude(a[0].DoubleValue, a[1].DoubleValue)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "FusedMultiplyAdd", ["System.Double", "System.Double", "System.Double"]),
+            static (_, a) => StackSlot.OfFloat(Math.FusedMultiplyAdd(a[0].DoubleValue, a[1].DoubleValue, a[2].DoubleValue)), BindingOrigin.Managed);
+        // DivRem (左, 右) → (商, 余り) ValueTuple`2 面 (戻り = VM 構造体値)
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "DivRem", "System.ValueTuple`2", ["System.Int32", "System.Int32"]),
+            static (ctx, a) => Tuple2Int32(ctx, a[0].AsInt32, a[1].AsInt32), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "DivRem", "System.ValueTuple`2", ["System.Int64", "System.Int64"]),
+            static (ctx, a) => Tuple2Int64(ctx, a[0].Int64Value, a[1].Int64Value), BindingOrigin.Managed);
+    }
+
+    private static StackSlot ModFImpl(StackSlot[] a) {
+        var intPart = Math.Truncate(a[0].DoubleValue);
+        if (a[1].ObjectValue is VmByRef byref)
+            byref.Slot = StackSlot.OfFloat(a[0].DoubleValue - intPart);
+        return StackSlot.OfFloat(intPart);
+    }
+
+    /// <summary>Math.DivRem の (商, 余り) 戻り面。System.ValueTuple`2&lt;System.Int32,System.Int32&gt; の
+    /// 構造体値 (Fields = Item1 / Item2 スロット) を構築して返す。</summary>
+    private static StackSlot Tuple2Int32(IntrinsicContext ctx, int item1, int item2) {
+        var (def, args) = Tuple2Type(ctx, "System.Int32")
+            ?? throw new InvalidOperationException("System.ValueTuple`2 (CoreLib 実型) がロードされていません。");
+        var constructed = new VmConstructedType { Definition = def, TypeArguments = [args, args] };
+        var fields = new StackSlot[2];
+        fields[0] = StackSlot.OfInt32(item1);
+        fields[1] = StackSlot.OfInt32(item2);
+        return StackSlot.OfValueType(new VmStructValue(constructed, fields));
+    }
+
+    /// <summary>Math.DivRem(long,long) の (商, 余り) 戻り面 (i8 スロット)。</summary>
+    private static StackSlot Tuple2Int64(IntrinsicContext ctx, long item1, long item2) {
+        var (def, args) = Tuple2Type(ctx, "System.Int64")
+            ?? throw new InvalidOperationException("System.ValueTuple`2 (CoreLib 実型) がロードされていません。");
+        var constructed = new VmConstructedType { Definition = def, TypeArguments = [args, args] };
+        var fields = new StackSlot[2];
+        fields[0] = StackSlot.OfInt64(item1);
+        fields[1] = StackSlot.OfInt64(item2);
+        return StackSlot.OfValueType(new VmStructValue(constructed, fields));
+    }
+
+    /// <summary>ValueTuple`2 の定義型と実引数型 (確認。値型統合済み型) を解決する。</summary>
+    private static (VmClassType Def, VmType Arg)? Tuple2Type(IntrinsicContext ctx, string argTypeName) {
+        if (ctx.Types.FindTypeByFullName("System.ValueTuple`2") is not VmClassType def)
+            return null;
+        var arg = ctx.Types.FindTypeByFullName(argTypeName)
+            ?? ctx.Types.ResolveWellKnownType(argTypeName)
+            ?? throw new InvalidOperationException($"{argTypeName} が解決できません。");
+        return (def, arg);
     }
 
     // ---- System.SR (CoreLib 内部リソース文字列: 例外既定文言の culture インフラ) ----
@@ -250,6 +702,236 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.Instance("System.Object", "GetHashCode"),
             static (ctx, a) => StackSlot.OfInt32(ctx.IdentityHash(a[0].ObjectValue)),
             BindingOrigin.Managed);
+
+        // ---- System.Type の runtime-representation 面 (culture 機構 / Enum 書式 IL が辿る Type 面) ----
+        // 本家 Type の get_* 面は RuntimeType 内部表現 (IL なし = ランタイム intrinsic) を辿るため
+        // ② IL 実行に落ちず、VM 型モデルから同一要素を提示する (監査表 (c) runtime-representation)
+        // get_BaseType: VM 型モデル (VmType.BaseType) の判定で返す (System.Object の親 = null)
+        r.RegisterBinding(BindingKey.Instance("System.Type", "get_BaseType"),
+            static (ctx, a) =>
+                a[0].ObjectValue is VmRuntimeObject rt && rt.Target.BaseType is { } baseType
+                    ? DefaultIntrinsics.MakeRuntimeObject(ctx, baseType)
+                    : null, // BaseType 無し (System.Object 等) = CLR と同一の null
+            BindingOrigin.InternalCall);
+        // Type::get_TypeHandle: 本家は RuntimeTypeHandle (runtime representation)。
+        // VM 型への参照 (VmTypeHandle) を返す (GetCultureInfo 機構 IL 内の静的リテラル type handle 面)
+        r.RegisterBinding(BindingKey.Instance("System.Type", "get_TypeHandle"),
+            static (ctx, a) =>
+                a[0].ObjectValue is VmRuntimeObject rt
+                    ? StackSlot.OfObject(ctx.Heap.Allocate(new VmTypeHandle { Target = rt.Target }))
+                    : throw new InvalidOperationException("Type::get_TypeHandle の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
+        // Type 面の runtime-representation 補完 (culture 機構 IL / Dictionary cache ctor が辿る判定面):
+        // IsValueTypeImpl / IsSubclassOf は RuntimeType 内部表現 (IL なし) を辿るため VM 型モデルで
+        // 同一判定を提供する。IsValueType = IsValueTypeImpl と同値 (プリミティブは ValueType 派生)
+        r.RegisterBinding(BindingKey.Instance("System.Type", "IsValueTypeImpl"),
+            static (ctx, a) =>
+                a[0].ObjectValue is VmRuntimeObject rt
+                    ? StackSlot.OfInt32(rt.Target.IsValueType ? 1 : 0)
+                    : throw new InvalidOperationException("Type::IsValueTypeImpl の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "get_IsValueType"),
+            static (ctx, a) =>
+                a[0].ObjectValue is VmRuntimeObject rt2
+                    ? StackSlot.OfInt32(rt2.Target.IsValueType ? 1 : 0)
+                    : throw new InvalidOperationException("Type::get_IsValueType の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "IsSubclassOf", "System.Type"),
+            static (ctx, a) => {
+                var self = a[0].ObjectValue is VmRuntimeObject s ? s.Target : null;
+                var other = a[1].ObjectValue is VmRuntimeObject o ? o.Target : null;
+                if (self is null || other is null)
+                    throw new InvalidOperationException("IsSubclassOf の引数が Type ファサードではありません。");
+                for (VmType? t = self.BaseType; t is not null;) {
+                    if (t.FullName == other.FullName)
+                        return StackSlot.OfInt32(1);
+                    t = t.BaseType;
+                }
+                return StackSlot.OfInt32(0);
+            },
+            BindingOrigin.InternalCall);
+        // static abstract char IUtfChar<T>.CastFrom(T)  ([Intrinsic]: 実 IL はダミー throw。
+        // String/span IL が T(char)→char の面を経由するため、char 系 T の値を i4 スロットで透過)
+        r.RegisterBinding(BindingKey.StaticAnyParams("System.IUtfChar`1", "CastFrom"),
+            static (_, a) => StackSlot.OfInt32(a[0].AsInt32),
+            BindingOrigin.InternalCall);
+    }
+
+    // ---- System.TimeSpan / System.DateTime (culture 依存 IL 面の不変カルチャ委譲) ----
+
+    // Time 面の Parse / ToString / AddDays / AddYears は本家 IL が CultureInfo / CultureData /
+    // TextInfo (culture 機構) の全面を辿る (Dictionary cache / CompareInfo / Calendar 面で
+    // VM 表現境界に落ちる)。C5.5 Wave 5 と同じ culture-out-of-scope の ① バインドで、
+    // VM 規約の不変カルチャ (CultureInfo.InvariantCulture) 相当のホスト BCL 委譲で受ける。
+    // VM 内表現は CoreLib の DateTime(_dateData: ulong) / TimeSpan(_ticks: long) 構造体 (単一スロット)
+    // で正規化する。
+
+    private static void RegisterTimeCultureFaces(IntrinsicRegistry r) {
+        // VM System.TimeSpan 構造体値の構築 (ホスト TimeSpan.Ticks → CoreLib TimeSpan._ticks)
+        static StackSlot MakeTimeSpanStruct(IntrinsicContext ctx, TimeSpan ts) {
+            var cls = FindCoreLibType(ctx, "System.TimeSpan");
+            var fields = new StackSlot[InstanceFieldCount(cls)];
+            var index = 0;
+            foreach (var field in cls.Fields) {
+                if (field.IsStatic || field.IsLiteral)
+                    continue;
+                fields[index++] = field.Name switch {
+                    "_ticks" => StackSlot.OfInt64(ts.Ticks),
+                    _ => SlotDefaultZero(field),
+                };
+            }
+            return StackSlot.OfValueType(new VmStructValue(cls, fields));
+        }
+        // VM System.DateTime 構造体値の構築 (_dateData = ticks | kind<<62 本家レイアウト。
+        // Invariant 解析は Unspecified (kind=0) 相当で ticks のみ)
+        static StackSlot MakeDateTimeStruct(IntrinsicContext ctx, DateTime dt) {
+            var cls = FindCoreLibType(ctx, "System.DateTime");
+            var fields = new StackSlot[InstanceFieldCount(cls)];
+            var index = 0;
+            foreach (var field in cls.Fields) {
+                if (field.IsStatic || field.IsLiteral)
+                    continue;
+                fields[index++] = field.Name switch {
+                    "_dateData" => StackSlot.OfInt64((long)dt.Ticks), // kind=0 (Unspecified) のビット列
+                    _ => SlotDefaultZero(field),
+                };
+            }
+            return StackSlot.OfValueType(new VmStructValue(cls, fields));
+        }
+        // VM VmStructValue → ホスト TimeSpan (CoreLib _ticks スロットを読む。CoreLib 未ロードの
+        // legacy 経路では VmStructValue 以外が来るため fail-closed)
+        static TimeSpan TimeSpanOf(in StackSlot slot) {
+            if (slot.ObjectValue is not VmStructValue sv || sv.StructType.FullName != "System.TimeSpan")
+                throw new InvalidOperationException(
+                    $"TimeSpan 面の引数が CoreLib TimeSpan 構造体値ではありません ({slot.Kind})。");
+            return new TimeSpan(sv.Fields[0].Int64Value);
+        }
+        static DateTime DateTimeOf(in StackSlot slot) {
+            if (slot.ObjectValue is not VmStructValue sv || sv.StructType.FullName != "System.DateTime")
+                throw new InvalidOperationException(
+                    $"DateTime 面の引数が CoreLib DateTime 構造体値ではありません ({slot.Kind})。");
+            return new DateTime(sv.Fields[0].Int64Value);
+        }
+        static string? S(in StackSlot slot) => (slot.ObjectValue as VmString)?.Value;
+        static VmString? ResultString(IntrinsicContext ctx, string value) => ctx.MakeString(value);
+
+        var timeSpanT = "System.TimeSpan";
+        // TimeSpan.ToString (無引数 / format / format,provider): 本家 IL は Span 解析 + culture 機構
+        // (TimeSpanFormat / TimeSpanParse は Number.Formatting 系 + IFormatProvider) で構成され、
+        // Span 表現境界のため IL 実行にできない。不変カルチャ固定のホスト委譲で提供
+        r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
+                Array.Empty<string>()),
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(null, System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
+                ["System.String"]),
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
+                ["System.String", "System.IFormatProvider"]),
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        // TimeSpan.Parse (string[, provider]): 不変カルチャ規約固定。FormatException / OverflowException は本家と同一分類
+        r.RegisterBinding(BindingKey.StaticWithReturn(timeSpanT, "Parse", timeSpanT, ["System.String"]),
+            static (ctx, a) => {
+                try {
+                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.InvariantCulture));
+                } catch (FormatException) {
+                    throw new UnhandledGuestException("System.FormatException", null);
+                } catch (OverflowException) {
+                    throw new UnhandledGuestException("System.OverflowException", null);
+                }
+            },
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(timeSpanT, "Parse", timeSpanT,
+                ["System.String", "System.IFormatProvider"]),
+            static (ctx, a) => {
+                try {
+                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.InvariantCulture));
+                } catch (FormatException) {
+                    throw new UnhandledGuestException("System.FormatException", null);
+                } catch (OverflowException) {
+                    throw new UnhandledGuestException("System.OverflowException", null);
+                }
+            },
+            BindingOrigin.Managed);
+        // TimeSpan 掛け算系 (乘演算 = op_Multiply は本家 IL が TimeSpan.ValueTuple で構成されるため
+        // IL 実行可能のため inert (② で走る))
+
+        var dateTimeT = "System.DateTime";
+        // DateTime.Parse (string[, provider]): 本家 IL は culture 機構 (CultureInfo.GetCultureInfo →
+        // Dictionary cache → Type face 判定群) の全面を辿るため culture-out-of-scope で委譲
+        r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, "Parse", dateTimeT, ["System.String"]),
+            static (ctx, a) => {
+                try {
+                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.InvariantCulture));
+                } catch (FormatException) {
+                    throw new UnhandledGuestException("System.FormatException", null);
+                } catch (Exception ex) when (ex is OverflowException or ArgumentException) {
+                    throw new UnhandledGuestException(ex.GetType().Name.Replace("Exception", "Exception") == "OverflowException"
+                        ? "System.OverflowException" : "System.ArgumentException", null);
+                }
+            },
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, "Parse", dateTimeT,
+                ["System.String", "System.IFormatProvider"]),
+            static (ctx, a) => {
+                try {
+                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.InvariantCulture));
+                } catch (FormatException) {
+                    throw new UnhandledGuestException("System.FormatException", null);
+                }
+            },
+            BindingOrigin.Managed);
+        // DateTime.ToString (無引数 / format / format,provider): 本家 IL は DateTimeFormatInfo 機構を辿る
+        // ため culture-out-of-scope で不変カルチャ固定のホスト委譲
+        r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String", Array.Empty<string>()),
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(null, System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String", ["System.String"]),
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String",
+                ["System.String", "System.IFormatProvider"]),
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.InvariantCulture))
+                is { } s ? StackSlot.OfObject(s) : null,
+            BindingOrigin.Managed);
+        // 日付演算 (AddDays / AddYears): 本家 IL は Calendar (DaysToMonth366 FieldRVA static array +
+        // RuntimeHelpers.CreateSpan 面) を辿るため表現境界。不変 Calendar (Gregorian) のホスト演算を委譲
+        r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "AddDays", dateTimeT, ["System.Double"]),
+            static (ctx, a) => MakeDateTimeStruct(ctx, DateTimeOf(a[0]).AddDays(a[1].DoubleValue)),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "AddYears", dateTimeT, ["System.Int32"]),
+            static (ctx, a) => MakeDateTimeStruct(ctx, DateTimeOf(a[0]).AddYears(a[1].AsInt32)),
+            BindingOrigin.Managed);
+        // internal static long DateTime.DateToTicks(int year, int month, int day)
+        // 本家 DateToTicks IL は DaysToMonth366 (FieldRVA 静的配列) の
+        // RuntimeHelpers.CreateSpan / RuntimeFieldHandle::m_ptr 面を辿るため VM 表現境界。
+        // Gregorian 不変 Calendar のホスト演算 (new DateTime(y, m, d).Ticks) を委譲する
+        // (DateTime::ctor(int, int, int) IL はこの面と DateTime::.ctor(long) IL (単純フィールド代入)
+        // で構成されるため、ここだけ受けることでゲスト new DateTime(y, m, d) 全体が VM で通る)
+        // private static ulong DateTime.DateToTicks(int year, int month, int day)
+        // 本家 DateToTicks IL は DaysToMonth365/366 (FieldRVA 静的配列) の
+        // RuntimeHelpers.CreateSpan / GetSpanDataFrom / RuntimeFieldHandle::IsNullHandle (m_ptr
+        // ByRef 読み) 面を辿るため VM 表現境界。Gregorian 不変 Calendar のホスト演算
+        // ((ulong)new DateTime(y, m, d).Ticks) を委譲する (DateTime::.ctor(int, int, int) IL は
+        // この面と DateTime::.ctor(long) IL (単純フィールド代入) で構成されるため、
+        // ここだけ受けることでゲスト new DateTime(y, m, d) 全体が VM で通る)
+        r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, "DateToTicks", "System.UInt64",
+                ["System.Int32", "System.Int32", "System.Int32"]),
+            static (_, a) => StackSlot.OfInt64(unchecked((long)new DateTime(
+                a[0].AsInt32, a[1].AsInt32, a[2].AsInt32).Ticks)),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, "DateToTicks", "System.Int64",
+                ["System.Int32", "System.Int32", "System.Int32"]),
+            static (_, a) => StackSlot.OfInt64(new DateTime(
+                a[0].AsInt32, a[1].AsInt32, a[2].AsInt32).Ticks),
+            BindingOrigin.Managed);
     }
 
     // ---- System.Threading.Monitor (VM は単一スレッド実行のため競合なしのロック面) ----
@@ -300,6 +982,38 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String"),
             static (_, a) => StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.InvariantCulture)),
             BindingOrigin.Managed);
+        // Equals(String, String) (op_Equality の呼び先): 本家 IL 末尾が SpanHelpers.SequenceEqual
+        // (ref byte, ref byte, nuint) で、その scalar フォールバック自体が GSJA 抽象化
+        // (ISimdVector static abstract = Vector128<T> inline 表現依存) のため VM 表現境界。
+        // ordinal 等価は culture 無関当面のためホスト ordinal 等価へ委譲する
+        r.RegisterBinding(BindingKey.Static(T, "Equals", "System.String", "System.String"),
+            static (_, a) => StackSlot.OfInt32(string.Equals(Ns(a, 0), Ns(a, 1), StringComparison.Ordinal) ? 1 : 0),
+            BindingOrigin.Managed);
+        // StringComparison overload 群 (Equals static / Equals instance / Compare SCI):
+        // 本家 IL は StringComparison 分岐後、ordinal 面 (String.EqualsFast / String.CompareOrdinal)
+        // を直接辿る面と culture 機構面 (CompareInfo / SpanHelpers SIMD 抽象化 —
+        // EqualsIgnoreCase_Vector は ISimdVector<TVector,T> static abstract = GSJA 抽象化で
+        // Vector128<T> inline 表現依存) に分かれる。SIMD 抽象化面は VM 表現境界のため、
+        // SCI 面 3 overload を上記 culture 面と同じホスト BCL 委譲に統一する。
+        // CurrentCulture / CurrentCultureIgnoreCase は VM 規約 (不変カルチャ固定) どおり
+        // InvariantCulture / InvariantCultureIgnoreCase へ写像し、Ordinal 系はそのまま通す
+        static StringComparison InvariantOf(int comparison) => comparison switch {
+            0 => StringComparison.InvariantCulture,            // CurrentCulture
+            1 => StringComparison.InvariantCultureIgnoreCase, // CurrentCultureIgnoreCase
+            2 => StringComparison.InvariantCulture,
+            3 => StringComparison.InvariantCultureIgnoreCase,
+            4 => StringComparison.Ordinal,
+            _ => StringComparison.OrdinalIgnoreCase,
+        };
+        r.RegisterBinding(BindingKey.Static(T, "Equals", "System.String", "System.String", "System.StringComparison"),
+            static (_, a) => StackSlot.OfInt32(string.Equals(Ns(a, 0), Ns(a, 1), InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "Equals", "System.String", "System.StringComparison"),
+            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.Equals(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String", "System.StringComparison"),
+            static (_, a) => StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), InvariantOf(a[2].AsInt32))),
+            BindingOrigin.Managed);
         // CompareTo (instance): 本家 IL も CurrentCulture の Compare を呼ぶ文化面。
         // ① が ② IL より先に解決されるため、無いと IL 実行時に CompareInfo で fail-closed になる
         r.RegisterBinding(BindingKey.Instance(T, "CompareTo", "System.String"),
@@ -337,6 +1051,78 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.Static(T, "CreateFromChar", "System.Char"),
             static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Ch(a, 0).ToString())),
             BindingOrigin.InternalCall);
+        // ---- System.Char culture 面 (C5.5 Wave 5 継続): 本家 IL は
+        //      CultureInfo.CurrentCulture.TextInfo (culture 機構 + InternalCall) を辿るため
+        //      不変カルチャ規約どおりホストの不変面へ委譲 (1 引数面のみ。CultureInfo 引数の
+        //      overload は呼び出し側 IL が CultureInfo 構築を必要とするため当面未対応)。
+        //      GetNumericValue は Unicode 数字値 (ネイティブ Unicode テーブル InternalCall)
+        r.RegisterBinding(BindingKey.Static("System.Char", "ToUpper", "System.Char"),
+            static (_, a) => StackSlot.OfInt32(char.ToUpperInvariant(Ch(a, 0))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static("System.Char", "ToLower", "System.Char"),
+            static (_, a) => StackSlot.OfInt32(char.ToLowerInvariant(Ch(a, 0))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static("System.Char", "GetNumericValue", "System.Char"),
+            static (_, a) => StackSlot.OfFloat(char.GetNumericValue(Ch(a, 0))),
+            BindingOrigin.InternalCall);
+
+        // ---- 文字整形・部分文字列面 (C5.5 探査継続):
+        //      本家 IL は Span / fixed char* 内部 (PadLeft の SpanFill、Remove の Substring
+        //      InnerAlloc 連鎖、EndsWith/IndexOf の StringComparison 抽象化面) を辿るため、
+        //      VM の表現境界として同一意味論のホスト ordinal / 不変面へ委譲する。
+        //      Join (params object[]) も CLR 同一規約 (null → 空、要素はフォーマット相当)
+        //      でホスト面を通す (要素の ToString は VM の暗黙 ToString フック経由で正規化)。
+        r.RegisterBinding(BindingKey.Instance(T, "Remove", ["System.Int32", "System.Int32"]),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.Remove(a[1].AsInt32, a[2].AsInt32))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "PadLeft", ["System.Int32", "System.Char"]),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.PadLeft(a[1].AsInt32, Ch(a, 2)))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "PadLeft", ["System.Int32"]),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.PadLeft(a[1].AsInt32))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "PadRight", ["System.Int32", "System.Char"]),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.PadRight(a[1].AsInt32, Ch(a, 2)))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "PadRight", ["System.Int32"]),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.PadRight(a[1].AsInt32))),
+            BindingOrigin.Managed);
+        // —— SCI overload 群 (IndexOf(string[, SCI]) / EndsWith / StartsWith):
+        //      Ordinal 面 (IndexOf(Char, SCI) の被評価 IL は string.IndexOf(char) や
+        //      SpanHelpers を辿る。SIMD ignore-case 抽象化 = GSJA 抽象化のため culture 無関
+        //      … ordinal 等価は文化に依存しない = ordinal のホスト面に渡す
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Join", "System.String", ["System.String", "System.String[]"]),
+            static (ctx, a) => JoinedFace(ctx, Ns(a, 0), a[1]),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Join", "System.String", ["System.String", "System.Object[]"]),
+            static (ctx, a) => JoinedFace(ctx, Ns(a, 0), a[1]),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "StartsWith", ["System.String", "System.StringComparison"]),
+            static (_, a) => StackSlot.OfInt32(
+                Str(a, 0).Value.StartsWith(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "EndsWith", ["System.String", "System.StringComparison"]),
+            static (_, a) => StackSlot.OfInt32(
+                Str(a, 0).Value.EndsWith(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "IndexOf", ["System.String", "System.StringComparison"]),
+            static (_, a) => StackSlot.OfInt32(
+                Str(a, 0).Value.IndexOf(Str(a, 1).Value, InvariantOf(a[2].AsInt32))),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "LastIndexOf", ["System.String", "System.StringComparison"]),
+            static (_, a) => StackSlot.OfInt32(
+                Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, InvariantOf(a[2].AsInt32))),
+            BindingOrigin.Managed);
+    }
+
+    /// <summary>string.Join の要素の ToString 面 (VM オブジェクトを正規化して連結する)。</summary>
+    private static StackSlot? JoinedFace(IntrinsicContext ctx, string? separator, StackSlot valuesSlot) {
+        if (valuesSlot.ObjectValue is not VmArray array)
+            throw new InvalidOperationException("string.Join の第 2 引数が配列ではありません。");
+        var parts = new string[array.Length];
+        for (var i = 0; i < array.Length; i++)
+            parts[i] = DefaultIntrinsics.ConcatFormat(ctx, array.Elements[i]);
+        return StackSlot.OfObject(ctx.MakeString(string.Join(separator ?? string.Empty, parts)));
     }
 
     private static char Ch(StackSlot[] a, int i) => (char)a[i].AsInt32;
@@ -374,7 +1160,16 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "AddByteOffset"),
             static (ctx, a) => AddImpl(ctx, a, elementStride: false), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "As"),
-            static (_, a) => StackSlot.OfObject(RequirePointer(a[0], "Unsafe.As")),
+            // static TTo Unsafe.As<TFrom, TTo>(ref TFrom source): 参照の型視点再解釈
+            // (アドレス不変)。バイト実体ポインタは素通り、スロット列参照 (string 内部 char
+            // 配列等の配列データ面) も同一アドレスとして素通りさせる — decimal 演算面の
+            // scalar IL が Unsafe.As<char, byte>(ref char) をスロット列参照で呼ぶ
+            static (_, a) => {
+                var (native, slotRef) = ResolvePointerBase(a[0], "Unsafe.As");
+                if (native is not null)
+                    return StackSlot.OfObject(native);
+                return StackSlot.OfByRef(slotRef!);
+            },
             BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "AreSame"),
             static (_, a) => StackSlot.OfInt32(AreSameImpl(a) ? 1 : 0), BindingOrigin.InternalCall);
@@ -395,6 +1190,11 @@ internal static class CoreLibBindings {
         // 提供する。Math.Abs(double) の IL が BitConverter.DoubleToUInt64Bits 経由で呼ぶ)
         r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "BitCast"),
             static (ctx, a) => BitCastImpl(ctx.ParamAt(0), a[0]), BindingOrigin.InternalCall);
+        // static void Unsafe.CopyBlockUnaligned(ref byte destination, ref byte source, nuint byteCount)
+        // ([Intrinsic]: 実 IL はダミー throw = JIT intrinsic。String / Span IL がバイト実体コ
+        // ピーに使うため Buffer.Memmove 相当の memmove で同等意味論を提供する)
+        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "CopyBlockUnaligned"),
+            static (ctx, a) => MemmoveImpl(ctx, a, strideOverride: 1), BindingOrigin.InternalCall);
         // ref T MemoryMarshal.GetArrayDataReference<T>(T[] array) / ref byte (Array array)
         // ([Intrinsic]: 実 IL は配列データ先頭へのランタイム内部参照。IL を実行させると
         // 同名オーバーロードへの自己再帰に落ちるため、VM は要素格納列の先頭スロットへの
@@ -482,10 +1282,12 @@ internal static class CoreLibBindings {
         };
     }
 
-    private static StackSlot? MemmoveImpl(IntrinsicContext ctx, StackSlot[] a) {
-        // T の要素サイズ (elementCount は要素数) を宣言上のパラメータ型名から取る。
-        // 型引数が解決できない呼出は VM 表現に落とせないため fail-closed にする
-        var stride = SlotStride(ctx.ParamAt(0));
+    private static StackSlot? MemmoveImpl(IntrinsicContext ctx, StackSlot[] a, int? strideOverride = null) {
+        // T の要素サイズ (elementCount は要素数) を宣言のパラメータ型から解決する。
+        // 型名が解決できず呼出 VM 形状に乗らないものは fail-closed にする。
+        // strideOverride は CopyBlockUnaligned 等の「byteCount リテラルとバイト長が一致する面」
+        // (全型 1 バイト固定 stride) 用。
+        var stride = strideOverride ?? SlotStride(ctx.ParamAt(0));
         var (dstNative, dstRef) = ResolvePointerBase(a[0], "Buffer.Memmove");
         var (srcNative, srcRef) = ResolvePointerBase(a[1], "Buffer.Memmove");
         var count = a[2].Kind == StackKind.Int64 ? a[2].Int64Value : a[2].AsInt32;
@@ -686,6 +1488,235 @@ internal static class CoreLibBindings {
                 return StackSlot.OfInt32(type is null || ContainsReferences(type) ? 1 : 0);
             },
             BindingOrigin.InternalCall);
+        // static T? IsBitwiseEquatable<T>()  ([Intrinsic]: 実 IL はダミー throw = JIT intrinsic)。
+        // SpanHelpers.SequenceEqual 等が T を bitwise 比較可能か判定する面 (typeof(T) の呼び出し
+        // はメソッド型実引数で判別可能)。プリミティブ数値 / char / bool 系のみ true (Span IL の
+        // 早抜け経路に誘導。非 primitive は false = 比較 delegate 経路にフォールバック)
+        r.RegisterBinding(BindingKey.StaticAnyParams(RuntimeHelpersType, "IsBitwiseEquatable"),
+            static (ctx, _) => {
+                var name = ctx.MethodTypeArgAt(0);
+                var primitive = name is "System.Byte" or "System.SByte" or "System.Char" or "System.Int16"
+                    or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64"
+                    or "System.UInt64" or "System.Boolean" or "System.IntPtr" or "System.UIntPtr"
+                    or "System.Single" or "System.Double";
+                return StackSlot.OfInt32(primitive ? 1 : 0);
+            },
+            BindingOrigin.InternalCall);
+        // static bool IsKnownConstant<T>(T value)  ([Intrinsic]):
+        // 本家 IL はダミー throw の JIT intrinsic。VM は JIT 定数畳み込みを持たないため false を返す
+        // (未定義でも呼出 IL の fallback 分岐が動くが、false 固定にして恒常経路に誘導する)
+        r.RegisterBinding(BindingKey.StaticAnyParams(RuntimeHelpersType, "IsKnownConstant"),
+            static (_, _) => StackSlot.OfInt32(0),
+            BindingOrigin.InternalCall);
+    }
+
+    // ---- System.Runtime.Intrinsics.Vector64/128/256/512 (JIT intrinsic 判定面) ----
+
+    /// <summary>本家 get_IsHardwareAccelerated は [Intrinsic] 付きのダミー自己再帰 IL
+    /// (return IsHardwareAccelerated;) で、実 CLR では JIT がハードウェア判定へ置換するため
+    /// 決して実行されない (RuntimeHelpers.GetMethodTable と同型)。VM は SIMD 値型
+    /// (Vector128&lt;T&gt; 等の 16/32/64 バイト inline 表現) を持たないため SIMD パスの IL を
+    /// 実行できず、true を返すと SpanHelpers 等が SIMD 面で fail-closed に落ちる。
+    /// そこで false を返して scalar フォールバック IL に誘導する (string SCI overload 群が
+    /// 同一結果を得る経路)。SIMD 演算面自体は未バインド → fail-closed。ゲストがこの面を
+    /// 直接観測した場合の実 x64 CLR (true) との既知差異は SIMD 表現境界として監査表に記載。</summary>
+    private static void RegisterVectorIntrinsics(IntrinsicRegistry r) {
+        foreach (var vectorType in new[] {
+            "System.Runtime.Intrinsics.Vector64",
+            "System.Runtime.Intrinsics.Vector128",
+            "System.Runtime.Intrinsics.Vector256",
+            "System.Runtime.Intrinsics.Vector512",
+        }) {
+            r.RegisterBinding(BindingKey.Static(vectorType, "get_IsHardwareAccelerated"),
+                static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
+        }
+    }
+
+    // ---- System.Runtime.InteropServices.Marshal / Interop+Kernel32 (環境取得起動面) ----
+
+    /// <summary>VM 代替の last system error (Marshal.SetLastSystemError / GetLastSystemError 面)。
+    /// 実 CLR の per-thread TLS スロットの代わりにスレッドローカルの単一値で模倣する。
+    /// CultureInfo.InvariantCulture 初期化 (GlobalizationMode → GetEnvironmentVariableCore)
+    /// が GetLastSystemError() &lt; ERROR_ENVVAR_NOT_FOUND(203) で成功判定に使う。</summary>
+    [ThreadStatic]
+    private static int _lastSystemError;
+
+    /// <summary>本家 CultureInfo::.cctor → CultureData.get_Invariant → GlobalizationMode の
+    /// IL は AppContextConfigHelper → Environment.GetEnvironmentVariableCore を辿り、その
+    /// Kernel32.GetEnvironmentVariable(name, buffer, size) が P/Invoke 面。VM はホスト BCL の
+    /// 環境取得 (実 Kernel32 と同一意味論) を代替として叩き、バッファへは Win32 規約
+    /// (戻り = 終端 null 除くコピー文字数 / 不足時は終端含む必要文字数を返すのみ、
+    /// 未定義なら 0 + lastError = 203) で書き込む。Marshal の 2 面は IL 実体が下請け
+    /// P/Invoke shim 呼びのみのため internal-call リーフで VM lastError に代替する。</summary>
+    private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
+        const string MarshalType = "System.Runtime.InteropServices.Marshal";
+        r.RegisterBinding(BindingKey.Static(MarshalType, "SetLastSystemError", "System.Int32"),
+            static (_, a) => {
+                _lastSystemError = a[0].AsInt32;
+                return null;
+            },
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(MarshalType, "GetLastSystemError"),
+            static (_, _) => StackSlot.OfInt32(_lastSystemError),
+            BindingOrigin.InternalCall);
+        // SystemError/PInvokeError は実 CLR でも同一 TLS スロットの alias 面
+        // (SetLastSystemError/GetLastSystemError の IL 実体が呼ぶ下請け)
+        r.RegisterBinding(BindingKey.Static(MarshalType, "SetLastPInvokeError", "System.Int32"),
+            static (_, a) => {
+                _lastSystemError = a[0].AsInt32;
+                return null;
+            },
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(MarshalType, "GetLastPInvokeError"),
+            static (_, _) => StackSlot.OfInt32(_lastSystemError),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("Interop+Kernel32", "GetEnvironmentVariable",
+                "System.String", "System.Char&", "System.UInt32"),
+            static (_, a) => GetEnvironmentVariableImpl(a),
+            BindingOrigin.PInvokeReplacement);
+        // GlobalizationMode+Settings::get_Invariant を true 固定にする (VM 規約: culture は
+        // 不変カルチャ固定)。本家の DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論
+        // で、本家 IL の分岐は CultureInfo::GetUserDefaultLocaleName 等の OS locale 取得
+        // (Kernel32 P/Invoke) を通らない managed 経路に落ちる。OS locale 面自体は
+        // culture 機構スコープ外のため代替実装を持たない (fail-closed を維持)
+        r.RegisterBinding(BindingKey.Static("System.Globalization.GlobalizationMode+Settings", "get_Invariant"),
+            static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
+        // Type::GetTypeFromHandle: 本家 IL 本体は RuntimeType.GetTypeFromHandle (runtime
+        // intrinsic = IL なし) の呼び出しを含むため ② IL 実行に落とせない (ldfld
+        // RuntimeTypeHandle::m_type が VM 表現境界外)。実 CLR もこの面は IL を実行しない
+        // (監査表 (c) runtime-representation)。VmTypeHandle → VmRuntimeObject ファサード変換
+        // として同等面を提供する
+        r.RegisterBinding(BindingKey.Static("System.Type", "GetTypeFromHandle", "System.RuntimeTypeHandle"),
+            static (ctx, a) => a[0].ObjectValue is VmTypeHandle handle
+                ? DefaultIntrinsics.MakeRuntimeObject(ctx, handle.Target)
+                : throw new InvalidOperationException("GetTypeFromHandle の引数が RuntimeTypeHandle ではありません。"),
+            BindingOrigin.InternalCall);
+    }
+
+    // ---- System.Threading.Interlocked (JIT intrinsic 面) ----
+
+    /// <summary>本家 Interlocked は IL 本体が JIT intrinsic ダミー (typeof(T); throw new
+    /// PlatformNotSupportedException()) のため、② IL 実行に落ちるとダミー本体が表出する。
+    /// 実 CLR では JIT が命令列へ置換するため IL は決して実行されない (監査表 (c) jit-intrinsic)。
+    /// legacy intrinsic (③) は IL 本体なしの面しか受けないため、ここに ① バインドで登録する。
+    /// VM は単一スレッドで走るため比較と交換は逐次実行で競合なし (意味論は CLR と同一)。</summary>
+    private static void RegisterInterlockedBindings(IntrinsicRegistry r) {
+        const string T = "System.Threading.Interlocked";
+        static VmByRef Location(StackSlot slot, string method) =>
+            slot.ObjectValue as VmByRef
+            ?? throw new UnhandledGuestException("System.ArgumentException",
+                $"Interlocked.{method} の第 1 引数は ref フィールド (ByRef) である必要があります。");
+        // 比較対象の等価判定 (プリミティブは値、参照は同一性)
+        static bool SlotEquals(in StackSlot x, in StackSlot y) {
+            if (x.Kind != y.Kind)
+                return false;
+            return x.Kind switch {
+                StackKind.Empty => true,
+                StackKind.Object or StackKind.ByRef => ReferenceEquals(x.ObjectValue, y.ObjectValue),
+                StackKind.Float => x.DoubleValue.Equals(y.DoubleValue),
+                _ => x.Int64Value == y.Int64Value,
+            };
+        }
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "CompareExchange"), static (_, a) => {
+            var loc = Location(a[0], "CompareExchange");
+            var original = loc.Slot;
+            var equal = SlotEquals(original, a[2]);
+            if (equal)
+                loc.Slot = a[1];
+            if (a.Length >= 4 && a[3].ObjectValue is VmByRef succeeded)
+                succeeded.Slot = StackSlot.OfInt32(equal ? 1 : 0);
+            return original;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Exchange"), static (_, a) => {
+            var loc = Location(a[0], "Exchange");
+            var original = loc.Slot;
+            loc.Slot = a[1];
+            return original;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Add"), static (_, a) => {
+            var loc = Location(a[0], "Add");
+            StackSlot updated;
+            if (loc.Slot.Kind == StackKind.Int64) {
+                updated = StackSlot.OfInt64(loc.Slot.Int64Value + a[1].Int64Value);
+            } else {
+                int sum;
+                try { sum = checked((int)loc.Slot.Int64Value + a[1].AsInt32); }
+                catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
+                updated = StackSlot.OfInt32(sum);
+            }
+            loc.Slot = updated;
+            return updated;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Increment"), static (_, a) => {
+            var loc = Location(a[0], "Increment");
+            var updated = loc.Slot.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(loc.Slot.Int64Value + 1)
+                : StackSlot.OfInt32((int)loc.Slot.Int64Value + 1);
+            loc.Slot = updated;
+            return updated;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Decrement"), static (_, a) => {
+            var loc = Location(a[0], "Decrement");
+            var updated = loc.Slot.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(loc.Slot.Int64Value - 1)
+                : StackSlot.OfInt32((int)loc.Slot.Int64Value - 1);
+            loc.Slot = updated;
+            return updated;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "And"), static (_, a) => {
+            var loc = Location(a[0], "And");
+            var original = loc.Slot;
+            loc.Slot = original.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(original.Int64Value & a[1].Int64Value)
+                : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32);
+            return original;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Or"), static (_, a) => {
+            var loc = Location(a[0], "Or");
+            var original = loc.Slot;
+            loc.Slot = original.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(original.Int64Value | a[1].Int64Value)
+                : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32);
+            return original;
+        }, BindingOrigin.InternalCall);
+        // 単一スレッド実行のためフェンスは意味論上ノーオペレーション
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "MemoryBarrier"),
+            static (_, _) => null, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "ReadMemoryBarrier"),
+            static (_, _) => null, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(T, "WriteMemoryBarrier"),
+            static (_, _) => null, BindingOrigin.InternalCall);
+    }
+
+    private static StackSlot GetEnvironmentVariableImpl(StackSlot[] a) {
+        var name = (a[0].ObjectValue as VmString)?.Value;
+        var (native, slotRef) = ResolvePointerBase(a[1], "Interop+Kernel32.GetEnvironmentVariable");
+        if (name is null || (native is null && slotRef is null))
+            throw new UnhandledGuestException("System.NullReferenceException", null);
+        var value = Environment.GetEnvironmentVariable(name);
+        _lastSystemError = value is null ? 203 /* ERROR_ENVVAR_NOT_FOUND */ : 0;
+        if (string.IsNullOrEmpty(value))
+            return StackSlot.OfInt32(0);
+        // バッファ不足 (nSize <= 文字数): 書き込みは行わず終端含む必要文字数を返す
+        // (lpBuffer 内容は Win32 規約上不定 — 呼び出し側の GetEnvironmentVariableCore は
+        // この戻りで容量を確保して再試行する)
+        if (value.Length + 1 > a[2].AsInt32)
+            return StackSlot.OfInt32(value.Length + 1);
+        if (native is not null) {
+            var offset = native.ByteOffset;
+            if (offset < 0 || (long)offset + value.Length * 2 + 2 > native.Bytes.Length)
+                throw new InvalidOperationException(
+                    $"Kernel32.GetEnvironmentVariable のバッファがブロック外を参照します (offset={offset}, 必要 {value.Length + 1} 文字, ブロック {native.Bytes.Length} バイト)。");
+            var bytes = native.Bytes;
+            for (var i = 0; i < value.Length; i++)
+                System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(offset + i * 2, 2), (short)value[i]);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(offset + value.Length * 2, 2), (short)'\0');
+        } else {
+            for (var i = 0; i < value.Length; i++)
+                slotRef!.Container[slotRef.Index + i] = StackSlot.OfInt32(value[i]);
+            slotRef!.Container[slotRef.Index + value.Length] = StackSlot.OfInt32('\0');
+        }
+        return StackSlot.OfInt32(value.Length);
     }
 
     /// <summary>CLR の IsReferenceOrContainsReferences 意味論: 型が参照型であるか、

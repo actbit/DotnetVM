@@ -31,6 +31,13 @@ internal static class DelegateContinuingSurfaces {
         "System.Int64",
         "System.UInt32",
         "System.UInt64",
+        // Object の既定面 (ToString() / Equals ×2 / .ctor) は C5.5 Wave 4 で逆アセンブル確認
+        // の上 managed IL 本体のみで構成されることが確定 (ToString は GetType() 呼び、
+        // Equals は参照比較 + 仮想呼び、.ctor は空本体。依存は GetType / Type 面 intrinsic
+        // リーフで完結)。③ legacy intrinsic (VM ランタイム オブジェクト向け特殊化) より
+        // ② IL 本体を優先する。GetType / GetHashCode は内部表現依存のため ① バインドが
+        // 常に先に握る (CoreLibBindings.RegisterObject)
+        "System.Object",
     };
 
     public static bool Contains(string typeFullName) => Types.Contains(typeFullName);

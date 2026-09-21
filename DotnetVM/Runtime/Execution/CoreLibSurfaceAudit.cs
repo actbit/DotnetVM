@@ -253,8 +253,9 @@ internal static class CoreLibSurfaceAudit {
             JitIntrinsic + " (FieldRVA 初期データをリトルエンディアンで展開)", hasThis: false, paramCount: 2);
 
         // ---- DefaultIntrinsics: プリミティブ ToString() 無パラメータ面 (残置 shadow) ----
-        // 整数 4 型: ② IlPreferred + Faces 置換 (②' choke point) が常に先 → この legacy キーは到達しない
-        var int4Shadow = "shadowed-legacy (② IlPreferred + 置換面 choke point が常に先に解決するため到達しない。Wave 1+ で廃止)";
+        // 整数 4 型: ② IlPreferred + Faces 置換 (②' choke point) が常に先。CoreLib 未ロード時の
+        // 代替経路として永続残置 (未ロード時のゲスト整数 ToString() をこの legacy キーが受ける)
+        var int4Shadow = "shadowed-legacy (ロード時は ② IlPreferred + 置換面 choke point が常に先。CoreLib 未ロード時の代替経路として永続残置)";
         foreach (var t in integer4)
             Add(t, "ToString", CoreLibSurfaceKind.RealCoreLibIl, int4Shadow, hasThis: true, paramCount: 0);
         // Wave 2 移行済み 6 型 (Byte/SByte/Int16/UInt16/Char/Boolean): ① バインド廃止に伴い
@@ -274,15 +275,22 @@ internal static class CoreLibSurfaceAudit {
             RuntimeRepresentation + " (Unicode プロパティ表依存の面をホスト char.IsWhiteSpace と同一意味論で委譲)", hasThis: false, paramCount: 1);
 
         // ---- DefaultIntrinsics: Object ----
-        var objectJ = RuntimeRepresentation + " (VM のオブジェクト モデルで同等提供。Wave 4 で実 IL 化の要否を再評価)";
-        Add("System.Object", ".ctor", CoreLibSurfaceKind.RuntimeInternal, objectJ, hasThis: true, paramCount: 0);
-        Add("System.Object", "ToString", CoreLibSurfaceKind.RuntimeInternal, objectJ, hasThis: true, paramCount: 0);
-        Add("System.Object", "Equals", CoreLibSurfaceKind.RuntimeInternal, objectJ, hasThis: true, paramCount: 1);
-        Add("System.Object", "Equals", CoreLibSurfaceKind.RuntimeInternal, objectJ, hasThis: false, paramCount: 2);
+        // C5.5 Wave 4 確定: Object の既定面 (ToString() / Equals ×2 / .ctor) は本家 managed IL
+        // 本体のみで構成 (ToString は GetType() 呼び / Equals は参照比較 + 仮想呼び / .ctor は
+        // 空本体) → Object は IlPreferred に上げ、ロード時は ② IL 本体実行。
+        // これらの legacy intrinsic は CoreLib 未ロード時の代替経路として残置
+        // (VM ランタイム オブジェクト向けの特殊化 — VmExceptionObject の「型名: メッセージ」等 — を含む)
+        var objectShadow = "shadowed-legacy (CoreLib 未ロード時の代替経路。ロード時は ② IL 本体 (C5.5 Wave 4 で逆アセンブル確認済み) が常に先に実行される)";
+        Add("System.Object", ".ctor", CoreLibSurfaceKind.RealCoreLibIl, objectShadow, hasThis: true, paramCount: 0);
+        Add("System.Object", "ToString", CoreLibSurfaceKind.RealCoreLibIl, objectShadow, hasThis: true, paramCount: 0);
+        Add("System.Object", "Equals", CoreLibSurfaceKind.RealCoreLibIl, objectShadow, hasThis: true, paramCount: 1);
+        Add("System.Object", "Equals", CoreLibSurfaceKind.RealCoreLibIl, objectShadow, hasThis: false, paramCount: 2);
+        // GetHashCode: 本体 IL は TryGetHashCode (InternalCall) → GetHashCodeSlow (QCall ネイティブ)
+        // を辿り identity hash の発行自体がランタイム内部 (実 CLR も IL を実行しない面)。
+        // P/Invoke 代替の原則で ① バインド (CoreLibBindings.RegisterObject) が IdentityHash を優先提供。
+        // 未ロード時はこの legacy intrinsic が受ける
         Add("System.Object", "GetHashCode", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (ランタイム ハッシュ プロバイダ依存。IdentityHash で同等提供)", hasThis: true, paramCount: 0);
-        Add("System.Object", "GetType", CoreLibSurfaceKind.RuntimeInternal,
-            "shadowed-legacy (① GetType バインドが常に先に解決するため到達しない)", hasThis: true, paramCount: 0);
+            RuntimeRepresentation + " (identity hash は QCall ネイティブ面 = ObjectNative_GetHashCodeSlow。① バインドが IdentityHash を優先提供)", hasThis: true, paramCount: 0);
 
         // ---- DefaultIntrinsics: Exception ----
         var exceptionJ = RuntimeRepresentation +
@@ -293,8 +301,9 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Exception", "ToString", CoreLibSurfaceKind.RuntimeInternal, exceptionJ, hasThis: true, paramCount: 0);
 
         // ---- DefaultIntrinsics: String (IlPreferred = ② IL 実行が基本。影の残置キー) ----
-        var stringIlShadow = "shadowed-legacy (String は IlPreferred のため managed IL 本体を持つ面は ② IL 実行が常に先。Wave 4 で廃止)";
-        var stringBindingShadow = "shadowed-legacy (① culture / 表現面バインドが常に先に解決するため到達しない。Wave 5 の移行時に廃止)";
+        // IL 本体を持つ面の legacy intrinsic はロード時 ② が常に先。未ロード時の代替経路として永続残置
+        var stringIlShadow = "shadowed-legacy (String は IlPreferred のため managed IL 本体を持つ面は ② IL 実行が常に先。CoreLib 未ロード時の代替経路として永続残置)";
+        var stringBindingShadow = "shadowed-legacy (① culture / 表現面バインドが常に先に解決するため到達しない。C5.5 Wave 5 の移行時に置換面 (b) へ移行予定)";
         Add("System.String", ".ctor", CoreLibSurfaceKind.RuntimeInternal,
             "shadowed-legacy (newobj string 構築は ObjectEngine の NewStringFromCtor が処理するため到達しない)", hasThis: true, paramCount: 0);
         foreach (var (method, hasThis, pc, kind, j) in new[] {
@@ -335,7 +344,8 @@ internal static class CoreLibSurfaceAudit {
             Add("System.String", method, kind, j, hasThis, pc);
 
         // ---- DefaultIntrinsics: Math (IlPreferred。IL 本体が証明済みの面は影、演画面は委譲) ----
-        var mathIlShadow = "shadowed-legacy (Math は IlPreferred のため managed IL 本体を持つ面は ② IL 実行が常に先。CLR 突合 + tracer で IL 実行証明済み。Wave 4 で廃止)";
+        // IL 本体を持つ面の legacy intrinsic はロード時 ② が常に先。未ロード時の代替経路として永続残置
+        var mathIlShadow = "shadowed-legacy (Math は IlPreferred のため managed IL 本体を持つ面は ② IL 実行が常に先。CLR 突合 + tracer で IL 実行証明済み。CoreLib 未ロード時の代替経路として永続残置)";
         Add("System.Math", "Abs", CoreLibSurfaceKind.RealCoreLibIl, mathIlShadow, hasThis: false, paramCount: 1);
         Add("System.Math", "Max", CoreLibSurfaceKind.RealCoreLibIl, mathIlShadow, hasThis: false, paramCount: 2);
         Add("System.Math", "Min", CoreLibSurfaceKind.RealCoreLibIl, mathIlShadow, hasThis: false, paramCount: 2);

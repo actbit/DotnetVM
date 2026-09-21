@@ -131,6 +131,22 @@ internal sealed class CallEngine(
         if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, target.ClassArgs))
             return bound;
 
+        // callvirt で宣言どおりに着地した (実行時型で override が見つからなかった) 場合、
+        // レシーバが VM ランタイムオブジェクト (typeof() 結果等) なら実行時型は intrinsic 面
+        // (System.Type / MethodBase) に相当するため、実面に登録された intrinsic を IL 本体より
+        // 先に実行する (C5.5 Wave 4: Object を IlPreferred に上げると Object::ToString IL 内の
+        // callvirt Object::ToString (レシーバ = Type ファサード) が自己再帰するため。
+        // intrinsic ターゲット経路 (CallEngine.Call の intrinsic 分岐) と同一の救済)
+        if (isCallvirt && method.Signature.HasThis && ReferenceEquals(method, target.Method) &&
+            RuntimeReceiverSurfaceType(args[0].ObjectValue) is { } runtimeSurface &&
+            _objectEngine.TryGetIntrinsicThroughHierarchy(runtimeSurface, method.Name,
+                method.Signature.ParamTypes.Length + 1, method.Signature.HasThis, out var runtimeSurfaceImpl)) {
+            gate.ConsumeInstruction();
+            gate.CheckSafepoint();
+            _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
+            return runtimeSurfaceImpl(_intrinsicContext, args);
+        }
+
         if (method.Body is null) {
             // 本体の無い面 (InternalCall / P/Invoke / 抽象宣言) はバインドが無い限り IL 実行できない。
             // callvirt の場合のみレシーバ実行時型への最終救済 (EII) を試してから legacy intrinsic へ
@@ -241,9 +257,14 @@ internal sealed class CallEngine(
     }
 
     /// <summary>宣言メソッド (仮想 / インターフェース) をレシーバの実行時型のディスパッチ表で解決する。
-    /// 宣言型がレシーバの継承チェーンに属さない (ファサード宣言等) 場合は null。</summary>
+    /// 宣言型がレシーバの継承チェーンに属さない (ファサード宣言等) 場合は null。
+    /// VmString レシーバも宣言スロットキー (署名完全一致) なら安全に解決できるため
+    /// 実型 (System.String) を与える (C5.5 Wave 4: Object::ToString の IL 化で
+    /// "str".ToString() が宣言どおり Object::ToString に着地し、② IL の GetType() 経路が
+    /// 文字列自身でなく型名を返す退行のため。名前+引数個数の TryDispatchVirtual へは
+    /// 従来どおり VmString を渡さない — InterfaceReceiverType のコメント参照)。</summary>
     private VmMethod? TryDispatchDeclared(VmMethod declared, in StackSlot receiver) {
-        var receiverType = ReceiverRuntimeType(receiver);
+        var receiverType = ReceiverRuntimeType(receiver) ?? InterfaceReceiverType(receiver);
         if (receiverType is null || declared.DeclaringType is not VmClassType declaringClass)
             return null;
         var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
@@ -343,9 +364,9 @@ internal sealed class CallEngine(
             declaringTypeName + "::" + name + "(" + string.Join(",", paramTypeNames) + ")");
     }
 
-    /// <summary>インターフェーススロットキー照合専用のレシーバ実行時型。VmString の場合のみ
-    /// 実型 (System.String CoreLib TypeDef) を返す。String は IConvertible 等を EII 実装し、
-    /// インターフェースキーは署名完全一致なのでオーバーロード誤解決がない。
+    /// <summary>署名精度照合 (インターフェーススロットキー / 宣言スロットキー) 専用のレシーバ
+    /// 実行時型。VmString の場合のみ実型 (System.String CoreLib TypeDef) を返す。String は
+    /// IConvertible 等を EII 実装し、キーは署名完全一致なのでオーバーロード誤解決がない。
     /// 名前+引数個数の TryDispatchVirtual には VmString を渡さない (Replace 等の
     /// (string,string)/(char,char) オーバーロードを実型 IL へ誤解決させる恐れ)。
     /// StringType は VM 単位 (InterpreterServices) で保持する。</summary>

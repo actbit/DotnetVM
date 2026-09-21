@@ -236,6 +236,21 @@ public class CoreLibFacesIlTests {
                 // double 入力は本家 IL の IConvertible ディスパッチで完結、
                 // string 入力は String EII → Convert.ToDouble(string, provider) → 置換面で解析される
                 public static double ConvertToDoubleObject(object v) => Convert.ToDouble(v);
+
+                // ---- C5.5 Wave 4: Object 既定面 (本体は managed IL のみ) ----
+                public sealed class Plain { }
+                public static string PlainToString() => new Plain().ToString();
+                public static string PlainToStringViaGetType() => new Plain().GetType().ToString();
+                public static bool StaticEqualsSame() { var o = new object(); return object.Equals(o, o); }
+                public static bool StaticEqualsNullNull() => object.Equals(null, null);
+                public static bool StaticEqualsNullValue() { var o = new object(); return object.Equals(o, null); }
+                public static bool StaticEqualsDistinct() => object.Equals(new object(), new object());
+                public static bool StaticEqualsBoxedSame() => object.Equals((object)1, (object)1);
+                public static bool StaticEqualsBoxedDiff() => object.Equals((object)1, (object)2);
+                public static bool InstanceEqualsSelf() { var o = new object(); return o.Equals(o); }
+                public static bool InstanceEqualsOther() => new object().Equals(new object());
+                public static string BoxedToString() => ((object)1).ToString();
+                public static int HashOfSame() { var o = new object(); return o.GetHashCode() == o.GetHashCode() ? 1 : 0; }
             }
         }
         """;
@@ -594,5 +609,36 @@ public class CoreLibFacesIlTests {
             ("DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse"));
         // object 経由面の double 入力は本家 CoreLib IL (IConvertible ディスパッチ) で実行
         AssertRunsCoreLibIl("ConvertToDoubleObject", [3.5], ("System.Convert", "ToDouble"));
+    }
+
+    // ---- C5.5 Wave 4: Object 既定面 (IlPreferred 化 — 本体は managed IL のみで構成) ----
+
+    [Fact]
+    public void Object_Default_Faces_Match_Clr() {
+        // ToString() 既定 (GetType().ToString()) と static / instance Equals。
+        // GetHashCode は identity hash で値不定なため「同一参照で同値」のみ突合
+        AssertSame("PlainToString");
+        AssertSame("PlainToStringViaGetType");
+        AssertSame("StaticEqualsSame");
+        AssertSame("StaticEqualsNullNull");
+        AssertSame("StaticEqualsNullValue");
+        AssertSame("StaticEqualsDistinct");
+        AssertSame("StaticEqualsBoxedSame");
+        AssertSame("StaticEqualsBoxedDiff");
+        AssertSame("InstanceEqualsSelf");
+        AssertSame("InstanceEqualsOther");
+        AssertSame("BoxedToString");
+        AssertSame("HashOfSame");
+    }
+
+    [Fact]
+    public void Object_Default_Faces_Run_CoreLib_Il() {
+        // Object は C5.5 Wave 4 で IlPreferred に上がった: ToString() / Equals ×2 の本体 IL が
+        // System.Private.CoreLib として記録される (③ legacy intrinsic に落ちていない証明)
+        AssertRunsCoreLibIl("PlainToString", [], ("System.Object", "ToString"));
+        AssertRunsCoreLibIl("StaticEqualsSame", [], ("System.Object", "Equals"));
+        AssertRunsCoreLibIl("InstanceEqualsSelf", [], ("System.Object", "Equals"));
+        // GetHashCode は ① バインド (IdentityHash) で処理 → IL フレームは立たない
+        // (到達しないことをここでは検査せず、CLR 突合側で正常動作のみ確認)
     }
 }

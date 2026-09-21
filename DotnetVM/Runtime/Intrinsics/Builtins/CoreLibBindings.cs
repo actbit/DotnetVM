@@ -241,6 +241,15 @@ internal static class CoreLibBindings {
         r.RegisterBinding(BindingKey.Instance("System.Object", "GetType"),
             static (ctx, a) => DefaultIntrinsics.TypeFacadeOf(ctx, a[0]),
             BindingOrigin.Managed);
+        // public virtual int Object.GetHashCode()
+        // C5.5 Wave 4 で監査確定: 本体 IL (RuntimeHelpers.GetHashCode 呼び) は
+        // TryGetHashCode (InternalCall) → GetHashCodeSlow (QCall ネイティブ =
+        // ObjectNative_GetHashCodeSlow) を辿り identity hash の発行自体がランタイム内部。
+        // P/Invoke 代替の原則で identity hash リーフとして ① バインドで優先提供する
+        // (Object は IlPreferred に上がったため ① が無いと ② がこの面を辿ってしまう)
+        r.RegisterBinding(BindingKey.Instance("System.Object", "GetHashCode"),
+            static (ctx, a) => StackSlot.OfInt32(ctx.IdentityHash(a[0].ObjectValue)),
+            BindingOrigin.Managed);
     }
 
     // ---- System.Threading.Monitor (VM は単一スレッド実行のため競合なしのロック面) ----

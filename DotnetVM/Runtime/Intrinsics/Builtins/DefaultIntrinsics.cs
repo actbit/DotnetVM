@@ -266,6 +266,11 @@ public static class DefaultIntrinsics {
                 : (VmType)ci.ClassType,
             VmBoxedValue bv => bv.Type,
             VmArray arr => arr.ArrayType,
+            // C5.5 Wave 4: Object.ToString の IL 化で "str".GetType() がこの面を辿る。
+            // VmString の実行時型は System.String (旧 ③ intrinsic の「VmString は自分自身」
+            // 特殊化に相当する型同一性)
+            VmString => ctx.Types.FindIntrinsicType("System.String")
+                ?? throw new InvalidOperationException("ファサード型 System.String が未登録です。"),
             VmExceptionObject e => e.Type,
             VmRuntimeObject rt => rt.Target,
             null => throw new UnhandledGuestException("System.NullReferenceException", null),
@@ -823,6 +828,10 @@ public static class DefaultIntrinsics {
     }
 
     // ---- System.Object ----
+    // C5.5 Wave 4 確定: ToString() / Equals ×2 の本家本体は managed IL のみ
+    // (ToString は GetType() 呼び / Equals は参照比較 + 仮想呼び) で Object は IlPreferred のため
+    // CoreLib ロード時は ② IL 本体が常に先に実行される。以下の intrinsic は CoreLib 未ロード時の
+    // 代替経路 (VM ランタイム オブジェクト向けの特殊化を含む)
 
     private static void RegisterObject(IntrinsicRegistry r) {
         const string T = "System.Object";
@@ -849,9 +858,9 @@ public static class DefaultIntrinsics {
         });
         r.Register(IntrinsicKey.Instance(T, "GetHashCode", 0), static (ctx, a) =>
             StackSlot.OfInt32(ctx.IdentityHash(a[0].ObjectValue)));
-        // Object.GetType(): レシーバの実行時型 (構築型なら型引数込み) の System.Type ファサードを返す
-        r.Register(IntrinsicKey.Instance(T, "GetType", 0), static (ctx, a) =>
-            MakeRuntimeObject(ctx, RuntimeTypeOf(ctx, a[0])));
+        // Object.GetType() は C5.5 Wave 4 で legacy intrinsic を廃止:
+        // ① バインド (CoreLibBindings.RegisterObject) がロード / 未ロードを問わず常に先に
+        // 解決するため、この intrinsic は到達しない死キーだった
     }
 
     // ---- System.Exception (ファサード階層の共通面) ----

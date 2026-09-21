@@ -35,27 +35,16 @@ internal static class CoreLibBindings {
     /// <summary>プリミティブの instance ToString バインド。String.Concat(object, object)
     /// 等、CoreLib IL 内の `boxedPrimitive?.ToString()` の callvirt が culture 機構依存の
     /// managed IL に仮想解決されるのを受ける面。
-    /// 整数 4 型 (Int32/Int64/UInt32/UInt64) は ToString() の無パラメータ面を
-    /// VmCoreLibSurfaces (DotnetVM.CoreLib の managed IL) に置換するためここには載せない
-    /// (載せると ① が ②/置換面を塞いでしまう)。パラメータ付きオーバーロード
-    /// (書式 / IFormatProvider 面) のみ明示キーで委譲を続ける。</summary>
+    /// C5.5 Wave 2 で整数 8 型 + Boolean/Char の全 ToString 面 (無引数 / format /
+    /// format+IFormatProvider / IFormatProvider) を VmCoreLibSurfaces (DotnetVM.CoreLib
+    /// FormatSpecifiers の managed IL) に置換したため、ここには載せない (載せると ① が
+    /// ②'/置換面を塞いでしまう)。Single/Double のみ Wave 3 (浮動小数点書式移植) まで
+    /// format 無視の委譲を続ける。</summary>
     private static void RegisterPrimitiveToString(IntrinsicRegistry r) {
-        // 置換面に任せる整数 4 型: 無パラメータ ToString() / ToString(IFormatProvider) は
-        // バインドしない (VmCoreLibSurfaces.Faces の置換 IL が受ける — IFormatProvider は
-        // 不変カルチャ固定で無視)。監査闭合テストのシャドウ禁止 (① が (b) を塞ぐ退行の防止)
-        foreach (var t in new[] { "System.Int32", "System.UInt32", "System.Int64", "System.UInt64" }) {
-            r.RegisterBinding(BindingKey.Instance(t, "ToString", "System.String"),
-                (ctx, a) => PrimitiveToString(ctx, a[0], t), BindingOrigin.Managed);
-            r.RegisterBinding(BindingKey.Instance(t, "ToString", "System.String,System.IFormatProvider"),
-                (ctx, a) => PrimitiveToString(ctx, a[0], t), BindingOrigin.Managed);
-        }
-        // 残りのプリミティブは従来どおり全オーバーロードを委譲 (IFormatProvider は無視 =
-        // 常に CurrentCulture。CLR の不変カルチャ書式との差分は culture 面の課題)
-        var primitives = new[] {
-            "System.Int16", "System.UInt16", "System.SByte", "System.Byte",
-            "System.Char", "System.Boolean", "System.Single", "System.Double",
-        };
-        foreach (var t in primitives)
+        // Wave 3 移行予定: Single/Double は実在側が Number.Formatting (Grisu3 / Dragon4 /
+        // byte* ポインタ) で VM 表現に落ちないため、書式を無視して既存委譲を維持する。
+        // 監査表 (CoreLibSurfaceAudit) に Wave 3 移行予定として記載
+        foreach (var t in new[] { "System.Single", "System.Double" })
             r.RegisterBinding(BindingKey.InstanceAnyParams(t, "ToString"),
                 (ctx, a) => PrimitiveToString(ctx, a[0], t), BindingOrigin.Managed);
     }

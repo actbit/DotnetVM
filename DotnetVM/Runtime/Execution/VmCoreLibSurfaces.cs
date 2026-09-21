@@ -61,6 +61,45 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Convert", "ToUInt16", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt16", ["System.String"]),
         ("System.Convert", "ToUInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt32", ["System.String"]),
         ("System.Convert", "ToUInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt64", ["System.String"]),
+        // ---- C5.5 Wave 2: 整数書式 overload (標準書式 G/D/X/B/C/F/N/E/P/R + カスタム書式)。
+        // 実在側は Number.Formatting (byte* 生ポインタ + NumberBuffer + stackalloc) +
+        // NumberFormatInfo culture 機構で構成され VM の表現モデルに落ちないため、
+        // DotnetVM.CoreLib.FormatSpecifiers (意味論移植・不変カルチャ固定) へ差し替える。
+        // provider は不変カルチャ固定で無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
+        ("System.Byte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte", "System.String"]),
+        ("System.SByte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte", "System.String"]),
+        ("System.Int16", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16", "System.String"]),
+        ("System.UInt16", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16", "System.String"]),
+        ("System.Int32", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "Int32ToString", ["System.Int32", "System.String"]),
+        ("System.UInt32", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt32ToString", ["System.UInt32", "System.String"]),
+        ("System.Int64", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "Int64ToString", ["System.Int64", "System.String"]),
+        ("System.UInt64", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt64ToString", ["System.UInt64", "System.String"]),
+        ("System.Byte", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte", "System.String", "System.Object"]),
+        ("System.SByte", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte", "System.String", "System.Object"]),
+        ("System.Int16", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16", "System.String", "System.Object"]),
+        ("System.UInt16", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16", "System.String", "System.Object"]),
+        ("System.Int32", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int32ToString", ["System.Int32", "System.String", "System.Object"]),
+        ("System.UInt32", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt32ToString", ["System.UInt32", "System.String", "System.Object"]),
+        ("System.Int64", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int64ToString", ["System.Int64", "System.String", "System.Object"]),
+        ("System.UInt64", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt64ToString", ["System.UInt64", "System.String", "System.Object"]),
+        // 整数 4 小型 (Byte/SByte/Int16/UInt16) の無引数 / provider のみの面 (既存の NumberFormatting
+        // 面は Int32/64/UInt32/64 のみだった)。IFormatProvider のみの面は余剰スロット無視で 1 引数 impl へ
+        ("System.Byte", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte"]),
+        ("System.SByte", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte"]),
+        ("System.Int16", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16"]),
+        ("System.UInt16", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16"]),
+        ("System.Byte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte"]),
+        ("System.SByte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte"]),
+        ("System.Int16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16"]),
+        ("System.UInt16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16"]),
+        // Boolean / Char の ToString 面 (実在側は culture 機構を辿る。True/False と 1 文字は
+        // 不変)。Char の 1 文字生成は char.ToString() を使わない (Faces 置換の再帰になるため
+        // new string(char, int) で生成する)
+        ("System.Boolean", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "BooleanToString", ["System.Boolean"]),
+        ("System.Boolean", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "BooleanToString", ["System.Boolean"]),
+        ("System.Char", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "CharToString", ["System.Char"]),
+        ("System.Char", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "CharToString", ["System.Char"]),
     ];
 
     private readonly TypeLoader _coreLibLoader;

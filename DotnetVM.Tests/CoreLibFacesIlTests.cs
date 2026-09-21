@@ -142,6 +142,40 @@ public class CoreLibFacesIlTests {
                         return ex.GetType().Name + ":" + ex.Message.Length;
                     }
                 }
+
+                // ---- C5.5 Wave 2: 書式付き ToString 面 (Faces 置換 → FormatSpecifiers IL) ----
+                // ゲスト差分で使う書式は culture 非依存のものに限る (N/C/P 等の culture 面の
+                // 全面グリッドは FormatSpecifiersClrTests で不変カルチャ固定して突合済み)
+                public static string IntFormatFaces(int v, string fmt) => v.ToString(fmt);
+
+                public static string LongFormatFaces(long v, string fmt) => v.ToString(fmt);
+
+                public static string UnsignedFormatFaces(ulong v, string fmt) => v.ToString(fmt);
+
+                public static string SmallTypeFormatFaces(int v, string fmt) =>
+                    ((byte)v).ToString(fmt) + ":" + ((sbyte)v).ToString(fmt) + ":" +
+                    ((short)v).ToString(fmt) + ":" + ((ushort)v).ToString(fmt);
+
+                public static string BoolCharToStringFaces(bool b, char c) => b.ToString() + ":" + c.ToString();
+
+                // 連結文脈でない素の呼出 (Roslyn は連結内の char.ToString() を
+                // String::op_Implicit(char) へ最適化するため、Char ToString 面の直接証明用)
+                public static string BoolToStringFace(bool b) => b.ToString();
+
+                public static string CharToStringFace(char c) => c.ToString();
+
+                // provider のみの面 (ToString(IFormatProvider)) と format=null (G 既定) 面
+                public static string ProviderOnlyFaces(short v, byte b) =>
+                    v.ToString((IFormatProvider)null!) + ":" + b.ToString((string?)null);
+
+                // FormatException 分類 (無効な標準書式文字 "Q5" 等 / letter+ガベージ "D2x")
+                public static string FormatClassify(int v, string fmt) {
+                    try {
+                        return v.ToString(fmt);
+                    } catch (FormatException) {
+                        return "format";
+                    }
+                }
             }
         }
         """;
@@ -337,5 +371,67 @@ public class CoreLibFacesIlTests {
     [Fact]
     public void Exception_Default_Message_Matches_Clr() {
         AssertSame("ExceptionDefaultMessage", 5);
+    }
+
+    // ---- C5.5 Wave 2: 整数書式 overload (Faces 置換面 → FormatSpecifiers IL) ----
+
+    [Fact]
+    public void Integer_Format_Overloads_Match_Clr() {
+        foreach (var fmt in new[] { "G", "D", "D2", "D10", "x", "X4", "X8", "b", "B16", "0.00", "#,##0" })
+            foreach (var v in new[] { 0, 5, -7, 255, 12345, int.MaxValue, int.MinValue })
+                AssertSame("IntFormatFaces", v, fmt);
+        foreach (var fmt in new[] { "G", "D20", "x16", "X8", "B64", "0.000" })
+            foreach (var v in new long[] { 0, 9, -999, long.MaxValue, long.MinValue })
+                AssertSame("LongFormatFaces", v, fmt);
+        foreach (var fmt in new[] { "G", "X16", "b64", "N0" })
+            AssertSame("UnsignedFormatFaces", (ulong)ulong.MaxValue, fmt);
+        foreach (var fmt in new[] { "x2", "X4", "D6", "0.0" }) {
+            AssertSame("SmallTypeFormatFaces", 200, fmt);
+            AssertSame("SmallTypeFormatFaces", 7, fmt);
+        }
+    }
+
+    [Fact]
+    public void Bool_Char_And_Provider_ToString_Match_Clr() {
+        AssertSame("BoolCharToStringFaces", true, 'A');
+        AssertSame("BoolCharToStringFaces", false, 'z');
+        AssertSame("BoolToStringFace", true);
+        AssertSame("BoolToStringFace", false);
+        AssertSame("CharToStringFace", 'A');
+        AssertSame("CharToStringFace", '‰');
+        AssertSame("ProviderOnlyFaces", (short)42, (byte)7);
+        AssertSame("ProviderOnlyFaces", (short)-1, (byte)200);
+    }
+
+    [Fact]
+    public void Integer_Format_Exception_Classification_Matches_Clr() {
+        foreach (var fmt in new[] { "G", "D2", "x", "X8", "B", "Q5", "q3", "z0", "D2x", "X2j", "E+2", "" })
+            AssertSame("FormatClassify", 12345, fmt);
+    }
+
+    [Fact]
+    public void Integer_Format_Overloads_Run_VmCoreLib_Il() {
+        // Faces 置換面の証明: 書式付き ToString の IL フレームが
+        // アセンブリ名 "DotnetVM.CoreLib" の FormatSpecifiers として記録される
+        AssertRunsVmCoreLibIl("IntFormatFaces", [255, "x"],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "Int32ToString"));
+        AssertRunsVmCoreLibIl("IntFormatFaces", [-7, "D10"],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "Int32ToString"));
+        AssertRunsVmCoreLibIl("LongFormatFaces", [-1, "X16"],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "Int64ToString"));
+        AssertRunsVmCoreLibIl("UnsignedFormatFaces", [ulong.MaxValue, "b64"],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "UInt64ToString"));
+        AssertRunsVmCoreLibIl("SmallTypeFormatFaces", [200, "x2"],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "ByteToString"),
+            ("DotnetVM.CoreLib.FormatSpecifiers", "SByteToString"),
+            ("DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString"),
+            ("DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString"));
+        AssertRunsVmCoreLibIl("BoolToStringFace", [true],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "BooleanToString"));
+        AssertRunsVmCoreLibIl("CharToStringFace", ['A'],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "CharToString"));
+        AssertRunsVmCoreLibIl("ProviderOnlyFaces", [42, 7],
+            ("DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString"),
+            ("DotnetVM.CoreLib.FormatSpecifiers", "ByteToString"));
     }
 }

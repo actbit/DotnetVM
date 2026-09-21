@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- 外部依存なし (BCL の使用も最小面に限定)。VM が IL を直接実行するため
+         span / pointer / ref 戻り値等の表現境界面は使わない -->
+  </PropertyGroup>
+
+</Project>

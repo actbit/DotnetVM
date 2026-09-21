@@ -60,12 +60,18 @@ public abstract class VmType {
             return true;
         if (this is VmConstructedType constructed && target is VmConstructedType targetConstructed)
             return constructed.IsConstructedAssignableTo(targetConstructed);
+        // 基底チェーンも先頭と同じ緩和で照合する (VM 内部例外のファサード階層 ⇔
+        // CoreLib 実型階層の橋渡し: facade DivideByZeroException → facade Exception と
+        // 実型 System.Exception を完全名で一致させる)
         for (var current = BaseType; current is not null; current = current.BaseType)
-            if (ReferenceEquals(current, target))
+            if (ReferenceEquals(current, target) || current.FullName == target.FullName)
                 return true;
-        foreach (var iface in Interfaces)
-            if (iface.IsAssignableTo(target))
-                return true;
+        // インターフェース実装は基底クラスで宣言されたものも派生型に引き継がれる (CLR 規約)。
+        // 基底チェーン全体の実装インターフェースを照合する (enum → System.Enum の IConvertible 等)
+        for (var current = (VmType?)this; current is not null; current = current.BaseType)
+            foreach (var iface in current.Interfaces)
+                if (iface.IsAssignableTo(target))
+                    return true;
         return false;
     }
 

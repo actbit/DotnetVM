@@ -10,4 +10,10 @@
     <InternalsVisibleTo Include="DotnetVM.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- VM CoreLib (置換面の managed IL 実装)。DotnetVM.dll と同じ出力先に配置され、
+         LoadHostCoreLib = true 時に VM がロードして IL 実行する -->
+    <ProjectReference Include="..\DotnetVM.CoreLib\DotnetVM.CoreLib.csproj" />
+  </ItemGroup>
+
 </Project>

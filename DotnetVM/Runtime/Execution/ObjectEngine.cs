@@ -28,9 +28,38 @@ internal sealed class ObjectEngine(
     private readonly HashSet<string> _initializedConstructedTypes = [];
     /// <summary>intrinsic 型の静的フィールドのストレージ (トークンごとに 1 スロット。例: String.Empty)。GC ルート源。</summary>
     private readonly Dictionary<int, StackSlot[]> _intrinsicStaticFields = [];
+    /// <summary>静的 FieldRVA データフィールドのアドレス (トークンごとに 1 つ。例: Char.Latin1CharInfo の
+    /// &lt;PrivateImplementationDetails&gt; 初期化データ)。GC グラフ源 (Interpreter が到達可能性に使う)。</summary>
+    private readonly Dictionary<int, VmNativePointer> _rvaFieldAddresses = [];
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;
+
+    /// <summary>intrinsic 静的フィールド / FieldRVA データアドレスの実体一覧 (GC グラフ源)。</summary>
+    public IEnumerable<VmNativePointer> RvaFieldAddresses => _rvaFieldAddresses.Values;
+
+    /// <summary>静的 FieldRVA データフィールド (&lt;PrivateImplementationDetails&gt; の静的配列初期化データ)
+    /// へのアドレス解決 (ldsflda 用)。CoreLib は静的テーブル (例: Char.Latin1CharInfo の byte[256]) を
+    /// 「ldsflda + newobj ReadOnlySpan(void*, int)」で参照するため、画像の初期データをバイト実体
+    /// (画像からコピーして確保。確保はヒープ会計外のメタデータ派生読み取り専用データ) として公開する。
+    /// FieldRVA を持たないフィールドトークンは null (通常の静的ストレージ経路へ)。</summary>
+    public StackSlot? TryGetStaticFieldRvaAddress(int token) {
+        var table = (TableKind)(token >> 24);
+        var rid = (int)(token & 0xFFFFFF);
+        if (table != TableKind.Field)
+            return null;
+        var rva = _loader.Image.GetFieldRva(rid);
+        if (rva == 0)
+            return null;
+        if (!_rvaFieldAddresses.TryGetValue(token, out var pointer)) {
+            pointer = new VmNativePointer {
+                Memory = new VmLocallocMemory { Bytes = _loader.Image.GetRvaDataToEnd(rva).ToArray() },
+                ByteOffset = 0,
+            };
+            _rvaFieldAddresses[token] = pointer;
+        }
+        return StackSlot.OfObject(pointer);
+    }
 
     // ---- 型トークン解決 ----
 
@@ -53,6 +82,47 @@ internal sealed class ObjectEngine(
     }
 
     // ---- フィールドアクセス ----
+
+    /// <summary>CoreLib String の実体フィールド名 → バッファ内バイトオフセット。</summary>
+    private static bool TryGetStringFieldOffset(string fieldName, out int byteOffset) {
+        // CoreLib は _stringLength/_firstChar、可変長文字列構文の別画像では m_ 接頭辞の可能性も許容
+        switch (fieldName) {
+            case "_stringLength" or "m_stringLength":
+                byteOffset = VmString.HeaderByteCount - sizeof(int); // ヘッダ先頭 = 0
+                return true;
+            case "_firstChar" or "m_firstChar":
+                byteOffset = VmString.CharDataByteOffset;
+                return true;
+            default:
+                byteOffset = 0;
+                return false;
+        }
+    }
+
+    /// <summary>ldflda 用のアドレス解決。VnString (可変 char バッファ) はバイト実体への
+    /// unmanaged ポインタを返し (CoreLib IL が Unsafe.Add / Buffer.Memmove に渡す形)、
+    /// それ以外は ByRef を返す。</summary>
+    public StackSlot FieldAddress(in StackSlot objSlot, VmField field) {
+        if (objSlot.Kind == StackKind.Object && objSlot.ObjectValue is VmString str &&
+            TryGetStringFieldOffset(field.Name, out var offset))
+            return StackSlot.OfObject(new VmNativePointer {
+                Memory = str.PointerMemory,
+                ByteOffset = offset,
+            });
+        return StackSlot.OfByRef(FieldLocation(objSlot, field));
+    }
+
+    /// <summary>stfld の文字列実体への書込。VnString レシーバでなければ false (通常経路へ)。</summary>
+    public bool TryStoreStringField(in StackSlot objSlot, VmField field, in StackSlot value) {
+        if (objSlot.Kind != StackKind.Object || objSlot.ObjectValue is not VmString str ||
+            !TryGetStringFieldOffset(field.Name, out _))
+            return false;
+        if (field.Name is "_stringLength" or "m_stringLength")
+            str.WriteStringLength(value.AsInt32);
+        else
+            str.WriteFirstChar((char)value.AsInt32);
+        return true;
+    }
 
     /// <summary>フィールドトークン (Field / MemberRef) を解決する。TypeSpec 親 (構築型のフィールド) も解決する。</summary>
     public VmField ResolveFieldToken(int token, GenericContext? context = null) {
@@ -112,6 +182,12 @@ internal sealed class ObjectEngine(
         switch (objSlot.Kind) {
             case StackKind.Object when objSlot.ObjectValue is null:
                 throw new UnhandledGuestException("System.NullReferenceException", null);
+            case StackKind.Object when objSlot.ObjectValue is VmString str &&
+                TryGetStringFieldOffset(field.Name, out var stringFieldOffset):
+                // CoreLib String の実体フィールド。バイト実体が真実源のため、読み出しのたびに
+                // 合成スロットへ同期してから返す (直近のポインタ書込が反映される)
+                str.SyncFieldSlotsFromBytes();
+                return new VmByRef(str.FieldSlots, stringFieldOffset == 0 ? 0 : 1);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
                 return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field));
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed: {
@@ -234,20 +310,90 @@ internal sealed class ObjectEngine(
         return @delegate;
     }
 
-    /// <summary>.ctor を基底連鎖 (ジェネリック定義へ解いて) から探す。</summary>
-    private static VmMethod? FindCtorThroughChain(VmClassType type, string name, int paramCount) {
+    /// <summary>.ctor を基底連鎖 (ジェネリック定義へ解いて) から探す。署名精度 (スロットキー一致) を
+    /// 優先し、キー解決不可の候補は従来どおり名前+引数個数の最初の一致にフォールバックする
+    /// (ReadOnlySpan の (in T&amp;) と (T[]) 等の同引数個数オーバーロード誤解決の解消)。</summary>
+    private VmMethod? FindCtorThroughChain(VmClassType type, string name, int paramCount, SigType[]? paramTypes) {
+        var queryKey = paramTypes is not null && _loader.TryResolveSlotParams(paramTypes) is { } parameters
+            ? VmSlotKeys.Of(name, parameters) : null;
+        VmMethod? byParamCount = null;
         for (VmType? t = type; t is not null;) {
             if (t is VmConstructedType ct)
                 t = ct.Definition;
             if (t is not VmClassType cls)
                 break;
-            var ctor = cls.Methods.FirstOrDefault(m =>
-                m.Name == name && !m.IsStatic && m.Signature.ParamTypes.Length == paramCount);
-            if (ctor is not null)
-                return ctor;
+            foreach (var method in cls.Methods) {
+                if (method.Name != name || method.IsStatic)
+                    continue;
+                if (queryKey is not null && method.SlotKey == queryKey)
+                    return method; // 署名一致 (オーバーロード誤解決の解消)
+                if (byParamCount is null && method.Signature.ParamTypes.Length == paramCount)
+                    byParamCount = method;
+            }
             t = cls.BaseType;
         }
-        return null;
+        return byParamCount;
+    }
+
+    /// <summary>string::.ctor の構築面 (char[] / char[],int / char)。CLR と同じ確保点
+    /// (FastAllocateString 相当の VmStringPool.Allocate) で確保し、char 列をバッファへ
+    /// 書き込む。引数検査は CLR と同じ例外分類 (null 配列は ArgumentNullException、
+    /// 範囲外は ArgumentOutOfRangeException)。</summary>
+    private StackSlot NewStringFromCtor(int paramCount, InterpreterFrame caller) {
+        var args = new StackSlot[paramCount];
+        for (var i = paramCount; i >= 1; i--)
+            args[i - 1] = caller.Stack.Pop();
+        gate.ConsumeInstruction();
+        gate.CheckSafepoint();
+        var strings = _intrinsicContext.Strings;
+        switch (paramCount) {
+            case 1: {
+                // string(char[] value)
+                var array = RequireCharArray(args[0]);
+                var result = strings.Allocate(array.Length);
+                CopyChars(result, 0, array, 0, array.Length);
+                return StackSlot.OfObject(result);
+            }
+            case 2: {
+                // string(char c, int count)
+                var c = (char)args[0].Int64Value;
+                var count = (int)args[1].Int64Value;
+                if (count < 0)
+                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
+                var result = strings.Allocate(count);
+                for (var i = 0; i < count; i++)
+                    WriteChar(result, i, c);
+                return StackSlot.OfObject(result);
+            }
+            case 3: {
+                // string(char[] value, int startIndex, int length)
+                var array = RequireCharArray(args[0]);
+                var startIndex = (int)args[1].Int64Value;
+                var length = (int)args[2].Int64Value;
+                if ((uint)startIndex > (uint)array.Length || length < 0 || (uint)length > (uint)(array.Length - startIndex))
+                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
+                var result = strings.Allocate(length);
+                CopyChars(result, 0, array, startIndex, length);
+                return StackSlot.OfObject(result);
+            }
+            default:
+                throw new NotSupportedException($"string::.ctor (引数 {paramCount} 個) は対応していません。");
+        }
+    }
+
+    private static VmArray RequireCharArray(StackSlot slot) =>
+        slot.ObjectValue as VmArray
+        ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
+
+    private static void CopyChars(VmString target, int targetIndex, VmArray source, int sourceIndex, int count) {
+        for (var i = 0; i < count; i++)
+            WriteChar(target, targetIndex + i, (char)source.Elements[sourceIndex + i].Int64Value);
+    }
+
+    private static void WriteChar(VmString target, int charIndex, char value) {
+        var offset = VmString.CharDataByteOffset + charIndex * 2;
+        target.Bytes[offset] = (byte)value;
+        target.Bytes[offset + 1] = (byte)((ushort)value >> 8);
     }
 
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
@@ -267,6 +413,12 @@ internal sealed class ObjectEngine(
             var name = _loader.GetMemberRefName(rid);
             var typeName = _loader.GetMemberRefParentTypeName(rid);
             if (typeName is not null) {
+                // string の構築面 (new string(char[]) / new string(char, int) 等):
+                // FastAllocateString + char 列コピーと同じ確保点で VmString を生成する。
+                // 置換面 (DotnetVM.CoreLib の NumberFormatting IL) が使うほか、ゲストの
+                // 直接の new string(...) もここに着地する
+                if (typeName == "System.String" && name == ".ctor")
+                    return NewStringFromCtor(facadeParamCount, caller);
                 var facadeType = _loader.FindIntrinsicType(typeName);
                 if (facadeType is not null) {
                     // デリゲートファサード (Action/Func/Predicate 等) の newobj (object, native int)
@@ -313,7 +465,7 @@ internal sealed class ObjectEngine(
             // intrinsic ファサードでない TypeRef 親 (依存アセンブリの型 / ネスト型) は
             // 実 TypeDef の .ctor として解決し、MethodDef と共通の生成経路へ流す
             if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass) {
-                ctor = FindCtorThroughChain(realClass, name, facadeParamCount)
+                ctor = FindCtorThroughChain(realClass, name, facadeParamCount, signature.ParamTypes)
                     ?? throw new BadImageFormatException(
                         $"newobj の MemberRef 0x{token:X8} の解決先 .ctor {realClass.FullName}::{name} (引数 {facadeParamCount} 個) が見つかりません。");
             } else {
@@ -376,16 +528,9 @@ internal sealed class ObjectEngine(
 
         var definition = (VmClassType)constructed.Definition;
 
-        // .ctor は宣言型 (継承チェーン上の基底ジェネリック定義も含む) から探す
-        VmMethod? ctor = null;
-        for (VmType? t = definition; t is not null && ctor is null; t = t.BaseType) {
-            if (t is VmConstructedType ct)
-                t = ct.Definition;
-            if (t is not VmClassType cls)
-                break;
-            ctor = cls.Methods.FirstOrDefault(m =>
-                m.Name == ctorName && !m.IsStatic && m.Signature.ParamTypes.Length == paramCount);
-        }
+        // .ctor は宣言型 (継承チェーン上の基底ジェネリック定義も含む) から署名精度で探す
+        // (MemberRef の !0 と定義側のスロットキーはどちらも VmGenericParameterType に正規化され照合可能)
+        var ctor = FindCtorThroughChain(definition, ctorName, paramCount, signature.ParamTypes);
         EnsureInitialized(definition);
         if (ctor is null)
             throw new BadImageFormatException(

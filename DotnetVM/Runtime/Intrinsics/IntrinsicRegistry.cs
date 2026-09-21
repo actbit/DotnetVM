@@ -51,6 +51,15 @@ public sealed class IntrinsicContext {
     /// </summary>
     public string[] ParameterTypeNames { get; internal set; } = [];
 
+    /// <summary>呼出ゲート (CallEngine.TryInvokeBinding) が設定する「今回の呼出のメソッド型実引数名」。
+    /// ジェネリック メソッドのバインド (IsReferenceOrContainsReferences&lt;T&gt;() 等の値パラメータ
+    /// 0 個の面) で T を判別するために使う。</summary>
+    public string[] MethodTypeArgumentNames { get; internal set; } = [];
+
+    /// <summary>メソッド型実引数のインデックス名 (範囲外は空文字列)。</summary>
+    public string MethodTypeArgAt(int i) =>
+        i >= 0 && i < MethodTypeArgumentNames.Length ? MethodTypeArgumentNames[i] : "";
+
     /// <summary>インデックスのパラメータ型名 (範囲外は空文字列)。</summary>
     public string ParamAt(int i) =>
         i >= 0 && i < ParameterTypeNames.Length ? ParameterTypeNames[i] : "";

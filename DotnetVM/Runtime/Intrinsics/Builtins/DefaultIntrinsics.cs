@@ -82,6 +82,34 @@ public static class DefaultIntrinsics {
     /// <summary>スタックスロットの CLR 互換文字列化 (String.Concat(object,...) の引数用)。</summary>
     private static string FormatSlot(IntrinsicContext ctx, in StackSlot slot) => FormatValue(ctx, slot, "");
 
+    /// <summary>プリミティブ スロットの CLR 互換 ToString (instance ToString 面 / ボックス化
+    /// プリミティブへの仮想呼出のバインド用)。callvirt のレシーバは box 済み VmBoxedValue
+    /// (Object スロット)、constrained. 経由では正規化後の生スロットのどちらかで来るため、
+    /// 箱なら中身と型名を取り出す。primitiveTypeName で i4 スロットに統合される char / bool /
+    /// 符号なしの書式を判別する (CLR の int.ToString() 等は CurrentCulture)。</summary>
+    internal static string FormatPrimitiveToString(in StackSlot slot, string primitiveTypeName) {
+        var value = slot;
+        if (slot.Kind == StackKind.Object && slot.ObjectValue is VmBoxedValue boxed) {
+            primitiveTypeName = boxed.Type.FullName;
+            value = boxed.Fields[0];
+        }
+        return primitiveTypeName switch {
+            "System.Int32" => ((int)value.Int64Value).ToString(),
+            "System.UInt32" => ((uint)value.Int64Value).ToString(),
+            "System.Int64" => value.Int64Value.ToString(),
+            "System.UInt64" => ((ulong)value.Int64Value).ToString(),
+            "System.Int16" => ((short)value.Int64Value).ToString(),
+            "System.UInt16" => ((ushort)value.Int64Value).ToString(),
+            "System.SByte" => ((sbyte)value.Int64Value).ToString(),
+            "System.Byte" => ((byte)value.Int64Value).ToString(),
+            "System.Boolean" => value.Int64Value != 0 ? "True" : "False",
+            "System.Char" => ((char)value.Int64Value).ToString(),
+            "System.Single" => ((float)value.DoubleValue).ToString(),
+            "System.Double" => value.DoubleValue.ToString(),
+            _ => value.Int64Value.ToString(),
+        };
+    }
+
     /// <summary>String.Concat の配列面 (CoreLibBindings と共有) の要素フォーマット。
     /// CLR 規約どおり null は空文字列化する。</summary>
     internal static string ConcatFormat(IntrinsicContext ctx, in StackSlot slot) => FormatSlot(ctx, slot);
@@ -212,6 +240,7 @@ public static class DefaultIntrinsics {
         RegisterObject(registry);
         RegisterString(registry);
         RegisterPrimitiveToString(registry);
+        RegisterChar(registry);
         RegisterMath(registry);
         RegisterConsole(registry);
         RegisterConvert(registry);
@@ -785,6 +814,14 @@ public static class DefaultIntrinsics {
         S("System.Double", s => s.DoubleValue.ToString());
     }
 
+    /// <summary>System.Char の static 面 (String の CoreLib IL — Trim 等 — が呼ぶ)。
+    /// Unicode の空白判定はホストの char.IsWhiteSpace と同一意味論。</summary>
+    private static void RegisterChar(IntrinsicRegistry r) {
+        const string T = "System.Char";
+        r.Register(IntrinsicKey.Static(T, "IsWhiteSpace", 1),
+            static (_, a) => StackSlot.OfInt32(char.IsWhiteSpace((char)a[0].AsInt32) ? 1 : 0));
+    }
+
     // ---- System.Object ----
 
     private static void RegisterObject(IntrinsicRegistry r) {
@@ -881,7 +918,9 @@ public static class DefaultIntrinsics {
                     IntrinsicContext.GetExceptionMessage(ci),
                 _ => null,
             };
-            // CLR 互換: メッセージ未設定なら「Exception of type 'X' was thrown.」
+            // CLR 互換: メッセージ未設定なら既定文言面。VM 内部例外 (ゼロ除算等) と
+            // パラメータなし .ctor の両方がここを通るため、既定文言をホスト CLR の
+            // 例外型に委譲して再現する (Format 等と同じ culture 依存テキストのプロキシ委譲)
             var typeName = s[0].ObjectValue switch {
                 VmExceptionObject e => e.Type.FullName,
                 VmClassInstance ci => ci.ClassType.FullName,
@@ -889,7 +928,7 @@ public static class DefaultIntrinsics {
             };
             var text = message is not null && message.Value.Length > 0
                 ? message.Value
-                : $"Exception of type '{typeName}' was thrown.";
+                : HostDefaultMessageOrDefault(typeName);
             return StackSlot.OfObject(ctx.MakeString(text));
         });
         Instance("ToString", 0, static (ctx, a) => {
@@ -913,6 +952,23 @@ public static class DefaultIntrinsics {
                 break;
             default:
                 throw new InvalidOperationException($"例外 .ctor のレシーバが不正です: {DescribeReceiver(receiver)}");
+        }
+    }
+
+    /// <summary>メッセージ未設定の例外の CLR 既定文言 (例: DivideByZeroException →
+    /// "Attempted to divide by zero.")。culture 依存テキスト面のためホスト CLR の例外型を
+    /// インスタンス化して委譲する。ホストに対応型がない (ゲスト派生型等) / 生成できない場合は
+    /// CLR の汎用文言 "Exception of type 'X' was thrown." にフォールバックする。</summary>
+    private static string HostDefaultMessageOrDefault(string exceptionTypeName) {
+        const string generic = "Exception of type '{0}' was thrown.";
+        try {
+            var hostType = Type.GetType($"{exceptionTypeName}, System.Private.CoreLib", throwOnError: false) ??
+                Type.GetType($"{exceptionTypeName}, System.Runtime", throwOnError: false);
+            if (hostType is null || !typeof(Exception).IsAssignableFrom(hostType))
+                return string.Format(generic, exceptionTypeName);
+            return ((Exception)Activator.CreateInstance(hostType)!).Message;
+        } catch {
+            return string.Format(generic, exceptionTypeName);
         }
     }
 
@@ -1045,8 +1101,9 @@ public static class DefaultIntrinsics {
         Static("Intern", 1, static (ctx, a) => StackSlot.OfObject(new Args(a).String(0))); // プール済み VmString を返す
     }
 
-    /// <summary>String.Format 統合面 (第1引数が書式、残りが値。末尾 params object[] は展開)。</summary>
-    private static StackSlot? FormatImpl(IntrinsicContext ctx, StackSlot[] a) =>
+    /// <summary>String.Format 統合面 (第1引数が書式、残りが値。末尾 params object[] は展開)。
+    /// C5 からは CoreLibBindings 側のランタイムバインド (culture 依存面) からも再利用する。</summary>
+    internal static StackSlot? FormatImpl(IntrinsicContext ctx, StackSlot[] a) =>
         StackSlot.OfObject(ctx.MakeString(FormatValues(ctx, new Args(a).String(0).Value, FormatArgs(ctx, a))));
 
     /// <summary>書式値列の取り出し (末尾パラメータが object[] なら展開して連結する)。</summary>
@@ -1082,8 +1139,9 @@ public static class DefaultIntrinsics {
     }
 
     /// <summary>String.Split 統合面。宣言パラメータ型で char / char[] / string[] を判別する。
-    /// instance メソッドのため args[0] は this (= レシーバ文字列)、ParamAt(0) がセパレータの宣言型。</summary>
-    private static StackSlot? SplitImpl(IntrinsicContext ctx, StackSlot[] a) {
+    /// instance メソッドのため args[0] は this (= レシーバ文字列)、ParamAt(0) がセパレータの宣言型。
+    /// C5 からは CoreLibBindings 側のランタイムバインド (SpanHelpers 依存の表現境界面) からも再利用する。</summary>
+    internal static StackSlot? SplitImpl(IntrinsicContext ctx, StackSlot[] a) {
         var s = new Args(a);
         var value = s.String(0).Value;
         var t1 = ctx.ParamAt(0);
@@ -1254,12 +1312,20 @@ public static class DefaultIntrinsics {
         void S(string name, int ps, IntrinsicImpl impl) =>
             r.Register(IntrinsicKey.Static(T, name, ps), impl);
 
-        S("ToBoolean", 1, static (_, a) => {
+        S("ToBoolean", 1, static (ctx, a) => {
             var s = new Args(a);
+            // CLR は char → bool を変換不可 (IConvertible.ToBoolean が InvalidCastException)。
+            // i4 スロットに統合される char はパラメータ型名で判別して同じ例外にする
+            if (s[0].Kind == StackKind.Int32 && ctx.ParamAt(0) == "System.Char")
+                throw new UnhandledGuestException("System.InvalidCastException", null);
             return s[0].Kind switch {
                 StackKind.Int32 => StackSlot.OfInt32(s.Int32(0) != 0 ? 1 : 0),
                 StackKind.Int64 => StackSlot.OfInt32(s.Int64(0) != 0 ? 1 : 0),
                 StackKind.Float => StackSlot.OfInt32(s.Float(0) != 0 ? 1 : 0),
+                // ボックス化された enum/プリミティブ (Convert.ToInt32((Enum)…) 経由) は
+                // 基底値スロットで判定する (CLR も IConvertible で基底値に落とす)
+                StackKind.Object when s[0].ObjectValue is VmBoxedValue boxed =>
+                    StackSlot.OfInt32(boxed.Fields[0].Int64Value != 0 ? 1 : 0),
                 _ => StackSlot.OfInt32(bool.Parse(s.String(0).Value) ? 1 : 0),
             };
         });
@@ -1269,6 +1335,9 @@ public static class DefaultIntrinsics {
                 StackKind.Int32 => StackSlot.OfInt32(s.Int32(0)),
                 StackKind.Int64 => StackSlot.OfInt32(Checked(s.Int64(0))),
                 StackKind.Float => StackSlot.OfInt32((int)Math.Round(s.Float(0), MidpointRounding.ToEven)),
+                // ボックス化された enum は基底値 (int) に落としてから返す
+                StackKind.Object when s[0].ObjectValue is VmBoxedValue boxed =>
+                    StackSlot.OfInt32(Checked(boxed.Fields[0].Int64Value)),
                 StackKind.Object when s[0].ObjectValue is VmString str => StackSlot.OfInt32(int.Parse(str.Value)),
                 _ => throw new InvalidOperationException($"Convert.ToInt32 未対応の入力型: {s[0].Kind}"),
             };
@@ -1284,6 +1353,8 @@ public static class DefaultIntrinsics {
                 StackKind.Int32 => StackSlot.OfInt64(s.Int32(0)),
                 StackKind.Int64 => StackSlot.OfInt64(s.Int64(0)),
                 StackKind.Float => StackSlot.OfInt64((long)Math.Round(s.Float(0), MidpointRounding.ToEven)),
+                StackKind.Object when s[0].ObjectValue is VmBoxedValue boxed =>
+                    StackSlot.OfInt64(boxed.Fields[0].Int64Value),
                 StackKind.Object when s[0].ObjectValue is VmString str => StackSlot.OfInt64(long.Parse(str.Value)),
                 _ => throw new InvalidOperationException($"Convert.ToInt64 未対応の入力型: {s[0].Kind}"),
             };
@@ -1294,6 +1365,10 @@ public static class DefaultIntrinsics {
                 StackKind.Int32 => StackSlot.OfFloat(s.Int32(0)),
                 StackKind.Int64 => StackSlot.OfFloat(s.Int64(0)),
                 StackKind.Float => StackSlot.OfFloat(s.Float(0)),
+                StackKind.Object when s[0].ObjectValue is VmBoxedValue boxed =>
+                    StackSlot.OfFloat(boxed.Fields[0].Kind == StackKind.Float
+                        ? boxed.Fields[0].DoubleValue
+                        : boxed.Fields[0].Int64Value),
                 StackKind.Object when s[0].ObjectValue is VmString str => StackSlot.OfFloat(double.Parse(str.Value)),
                 _ => throw new InvalidOperationException($"Convert.ToDouble 未対応の入力型: {s[0].Kind}"),
             };
@@ -1308,8 +1383,11 @@ public static class DefaultIntrinsics {
                 _ => throw new InvalidOperationException($"Convert.ToString 未対応の入力型: {s[0].Kind}"),
             };
         });
-        S("ToChar", 1, static (_, a) => {
+        S("ToChar", 1, static (ctx, a) => {
             var s = new Args(a);
+            // CLR は bool → char を変換不可 (IConvertible.ToChar が InvalidCastException)
+            if (s[0].Kind == StackKind.Int32 && ctx.ParamAt(0) == "System.Boolean")
+                throw new UnhandledGuestException("System.InvalidCastException", null);
             return StackSlot.OfInt32(s[0].Kind switch {
                 StackKind.Int32 => checked((char)s.Int32(0)),
                 StackKind.Int64 => checked((char)s.Int64(0)),

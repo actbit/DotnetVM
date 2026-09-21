@@ -22,6 +22,8 @@ internal sealed class CallEngine(
     private readonly VmHeap _heap = services.Heap;
     private readonly IntrinsicContext _intrinsicContext = services.IntrinsicContext;
     private readonly ObjectEngine _objectEngine = objectEngine;
+    private readonly VmCoreLibSurfaces? _coreLibSurfaces = services.CoreLibSurfaces;
+    private readonly InterpreterServices _services = services;
 
     // ---- 呼出 (call / callvirt) ----
 
@@ -62,6 +64,10 @@ internal sealed class CallEngine(
                     throw new UnhandledGuestException("System.NullReferenceException",
                         $"null レシーバで {target.DeclaringType}::{target.Name} を呼び出しました。");
                 if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
+                    // 優先順位 ①: override が実型 (CoreLib TypeDef) の場合、IL 実行の前に
+                    // ランタイムバインド (署名キー) を試す (culture / 表現境界に依存する面の委譲)
+                    if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var overrideBound))
+                        return overrideBound;
                     var context = BuildCallContext(target, guestOverride, args[0]);
                     var guestRet = invoker.Invoke(guestOverride, args, context);
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
@@ -120,8 +126,9 @@ internal sealed class CallEngine(
             method = DispatchVirtual(method, args[0]);
         }
 
-        // 優先順位 ①: ランタイムバインド (署名照合) を最優先で解決する
-        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound))
+        // 優先順位 ①: ランタイムバインド (署名照合) を最優先で解決する。
+        // 構築型の実引数 (ClassArgs) もキー化に使う (IComparable`1<uint> の !0 等)
+        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, target.ClassArgs))
             return bound;
 
         if (method.Body is null) {
@@ -172,6 +179,9 @@ internal sealed class CallEngine(
     private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args) {
         if (isCallvirt && target.HasThis) {
             if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
+                // 優先順位 ①: IL 実行の前にランタイムバインドを試す (上の intrinsic 経路と同じ)
+                if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var lateBound))
+                    return lateBound;
                 var context = BuildCallContext(target, guestOverride, args[0]);
                 var ret = invoker.Invoke(guestOverride, args, context);
                 return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
@@ -221,6 +231,9 @@ internal sealed class CallEngine(
             StackKind.Object => value.ObjectValue switch {
                 VmClassInstance ci => (VmType)ci.ClassType,
                 VmBoxedValue bv => bv.Type,
+                // VmString の仮想ディスパッチ (名前+引数個数) はオーバーロード誤解決の恐れが
+                // あるため実型を与えない (バインド / 置換面 / legacy の従来経路を優先)。
+                // インターフェースキー照合 (署名完全一致) は TryDispatchInterfaceKey で別途解決する
                 _ => null,
             },
             _ => null,
@@ -319,7 +332,7 @@ internal sealed class CallEngine(
     private VmMethod? TryDispatchInterfaceKey(string? declaringTypeName, string name, string[]? paramTypeNames, in StackSlot receiver) {
         if (declaringTypeName is null || paramTypeNames is null || paramTypeNames.Any(string.IsNullOrEmpty))
             return null;
-        var receiverType = ReceiverRuntimeType(receiver);
+        var receiverType = ReceiverRuntimeType(receiver) ?? InterfaceReceiverType(receiver);
         if (receiverType is null)
             return null;
         var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
@@ -329,6 +342,16 @@ internal sealed class CallEngine(
         return maps.InterfaceMap.GetValueOrDefault(
             declaringTypeName + "::" + name + "(" + string.Join(",", paramTypeNames) + ")");
     }
+
+    /// <summary>インターフェーススロットキー照合専用のレシーバ実行時型。VmString の場合のみ
+    /// 実型 (System.String CoreLib TypeDef) を返す。String は IConvertible 等を EII 実装し、
+    /// インターフェースキーは署名完全一致なのでオーバーロード誤解決がない。
+    /// 名前+引数個数の TryDispatchVirtual には VmString を渡さない (Replace 等の
+    /// (string,string)/(char,char) オーバーロードを実型 IL へ誤解決させる恐れ)。
+    /// StringType は VM 単位 (InterpreterServices) で保持する。</summary>
+    private VmType? InterfaceReceiverType(in StackSlot receiver) =>
+        receiver.Kind == StackKind.Object && receiver.ObjectValue is VmString && _services.StringType is { } s
+            ? s : null;
 
     /// <summary>レシーバ型の継承チェーン上で宣言型 declaring が現れるまでのステップ数
     /// (最派生 = 0。チェーンに無い場合は -1)。同一型は参照または完全名で判定する
@@ -433,9 +456,10 @@ internal sealed class CallEngine(
     /// パラメータ型名は「そのメソッドを定義したローダ」で解決する (TypeToken は自画像の
     /// TypeDef rid を指すため)。ジェネリック変数は MethodSpec の実引数で置換し、実引数が無い
     /// 場合は開いた名 (!n / !!n) のままキー化する (登録側の開いたキーと一致)。</summary>
-    private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result) {
+    private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result,
+        VmType[]? classArgs = null) {
         result = null;
-        var names = ParamTypeNamesOf(method, methodArgs);
+        var names = ParamTypeNamesOf(method, methodArgs, classArgs);
         if (names is null || names.Any(string.IsNullOrEmpty))
             return false;
         var declaringName = method.DeclaringType.FullName;
@@ -445,6 +469,9 @@ internal sealed class CallEngine(
         if (!_intrinsics.TryGetBinding(key, out var impl, out _))
             return false;
         NormalizeByRefReceiver(method, args);
+        // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の
+        // ジェネリック面でも T を判別できるようにする)
+        _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
         result = InvokeDelegated(impl, names, args);
         return true;
     }
@@ -484,13 +511,13 @@ internal sealed class CallEngine(
 
     /// <summary>解決済みメソッドの宣言パラメータ型名 (i4 統合面の判別 / バインドキー構築用)。
     /// 呼出トークン解決で確定済みならそれを使い、無い場合は定義ローダで署名を解決する。</summary>
-    private string[]? ParamTypeNamesOf(VmMethod method, VmType[]? methodArgs) {
+    private string[]? ParamTypeNamesOf(VmMethod method, VmType[]? methodArgs, VmType[]? classArgs = null) {
         var loader = method.Loader;
         if (loader is null)
             return null;
         var names = new string[method.Signature.ParamTypes.Length];
         for (var i = 0; i < names.Length; i++) {
-            var name = DescribeBindingType(method.Signature.ParamTypes[i], methodArgs, loader);
+            var name = DescribeBindingType(method.Signature.ParamTypes[i], methodArgs, classArgs, loader);
             if (name is null)
                 return null;
             names[i] = name;
@@ -499,9 +526,10 @@ internal sealed class CallEngine(
     }
 
     /// <summary>バインドキー用のパラメータ型名 (完全名)。ジェネリック変数は実引数 (MethodSpec) で
-    /// 置換し、実引数が無い場合は開いた名 (!!n / !n) のまま返す。トークンは「そのメソッドを定義した
-    /// ローダ」で解決する (署名の解決は定義ローダの原則)。</summary>
-    private static string? DescribeBindingType(SigType type, VmType[]? methodArgs, TypeLoader loader) => type.Kind switch {
+    /// 置換し、実引数が無い場合は開いた名 (!!n / !n) のまま返す。クラス実引数 (構築型の !n) も
+    /// 置換する (例: IComparable`1&lt;uint&gt;::CompareTo の !0 → System.UInt32)。
+    /// トークンは「そのメソッドを定義したローダ」で解決する (署名の解決は定義ローダの原則)。</summary>
+    private static string? DescribeBindingType(SigType type, VmType[]? methodArgs, VmType[]? classArgs, TypeLoader loader) => type.Kind switch {
         SigKind.Boolean => "System.Boolean",
         SigKind.Char => "System.Char",
         SigKind.I1 => "System.SByte",
@@ -519,14 +547,16 @@ internal sealed class CallEngine(
         SigKind.String => "System.String",
         SigKind.Object => "System.Object",
         SigKind.TypedByRef => "System.TypedReference",
-        SigKind.SzArray => DescribeBindingType(type.Inner!, methodArgs, loader) is { } inner ? inner + "[]" : null,
-        SigKind.ByRef => DescribeBindingType(type.Inner!, methodArgs, loader) is { } element ? element + "&" : null,
-        SigKind.Pointer => DescribeBindingType(type.Inner!, methodArgs, loader) is { } pointee ? pointee + "*" : null,
-        SigKind.Array => DescribeBindingType(type.Inner!, methodArgs, loader) is { } multi ? $"{multi}[{type.Rank}]" : null,
+        SigKind.SzArray => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } inner ? inner + "[]" : null,
+        SigKind.ByRef => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } element ? element + "&" : null,
+        SigKind.Pointer => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } pointee ? pointee + "*" : null,
+        SigKind.Array => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } multi ? $"{multi}[{type.Rank}]" : null,
         SigKind.GenericMethodVar => type.VarNumber < (methodArgs?.Length ?? 0)
             ? methodArgs![type.VarNumber].FullName
             : $"!!{type.VarNumber}",
-        SigKind.GenericVar => $"!{type.VarNumber}",
+        SigKind.GenericVar => type.VarNumber < (classArgs?.Length ?? 0)
+            ? classArgs![type.VarNumber].FullName
+            : $"!{type.VarNumber}",
         SigKind.GenericInst or SigKind.TypeToken => TryDescribeToken(type, loader),
         _ => null,
     };
@@ -595,6 +625,40 @@ internal sealed class CallEngine(
                             HasThis = signature.HasThis,
                             ParamTypeNames = paramNames,
                         };
+                    }
+                    // 優先順位 ②: IL 優先面は legacy intrinsic より先に実型 IL へ解決する
+                    // (CoreLib IL 実行の全面化。内部面バインドが揃った型から IlPreferred へ移す。
+                    //  legacy の名前 + 引数個数照合は CoreLib の新しいため (ReadOnlySpan を取る
+                    //  Concat 合成等) 誤経由する恐れがあり、IL 優先面では ② を先に見る。
+                    //  IlPreferredFaces は型単位でなく面単位 (パラメータ型名一致) の IL 優先)
+                    if ((DelegateContinuingSurfaces.PrefersIl(typeName) ||
+                         DelegateContinuingSurfaces.PrefersIlFace(typeName, name, paramNames)) &&
+                        _loader.ResolveTypeRefType(parent.Rid) is VmClassType preferred) {
+                        var ilFirst = FindMethodThroughChain(preferred, name, signature.ParamTypes);
+                        if (ilFirst is { Body: not null })
+                            return new CallTarget {
+                                Arity = arity,
+                                Method = ilFirst,
+                                Name = ilFirst.Name,
+                                ParamCount = ilFirst.Signature.ParamTypes.Length,
+                                HasThis = ilFirst.Signature.HasThis,
+                            };
+                    }
+                    // 置換面 (C5): IlPreferred に載っていない型でも VM CoreLib (DotnetVM.CoreLib)
+                    // の managed IL が面を置換する場合 (System.Convert 等) は実型 IL へ解決させる
+                    // (実際の差し替えは Interpreter.Invoke の choke point)。対応表に載っていない
+                    // 面 (Convert.ToInt32(object) 等のボックス化経由面) は従来どおり ③ で処理される
+                    if (_coreLibSurfaces?.HasFace(typeName, name, paramNames) == true &&
+                        _loader.ResolveTypeRefType(parent.Rid) is VmClassType faceOwner) {
+                        var faceMethod = FindMethodThroughChain(faceOwner, name, signature.ParamTypes);
+                        if (faceMethod is { Body: not null })
+                            return new CallTarget {
+                                Arity = arity,
+                                Method = faceMethod,
+                                Name = faceMethod.Name,
+                                ParamCount = faceMethod.Signature.ParamTypes.Length,
+                                HasThis = faceMethod.Signature.HasThis,
+                            };
                     }
                     if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
                         return new CallTarget {
@@ -783,7 +847,7 @@ internal sealed class CallEngine(
                 var concreteParams = signature.ParamTypes
                     .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray();
                 var openParams = signature.ParamTypes
-                    .Select(t => DescribeBindingType(t, null, _loader) ?? "").ToArray();
+                    .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
                 if (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, out var boundImpl) ||
                     TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, out boundImpl)) {
                     return new CallTarget {

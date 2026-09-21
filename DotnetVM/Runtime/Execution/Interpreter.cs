@@ -35,6 +35,9 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     private readonly VmHeap _heap;
     private readonly NetworkGateway? _network;
     private readonly StorageGateway? _storage;
+    private readonly Diagnostics.ExecutionTracer? _tracer;
+    private readonly VmCoreLibSurfaces? _coreLibSurfaces;
+    private readonly VmType? _stringType;
     private readonly InterpreterServices _services;
     private readonly MethodPreparer _preparer;
     private readonly ObjectEngine _objectEngine;
@@ -59,14 +62,18 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         public required ExceptionDispatcher Exceptions { get; init; }
     }
 
-    public Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
-        NetworkGateway? network = null, StorageGateway? storage = null) {
+    internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
+        NetworkGateway? network = null, StorageGateway? storage = null, Diagnostics.ExecutionTracer? tracer = null,
+        VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null) {
         _memory = memory;
         _intrinsics = intrinsics;
         _console = console;
         _heap = heap;
         _network = network;
         _storage = storage;
+        _tracer = tracer;
+        _coreLibSurfaces = coreLibSurfaces;
+        _stringType = stringType;
         var strings = new VmStringPool(heap);
         var primary = CreateEngines(loader, strings);
         _services = primary.Services;
@@ -99,7 +106,11 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             Network = _network,
             Storage = _storage,
         };
-        var services = new InterpreterServices(loader, _intrinsics, _console, _memory, _heap, strings, intrinsicContext);
+        var services = new InterpreterServices(loader, _intrinsics, _console, _memory, _heap, strings,
+            intrinsicContext, _tracer, _coreLibSurfaces) {
+            // VmString の型同一性を接続する System.String 実型 (VM 単位。LoadHostCoreLib = true 時のみ非 null)
+            StringType = _stringType,
+        };
         var preparer = new MethodPreparer(loader);
         var objects = new ObjectEngine(services, this, this);
         var calls = new CallEngine(services, this, this, objects);
@@ -156,6 +167,23 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             _running = true;
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
+        // 置換面 (C5): 実在 CoreLib 由来のメソッドのうち DotnetVM.CoreLib の managed IL が
+        // 面を置換するものは、ここ (唯一の IL 実行入口) で本体を差し替える。MemberRef 解決
+        // でも仮想ディスパッチでも最終的にここを通るため、CoreLib IL 内の boxed int の
+        // callvirt ToString も同じ面で置換される
+        if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
+            // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する:
+            // constrained callvirt (直接の int.ToString() 等) では VmByRef、CoreLib IL 内の
+            // box 済み値の callvirt (String.Concat など) では VmBoxedValue 参照で渡るため、
+            // どちらも保持している値スロットへ読み替えてから渡す
+            if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)
+                arguments[0] = arguments[0].ObjectValue switch {
+                    VmByRef byRef => byRef.Slot,
+                    VmBoxedValue boxed => boxed.Fields[0],
+                    _ => arguments[0],
+                };
+            method = substituted;
+        }
         if (method.Body is null)
             ThrowNoBody(method);
         if (_depth >= _memory.MaxRecursionDepth)
@@ -169,6 +197,10 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             _liveFrames.Add(frame);
+            // 実行トレース: IL 本体を実行したフレームのみ記録する
+            // (intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されない)
+            if (_tracer is { } tracer)
+                tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
             try {
                 FixupStructLocals(frame);
                 return engines.Exceptions.RunFrame(frame);
@@ -501,7 +533,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.Float);
                     break;
                 case ILOp.Stelem_Ref:
-                    MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.Object);
+                    MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.Object, _services.StringType);
                     break;
                 case ILOp.Stelem:
                     MemoryOps.ArrayStore(frame,
@@ -519,11 +551,13 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 case ILOp.Ldfld or ILOp.Ldflda: {
                     var field = objects.ResolveFieldToken(instruction.IntOperand, frame.Context);
                     var objSlot = frame.Stack.Pop();
-                    var location = objects.FieldLocation(objSlot, field);
                     if (instruction.Op == ILOp.Ldflda) {
-                        frame.Stack.Push(StackSlot.OfByRef(location));
+                        // VnString (可変 char バッファ) はバイト実体への unmanaged ポインタ、
+                        // それ以外は ByRef (CoreLib IL が Unsafe.Add / Buffer.Memmove に渡す形)
+                        frame.Stack.Push(objects.FieldAddress(objSlot, field));
                         break;
                     }
+                    var location = objects.FieldLocation(objSlot, field);
                     frame.Stack.Push(SlotOps.PushCopyOfValue(location.Slot));
                     break;
                 }
@@ -531,6 +565,9 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     var field = objects.ResolveFieldToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
                     var objSlot = frame.Stack.Pop();
+                    // VnString レシーバはバイト実体 (真実源) に直接書く
+                    if (objects.TryStoreStringField(objSlot, field, value))
+                        break;
                     objects.FieldLocation(objSlot, field).Slot = SlotOps.StoreCopyOfValue(value);
                     break;
                 }
@@ -539,9 +576,16 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     frame.Stack.Push(SlotOps.PushCopyOfValue(slot.Slot));
                     break;
                 }
-                case ILOp.Ldsflda:
-                    frame.Stack.Push(StackSlot.OfByRef(objects.StaticFieldLocation(instruction.IntOperand, frame.Context)));
+                case ILOp.Ldsflda: {
+                    // 静的 FieldRVA データ (<PrivateImplementationDetails> 初期化データ) は
+                    // バイト実体への unmanaged ポインタ (CoreLib IL が ReadOnlySpan(void*) ctor に渡す形)、
+                    // それ以外は通常の静的ストレージへの ByRef
+                    if (objects.TryGetStaticFieldRvaAddress(instruction.IntOperand) is { } rvaSlot)
+                        frame.Stack.Push(rvaSlot);
+                    else
+                        frame.Stack.Push(StackSlot.OfByRef(objects.StaticFieldLocation(instruction.IntOperand, frame.Context)));
                     break;
+                }
                 case ILOp.Stsfld: {
                     var value = frame.Stack.Pop();
                     objects.StaticFieldLocation(instruction.IntOperand, frame.Context).Slot = value;
@@ -627,7 +671,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                         }
                     } else {
                         // 参照型への unbox.any は castclass と同等
-                        var ok = value.ObjectValue is null || TypeChecks.IsAssignableToType(value.ObjectValue, target);
+                        var ok = value.ObjectValue is null ||
+                            TypeChecks.IsAssignableToType(value.ObjectValue, target, _services.StringType);
                         if (!ok)
                             throw new UnhandledGuestException("System.InvalidCastException",
                                 $"{SlotOps.Describe(value)} を {target.FullName} に変換できません。");
@@ -640,7 +685,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 case ILOp.Castclass or ILOp.Isinst: {
                     var target = objects.ResolveTypeToken(instruction.IntOperand, frame.Context);
                     var value = frame.Stack.Pop();
-                    var ok = value.ObjectValue is null || TypeChecks.IsAssignableToType(value.ObjectValue, target);
+                    var ok = value.ObjectValue is null ||
+                        TypeChecks.IsAssignableToType(value.ObjectValue, target, _services.StringType);
                     if (!ok && instruction.Op == ILOp.Castclass)
                         throw new UnhandledGuestException("System.InvalidCastException",
                             $"{SlotOps.Describe(value)} を {target.FullName} にキャストできません。");

@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\DotnetVM.CoreLib\DotnetVM.CoreLib.csproj" />
     <ProjectReference Include="..\DotnetVM\DotnetVM.csproj" />
   </ItemGroup>
 

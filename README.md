@@ -50,7 +50,7 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 **メソッド解決の優先順位** (C4 ランタイムバインド層):
 1. **ランタイムバインド** — `BindingKey(型完全名, メソッド名, パラメータ型名, this 有無)` の署名照合
-2. **IL 本体実行** — CoreLib を含む全アセンブリの managed IL
+2. **IL 本体実行** — CoreLib を含む全アセンブリの managed IL (`IlPreferred` 面の型は 3. より先にこちらへ解決。置換面 `VmCoreLibSurfaces` に載った面は解決後に `DotnetVM.CoreLib` の managed IL へ差し替え)
 3. **legacy intrinsic** — 名前 + 引数個数のレガシー照合 (既存面との互換)
 4. **fail-closed** — 未登録の InternalCall は `NotSupportedException`、未登録の P/Invoke は `OperationNotAllowedException` (ネイティブ実行は構造的に禁止。代替実装が登録済みの面のみ `PInvokeReplacement` として委譲)
 
@@ -58,6 +58,17 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ### CoreLib ロード (実在 System.Private.CoreLib の実行)
 `VmHostOptions.LoadHostCoreLib = true` でホスト自身の System.Private.CoreLib.dll をロードし、CoreLib の managed IL を VM インタプリタで実行します。参照アセンブリ (System.Runtime 等) との型ユニフィケーション、署名精度の VTable / InterfaceMap ディスパッチ (EII 含む)、依存 DLL の同一ディレクトリ自動解決を備えます。
+
+### VM CoreLib (DotnetVM.CoreLib) による置換面
+実在 CoreLib の一部の面は、その managed IL が VM の表現モデルに落ちません (`Number.Formatting` の byte* 生ポインタ演算 / NumberBuffer / culture 機構の静的キャッシュ等)。これらは自前の互換ライブラリ **DotnetVM.CoreLib** の managed IL に差し替えて実行します (`VmCoreLibSurfaces` の監査可能な対応表)。
+
+- DotnetVM.CoreLib は外部依存ゼロの普通の .NET クラスライブラリでもあり、**CLR 上でそのまま動作**します (`int.ToString()` / `int.Parse` / `Convert` 系と同一結果)。CLR 差分テストで正当性を担保してから VM に配線します
+- 差し替えは `Interpreter.Invoke` (唯一の IL 実行入口) で行われるため、MemberRef 解決でも CoreLib IL 内の仮想呼出 (box 済み int の `callvirt ToString` 等) でも同一の面に置換されます。実 CLR 同様 culture は不変カルチャ規約 (符号 "-" / 桁区切りなし) に固定
+- IL 実行されるため ExecutionTracer には `DotnetVM.CoreLib` フレームとして記録され、legacy intrinsic 委譲と区別できます
+- 対応表に載っていない面 (ボックス化 `object` 経由の `Convert.ToInt32(object)` 等は従来どおり legacy intrinsic 委譲。`System.Convert` 全面を安易に IlPreferred に載せない) の監査は `VmCoreLibSurfaces.Faces` / `DelegateContinuingSurfaces.IlPreferred` で行います
+
+### 実行トレース (ExecutionTracer)
+`vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
 
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
@@ -147,7 +158,7 @@ VirtualMachine (Host/)          組み込みファサード
 dotnet test DotnetVM.Tests
 ```
 
-197 テスト (2026-09-20 時点)。
+197 テスト (2026-09-20 時点) → **289 テスト** (2026-09-21 時点、全グリーン)。
 
 ## 状況
 
@@ -161,9 +172,9 @@ dotnet test DotnetVM.Tests
 - [x] C2: 参照アセンブリ⇔CoreLib 型ユニフィケーション + 実型置換
 - [x] C3: 署名精度の仮想/インターフェースディスパッチ (VTable / InterfaceMap / EII)
 - [x] C4: ランタイムバインド層 (BindingKey + BindingOrigin / 優先順位 ①〜④ / CoreLib InternalCall・JIT intrinsic 面のバインド)
-- [ ] C5: CoreLib IL 実行の全面化 + 差分テスト (String 表現境界の撤去、ExecutionTracer で IL 実行証明)
+- [x] C5: CoreLib IL 実行の全面化 + 差分テスト (String/整数 ToString・Parse/Convert/Math の IL 実行、ExecutionTracer で IL 実行証明、VM CoreLib (DotnetVM.CoreLib) 置換面、newobj string 構築面、例外既定文言のホスト CLR 委譲)
 - [ ] C6: ゲストスレッド対応 (スレッドモデル + Monitor の真の競合・ブロッキング。現行の Monitor バインドは単一スレッド前提の暫定ファサード)
 - [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
 - [ ] M9: デバッガ / 実行トレース
 
-プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。
+プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。同梱の DotnetVM.CoreLib も依存ゼロのクラスライブラリで、VM の置換面として DotnetVM.dll と同じディレクトリに配置される。

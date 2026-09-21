@@ -8,12 +8,15 @@ namespace DotnetVM.Runtime.Execution;
 internal static class TypeChecks {
 
     /// <summary>VM オブジェクトがターゲット型に代入可能か (castclass/isinst/配列共変/例外 catch の共通判定)。
-    /// ジェネリック型のインスタンスは実引数を記録した構築型を作って判定する (変性込み・M5)。</summary>
-    public static bool IsAssignableToType(object vmValue, VmType target) => vmValue switch {
+    /// ジェネリック型のインスタンスは実引数を記録した構築型を作って判定する (変性込み・M5)。
+    /// stringType は呼出元 VM の System.String 実型 (InterpreterServices.StringType。VM 単位で
+    /// 保持される — 静的に持つと並列実行する VM 間で Dispose 競合が起きる)。</summary>
+    public static bool IsAssignableToType(object vmValue, VmType target, VmType? stringType = null) => vmValue switch {
         VmClassInstance ci => ci.RuntimeType.IsAssignableTo(target),
         VmStructValue sv => sv.RuntimeType.IsAssignableTo(target),
         DotnetVM.Runtime.Objects.VmExceptionObject e => e.ExceptionType.IsAssignableTo(target),
-        VmString => target.FullName is "System.String" or "System.Object",
+        VmString => target.FullName is "System.String" or "System.Object" ||
+            (stringType is { } st && st.IsAssignableTo(target)),
         VmArray array => target switch {
             VmArrayType other => array.ArrayType.ElementType.IsAssignableTo(other.ElementType),
             _ => target.FullName is "System.Array" or "System.Object" or "System.ICloneable"

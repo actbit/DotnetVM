@@ -25,6 +25,8 @@ public sealed class VirtualMachine : IDisposable {
     private readonly List<TypeLoader> _loaders = [];
     private readonly VmAssemblyContext _context;
     private Interpreter? _interpreter;
+    private VmCoreLibSurfaces? _coreLibSurfaces;
+    private VmClassType? _stringType;
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
@@ -46,6 +48,23 @@ public sealed class VirtualMachine : IDisposable {
         if (string.IsNullOrEmpty(coreLibPath))
             throw new InvalidOperationException("ホストの System.Private.CoreLib.dll の場所を特定できません (Single-file 発行等)。");
         LoadAssembly(coreLibPath);
+        // VM CoreLib (置換面の managed IL 実装) を DotnetVM.dll と同じディレクトリからロードし、
+        // 実在 CoreLib の面 → DotnetVM.CoreLib IL の置換辞書を構築する (欠面は fail-closed)
+        var vmCoreLibPath = Path.Combine(
+            Path.GetDirectoryName(typeof(VirtualMachine).Assembly.Location)!, "DotnetVM.CoreLib.dll");
+        if (!File.Exists(vmCoreLibPath))
+            throw new InvalidOperationException(
+                $"VM CoreLib ({vmCoreLibPath}) が見つかりません。DotnetVM.CoreLib.dll を DotnetVM.dll と同じディレクトリに配置してください。");
+        LoadAssembly(vmCoreLibPath);
+        _coreLibSurfaces = VmCoreLibSurfaces.Create(_loaders[^1]);
+        // VmString の型同一性を System.String 実型 (CoreLib TypeDef) に接続する
+        // (castclass IConvertible / インターフェースディスパッチ / String IL 面)。
+        // VM 単位の状態として Interpreter へ渡す (静的に持つと並列実行する VM 間で
+        // Dispose 競合が起きるため)
+        _stringType = _loaders
+            .Select(l => l.FindTypeByFullName("System.String"))
+            .OfType<VmClassType>()
+            .FirstOrDefault();
     }
 
     /// <summary>VmAssemblyContext が依存アセンブリの同一ディレクトリ探索で見つけた DLL をロードする。</summary>
@@ -91,6 +110,9 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>登録済みランタイムバインドの監査面 (キーと由来。監査テスト / 診断用)。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings => _intrinsics.Bindings;
+
+    /// <summary>登録済み legacy intrinsic キーの列挙 (監査テスト / 診断用)。</summary>
+    public IEnumerable<IntrinsicKey> IntrinsicKeys => _intrinsics.Keys;
 
     /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
     /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>
@@ -236,7 +258,11 @@ public sealed class VirtualMachine : IDisposable {
 
     private Interpreter GetInterpreter() =>
         _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
-            _network, _storage);
+            _network, _storage, Tracer, _coreLibSurfaces, _stringType);
+
+    /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
+    /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>
+    public Diagnostics.ExecutionTracer Tracer { get; } = new();
 
     private TypeLoader GetPrimaryLoader() {
         if (_loaders.Count == 0)

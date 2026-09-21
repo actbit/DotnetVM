@@ -58,7 +58,7 @@ internal static class MemoryOps {
         };
     }
 
-    public static void ArrayStore(InterpreterFrame frame, ArrayElementKind kind) {
+    public static void ArrayStore(InterpreterFrame frame, ArrayElementKind kind, VmType? stringType = null) {
         var value = frame.Stack.Pop();
         var index = frame.Stack.Pop().AsInt32;
         var array = GetArray(frame.Stack.Pop());
@@ -66,7 +66,7 @@ internal static class MemoryOps {
 
         // 共変配列の書込検査 (stelem.ref)
         if (kind == ArrayElementKind.Object && value.ObjectValue is not null &&
-            !TypeChecks.IsAssignableToType(value.ObjectValue, array.ArrayType.ElementType))
+            !TypeChecks.IsAssignableToType(value.ObjectValue, array.ArrayType.ElementType, stringType))
             throw new UnhandledGuestException("System.ArrayTypeMismatchException",
                 $"{SlotOps.Describe(value)} を {array.ArrayType.ElementType.FullName}[] に格納できません。");
 
@@ -178,6 +178,18 @@ internal static class MemoryOps {
         }
         if (address.ObjectValue is null)
             throw new UnhandledGuestException("System.NullReferenceException", null);
+        // ボックス実体への直接読み出しの緩和: 値型のインターフェース実装 (EII) は
+        // box レシーバを this に受け、本体冒頭の ldind で m_value を読む (ldarg.0; ldind.i4)。
+        // CLR は callvirt 時に unbox 済み this ポインタを渡すが、VM は box をそのまま渡すため
+        // ここで unbox + 読み出しに落とす (IConvertible EII のプリミティブ / enum 基底型面)
+        if (address.ObjectValue is VmBoxedValue boxed) {
+            return op switch {
+                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(boxed.Fields[0].Int64Value),
+                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(boxed.Fields[0].DoubleValue),
+                ILOp.Ldind_Ref => boxed.Fields[0],
+                _ => StackSlot.OfInt32((int)boxed.Fields[0].Int64Value), // I1〜U4 は i4 正規化スロット
+            };
+        }
         if (address.ObjectValue is VmByRef byRef) {
             return op switch {
                 ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(byRef.Slot.Int64Value),
@@ -205,6 +217,16 @@ internal static class MemoryOps {
         }
         if (address.ObjectValue is null)
             throw new UnhandledGuestException("System.NullReferenceException", null);
+        // ボックス実体への書き込みの緩和 (LoadIndirect と対。box が指す先 = Fields[0] を更新する)
+        if (address.ObjectValue is VmBoxedValue boxed) {
+            boxed.Fields[0] = op switch {
+                ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
+                ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
+                _ => StackSlot.OfInt32((int)value.Int64Value),
+            };
+            return;
+        }
         if (address.ObjectValue is VmByRef byRef) {
             byRef.Slot = op switch {
                 ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
@@ -239,6 +261,19 @@ internal static class MemoryOps {
         }
         var definition = type is VmConstructedType constructed ? constructed.Definition : type;
         if (definition is VmClassType cls && cls.IsValueType) {
+            // CoreLib 実型化されたプリミティブ (m_value 単一フィールド) は CLR と同じ
+            // 実際のサイズ。フィールドを辿ると m_value → 自身の相互参照になるため先に潰す
+            // (sizeof: CoreLib IL の BitConverter 系 / Span 計算から参照される)
+            var primitiveSize = cls.FullName switch {
+                "System.SByte" or "System.Byte" or "System.Boolean" => 1,
+                "System.Char" or "System.Int16" or "System.UInt16" => 2,
+                "System.Int32" or "System.UInt32" or "System.Single" => 4,
+                "System.Int64" or "System.UInt64" or "System.Double"
+                    or "System.IntPtr" or "System.UIntPtr" => 8,
+                _ => 0,
+            };
+            if (primitiveSize > 0)
+                return primitiveSize;
             if (!visiting.Add(cls))
                 throw new BadImageFormatException($"sizeof: 相互参照する値型レイアウト {cls.FullName} は不正です。");
             try {

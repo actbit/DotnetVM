@@ -35,22 +35,12 @@ internal static class CoreLibBindings {
     /// <summary>プリミティブの instance ToString バインド。String.Concat(object, object)
     /// 等、CoreLib IL 内の `boxedPrimitive?.ToString()` の callvirt が culture 機構依存の
     /// managed IL に仮想解決されるのを受ける面。
-    /// C5.5 Wave 2 で整数 8 型 + Boolean/Char の全 ToString 面 (無引数 / format /
-    /// format+IFormatProvider / IFormatProvider) を VmCoreLibSurfaces (DotnetVM.CoreLib
-    /// FormatSpecifiers の managed IL) に置換したため、ここには載せない (載せると ① が
-    /// ②'/置換面を塞いでしまう)。Single/Double のみ Wave 3 (浮動小数点書式移植) まで
-    /// format 無視の委譲を続ける。</summary>
+    /// C5.5 Wave 2 で整数 8 型 + Boolean/Char、Wave 3 で Single/Double の全 ToString 面
+    /// (無引数 / format / format+IFormatProvider / IFormatProvider) を VmCoreLibSurfaces
+    /// (DotnetVM.CoreLib FormatSpecifiers / DoubleFormatting の managed IL) に置換したため、
+    /// ここには載せない (載せると ① が ②'/置換面を塞いでしまう)。</summary>
     private static void RegisterPrimitiveToString(IntrinsicRegistry r) {
-        // Wave 3 移行予定: Single/Double は実在側が Number.Formatting (Grisu3 / Dragon4 /
-        // byte* ポインタ) で VM 表現に落ちないため、書式を無視して既存委譲を維持する。
-        // 監査表 (CoreLibSurfaceAudit) に Wave 3 移行予定として記載
-        foreach (var t in new[] { "System.Single", "System.Double" })
-            r.RegisterBinding(BindingKey.InstanceAnyParams(t, "ToString"),
-                (ctx, a) => PrimitiveToString(ctx, a[0], t), BindingOrigin.Managed);
     }
-
-    private static StackSlot PrimitiveToString(IntrinsicContext ctx, in StackSlot value, string typeName) =>
-        StackSlot.OfObject(ctx.MakeString(DefaultIntrinsics.FormatPrimitiveToString(value, typeName)));
 
     // ---- 構築ジェネリック インターフェース (プリミティブ実体化面) ----
 

@@ -28,6 +28,16 @@ namespace DotnetVM.Tests;
 ///   バインド (legacy intrinsic) で CLR 突合を保つ
 /// </summary>
 public class CoreLibFacesIlTests {
+    // 浮動小数点面 (C5.5 Wave 3) は ∞ 等の記号を culture 依存で出力する。VM 意味論は
+    // 不変カルチャ規約固定のため、CLR 突合側も InvariantCulture にピン留めする
+    // (xUnit はテストごとに新インスタンスをテストスレッド上で生成するためコンストラクタでピン留め)。
+    // C5.5 Wave 5 の TestCulture による全面ピン留めの前倒し適用
+    public CoreLibFacesIlTests() {
+        var invariant = System.Globalization.CultureInfo.InvariantCulture;
+        System.Threading.Thread.CurrentThread.CurrentCulture = invariant;
+        System.Threading.Thread.CurrentThread.CurrentUICulture = invariant;
+    }
+
     private const string Source = """
         namespace Vm.C5 {
             using System;
@@ -176,6 +186,56 @@ public class CoreLibFacesIlTests {
                         return "format";
                     }
                 }
+
+                // ---- C5.5 Wave 3: 浮動小数点書式 / parse 面 (Faces 置換 →
+                // DoubleFormatting / DoubleParsing IL) ----
+                public static string DoubleFormatFaces(double v, string fmt) => v.ToString(fmt);
+
+                public static string SingleFormatFaces(double v, string fmt) => ((float)v).ToString(fmt);
+
+                // provider のみの面 (ToString(IFormatProvider)) と 3 引数面 (ToString(format, provider))。
+                // provider は null 固定 (culture 機構はスコープ外)
+                public static string DoubleProviderFaces(double v) => v.ToString((IFormatProvider)null!);
+
+                public static string Double3ArgFaces(double v, string fmt) => v.ToString(fmt, (IFormatProvider)null!);
+
+                public static string DoubleParseFaces(string s) {
+                    try {
+                        return double.Parse(s).ToString();
+                    } catch (FormatException) {
+                        return "format";
+                    } catch (ArgumentNullException) {
+                        return "null";
+                    }
+                }
+
+                public static string SingleParseFaces(string s) {
+                    try {
+                        return float.Parse(s).ToString();
+                    } catch (FormatException) {
+                        return "format";
+                    }
+                }
+
+                // NumberStyles 面 (impl は Int32 受け)。HexSpecifier は ArgumentException 分類も含む
+                public static string StylesParseFaces(string s, int styles) {
+                    try {
+                        return double.Parse(s, (System.Globalization.NumberStyles)styles).ToString();
+                    } catch (ArgumentException) {
+                        return "arg";
+                    } catch (FormatException) {
+                        return "format";
+                    }
+                }
+
+                public static string ConvertDoubleFaces(string s) => Convert.ToDouble(s) + ":" + Convert.ToSingle(s);
+
+                public static string ConvertToStringDoubleFace(double v) => Convert.ToString(v);
+
+                // object 経由面 (C5.5 Wave 3 で IL 優先に上げた Convert.ToSingle/ToDouble(object))。
+                // double 入力は本家 IL の IConvertible ディスパッチで完結、
+                // string 入力は String EII → Convert.ToDouble(string, provider) → 置換面で解析される
+                public static double ConvertToDoubleObject(object v) => Convert.ToDouble(v);
             }
         }
         """;
@@ -196,8 +256,32 @@ public class CoreLibFacesIlTests {
         return vm.Invoke("Vm.C5.FaceOps", method, args);
     }
 
-    private static void AssertSame(string method, params object?[] args) =>
-        Assert.Equal(InvokeClr(method, args), InvokeVm(method, args));
+    private static void AssertSame(string method, params object?[] args) {
+        // AssertSame("M", null) は params 展開で args = null (配列自体が null) になるため
+        // [null] 1 要素へ正規化する
+        if (args is null) args = new object?[] { null };
+        // ゲストメソッドが catch していない例外組合わせ (ConvertDoubleFaces("abc") 等) では
+        // 両側とも例外になるため、例外は「!型名」に正規化して突合する
+        Assert.Equal(InvokeWithExnClass(() => InvokeClr(method, args)),
+                     InvokeWithExnClass(() => InvokeVm(method, args)));
+    }
+
+    private static object? InvokeWithExnClass(Func<object?> run) {
+        try {
+            return run();
+        } catch (DotnetVM.Policy.UnhandledGuestException guest) {
+            return "!" + NameTail(guest.ExceptionTypeName);
+        } catch (Exception ex) {
+            var inner = ex;
+            while (inner.InnerException != null) inner = inner.InnerException;
+            return "!" + inner.GetType().Name;
+        }
+    }
+
+    private static string NameTail(string fullName) {
+        var lastDot = fullName.LastIndexOf('.');
+        return lastDot < 0 ? fullName : fullName[(lastDot + 1)..];
+    }
 
     /// <summary>CoreLib IL 実行の証明: 当該メソッドの IL フレームが System.Private.CoreLib
     /// として記録されること。Math 系は実型 IL で走る (IlPreferred 面)。</summary>
@@ -433,5 +517,82 @@ public class CoreLibFacesIlTests {
         AssertRunsVmCoreLibIl("ProviderOnlyFaces", [42, 7],
             ("DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString"),
             ("DotnetVM.CoreLib.FormatSpecifiers", "ByteToString"));
+    }
+
+    // ---- C5.5 Wave 3: 浮動小数点 (Faces 置換面 → DoubleFormatting / DoubleParsing IL) ----
+
+    [Fact]
+    public void Float_Format_Overloads_Match_Clr() {
+        var doubles = new[] { 0.0, -0.0, 1.0, -1.0, 0.5, 3.141592653589793, 2.5e-10,
+            1e300, 1e-300, 5e-324, double.MaxValue, double.MinValue,
+            double.PositiveInfinity, double.NegativeInfinity, double.NaN };
+        foreach (var fmt in new[] { null, "G", "R", "E", "E4", "F", "F2", "N", "N2", "P", "P1", "C", "e2", "0.000", "#,##0.0" }) {
+            foreach (var v in doubles) {
+                AssertSame("DoubleFormatFaces", v, fmt!);
+                AssertSame("Double3ArgFaces", v, fmt!);
+            }
+            foreach (var v in new[] { 0.0, 1.0, -2.5, 3.4028235e38, float.MinValue, float.NaN, float.PositiveInfinity })
+                AssertSame("SingleFormatFaces", v, fmt!);
+        }
+        foreach (var v in doubles)
+            AssertSame("DoubleProviderFaces", v);
+    }
+
+    [Fact]
+    public void Float_Parse_Faces_Match_Clr() {
+        foreach (var s in new[] { "1.5", "-2.25", "abc", "", "NaN", "Infinity", "-Infinity", "+Infinity",
+                 "1e5", "1E-5", " 42 ", "0x10", "1.2.3", ".5", "5.", "1e", "+-1", "2.5e-10",
+                 "0", "-0", "5e-324", "1.798e308", "1,234" })
+            AssertSame("DoubleParseFaces", s);
+        foreach (var s in new[] { "1.5", "abc", "NaN", "Infinity", "1e40", "1e39" })
+            AssertSame("SingleParseFaces", s);
+        // NumberStyles 面: exponent の有無 / HexSpecifier の ArgumentException 分類を含む
+        foreach (var styles in new[] { 0, 7, 167, 231, 511, 515, 1295 }) {
+            foreach (var s in new[] { "1.5", "1e5", "(1.5)", "1,234", "abc", "NaN", "Infinity" })
+                AssertSame("StylesParseFaces", s, styles);
+        }
+        // null 入力の ArgumentNullException 分類
+        AssertSame("DoubleParseFaces", null);
+    }
+
+    [Fact]
+    public void Convert_Float_Faces_Match_Clr() {
+        AssertSame("ConvertDoubleFaces", "1.5");
+        AssertSame("ConvertDoubleFaces", "-2.25");
+        AssertSame("ConvertDoubleFaces", "abc");
+        AssertSame("ConvertDoubleFaces", "NaN");
+        AssertSame("ConvertToStringDoubleFace", 3.5);
+        AssertSame("ConvertToStringDoubleFace", double.NaN);
+        // object 経由面: double 入力は本家 IL の IConvertible ディスパッチ、
+        // string 入力は String EII → Convert.ToDouble(string, provider) → 置換面 (b)
+        AssertSame("ConvertToDoubleObject", 3.5);
+        AssertSame("ConvertToDoubleObject", "1.5");
+        AssertSame("ConvertToDoubleObject", double.NaN);
+    }
+
+    [Fact]
+    public void Float_Faces_Run_VmCoreLib_Il() {
+        // Faces 置換面の証明: 浮動小数点書式 / parse の IL フレームが
+        // アセンブリ名 "DotnetVM.CoreLib" の DoubleFormatting / DoubleParsing として記録される
+        AssertRunsVmCoreLibIl("DoubleFormatFaces", [3.5, "E4"],
+            ("DotnetVM.CoreLib.DoubleFormatting", "DoubleToString"));
+        AssertRunsVmCoreLibIl("SingleFormatFaces", [-2.5, "R"],
+            ("DotnetVM.CoreLib.DoubleFormatting", "SingleToString"));
+        AssertRunsVmCoreLibIl("DoubleProviderFaces", [3.5],
+            ("DotnetVM.CoreLib.DoubleFormatting", "DoubleToString"));
+        AssertRunsVmCoreLibIl("DoubleParseFaces", ["1.5"],
+            ("DotnetVM.CoreLib.DoubleParsing", "DoubleParse"));
+        AssertRunsVmCoreLibIl("SingleParseFaces", ["1.5"],
+            ("DotnetVM.CoreLib.DoubleParsing", "SingleParse"));
+        AssertRunsVmCoreLibIl("ConvertDoubleFaces", ["1.5"],
+            ("DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse"),
+            ("DotnetVM.CoreLib.DoubleParsing", "ConvertSingleParse"));
+        AssertRunsVmCoreLibIl("ConvertToStringDoubleFace", [3.5],
+            ("DotnetVM.CoreLib.DoubleFormatting", "DoubleToString"));
+        // object 経由面の string 入力も置換面 (b) で解析される
+        AssertRunsVmCoreLibIl("ConvertToDoubleObject", ["1.5"],
+            ("DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse"));
+        // object 経由面の double 入力は本家 CoreLib IL (IConvertible ディスパッチ) で実行
+        AssertRunsCoreLibIl("ConvertToDoubleObject", [3.5], ("System.Convert", "ToDouble"));
     }
 }

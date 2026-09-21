@@ -367,13 +367,16 @@ internal static class SlotOps {
         // ソース値を i8 (または f8) に統一してから切り詰める
         var isFloatSrc = value.Kind == StackKind.Float;
         var f = isFloatSrc ? value.DoubleValue : 0.0;
-        var i = isFloatSrc ? 0L : value.Int64Value;
+        // R8 → 整数への非検査変換はゼロ方向切捨て (C5.5 Wave 3 修正: 以前は
+        // float ソースで i を 0 に落としており conv.i1〜i8 / u1〜u8 が常に 0 を返した)。
+        // x64 cvttsd2si 規約に合わせ NaN は 0、範囲外は 0x8000... パターン
+        var i = isFloatSrc ? TruncateFloatToInt64(f) : value.Int64Value;
 
         switch (op) {
             // 無限精度の拡張/縮小 (ラップする)
             case ILOp.Conv_I1: return StackSlot.OfInt32((sbyte)i);
             case ILOp.Conv_I2: return StackSlot.OfInt32((short)i);
-            case ILOp.Conv_I4: return StackSlot.OfInt32((int)i);
+            case ILOp.Conv_I4: return StackSlot.OfInt32(isFloatSrc ? TruncateFloatToInt32(f) : (int)i);
             case ILOp.Conv_I8: return StackSlot.OfInt64(i);
             case ILOp.Conv_U1: return StackSlot.OfInt32((byte)i);
             case ILOp.Conv_U2: return StackSlot.OfInt32((ushort)i);
@@ -414,6 +417,24 @@ internal static class SlotOps {
             default:
                 throw new InvalidOperationException($"変換命令でない命令です: {op}");
         }
+    }
+
+    /// <summary>R8 → int64 への非検査切捨て変換 (conv.i8 系の float ソース)。
+    /// ホスト RyuJIT 規約 (ゼロ方向切捨て + 飽和): NaN → 0、範囲外は各極値へ飽和。</summary>
+    private static long TruncateFloatToInt64(double f) {
+        if (double.IsNaN(f)) return 0;
+        if (f >= 9223372036854775808.0) return long.MaxValue;
+        if (f < -9223372036854775808.0) return long.MinValue;
+        return (long)f;
+    }
+
+    /// <summary>R8 → int32 への非検査切捨て変換 (conv.i4 の float ソースは 64bit 経由でなく
+    /// 直接 32bit に切るため別経路)。ホスト RyuJIT 規約: NaN → 0、範囲外は各極値へ飽和。</summary>
+    private static int TruncateFloatToInt32(double f) {
+        if (double.IsNaN(f)) return 0;
+        if (f >= 2147483648.0) return int.MaxValue;
+        if (f < -2147483648.0) return int.MinValue;
+        return (int)f;
     }
 
     /// <summary>conv.ovf.*.un: ソースを符号なし整数とみなしてターゲット範囲を検査する。</summary>

@@ -112,8 +112,10 @@ public static class FormatSpecifiers {
 
     /// <summary>標準書式文字 (小文字のまま。大文字化は呼出側) と精度を返す。
     /// カスタム書式なら Fmt = '\0'。null / 空 / '\0' 開始は 'G'。
-    /// (out は VM IL 実績がないため NumberFormatting.ParseMagnitude と同じタプル戻り値)</summary>
-    private static (char Fmt, int Digits) ParseFormatSpecifier(string? format) {
+    /// (out は VM IL 実績がないため NumberFormatting.ParseMagnitude と同じタプル戻り値)。
+    /// 本家 ParseFormatSpecifier (Number.Formatting.Common.cs) の意味論と一致しており、
+    /// 浮動小数点書式エンジン (DoubleFormatting) からも共用する。</summary>
+    internal static (char Fmt, int Digits) ParseFormatSpecifier(string? format) {
         char c = '\0';
         if (format is not null && format.Length > 0) {
             c = format[0];
@@ -295,7 +297,9 @@ public static class FormatSpecifiers {
 
     // ---- 出力バッファ ----
 
-    private sealed class Out {
+    /// <summary>書式出力バッファ (本家 ValueListBuilder&lt;char&gt; の置換)。
+    /// 浮動小数点書式エンジン (DoubleFormatting) からも共用する。</summary>
+    internal sealed class Out {
         private char[] _buffer = new char[64];
         private int _length;
 

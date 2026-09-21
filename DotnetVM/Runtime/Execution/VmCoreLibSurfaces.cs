@@ -100,6 +100,40 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Boolean", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "BooleanToString", ["System.Boolean"]),
         ("System.Char", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "CharToString", ["System.Char"]),
         ("System.Char", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "CharToString", ["System.Char"]),
+        // ---- C5.5 Wave 3: 浮動小数点書式 overload (標準書式 G/C/F/N/E/P/R + カスタム書式)。
+        // 実在側は Number.Formatting (Grisu3 / Dragon4 / byte* 生ポインタ + NumberBuffer) +
+        // NumberFormatInfo culture 機構で構成され VM の表現モデルに落ちないため、
+        // DotnetVM.CoreLib.DoubleFormatting (dotnet/runtime MIT ソースのポインタなし移植・
+        // 不変カルチャ固定) へ差し替える。Single の impl は float 値を double へ拡大格納して
+        // 受ける (impl 内で (float) へ再丸めするため実型 Single の意味論を保持)。
+        // provider は不変カルチャ固定で無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
+        ("System.Single", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double"]),
+        ("System.Double", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double"]),
+        ("System.Single", "ToString", ["System.String"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double", "System.String"]),
+        ("System.Double", "ToString", ["System.String"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double", "System.String"]),
+        ("System.Single", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double", "System.String", "System.Object"]),
+        ("System.Double", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double", "System.String", "System.Object"]),
+        ("System.Single", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double", "System.Object"]),
+        ("System.Double", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double", "System.Object"]),
+        // 浮動小数点 10 進解析 (NumberStyles / 不変カルチャ相当。Impl は styles を Int32 受け)
+        ("System.Single", "Parse", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String"]),
+        ("System.Double", "Parse", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String"]),
+        ("System.Single", "Parse", ["System.String", "System.Globalization.NumberStyles"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String", "System.Int32"]),
+        ("System.Double", "Parse", ["System.String", "System.Globalization.NumberStyles"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String", "System.Int32"]),
+        ("System.Single", "Parse", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String", "System.Object"]),
+        ("System.Double", "Parse", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String", "System.Object"]),
+        ("System.Single", "Parse", ["System.String", "System.Globalization.NumberStyles", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String", "System.Int32", "System.Object"]),
+        ("System.Double", "Parse", ["System.String", "System.Globalization.NumberStyles", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String", "System.Int32", "System.Object"]),
+        // Convert の文字列⇔浮動小数点変換 (Convert.ToDouble/ToSingle(string[, provider]) は
+        // NumberStyles.Float | AllowThousands の不変カルチャ解析。ToString(Double/Single) は
+        // 実 IL が value.ToString(provider) を直接呼ぶが、面自体も置換面で受ける
+        ("System.Convert", "ToDouble", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse", ["System.String"]),
+        ("System.Convert", "ToSingle", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "ConvertSingleParse", ["System.String"]),
+        ("System.Convert", "ToDouble", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse", ["System.String", "System.Object"]),
+        ("System.Convert", "ToSingle", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "ConvertSingleParse", ["System.String", "System.Object"]),
+        ("System.Convert", "ToString", ["System.Double"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double"]),
+        ("System.Convert", "ToString", ["System.Single"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double"]),
     ];
 
     private readonly TypeLoader _coreLibLoader;

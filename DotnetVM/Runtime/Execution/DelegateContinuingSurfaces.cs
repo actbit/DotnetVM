@@ -46,14 +46,15 @@ internal static class DelegateContinuingSurfaces {
     /// ((IConvertible)value).ToXxx(null) の interface ディスパッチ 1 呼出のみで構成されるため、
     /// box レシーバの EII 解決に委ねて実 IL 直実行できる (Enum / プリミティブの EII は
     /// Enum.GetValue 等の internal-call リーフバインドで完結)。
-    /// 浮動小数点 2 面 (ToSingle / ToDouble) は文字列入力時の解析が Number.Formatting 依存
-    /// (Wave 3) のため ③ 委譲を継続する。CoreLib 未ロード時は解決に失敗して ③ に落ちるため
-    /// legacy 動作は変わらない。
+    /// 浮動小数点 2 面 (ToSingle / ToDouble) も C5.5 Wave 3 で文字列入力時の解析が
+    /// DotnetVM.CoreLib.DoubleParsing 置換面 (b) として揃ったため IL 優先に上げた。
+    /// CoreLib 未ロード時は解決に失敗して ③ に落ちるため legacy 動作は変わらない。
     /// </summary>
     public static readonly IReadOnlySet<(string Type, string Method, string Params)> IlPreferredFaces =
         new HashSet<(string, string, string)>(
             new[] { "ToBoolean", "ToChar", "ToSByte", "ToByte", "ToInt16", "ToUInt16",
-                    "ToInt32", "ToUInt32", "ToInt64", "ToUInt64", "ToString" }
+                    "ToInt32", "ToUInt32", "ToInt64", "ToUInt64", "ToString",
+                    "ToSingle", "ToDouble" }
                 .Select(name => ("System.Convert", name, "System.Object")));
             // (string, string, string) の既定等値比較は要素ごとの ordinal string 比較なので
             // 明示的な comparer は不要

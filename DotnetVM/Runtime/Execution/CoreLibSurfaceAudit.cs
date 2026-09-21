@@ -86,13 +86,10 @@ internal static class CoreLibSurfaceAudit {
         var integer4 = new[] { "System.Int32", "System.UInt32", "System.Int64", "System.UInt64" };
 
         // ---- CoreLibBindings: 書式付きプリミティブ ToString (culture 書式面) ----
-        // C5.5 Wave 2 で整数 8 型 + Boolean/Char の全 ToString 面 (無引数 / format /
-        // format+IFormatProvider / IFormatProvider) を Faces 置換面 (b) へ移行済み
-        // (VmCoreLibSurfaces.Faces → DotnetVM.CoreLib.FormatSpecifiers。format を無視する
-        // バインドは廃止済み)。Single/Double のみ Wave 3 (浮動小数点書式エンジン移植) まで
-        // format を無視する暫定委譲を継続する
-        var formatJ = CultureOutOfScope + "。書式エンジン未整備のため format を無視する暫定委譲 (Wave 3 で DotnetVM.CoreLib 置換面 (b) へ移行予定)";
-        AddRange(new[] { "System.Single", "System.Double" }, "ToString", CoreLibSurfaceKind.RuntimeInternal, formatJ, hasThis: true);
+        // C5.5 Wave 2 で整数 8 型 + Boolean/Char、Wave 3 で Single/Double の全 ToString 面
+        // (無引数 / format / format+IFormatProvider / IFormatProvider) を Faces 置換面 (b) へ
+        // 移行済み (VmCoreLibSurfaces.Faces → DotnetVM.CoreLib FormatSpecifiers /
+        // DoubleFormatting。format を無視するバインドは廃止済み)
 
         // ---- CoreLibBindings: 構築ジェネリック インターフェース (プリミティブ実体化面) ----
         var comparableJ = RuntimeRepresentation +
@@ -267,10 +264,10 @@ internal static class CoreLibSurfaceAudit {
         var wave2Shadow = "shadowed-legacy (②' VmCoreLibSurfaces Faces 置換面 (b) が常に先に解決するため到達しない。C5.5 Wave 2 で ① バインドを廃止済み)";
         foreach (var t in wave2Done)
             Add(t, "ToString", CoreLibSurfaceKind.RealCoreLibIl, wave2Shadow, hasThis: true, paramCount: 0);
-        // Single/Double: ① InstanceAnyParams バインドが常に先 → 到達しない (Wave 3 で移行)
-        var prim2Shadow = "shadowed-legacy (① ToString 全引数一致バインドが常に先に解決するため到達しない。Wave 3 で廃止)";
-        Add("System.Single", "ToString", CoreLibSurfaceKind.RealCoreLibIl, prim2Shadow, hasThis: true, paramCount: 0);
-        Add("System.Double", "ToString", CoreLibSurfaceKind.RealCoreLibIl, prim2Shadow, hasThis: true, paramCount: 0);
+        // Single/Double: ②' Faces 置換面 (b) が常に先 → この legacy キーは到達しない
+        var floatShadow = "shadowed-legacy (②' VmCoreLibSurfaces Faces 置換面 (b) が常に先に解決するため到達しない。C5.5 Wave 3 で ① バインドを廃止済み)";
+        Add("System.Single", "ToString", CoreLibSurfaceKind.RealCoreLibIl, floatShadow, hasThis: true, paramCount: 0);
+        Add("System.Double", "ToString", CoreLibSurfaceKind.RealCoreLibIl, floatShadow, hasThis: true, paramCount: 0);
 
         // ---- DefaultIntrinsics: Char ----
         Add("System.Char", "IsWhiteSpace", CoreLibSurfaceKind.RuntimeInternal,
@@ -362,7 +359,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Convert", "ToBoolean", CoreLibSurfaceKind.RuntimeInternal, convertFaceJ, hasThis: false, paramCount: 1);
         Add("System.Convert", "ToChar", CoreLibSurfaceKind.RuntimeInternal, convertFaceJ, hasThis: false, paramCount: 1);
         var convertJ = RuntimeInternalKindNote() +
-            "。実 CLR は IConvertible 経由の managed IL。ToDouble/ToSingle は文字列入力の解析が Number.Formatting 依存 (Wave 3)、残 6 面 (整数 8bit/16bit/無符号系) は置換面ありの整合を Wave 2 で再評価予定";
+            "。実 CLR は IConvertible 経由の managed IL。文字列→浮動小数点 (ToDouble/ToSingle) の解析面は C5.5 Wave 3 で Faces 置換面 (b) (DotnetVM.CoreLib.DoubleParsing) に移行済み。このキーは CoreLib 未ロード時の代替経路と残 overload を受ける";
         Add("System.Convert", "ToDouble", CoreLibSurfaceKind.RuntimeInternal, convertJ, hasThis: false, paramCount: 1);
         Add("System.Convert", "ToSingle", CoreLibSurfaceKind.RuntimeInternal, convertJ, hasThis: false, paramCount: 1);
         foreach (var m in new[] { "ToByte", "ToSByte", "ToInt16", "ToUInt16", "ToUInt32", "ToUInt64" })

@@ -267,6 +267,18 @@ internal sealed class ObjectEngine(
         }
         var field = ResolveFieldToken(token);
         var owner = (VmClassType)field.DeclaringType;
+        // 本家 CoreLib の IL 内からの ldsfld / stsfld (Field token 直接)。実 CLR では
+        // ランタイムが値を設定する静的フィールド (String.Empty 等) は IL に初期化子が
+        // なく static storage の初期値は null になるため、intrinsic 静的フィールド登録
+        // (RegisterStaticField) があればそちらを優先する。MemberRef 経由のアクセスと
+        // 同一ストレージ (token 単位キャッシュ) を使うため両経路の参照は一致する
+        if (_intrinsics.TryGetStaticField(owner.FullName, field.Name, out var intrinsicValue)) {
+            if (!_intrinsicStaticFields.TryGetValue(token, out var storage)) {
+                storage = [intrinsicValue(_intrinsicContext)];
+                _intrinsicStaticFields[token] = storage;
+            }
+            return new VmByRef(storage, 0);
+        }
         EnsureInitialized(owner);
         var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader);
         return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));

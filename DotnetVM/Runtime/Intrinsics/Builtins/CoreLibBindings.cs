@@ -279,59 +279,64 @@ internal static class CoreLibBindings {
     private static void RegisterString(IntrinsicRegistry r) {
         const string T = "System.String";
         // 4 項以上の連結は Roslyn が String.Concat(params string[]) / (params object[]) に
-        // コンパイルする。要素は CLR 規約どおりフォーマットする (null は空文字列)
+        // コンパイルする。要素は CLR 規約どおりフォーマットする (null は空文字列)。
+        // 連結本体は実 IL の wstrcpy 生ポインタコピー面のため委譲継続 (C5.5 Wave 5 確定)
         r.RegisterBinding(BindingKey.Static(T, "Concat", "System.String[]"),
             static (ctx, a) => ConcatArray(ctx, a), BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Static(T, "Concat", "System.Object[]"),
             static (ctx, a) => ConcatArray(ctx, a), BindingOrigin.Managed);
-        // 比較面 (legacy intrinsic 未登録)。CLR の 2 引数 Compare は CurrentCulture 比較
+        // ---- culture 相当必須面 (C5.5 Wave 5 確定): 本家 IL は CultureInfo /
+        //      CompareInfo (culture 機構) で構成され culture スコープ外のため、
+        //      VM 規約の不変カルチャ固定をホスト BCL の InvariantCulture 面で委譲する
+        //      (不変カルチャ比較 IL 移植候補とのファズ突合で非 ASCII 差分が証明済み —
+        //      ordinal 近似では ß/ss 等のインバリアント等価が再現できない)。
+        //      対応する ordinal / 置換面 (CompareOrdinal / IndexOf(char) / Contains /
+        //      Replace / Split / Format) は VmCoreLibSurfaces の (b) 置換面に移行済みで
+        //      ここには載せない (載せると ① が ②'/置換面を塞ぐ退行)。
+        //      null 許容の静的比較面のみ本家どおり null を通す (Compare(null, x) = 負)
+        static string? Ns(StackSlot[] a, int i) => (a[i].ObjectValue as VmString)?.Value;
         static VmString Str(StackSlot[] a, int i) =>
             a[i].ObjectValue as VmString ?? throw new UnhandledGuestException("System.NullReferenceException", null);
         r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String"),
-            static (_, a) => StackSlot.OfInt32(string.Compare(Str(a, 0).Value, Str(a, 1).Value, StringComparison.CurrentCulture)),
+            static (_, a) => StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.InvariantCulture)),
             BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.Static(T, "CompareOrdinal", "System.String", "System.String"),
-            static (_, a) => StackSlot.OfInt32(string.CompareOrdinal(Str(a, 0).Value, Str(a, 1).Value)),
-            BindingOrigin.Managed);
-        // 検索 / 置換面。CoreLib IL は SpanHelpers の SIMD intrinsic (Vector128/256 面) に落ちるため
-        // VM のスロット表現では実行できない。CLR 同一の意味論 (1 引数 IndexOf/LastIndexOf/
-        // StartsWith/EndsWith は CurrentCulture、Contains/Replace は Ordinal) をバインドで優先提供する
-        r.RegisterBinding(BindingKey.Instance(T, "IndexOf", "System.Char"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Ch(a, 1))),
+        // CompareTo (instance): 本家 IL も CurrentCulture の Compare を呼ぶ文化面。
+        // ① が ② IL より先に解決されるため、無いと IL 実行時に CompareInfo で fail-closed になる
+        r.RegisterBinding(BindingKey.Instance(T, "CompareTo", "System.String"),
+            static (_, a) => StackSlot.OfInt32(string.Compare(Str(a, 0).Value, Str(a, 1).Value, StringComparison.InvariantCulture)),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "IndexOf", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Str(a, 1).Value, StringComparison.CurrentCulture)),
-            BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.Instance(T, "LastIndexOf", "System.Char"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Ch(a, 1))),
+            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Str(a, 1).Value, StringComparison.InvariantCulture)),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "LastIndexOf", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, StringComparison.CurrentCulture)),
-            BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.Instance(T, "Contains", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.Contains(Str(a, 1).Value) ? 1 : 0),
+            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, StringComparison.InvariantCulture)),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "StartsWith", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.StartsWith(Str(a, 1).Value, StringComparison.CurrentCulture) ? 1 : 0),
+            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.StartsWith(Str(a, 1).Value, StringComparison.InvariantCulture) ? 1 : 0),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "EndsWith", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.EndsWith(Str(a, 1).Value, StringComparison.CurrentCulture) ? 1 : 0),
+            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.EndsWith(Str(a, 1).Value, StringComparison.InvariantCulture) ? 1 : 0),
             BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.Instance(T, "Replace", "System.String", "System.String"),
-            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.Replace(Str(a, 1).Value, Str(a, 2).Value))),
+        // 大文字小文字面: 本家 IL は CultureInfo.CurrentCulture.TextInfo (culture 機構 +
+        // InternalCall) を辿る。不変カルチャ規約ではホストの不変大文字小文字化と同一結果。
+        // ToUpperInvariant / ToLowerInvariant も本家 IL は TextInfo を辿るため同様に委譲する
+        r.RegisterBinding(BindingKey.Instance(T, "ToUpper"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToUpperInvariant())),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "ToLower"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToLowerInvariant())),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "ToUpperInvariant"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToUpperInvariant())),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "ToLowerInvariant"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToLowerInvariant())),
             BindingOrigin.Managed);
         // 1 文字の文字列生成 (InternalCall 面。char.ToString() の実 IL が string.CreateFromChar
         // を辿る — VmString 生成は既存の文字列内部面と同一経路)
         r.RegisterBinding(BindingKey.Static(T, "CreateFromChar", "System.Char"),
             static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Ch(a, 0).ToString())),
             BindingOrigin.InternalCall);
-        // String.Format / String.Split (culture 依存面 / SpanHelpers 依存の表現境界面)。
-        // CoreLib IL (CultureInfo / ReadOnlySpan<char> の内部表現) に落とさず、既存の統合面
-        // (DefaultIntrinsics.FormatImpl / SplitImpl — CLR 同等意味論) をバインドで優先提供する
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Format"),
-            DefaultIntrinsics.FormatImpl, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.InstanceAnyParams(T, "Split"),
-            DefaultIntrinsics.SplitImpl, BindingOrigin.Managed);
     }
 
     private static char Ch(StackSlot[] a, int i) => (char)a[i].AsInt32;

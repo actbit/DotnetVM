@@ -123,33 +123,38 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Threading.Monitor", "Exit_FastPath", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
         Add("System.Threading.Monitor", "IsEnteredNative", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
 
-        // ---- CoreLibBindings: String culture / 表現面 (Wave 5 で ordinal 分を (b) へ移行予定) ----
+        // ---- CoreLibBindings: String culture 面 (C5.5 Wave 5 確定) ----
+        // culture 相当必須の面 (Compare / IndexOf(string) / LastIndexOf(string) /
+        // StartsWith / EndsWith / 大文字小文字 / CompareTo) は本家 IL が CultureInfo /
+        // CompareInfo / TextInfo (culture 機構) で構成され IL 移植対象外のため、
+        // VM 規約の不変カルチャ固定をホスト BCL 委譲 (① バインド) で提供する。
+        // ordinal 近似の IL 移植候補との ASCII+非 ASCII ファズ突合で差分が証明済み
+        // (インバリアントの ß/ss 等の比較等価は ordinal では再現できない)。
+        // 対して ordinal 面 (CompareOrdinal / IndexOf(char) / LastIndexOf(char) /
+        // Contains / Replace) と Format / Split は (b) 置換面 (VmCoreLibSurfaces.Faces →
+        // DotnetVM.CoreLib.StringOrdinalOps / StringFormatting) に移行済み。
+        // 各エントリは「ロード時 (b) 置換面 / 未ロード時 ③ legacy キー」の代替経路を併記する
+        var cultureFaceJ = CultureOutOfScope +
+            "。本家 IL は CompareInfo (culture 機構) で構成され IL 移植対象外のため、不変カルチャ固定のホスト BCL 委譲を継続する (C5.5 Wave 5 で CurrentCulture から不変へ修正)";
         Add("System.String", "Concat", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + "。要素の CLR 規約書式化が書式エンジン依存 (Wave 5 で再評価)", hasThis: false, paramCount: 1);
-        Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + " (CurrentCulture 比較。Wave 5 で不変比較 IL 実装へ移行予定)", hasThis: false, paramCount: 2);
+            RuntimeRepresentation + " (連結本体は実 IL の wstrcpy 生ポインタコピー / 正確な容量計算面。要素の ToString 面は Wave 4 で実 IL 化済み)", hasThis: false, paramCount: 1);
+        Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: false, paramCount: 2);
         Add("System.String", "CompareOrdinal", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (実 IL は fixed byte* 比較。Wave 5 で (b) 移行予定)", hasThis: false, paramCount: 2);
+            RuntimeRepresentation + " (実 IL は fixed byte* 比較。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: false, paramCount: 2);
         Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。char は ordinal で Wave 5 (b) 移行予定)", hasThis: true, paramCount: 1);
-        Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + " (CurrentCulture 検索。Wave 5 で不変比較 IL 実装へ移行予定)", hasThis: true, paramCount: 1);
+            cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
         Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。char は Wave 5 (b) 移行予定)", hasThis: true, paramCount: 1);
-        Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + " (CurrentCulture 検索。Wave 5 で移行予定)", hasThis: true, paramCount: 1);
+            cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
         Add("System.String", "Contains", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。ordinal。Wave 5 で (b) 移行予定)", hasThis: true, paramCount: 1);
-        Add("System.String", "StartsWith", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + " (CurrentCulture 比較。Wave 5 で移行予定)", hasThis: true, paramCount: 1);
-        Add("System.String", "EndsWith", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + " (CurrentCulture 比較。Wave 5 で移行予定)", hasThis: true, paramCount: 1);
+            RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true, paramCount: 1);
+        Add("System.String", "StartsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true, paramCount: 1);
+        Add("System.String", "EndsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true, paramCount: 1);
         Add("System.String", "Replace", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (実 IL は Span ベース表現。ordinal。Wave 5 で (b) 移行予定)", hasThis: true, paramCount: 2);
+            RuntimeRepresentation + " (実 IL は Span ベース表現。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true, paramCount: 2);
         Add("System.String", "Format", CoreLibSurfaceKind.RuntimeInternal,
-            CultureOutOfScope + "。複合書式が書式エンジン依存 (Wave 2/3 の書式エンジン整備後に (b) 移植予定)", hasThis: false);
+            RuntimeRepresentation + " (実 IL は StringBuilder チャンク + Span 解析。ロード時は (b) 置換面 StringFormatting、未ロード時この legacy キー)", hasThis: false);
         Add("System.String", "Split", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (SpanHelpers 依存の表現境界面。Wave 5 で再評価)", hasThis: true);
+            RuntimeRepresentation + " (SpanHelpers 依存の表現境界面。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true);
 
         // ---- CoreLibBindings: String 内部 / Buffer / Unsafe / MemoryMarshal ----
         Add("System.String", "FastAllocateString", CoreLibSurfaceKind.RuntimeInternal,
@@ -303,7 +308,12 @@ internal static class CoreLibSurfaceAudit {
         // ---- DefaultIntrinsics: String (IlPreferred = ② IL 実行が基本。影の残置キー) ----
         // IL 本体を持つ面の legacy intrinsic はロード時 ② が常に先。未ロード時の代替経路として永続残置
         var stringIlShadow = "shadowed-legacy (String は IlPreferred のため managed IL 本体を持つ面は ② IL 実行が常に先。CoreLib 未ロード時の代替経路として永続残置)";
-        var stringBindingShadow = "shadowed-legacy (① culture / 表現面バインドが常に先に解決するため到達しない。C5.5 Wave 5 の移行時に置換面 (b) へ移行予定)";
+        var stringSubstituteShadow = "shadowed-legacy (ロード時は ② IL 解決後の choke point で (b) 置換面に差し替え。未ロード時は ③ legacy intrinsic が受ける)";
+        // culture 面 (C5.5 Wave 5 確定): 本家 IL は CultureInfo.CurrentCulture.TextInfo /
+        // CompareInfo (culture 機構) を辿るため ② IL 実行では fail-closed になる。
+        // 不変カルチャ規約の同一結果を ① バインドで優先提供し、未ロード時はこの legacy キーが受ける
+        var stringCultureJ = CultureOutOfScope +
+            " (本家 IL は culture 機構依存のため不変カルチャ固定のホスト委譲を ① バインドで優先提供。未ロード時この legacy キー)";
         Add("System.String", ".ctor", CoreLibSurfaceKind.RuntimeInternal,
             "shadowed-legacy (newobj string 構築は ObjectEngine の NewStringFromCtor が処理するため到達しない)", hasThis: true, paramCount: 0);
         foreach (var (method, hasThis, pc, kind, j) in new[] {
@@ -312,26 +322,26 @@ internal static class CoreLibSurfaceAudit {
             ("Substring", true, 1, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Substring", true, 2, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Equals", true, 1, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
-            ("CompareTo", true, 1, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
-            ("Contains", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("StartsWith", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("EndsWith", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("IndexOf", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("LastIndexOf", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Replace", true, 2, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("ToUpper", true, 0, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
-            ("ToLower", true, 0, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
+            ("CompareTo", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("Contains", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("StartsWith", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("EndsWith", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("IndexOf", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("LastIndexOf", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("Replace", true, 2, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("ToUpper", true, 0, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
+            ("ToLower", true, 0, CoreLibSurfaceKind.RuntimeInternal, stringCultureJ),
             ("Trim", true, 0, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("ToString", true, 0, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Concat", false, 2, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Concat", false, 3, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Concat", false, 4, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
-            ("Format", false, 2, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Format", false, 3, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Format", false, 4, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Format", false, 5, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Split", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
-            ("Split", true, 2, CoreLibSurfaceKind.RuntimeInternal, stringBindingShadow),
+            ("Format", false, 2, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("Format", false, 3, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("Format", false, 4, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("Format", false, 5, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("Split", true, 1, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
+            ("Split", true, 2, CoreLibSurfaceKind.RuntimeInternal, stringSubstituteShadow),
             ("Join", false, 2, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("Equals", false, 2, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
             ("op_Equality", false, 2, CoreLibSurfaceKind.RealCoreLibIl, stringIlShadow),
@@ -342,6 +352,11 @@ internal static class CoreLibSurfaceAudit {
                 "shadowed-legacy (本体があれば ② IL が先、InternalCall の場合はこのキーが受ける — いずれも VM 文字列プールで同等)"),
         })
             Add("System.String", method, kind, j, hasThis, pc);
+        // ToUpperInvariant / ToLowerInvariant (C5.5 Wave 5 新設の ① バインド)。本家 IL は
+        // CultureInfo.InvariantCulture.TextInfo (culture 機構) を辿るため culture スコープ外。
+        // 不変カルチャ規約ではホストの不変大文字小文字化と同一結果
+        Add("System.String", "ToUpperInvariant", CoreLibSurfaceKind.RuntimeInternal, stringCultureJ, hasThis: true, paramCount: 0);
+        Add("System.String", "ToLowerInvariant", CoreLibSurfaceKind.RuntimeInternal, stringCultureJ, hasThis: true, paramCount: 0);
 
         // ---- DefaultIntrinsics: Math (IlPreferred。IL 本体が証明済みの面は影、演画面は委譲) ----
         // IL 本体を持つ面の legacy intrinsic はロード時 ② が常に先。未ロード時の代替経路として永続残置

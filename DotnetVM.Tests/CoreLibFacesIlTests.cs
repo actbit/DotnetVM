@@ -251,6 +251,47 @@ public class CoreLibFacesIlTests {
                 public static bool InstanceEqualsOther() => new object().Equals(new object());
                 public static string BoxedToString() => ((object)1).ToString();
                 public static int HashOfSame() { var o = new object(); return o.GetHashCode() == o.GetHashCode() ? 1 : 0; }
+
+                // ---- C5.5 Wave 5: String ordinal / Split / Format 面 (Faces 置換 →
+                //     StringOrdinalOps / StringFormatting IL) と culture 面 (不変カルチャ委譲バインド) ----
+                public static string OrdinalFace(string a, string b) =>
+                    string.CompareOrdinal(a, b) + ":" + a.IndexOf('a') + ":" + a.LastIndexOf('a') + ":" +
+                    (a.Contains(b) ? "y" : "n");
+
+                public static string ReplaceFace(string a, string b, string c) => a.Replace(b, c);
+
+                public static string SplitCharFace(string a, char sep) => Join(a.Split(sep));
+                public static string SplitCharCountFace(string a, char sep, int count) => Join(a.Split(sep, count));
+                public static string SplitCharOptionsFace(string a, char sep, int options) =>
+                    Join(a.Split(sep, (StringSplitOptions)options));
+                public static string SplitCharFullFace(string a, char sep, int count, int options) =>
+                    Join(a.Split(sep, count, (StringSplitOptions)options));
+                public static string SplitStringFace(string a, string sep, int count, int options) =>
+                    Join(a.Split(sep, count, (StringSplitOptions)options));
+                public static string SplitStringsFace(string a, int which) {
+                    if (which == 0)
+                        return Join(a.Split(new string[] { "b", "," }, StringSplitOptions.None));
+                    return Join(a.Split(new string[] { "", null, ",", "b" }, StringSplitOptions.None));
+                }
+
+                public static string FormatFaces(string fmt, object a, string b) => string.Format(fmt, a, b);
+                public static string FormatFaces3(string fmt, int a, string b, double c) => string.Format(fmt, a, b, c);
+
+                // culture 面 (不変カルチャ委譲 = ① バインド継続)。VM は文化機構を持たないため
+                // 委譲結果が CLR (invariant ピン留め) と一致することを突合する
+                public static string CultureFace(string a, string b) =>
+                    string.Compare(a, b) + ":" + a.CompareTo(b) + ":" +
+                    (a.StartsWith(b) ? "s" : "n") + ":" + (a.EndsWith(b) ? "e" : "n") + ":" +
+                    a.ToUpper() + ":" + a.ToLower() + ":" + a.IndexOf(b) + ":" + a.LastIndexOf(b);
+
+                private static string Join(string[] parts) {
+                    var r = "";
+                    for (var i = 0; i < parts.Length; i++) {
+                        if (i > 0) r += "|";
+                        r += parts[i];
+                    }
+                    return r;
+                }
             }
         }
         """;
@@ -640,5 +681,73 @@ public class CoreLibFacesIlTests {
         AssertRunsCoreLibIl("InstanceEqualsSelf", [], ("System.Object", "Equals"));
         // GetHashCode は ① バインド (IdentityHash) で処理 → IL フレームは立たない
         // (到達しないことをここでは検査せず、CLR 突合側で正常動作のみ確認)
+    }
+
+    // ---- C5.5 Wave 5: String culture / ordinal / Split / Format 面 ----
+
+    [Fact]
+    public void String_Ordinal_Faces_Match_Clr() {
+        AssertSame("OrdinalFace", "abcabc", "b");
+        AssertSame("OrdinalFace", "aÉb", "É");
+        AssertSame("OrdinalFace", "", "a");
+        AssertSame("ReplaceFace", "abcabc", "b", "B");
+        AssertSame("ReplaceFace", "aaa", "a", "");
+        AssertSame("ReplaceFace", "abc", "c", null);   // null newValue は空文字列扱い (本家どおり)
+        AssertRunsVmCoreLibIl("OrdinalFace", ["abcabc", "b"],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "CompareOrdinal"),
+            ("DotnetVM.CoreLib.StringOrdinalOps", "IndexOfChar"),
+            ("DotnetVM.CoreLib.StringOrdinalOps", "LastIndexOfChar"),
+            ("DotnetVM.CoreLib.StringOrdinalOps", "Contains"));
+        AssertRunsVmCoreLibIl("ReplaceFace", ["abcabc", "b", "B"],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "Replace"));
+    }
+
+    [Fact]
+    public void String_Split_Faces_Match_Clr() {
+        AssertSame("SplitCharFace", "a,b,c", ',');
+        AssertSame("SplitCharCountFace", "a,b,c", ',', 2);
+        AssertSame("SplitCharOptionsFace", "a,,b", ',', 1);        // RemoveEmptyEntries
+        AssertSame("SplitCharFullFace", "a,,b", ',', 2, 1);
+        AssertSame("SplitStringFace", "a,b,c", ",", 2, 0);
+        AssertSame("SplitStringFace", "a,b,c", null, 2, 0);        // string 単独 null = 分割なし 1 要素
+        AssertSame("SplitStringsFace", "a,bc", 0);                  // 配列順照合
+        AssertSame("SplitStringsFace", "a,bc", 1);                  // null / 空要素スキップ
+        // v.Split(char) は C# コンパイラが optional 引数を詰めた 2 引数 IL
+        // (Split(char, StringSplitOptions)) になるため Faces は SplitCharOptions に照合される
+        // (SplitChar 単独の Faces エントリは IL 直接参照用に保持)
+        AssertRunsVmCoreLibIl("SplitCharFace", ["a,b,c", ','],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "SplitCharOptions"));
+        AssertRunsVmCoreLibIl("SplitCharFullFace", ["a,,b", ',', 2, 1],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "SplitCharFull"),
+            ("DotnetVM.CoreLib.StringOrdinalOps", "SplitCore"));
+        AssertRunsVmCoreLibIl("SplitStringFace", ["a,b,c", ",", 2, 0],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "SplitStringFull"));
+        AssertRunsVmCoreLibIl("SplitStringsFace", ["a,bc", 0],
+            ("DotnetVM.CoreLib.StringOrdinalOps", "SplitStringsOptions"));
+    }
+
+    [Fact]
+    public void String_Format_Faces_Match_Clr() {
+        AssertSame("FormatFaces", "{0}={1}", 42, "x");
+        AssertSame("FormatFaces", "[{0:X}][{1:F2}]", 255, 1.5);
+        AssertSame("FormatFaces", "{0} and {1}", null, "x");   // null 引数は空文字列化 (本家どおり)
+        AssertSame("FormatFaces3", "{0}-{1}-{2:F1}", 7, "y", 2.25);
+        AssertRunsVmCoreLibIl("FormatFaces", ["{0}={1}", 42, "x"],
+            ("DotnetVM.CoreLib.StringFormatting", "Format3"));
+        AssertRunsVmCoreLibIl("FormatFaces3", ["{0}-{1}-{2:F1}", 7, "y", 2.25],
+            ("DotnetVM.CoreLib.StringFormatting", "Format4"));
+    }
+
+    [Fact]
+    public void String_Culture_Faces_Match_Clr_With_Invariant() {
+        // culture 面 (Compare / CompareTo / StartsWith / EndsWith / ToUpper / ToLower /
+        // IndexOf / LastIndexOf(string)) は不変カルチャ委譲 ① バインドのまま。
+        // TestCulture で invariant にピン留めされた CLR と VM の委譲結果が
+        // ASCII + 非 ASCII の全組合わせで一致する (= 委譲の同一意味論の証明)。
+        // 委譲面は VM 側 IL フレームを持たないため値突合のみ (IL 証明対象ではない)
+        string[] samples = ["abc", "ABC", "ab", "b", "", "ß", "Straße", "Å", "é"];
+        foreach (var a in samples)
+            foreach (var b in samples)
+                AssertSame("CultureFace", a, b);
     }
 }

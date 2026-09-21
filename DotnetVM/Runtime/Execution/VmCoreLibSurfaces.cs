@@ -134,6 +134,45 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Convert", "ToSingle", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleParsing", "ConvertSingleParse", ["System.String", "System.Object"]),
         ("System.Convert", "ToString", ["System.Double"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double"]),
         ("System.Convert", "ToString", ["System.Single"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double"]),
+        // ---- C5.5 Wave 5: String ordinal 面 (DotnetVM.CoreLib.StringOrdinalOps)。
+        // 実在側は SpanHelpers の SIMD intrinsic 面 (Vector128/256) / fixed byte* 比較で
+        // 構成され VM のスロット表現に落ちないため、同一意味論の純粋 char ループ IL へ
+        // 差し替える。ordinal は culture に依存しないため不変カルチャ規約と矛盾しない。
+        // 対して Compare / IndexOf(string) / LastIndexOf(string) / StartsWith / EndsWith /
+        // 大文字小文字面は CompareInfo / TextInfo (culture 機構) 依存のまま
+        // ① バインドの不変カルチャ委譲 (culture-out-of-scope) で提供する
+        ("System.String", "CompareOrdinal", ["System.String", "System.String"], "DotnetVM.CoreLib.StringOrdinalOps", "CompareOrdinal", ["System.String", "System.String"]),
+        ("System.String", "IndexOf", ["System.Char"], "DotnetVM.CoreLib.StringOrdinalOps", "IndexOfChar", ["System.String", "System.Char"]),
+        ("System.String", "LastIndexOf", ["System.Char"], "DotnetVM.CoreLib.StringOrdinalOps", "LastIndexOfChar", ["System.String", "System.Char"]),
+        ("System.String", "Contains", ["System.String"], "DotnetVM.CoreLib.StringOrdinalOps", "Contains", ["System.String", "System.String"]),
+        ("System.String", "Replace", ["System.String", "System.String"], "DotnetVM.CoreLib.StringOrdinalOps", "Replace", ["System.String", "System.String", "System.String"]),
+        // Split 全 overload (本家 SplitInternal の意味論: 配列順照合 / count は結果要素数 /
+        // RemoveEmptyEntries は空要素を数えない / null・空セパレータは空白区切り)
+        ("System.String", "Split", ["System.Char"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitChar", ["System.String", "System.Char"]),
+        ("System.String", "Split", ["System.Char", "System.Int32"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharCount", ["System.String", "System.Char", "System.Int32"]),
+        ("System.String", "Split", ["System.Char", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharOptions", ["System.String", "System.Char", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.Char", "System.Int32", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharFull", ["System.String", "System.Char", "System.Int32", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.Char[]"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharArray", ["System.String", "System.Char[]"]),
+        ("System.String", "Split", ["System.Char[]", "System.Int32"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharArrayCount", ["System.String", "System.Char[]", "System.Int32"]),
+        ("System.String", "Split", ["System.Char[]", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharArrayOptions", ["System.String", "System.Char[]", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.Char[]", "System.Int32", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitCharArrayFull", ["System.String", "System.Char[]", "System.Int32", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.String", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitStringOptions", ["System.String", "System.String", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.String", "System.Int32", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitStringFull", ["System.String", "System.String", "System.Int32", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.String[]", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitStringsOptions", ["System.String", "System.String[]", "System.StringSplitOptions"]),
+        ("System.String", "Split", ["System.String[]", "System.Int32", "System.StringSplitOptions"], "DotnetVM.CoreLib.StringOrdinalOps", "SplitStringsFull", ["System.String", "System.String[]", "System.Int32", "System.StringSplitOptions"]),
+        // ---- C5.5 Wave 5: String.Format 複合書式面 (DotnetVM.CoreLib.StringFormatting)。
+        // 本家 AppendFormatHelper (StringBuilder チャンク + Span 解析) の正確な移植で、
+        // index / width の上限や異常書式の FormatException 分類まで CLR 同一。
+        // 書式付き要素は IFormattable ディスパッチで整数 / 浮動小数点の既存置換面
+        // (FormatSpecifiers / DoubleFormatting) を辿る。provider は不変カルチャ固定で無視
+        ("System.String", "Format", ["System.String", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format2", ["System.String", "System.Object"]),
+        ("System.String", "Format", ["System.String", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format3", ["System.String", "System.Object", "System.Object"]),
+        ("System.String", "Format", ["System.String", "System.Object", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format4", ["System.String", "System.Object", "System.Object", "System.Object"]),
+        ("System.String", "Format", ["System.String", "System.Object[]"], "DotnetVM.CoreLib.StringFormatting", "FormatArray", ["System.String", "System.Object[]"]),
+        ("System.String", "Format", ["System.IFormatProvider", "System.String", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "FormatProvider3", ["System.Object", "System.String", "System.Object"]),
+        ("System.String", "Format", ["System.IFormatProvider", "System.String", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "FormatProvider4", ["System.Object", "System.String", "System.Object", "System.Object"]),
+        ("System.String", "Format", ["System.IFormatProvider", "System.String", "System.Object", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "FormatProvider5", ["System.Object", "System.String", "System.Object", "System.Object", "System.Object"]),
+        ("System.String", "Format", ["System.IFormatProvider", "System.String", "System.Object[]"], "DotnetVM.CoreLib.StringFormatting", "FormatProviderArray", ["System.Object", "System.String", "System.Object[]"]),
     ];
 
     private readonly TypeLoader _coreLibLoader;

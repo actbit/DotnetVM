@@ -243,6 +243,319 @@ public class VmCoreLibClrTests {
         AssertInvokesOverflow(() => impl.Invoke(null, [s])!);
     }
 
+    // ---- String ordinal 面 (C5.5 Wave 5 の (b) 置換面: StringOrdinalOps) ----
+
+    /// <summary>結果が同じなら値、例外なら「!型名」に正規化して突合する。</summary>
+    internal static object? Outcome(Func<object?> run) {
+        try {
+            return run();
+        } catch (Exception ex) {
+            return "!" + ex.GetType().Name;
+        }
+    }
+
+    public static IEnumerable<object[]> OrdinalPairs() =>
+        new[] {
+            ("abc", "abc"), ("abc", "abd"), ("abc", "ab"), ("ab", "abc"),
+            ("", ""), ("", "a"), ("a", ""), ("ABC", "abc"), ("abc", "ABC"),
+            ("ß", "ss"), ("ss", "ß"), ("Å", "A"), ("é", "e"), ("a", "á"),
+            ("￿", "\u0000"), ("Z", "a"), ("abc", "abc\u0001"),
+        }.Select(p => new object[] { p.Item1, p.Item2 });
+
+    [Theory]
+    [MemberData(nameof(OrdinalPairs))]
+    public void CompareOrdinal_Matches_Clr(string? a, string? b) {
+        // 本家どおり「最初の差分位置のコード単位差そのもの」/ 共通 prefix は長さ差 /
+        // null セーフ (null < 非 null) を値まで含めて突合する
+        Assert.Equal(string.CompareOrdinal(a, b), StringOrdinalOps.CompareOrdinal(a, b));
+    }
+
+    [Fact]
+    public void IndexOfChar_And_LastIndexOfChar_Match_Clr() {
+        string[] values = ["", "a", "abc", "aab", "aba", "banana", "éÉ", "a,b"];
+        char[] chars = ['a', 'b', 'z', ',', 'é'];
+        foreach (var v in values) {
+            foreach (var c in chars) {
+                Assert.Equal(v.IndexOf(c), StringOrdinalOps.IndexOfChar(v, c));
+                Assert.Equal(v.LastIndexOf(c), StringOrdinalOps.LastIndexOfChar(v, c));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("abcabc", "b")]
+    [InlineData("abcabc", "cab")]
+    [InlineData("abc", "xyz")]
+    [InlineData("abc", "")]
+    [InlineData("", "")]
+    [InlineData("", "a")]
+    [InlineData("Straße", "ß")]
+    public void Contains_Matches_Clr(string value, string needle) {
+        Assert.Equal(value.Contains(needle), StringOrdinalOps.Contains(value, needle));
+        // null needle は本家どおり ArgumentNullException (分類突合)
+        Assert.Equal(Outcome(() => value.Contains(null!)),
+                     Outcome(() => StringOrdinalOps.Contains(value, null!)));
+    }
+
+    [Theory]
+    [InlineData("abcabc", "b", "B")]
+    [InlineData("abcabc", "bc", "X")]
+    [InlineData("aaa", "a", "")]
+    [InlineData("aaa", "aa", "ab")]
+    [InlineData("abc", "xyz", "Q")]
+    [InlineData("", "a", "b")]
+    [InlineData("abc", "c", null)]
+    public void Replace_Matches_Clr(string value, string oldValue, string? newValue) {
+        Assert.Equal(Outcome(() => value.Replace(oldValue, newValue!)),
+                     Outcome(() => StringOrdinalOps.Replace(value, oldValue, newValue!)));
+    }
+
+    [Fact]
+    public void Replace_Exceptions_Match_Clr() {
+        // 空 oldValue は本家どおり ArgumentException / null oldValue は ArgumentNullException /
+        // null newValue は本家どおり空文字列扱い (例外ではない)
+        Assert.Equal(Outcome(() => "abc".Replace("", "x")),
+                     Outcome(() => StringOrdinalOps.Replace("abc", "", "x")));
+        Assert.Equal(Outcome(() => "abc".Replace(null!, "x")),
+                     Outcome(() => StringOrdinalOps.Replace("abc", null!, "x")));
+        Assert.Equal(Outcome(() => "abc".Replace("a", null!)),
+                     Outcome(() => StringOrdinalOps.Replace("abc", "a", null!)));
+    }
+
+    [Fact]
+    public void Split_AllOverloads_Match_Clr() {
+        string[] values = ["", "a", ",", "a,b", "a,,b", ",a,", "a,b,c", "a;b,c", "a;,;b", " a , b ", "ab cd", "abc"];
+        int[] counts = [0, 1, 2, 3, 5];
+        var optionsList = new[] { StringSplitOptions.None, StringSplitOptions.RemoveEmptyEntries };
+        var charArrs = new char[][] { [','], [',', ';'], [' '], [',', ';', ' '] };
+        var strSeps = new string?[] { ",", ";", "a,b", "ab", "", null };
+        var strArrs = new string?[][] { ["b", ","], [","], ["ab", "c"], ["", null, ",", "b"], [] };
+
+        foreach (var v in values) {
+            // ---- char 系 4 面 (char / char,count / char,options / char,count,options) ----
+            Assert.Equal(v.Split(','), StringOrdinalOps.SplitChar(v, ','));
+            foreach (var o in optionsList)
+                Assert.Equal(v.Split(',', o), StringOrdinalOps.SplitCharOptions(v, ',', o));
+            foreach (var count in counts) {
+                Assert.Equal(v.Split(',', count), StringOrdinalOps.SplitCharCount(v, ',', count));
+                foreach (var o in optionsList)
+                    Assert.Equal(v.Split(',', count, o), StringOrdinalOps.SplitCharFull(v, ',', count, o));
+            }
+
+            // ---- char[] 系 4 面 (複数 / 空白含む / 1 要素)。null・空配列は Fallback テストで ----
+            foreach (var ca in charArrs) {
+                Assert.Equal(v.Split(ca), StringOrdinalOps.SplitCharArray(v, ca));
+                foreach (var o in optionsList)
+                    Assert.Equal(v.Split(ca, o), StringOrdinalOps.SplitCharArrayOptions(v, ca, o));
+                foreach (var count in counts) {
+                    Assert.Equal(v.Split(ca, count), StringOrdinalOps.SplitCharArrayCount(v, ca, count));
+                    foreach (var o in optionsList)
+                        Assert.Equal(v.Split(ca, count, o), StringOrdinalOps.SplitCharArrayFull(v, ca, count, o));
+                }
+            }
+
+            // ---- string 系 2 面 (string,options / string,count,options)。
+            //      separator null / 空 = 分割なし 1 要素 (本家どおり、Fallback テストで直接突合) ----
+            foreach (var s in strSeps) {
+                foreach (var o in optionsList)
+                    Assert.Equal(v.Split(s, o), StringOrdinalOps.SplitStringOptions(v, s, o));
+                foreach (var count in counts) {
+                    foreach (var o in optionsList)
+                        Assert.Equal(v.Split(s, count, o), StringOrdinalOps.SplitStringFull(v, s, count, o));
+                }
+            }
+
+            // ---- string[] 系 2 面 (配列順照合 / null・空要素スキップ / null・空配列は空白)。
+            //      ホストに Split(string[]) / Split(string[], int) は存在しないため
+            //      options 付き overload 経由のみで突合する ----
+            foreach (var sa in strArrs) {
+                foreach (var o in optionsList)
+                    Assert.Equal(v.Split(sa, o), StringOrdinalOps.SplitStringsOptions(v, sa, o));
+                foreach (var count in counts) {
+                    foreach (var o in optionsList)
+                        Assert.Equal(v.Split(sa, count, o), StringOrdinalOps.SplitStringsFull(v, sa, count, o));
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void Split_WhitespaceFallback_Matches_Clr() {
+        // 本家の未指定意味論は系統ごとに異なる (実測確認済み):
+        // - char[] / string[]: null / 空 = 空白 (char.IsWhiteSpace) 区切り
+        // - string 単独: null / 空 = 分割なし 1 要素 (空白フォールバックしない)
+        string[] values = ["", "a", "a,b,c", " a , b ", "ab cd", "  x  y  "];
+        var none = StringSplitOptions.None;
+        foreach (var v in values) {
+            // char[] 系統 → 空白分割
+            Assert.Equal(StringOrdinalOps.SplitCharArray(v, null), v.Split());
+            Assert.Equal(StringOrdinalOps.SplitCharArray(v, []), v.Split());
+            Assert.Equal(StringOrdinalOps.SplitCharArrayFull(v, null, 3, none), v.Split((char[]?)null, 3, none));
+            // string[] 系統 → 空白分割
+            Assert.Equal(StringOrdinalOps.SplitStringsOptions(v, null, none), v.Split());
+            Assert.Equal(StringOrdinalOps.SplitStringsOptions(v, [], none), v.Split());
+            Assert.Equal(StringOrdinalOps.SplitStringsFull(v, null, 3, none), v.Split((string[]?)null, 3, none));
+            // string 単独系統 → 分割なし 1 要素 (count / options に関係なく whitespace
+            // フォールバックしない。実測: v.Split((string?)null, 3, None) も 1 要素)
+            Assert.Equal(StringOrdinalOps.SplitStringOptions(v, null, none), v.Split((string?)null, none));
+            Assert.Equal(StringOrdinalOps.SplitStringFull(v, null, 3, none), v.Split((string?)null, 3, none));
+        }
+    }
+
+    [Fact]
+    public void Split_InvalidArguments_Match_Clr() {
+        // 負 count → ArgumentOutOfRangeException / 無効 enum → ArgumentException (分類突合)
+        Assert.Equal(Outcome(() => "a,b".Split(',', -1)),
+                     Outcome(() => StringOrdinalOps.SplitCharCount("a,b", ',', -1)));
+        Assert.Equal(Outcome(() => "a,b".Split(',', 3, (StringSplitOptions)(-1))),
+                     Outcome(() => StringOrdinalOps.SplitCharFull("a,b", ',', 3, (StringSplitOptions)(-1))));
+        Assert.Equal(Outcome(() => "a,b".Split(',', (StringSplitOptions)99)),
+                     Outcome(() => StringOrdinalOps.SplitCharOptions("a,b", ',', (StringSplitOptions)99)));
+        Assert.Equal(Outcome(() => "a,b".Split(',', 3, (StringSplitOptions)99)),
+                     Outcome(() => StringOrdinalOps.SplitCharFull("a,b", ',', 3, (StringSplitOptions)99)));
+        Assert.Equal(Outcome(() => "a,b".Split([','], (StringSplitOptions)99)),
+                     Outcome(() => StringOrdinalOps.SplitCharArrayOptions("a,b", [','], (StringSplitOptions)99)));
+        Assert.Equal(Outcome(() => "a,b".Split(",", (StringSplitOptions)99)),
+                     Outcome(() => StringOrdinalOps.SplitStringOptions("a,b", ",", (StringSplitOptions)99)));
+        Assert.Equal(Outcome(() => "a,b".Split(",", -1, StringSplitOptions.None)),
+                     Outcome(() => StringOrdinalOps.SplitStringFull("a,b", ",", -1, StringSplitOptions.None)));
+        Assert.Equal(Outcome(() => "a,b".Split(new string?[] { "," }, (StringSplitOptions)99)),
+                     Outcome(() => StringOrdinalOps.SplitStringsOptions("a,b", [","], (StringSplitOptions)99)));
+        Assert.Equal(Outcome(() => "a,b".Split(new string?[] { "," }, -1, StringSplitOptions.None)),
+                     Outcome(() => StringOrdinalOps.SplitStringsFull("a,b", [","], -1, StringSplitOptions.None)));
+    }
+
+    // ---- String.Format 複合書式面 (C5.5 Wave 5 の (b) 置換面: StringFormatting) ----
+
+    [Fact]
+    public void Format_Grid_Matches_Clr() {
+        object?[][] argSets = [
+            [42],
+            [-42],
+            [0],
+            [int.MaxValue],
+            ["abc"],
+            [""],
+            [null],
+            [42, "abc"],
+            ["abc", 42, 3.5],
+            [true, 'x', (byte)7],
+        ];
+        string[] formats = [
+            "[{0}]", "[{0,10}]", "[{0,-10}]", "[{0:X4}]", "[{0:x8}]", "[{0:D5}]",
+            "[{0:F3}]", "[{0:N2}]", "[{0:E4}]", "[{0:0000.00}]", "[{0}{0}]",
+            "[{0,6:F2}]", "[{0, -8}]", "{0}", "pre {0} post", "", "{{{0}}}",
+            "[{2}]", "[{5}]", // 引数個数超過 → FormatException (分類突合)
+        ];
+        foreach (var args in argSets) {
+            foreach (var format in formats) {
+                Assert.Equal(Outcome(() => string.Format(format, args)),
+                             Outcome(() => StringFormatting.FormatArray(format, args)));
+            }
+        }
+    }
+
+    [Fact]
+    public void Format_IndividualOverloads_Match_Clr() {
+        Assert.Equal(string.Format("{0}", 42), StringFormatting.Format2("{0}", 42));
+        Assert.Equal(string.Format("{0}-{1}", 42, "x"), StringFormatting.Format3("{0}-{1}", 42, "x"));
+        Assert.Equal(string.Format("{0}-{1}-{2}", 1, 2, 3), StringFormatting.Format4("{0}-{1}-{2}", 1, 2, 3));
+        Assert.Equal(string.Format("{0}!{1}!{2}!{3}", 1, 2, 3, 4),
+                     StringFormatting.FormatArray("{0}!{1}!{2}!{3}", [1, 2, 3, 4]));
+    }
+
+    [Theory]
+    [InlineData("{")]
+    [InlineData("}")]
+    [InlineData("{0")]
+    [InlineData("{x}")]
+    [InlineData("{-1}")]
+    [InlineData("{5}")]
+    [InlineData("{}")]
+    [InlineData("{0:{1}}")]
+    [InlineData("abc{0")]
+    [InlineData("{0,")]
+    [InlineData("{0,x}")]
+    [InlineData("{0,1x}")]
+    [InlineData("{0:-1}")]
+    [InlineData("}{")]
+    [InlineData("{}}")]
+    [InlineData("{0:}}")]
+    [InlineData("{ {0}")]
+    [InlineData("{0,999999999999}")]
+    public void Format_Malformed_Matches_Clr(string format) {
+        Assert.Equal(Outcome(() => string.Format(format, 42)),
+                     Outcome(() => StringFormatting.FormatArray(format, [42])));
+    }
+
+    [Fact]
+    public void Format_Null_Matches_Clr() {
+        // format null → ArgumentNullException("format") / args null も本家どおり ANE
+        Assert.Equal(Outcome(() => string.Format(null!, [42])),
+                     Outcome(() => StringFormatting.FormatArray(null, [42])));
+        Assert.ThrowsAny<ArgumentNullException>(() => string.Format("x", (object[]?)null));
+        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray("x", null));
+        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray(null, null));
+    }
+
+    [Fact]
+    public void Format_ProviderOverloads_Match_Clr_With_Invariant() {
+        // provider 付き overload も不変カルチャ規約 (provider 無視) — 突合は invariant で行う
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        Assert.Equal(string.Format(inv, "{0:F2}", 1.5),
+                     StringFormatting.FormatProviderArray(inv, "{0:F2}", [1.5]));
+        Assert.Equal(string.Format(inv, "{0}-{1}", 42, "x"),
+                     StringFormatting.FormatProvider4(inv, "{0}-{1}", 42, "x"));
+        Assert.Equal(string.Format(inv, "[{0}]", 42),
+                     StringFormatting.FormatProvider3(inv, "[{0}]", 42));
+        Assert.Equal(string.Format(inv, "[{0}][{1}][{2}]", 1, 2, 3),
+                     StringFormatting.FormatProvider5(inv, "[{0}][{1}][{2}]", 1, 2, 3));
+        // provider を無視するため null でも同一結果 (VM 規約: culture スコープ外)
+        Assert.Equal(StringFormatting.FormatProviderArray(inv, "{0:F2}", [1.5]),
+                     StringFormatting.FormatProviderArray(null, "{0:F2}", [1.5]));
+    }
+
+    // ---- culture 正当化 (C5.5 Wave 5): ordinal では不変カルチャ比較を再現できない証明 ----
+
+    [Fact]
+    public void Invariant_Compare_Differs_From_Ordinal_Proving_Culture_Out_Of_Scope() {
+        // 実測 (net10.0): インバリアントは合成文字を等価とみなす (2 次ウェイト照合 =
+        // ignoreNonSpace) / ordinal では非等価。この差分が culture 必須面を
+        // (c) culture-out-of-scope (不変カルチャ委譲) に降格する根拠 —
+        // ordinal 近似の IL 移植では再現できない。
+        // 注: ß/ss はインバリアントでも非等価 (実測 1。de-DE 展開はスコープ外)。
+        // StringComparison.InvariantCulture は case-sensitive (実測: "a" vs "A" → 非 0)
+        string precomposed = "Å";      // A-ring precomposed
+        string combining = "Å";  // A + combining ring above
+        Assert.Equal(0, string.Compare(precomposed, combining, StringComparison.InvariantCulture));
+        Assert.NotEqual(0, string.CompareOrdinal(precomposed, combining));
+        string ePre = "é";             // e-acute precomposed
+        string eComb = "é";      // e + combining acute
+        Assert.Equal(0, string.Compare(ePre, eComb, StringComparison.InvariantCulture));
+        Assert.NotEqual(0, string.CompareOrdinal(ePre, eComb));
+    }
+
+    [Fact]
+    public void Invariant_Delegation_Matches_Clr_Culture_Faces_Fuzz() {
+        // VM ① バインド相当 (不変カルチャ委譲 = StringComparison.InvariantCulture) と
+        // CLR の CurrentCulture 依存面 (TestCulture で invariant にピン留め済み) が
+        // ASCII + 非 ASCII の全組合わせで一致すること (= 委譲の同一意味論の証明)
+        string[] samples = ["a", "A", "b", "abc", "abd", "ß", "ss", "Straße", "strasse",
+                            "Å", "Å", "é", "e", "Z", "", "a b"];
+        foreach (var a in samples) {
+            foreach (var b in samples) {
+                Assert.Equal(string.Compare(a, b, StringComparison.CurrentCulture),
+                             string.Compare(a, b, StringComparison.InvariantCulture));
+                Assert.Equal(a.IndexOf(b, StringComparison.CurrentCulture),
+                             a.IndexOf(b, StringComparison.InvariantCulture));
+                Assert.Equal(a.StartsWith(b, StringComparison.CurrentCulture),
+                             a.StartsWith(b, StringComparison.InvariantCulture));
+                Assert.Equal(a.EndsWith(b, StringComparison.CurrentCulture),
+                             a.EndsWith(b, StringComparison.InvariantCulture));
+            }
+        }
+    }
+
     /// <summary>デリゲート実行の例外が TargetInvocationException に包まれる場合に
     /// 内側の例外型が OverflowException であることを検証する。</summary>
     private static void AssertInvokesOverflow(Func<object?> invoke) {

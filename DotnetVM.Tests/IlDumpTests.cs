@@ -21,6 +21,12 @@ public class IlDumpTests {
             var (ns, n) = image.GetTypeDefName(owner);
             if (n != "Math") continue;
             sb2.AppendLine($"--- CoreLib Math::{name} ---");
+            // abstract/pinvoke メソッドはメソッド本体がないためスキップ
+            var body = image.GetMethodBody(rid);
+            if (body is null) {
+                sb2.AppendLine("// (abstract/pinvoke — IL body なし)");
+                continue;
+            }
             sb2.AppendLine(DotnetVM.Diagnostics.IlDisassembler.DisassembleMethod(image, rid));
         }
         File.WriteAllText(Path.Combine(Path.GetTempPath(), "ildump_math.txt"), sb2.ToString());

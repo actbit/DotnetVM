@@ -37,19 +37,29 @@ internal sealed class CallEngine(
         for (var i = target.Arity - 1; i >= 0; i--)
             args[i] = caller.Stack.Pop();
 
-        // constrained. 付けた値型レシーバの前処理 (ECMA III.2.2): 値型レシーバ (生 i4/i8 スロット,
-        // null/ByRef 以外) を同値型でボックス化しておく。仮想ディスパッチ (レシーバ実行時型)
-        // と constrained. 多重面の intrinsic 受けの両方で同じ形状を用いる
+        // constrained. 付けた値型レシーバの前処理 (ECMA III.2.2): 値型レシーバを同値型で
+        // ボックス化しておく。仮想ディスパッチ (レシーバ実行時型) と constrained. 多重面の
+        // intrinsic 受けの両方で同じ形状を用いる
         // (例: constrained. DayOfWeek + callvirt Object::ToString → enum box の ToString 面へ
-        // 仮想ディスパッチが実行時型 (DayOfWeek) で解決される)
+        // 仮想ディスパッチが実行時型 (DayOfWeek) で解決される)。
+        // ldloca.s 経由の ByRef レシーバは参照先スロットを見て、enum の場合のみボックス化する:
+        // enum は Int32 バックのため仮想ディスパッチが実行時型を解決できず、Enum.ToString() 面が
+        // VmBoxedValue を要求するため。それ以外の値型 (decimal/TimeSpan やプリミティブ) は
+        // ByRef のまま渡し、dispatch (ReceiverRuntimeType が参照先を読む) と binding
+        // (NormalizeByRefReceiver) に委ねる (既存規約を維持し、回帰を避ける)
         if (constrainedToken != 0 && isCallvirt && target.HasThis &&
-            args[0].Kind is not (StackKind.Object or StackKind.ByRef)) {
+            args[0].Kind is not StackKind.Object) {
             var constrainedType = _objectEngine.ResolveTypeToken(constrainedToken, caller.Context);
             if (constrainedType.IsValueType) {
-                var fields = args[0].Kind == StackKind.ValueType
-                    ? ((VmStructValue)args[0].ObjectValue!).Clone().Fields
-                    : [args[0]];
-                args[0] = StackSlot.OfObject(_heap.Allocate(new VmBoxedValue(constrainedType, fields)));
+                var valueSlot = args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef receiverByRef
+                    ? receiverByRef.Slot
+                    : args[0];
+                if (args[0].Kind != StackKind.ByRef || constrainedType.IsEnum) {
+                    var fields = valueSlot.Kind == StackKind.ValueType
+                        ? ((VmStructValue)valueSlot.ObjectValue!).Clone().Fields
+                        : [valueSlot];
+                    args[0] = StackSlot.OfObject(_heap.Allocate(new VmBoxedValue(constrainedType, fields)));
+                }
             }
         }
 
@@ -519,8 +529,13 @@ internal sealed class CallEngine(
         var key = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(declaringName, method.Name, returnName, names)
             : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);
-        if (!_intrinsics.TryGetBinding(key, out var impl, out _) &&
-            (returnName.Length == 0 || !_intrinsics.TryGetBinding(key.WithAnyReturn(), out impl, out _)))
+        // 呼出 domain の実判定 (タスク 2 hardening): 呼出元 (declaring method を宣言した
+        // loader) が trusted CoreLib 画像なら TrustedCoreLib domain で照合する。
+        // ゲスト画像からの呼出は TrustedCoreLib domain の特権 binding に到達しない
+        var callerDomain = method.Loader?.IsTrustedCoreLib == true
+            ? BindingDomain.TrustedCoreLib : BindingDomain.Guest;
+        if (!_intrinsics.TryGetBinding(key, out var impl, out _, callerDomain) &&
+            (returnName.Length == 0 || !_intrinsics.TryGetBinding(key.WithAnyReturn(), out impl, out _, callerDomain)))
             return false;
         NormalizeByRefReceiver(method, args);
         // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の

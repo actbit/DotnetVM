@@ -30,15 +30,44 @@ public sealed class VmAssemblyContext(Func<string, TypeLoader> loaderFactory) {
     }
 
     /// <summary>
-    /// AssemblyRef の単純名をロード済みアセンブリに解決する。未ロードなら参照元と同一ディレクトリの
-    /// 同名 DLL を loaderFactory (VirtualMachine の LoadAssembly) でロードして返す。
+    /// AssemblyRef の単純名をロード済みアセンブリに解決する。
+    /// 依存アセンブリの同一ディレクトリ探索は「参照元がファイルからロードされている
+    /// (SourcePath が確定している)」場合にのみ行う (Stream ロードはホストが明示 resolver /
+    /// LoadAssembly(path) で解決する — host current directory への暗黙フォールバック禁止)。
     /// 見つからなければ null (fail-closed は呼び出し側の型解決が行う)。
     /// </summary>
     public TypeLoader? TryResolveAssembly(string simpleName, AssemblyImage requesting) {
         if (_bySimpleName.TryGetValue(simpleName, out var loaded))
             return loaded;
+        return TryDiscoverFromDirectory(simpleName, requesting);
+    }
 
-        var sourceDir = Path.GetDirectoryName(Path.GetFullPath(requesting.SourcePath ?? "."));
+    /// <summary>
+    /// AssemblyRef の identity (Name / Version / Culture / PublicKeyToken) で解決する。
+    /// 単純名一致に加え、参照側が strong-named なら公開鍵トークンの一致を要求する
+    /// (タスク 2 hardening: 同名別 identity のアセンブリへ誤結合しない)。
+    /// ①ロード済みを identity 照合 → ②同一ディレクトリ探索 (identity 照合)。
+    /// </summary>
+    public TypeLoader? TryResolveAssembly(AssemblyIdentity reference, AssemblyImage requesting) {
+        // ① ロード済みアセンブリを identity で照合 (ロード数は小さいため線形で十分)
+        foreach (var loader in _loaders) {
+            if (reference.Matches(loader.Image.Identity))
+                return loader;
+        }
+        // ② 同一ディレクトリの同名 DLL をロードし、identity で照合する
+        var discovered = TryDiscoverFromDirectory(reference.Name, requesting);
+        return discovered is not null && reference.Matches(discovered.Image.Identity) ? discovered : null;
+    }
+
+    /// <summary>参照元と同一ディレクトリの同名 DLL を探索してロードする (SourcePath 無しは探索しない)。</summary>
+    private TypeLoader? TryDiscoverFromDirectory(string simpleName, AssemblyImage requesting) {
+        // SourcePath 無し (Stream ロード) は自動探索を行わない:
+        // requesting.SourcePath ?? "." による host current directory フォールバックは廃止
+        var sourcePath = requesting.SourcePath;
+        if (sourcePath is null)
+            return null;
+
+        var sourceDir = Path.GetDirectoryName(Path.GetFullPath(sourcePath));
         if (sourceDir is null)
             return null;
         var candidatePath = Path.Combine(sourceDir, simpleName + ".dll");

@@ -39,6 +39,11 @@ public sealed class TypeLoader {
     /// <summary>仮想/インターフェースディスパッチ表の構築担当 (遅延生成)。</summary>
     private DispatchMapBuilder? _dispatchBuilder;
 
+    /// <summary>この loader が trusted System.Private.CoreLib 実装画像か (LoadHostCoreLib の
+    /// 取得した loader 参照に対して VM 構築時に確定する。タスク 2 hardening:
+    /// ファイル名照合でなく参照同一性による trusted marker)。</summary>
+    public bool IsTrustedCoreLib { get; internal set; }
+
     public TypeLoader(AssemblyImage image) {
         _image = image;
         InitializeIntrinsicTypes();
@@ -461,10 +466,10 @@ public sealed class TypeLoader {
 
         // ④ fail-closed
         if (scopeTable == TableKind.AssemblyRef) {
-            var refName = GetAssemblyRefName(scopeRid);
-            if (context?.TryResolveAssembly(refName, _image) is null)
-                throw new AssemblyDependencyNotFoundException(refName,
-                    $"参照アセンブリ '{refName}' (型 '{fullName}' の解決に必要) がロード済みでも" +
+            var refIdentity = _image.GetAssemblyRefIdentity(scopeRid);
+            if (context?.TryResolveAssembly(refIdentity, _image) is null)
+                throw new AssemblyDependencyNotFoundException(refIdentity.Name,
+                    $"参照アセンブリ '{refIdentity}' (型 '{fullName}' の解決に必要) がロード済みでも" +
                     $"同一ディレクトリ ({LoaderDependencyDirectoryHint()}) にも見つかりません。");
         }
         throw new NotSupportedException($"型参照 '{fullName}' を解決できません (スコープ {scopeTable})。");
@@ -486,12 +491,13 @@ public sealed class TypeLoader {
         // ① 型統合: 同名の実 TypeDef が Context 配下 (CoreLib 等) にあればそれが正
         if (TryResolveUnifiedType(fullName) is { } unified)
             return unified;
-        var refName = GetAssemblyRefName(assemblyRefRid);
-        // ② 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)
-        if (string.Equals(refName, _image.Name, StringComparison.OrdinalIgnoreCase))
+        // ② 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)。
+        //    identity (Name + 公開鍵トークン) で照合する
+        var refIdentity = _image.GetAssemblyRefIdentity(assemblyRefRid);
+        if (refIdentity.Matches(_image.Identity))
             return FindTypeByFullName(fullName);
-        // ③ 依存アセンブリ
-        var target = Context!.TryResolveAssembly(refName, _image);
+        // ③ 依存アセンブリ (identity 照合: 同名別 identity へ誤結合しない)
+        var target = Context!.TryResolveAssembly(refIdentity, _image);
         return target?.FindTypeByFullName(fullName);
     }
 

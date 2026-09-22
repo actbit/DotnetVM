@@ -20,6 +20,15 @@ public sealed class AssemblyImage {
     /// <summary>アセンブリの単純名 (Assembly テーブル、なければ Module 名)。</summary>
     public string Name { get; }
 
+    /// <summary>アセンブリの identity (Name / Version / Culture / PublicKeyToken)。遅延構築
+    /// (Assembly テーブルの解析を要するため)。タスク 2 hardening の依存解決 / trusted 判定に使う。</summary>
+    private AssemblyIdentity? _identity;
+    public AssemblyIdentity Identity => _identity ??= AssemblyIdentity.FromAssemblyDef(this);
+
+    /// <summary>AssemblyRef rid の参照先 identity (依存解決の照合に使う)。</summary>
+    public AssemblyIdentity GetAssemblyRefIdentity(int assemblyRefRid) =>
+        AssemblyIdentity.FromAssemblyRef(this, assemblyRefRid);
+
     /// <summary>ファイルからロードした場合の元パス (依存アセンブリの同一ディレクトリ探索に使う。ストリームロードは null)。</summary>
     public string? SourcePath { get; internal set; }
 

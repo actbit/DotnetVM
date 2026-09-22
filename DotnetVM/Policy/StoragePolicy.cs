@@ -60,8 +60,12 @@ public sealed class StorageGateway {
 
     public byte[] Read(string path) {
         RequireBridge();
-        // maxBytes を事前に伝える (host 側の巨大バッファ増幅の回避)
-        var contents = _bridge!.Read(RequirePath(path), _policy.MaxBytesPerOperation);
+        // maxBytes を事前に伝える: 1 操作上限と累計残量の min (タスク 2 hardening)。
+        // 両者の min を bridge に渡すことで host 側の巨大バッファ増幅を避ける
+        var maxBytes = Math.Min(_policy.MaxBytesPerOperation, _totalBytes < 0
+            ? _policy.TotalByteLimit
+            : Math.Max(0, _policy.TotalByteLimit - _totalBytes));
+        var contents = _bridge!.Read(RequirePath(path), maxBytes);
         Charge(contents.LongLength, "読み取り");
         return contents;
     }

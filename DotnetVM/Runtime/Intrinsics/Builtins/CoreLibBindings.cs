@@ -1552,40 +1552,57 @@ internal static class CoreLibBindings {
     /// <summary>VM 代替の last system error (Marshal.SetLastSystemError / GetLastSystemError 面)。
     /// 実 CLR の per-thread TLS スロットの代わりにスレッドローカルの単一値で模倣する。
     /// CultureInfo.InvariantCulture 初期化 (GlobalizationMode → GetEnvironmentVariableCore)
-    /// が GetLastSystemError() &lt; ERROR_ENVVAR_NOT_FOUND(203) で成功判定に使う。</summary>
+    /// が GetLastSystemError() &lt; ERROR_ENVVAR_NOT_FOUND(203) で成功判定に使う。
+    /// (タスク 2 hardening: これらの面は TrustedCoreLib domain に属し、trusted CoreLib IL
+    /// からの呼出のみ照合される。)</summary>
     [ThreadStatic]
     private static int _lastSystemError;
 
+    /// <summary>VM ごとの仮想環境変数ストア (タスク 2 hardening)。
+    /// Kernel32.GetEnvironmentVariable 面は host の Environment.GetEnvironmentVariable を
+    /// 直接呼ばず、この VM ごとの仮想環境のみを参照する (host 環境の読み替えを遮断し、
+    /// trusted CoreLib domain 呼出でのみ到達する特権面に)。
+    /// 既定は空 (GlobalizationMode::get_Invariant を true 固定にする呼出経路が
+    /// DOTNET_SYSTEM_GLOBALIZATION_INVARIANT の実環境読み取りに依存しない)。</summary>
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> VirtualEnvironment =
+        new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>本家 CultureInfo::.cctor → CultureData.get_Invariant → GlobalizationMode の
     /// IL は AppContextConfigHelper → Environment.GetEnvironmentVariableCore を辿り、その
-    /// Kernel32.GetEnvironmentVariable(name, buffer, size) が P/Invoke 面。VM はホスト BCL の
-    /// 環境取得 (実 Kernel32 と同一意味論) を代替として叩き、バッファへは Win32 規約
-    /// (戻り = 終端 null 除くコピー文字数 / 不足時は終端含む必要文字数を返すのみ、
-    /// 未定義なら 0 + lastError = 203) で書き込む。Marshal の 2 面は IL 実体が下請け
-    /// P/Invoke shim 呼びのみのため internal-call リーフで VM lastError に代替する。</summary>
+    /// Kernel32.GetEnvironmentVariable(name, buffer, size) が P/Invoke 面。
+    /// タスク 2 hardening: この面は trusted CoreLib (TrustedCoreLib domain) からの呼出のみ
+    /// 到達する特権面 (BindingDomain.TrustedCoreLib) とし、VM ごとの仮想環境変数ストアを
+    /// 読む (host Environment.GetEnvironmentVariable への直接委譲を廃止)。
+    /// バッファへは Win32 規約 (戻り = 終端 null 除くコピー文字数 / 不足時は終端含む
+    /// 必要文字数を返すのみ、未定義なら 0 + lastError = 203) で書き込む。
+    /// Marshal の 4 面は IL 実体が下請け P/Invoke shim 呼びのみのため
+    /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定)。</summary>
     private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
         const string MarshalType = "System.Runtime.InteropServices.Marshal";
-        r.RegisterBinding(BindingKey.Static(MarshalType, "SetLastSystemError", "System.Int32"),
+        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastSystemError", "System.Int32"),
             static (_, a) => {
                 _lastSystemError = a[0].AsInt32;
                 return null;
             },
             BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.Static(MarshalType, "GetLastSystemError"),
+        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "GetLastSystemError"),
             static (_, _) => StackSlot.OfInt32(_lastSystemError),
             BindingOrigin.InternalCall);
         // SystemError/PInvokeError は実 CLR でも同一 TLS スロットの alias 面
         // (SetLastSystemError/GetLastSystemError の IL 実体が呼ぶ下請け)
-        r.RegisterBinding(BindingKey.Static(MarshalType, "SetLastPInvokeError", "System.Int32"),
+        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastPInvokeError", "System.Int32"),
             static (_, a) => {
                 _lastSystemError = a[0].AsInt32;
                 return null;
             },
             BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.Static(MarshalType, "GetLastPInvokeError"),
+        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "GetLastPInvokeError"),
             static (_, _) => StackSlot.OfInt32(_lastSystemError),
             BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.Static("Interop+Kernel32", "GetEnvironmentVariable",
+        // Kernel32.GetEnvironmentVariable は trusted CoreLib (GlobalizationMode 経路) からの
+        // 起動面としてのみ有効な特権面。BindingDomain.TrustedCoreLib で鍵化し、トレース
+        // 時 (CallEngine の callerDomain 判定) は trusted CoreLib IL からの呼出のみ照合する
+        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "GetEnvironmentVariable",
                 "System.String", "System.Char&", "System.UInt32"),
             static (_, a) => GetEnvironmentVariableImpl(a),
             BindingOrigin.PInvokeReplacement);
@@ -1594,7 +1611,7 @@ internal static class CoreLibBindings {
         // で、本家 IL の分岐は CultureInfo::GetUserDefaultLocaleName 等の OS locale 取得
         // (Kernel32 P/Invoke) を通らない managed 経路に落ちる。OS locale 面自体は
         // culture 機構スコープ外のため代替実装を持たない (fail-closed を維持)
-        r.RegisterBinding(BindingKey.Static("System.Globalization.GlobalizationMode+Settings", "get_Invariant"),
+        r.RegisterBinding(BindingKey.TrustedStatic("System.Globalization.GlobalizationMode+Settings", "get_Invariant"),
             static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
         // Type::GetTypeFromHandle: 本家 IL 本体は RuntimeType.GetTypeFromHandle (runtime
         // intrinsic = IL なし) の呼び出しを含むため ② IL 実行に落とせない (ldfld
@@ -1770,7 +1787,8 @@ internal static class CoreLibBindings {
         var (native, slotRef) = ResolvePointerBase(a[1], "Interop+Kernel32.GetEnvironmentVariable");
         if (name is null || (native is null && slotRef is null))
             throw new UnhandledGuestException("System.NullReferenceException", null);
-        var value = Environment.GetEnvironmentVariable(name);
+        // host Environment への直接委譲を廃止: VM ごとの仮想環境変数ストアを読む
+        var value = VirtualEnvironment.GetValueOrDefault(name);
         _lastSystemError = value is null ? 203 /* ERROR_ENVVAR_NOT_FOUND */ : 0;
         if (string.IsNullOrEmpty(value))
             return StackSlot.OfInt32(0);

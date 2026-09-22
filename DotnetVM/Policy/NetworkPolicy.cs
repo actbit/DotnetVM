@@ -82,11 +82,17 @@ public sealed class NetworkGateway {
             throw new NetworkQuotaExceededException(
                 $"送信バイト数 {requestBytes:N0} が 1 要求上限 {_policy.MaxBytesPerRequest:N0} を超過しました。");
 
-        // 応答上限を事前にブリッジへ伝える (host 側で巨大バッファを作ってから拒否する形を避ける)
+        // 応答上限を事前にブリッジへ伝える: 今回要求分を差し引いた累計残量と
+        // 1 要求上限の min を渡す (タスク 2 hardening)。host 側で巨大バッファを
+        // 作ってから VM 側で拒否する増幅を避ける
+        var totalRemaining = Math.Max(0, _policy.TotalTransferByteLimit - _totalBytesTransferred - requestBytes);
+        var maxResponseBytes = Math.Min(
+            _policy.MaxBytesPerRequest > requestBytes ? _policy.MaxBytesPerRequest - requestBytes : 0,
+            totalRemaining);
         var response = _bridge.Request(new NetworkRequest {
             Url = uri,
             Body = body,
-            MaxResponseBytes = _policy.MaxBytesPerRequest,
+            MaxResponseBytes = maxResponseBytes,
         });
         var transferred = (long)requestBytes + response.LongLength;
         if (transferred > _policy.MaxBytesPerRequest)

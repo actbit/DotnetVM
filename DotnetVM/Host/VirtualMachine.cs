@@ -48,6 +48,7 @@ public sealed class VirtualMachine : IDisposable {
         if (string.IsNullOrEmpty(coreLibPath))
             throw new InvalidOperationException("ホストの System.Private.CoreLib.dll の場所を特定できません (Single-file 発行等)。");
         LoadAssembly(coreLibPath);
+        var coreLibLoader = _loaders[0]; // trusted CoreLib loader (LoadHostCoreLib の取得した参照)
         // VM CoreLib (置換面の managed IL 実装) を DotnetVM.dll と同じディレクトリからロードし、
         // 実在 CoreLib の面 → DotnetVM.CoreLib IL の置換辞書を構築する (欠面は fail-closed)
         var vmCoreLibPath = Path.Combine(
@@ -55,14 +56,24 @@ public sealed class VirtualMachine : IDisposable {
         if (!File.Exists(vmCoreLibPath))
             throw new InvalidOperationException(
                 $"VM CoreLib ({vmCoreLibPath}) が見つかりません。DotnetVM.CoreLib.dll を DotnetVM.dll と同じディレクトリに配置してください。");
+        // trusted CoreLib の identity は LoadHostCoreLib が取得した loader 参照そのもの:
+        // タスク 2 hardening (trusted identity) — ファイル名照合でなく trusted marker。
+        // CallEngine はこの marker (TypeLoader.IsTrustedCoreLib) で caller domain を判定し、
+        // TrustedCoreLib domain の特権 binding (Kernel32 / Marshal 等) の呼出を CoreLib IL
+        // に限定する。ゲストが同名 DLL を偽配置しても trusted にならない。
+        // identity (Name / PublicKeyToken) が想定の System.Private.CoreLib であることを
+        // 検証してから mark する (防御深度)。
+        var coreLibIdentity = coreLibLoader.Image.Identity;
+        if (!coreLibIdentity.Name.Equals("System.Private.CoreLib", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"ホスト CoreLib の identity が想定外です: {coreLibIdentity} (System.Private.CoreLib を期待)。");
+        coreLibLoader.IsTrustedCoreLib = true;
         LoadAssembly(vmCoreLibPath);
         // 置換対象 (Substitute の呼出元) を trusted System.Private.CoreLib 画像に限定する
-        // (タスク 2 hardening: ゲスト画像や依存画像が同名面を宣言しても置換されない)
+        // (タスク 2 hardening: ゲスト画像や依存画像が同名面を宣言しても置換されない)。
+        // ファイル名照合でなく loader 参照 (identity) でマークする
         var surfaces = VmCoreLibSurfaces.Create(_loaders[^1]);
-        foreach (var loader in _loaders) {
-            if (loader.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true)
-                surfaces.MarkTrustedCoreLib(loader);
-        }
+        surfaces.MarkTrustedCoreLib(coreLibLoader);
         _coreLibSurfaces = surfaces;
         // VmString の型同一性を System.String 実型 (CoreLib TypeDef) に接続する
         // (castclass IConvertible / インターフェースディスパッチ / String IL 面)。
@@ -134,13 +145,20 @@ public sealed class VirtualMachine : IDisposable {
     /// LoadAssembly(path) / LoadDependencyAssembly で解決するか、resolver を登録する。
     /// host current directory への暗黙フォールバック (SourcePath ?? ".") を廃止した (タスク 2)。</summary>
     public AssemblyImage LoadAssembly(Stream peStream, string? sourcePath = null) {
-        // 入力サイズ上限 (loader hardening): Assembly バイト総量 > MaxAssemblyBytes はロード拒否
+        // 入力サイズ上限 (loader hardening): 読み込み途中で強制する (非 seekable な入力も含め、
+        // 上限を超えた時点で打ち切って拒否する。巨大 stream を丸ごと buffer してから判定しない)
         var maxBytes = _options.Memory.MaxAssemblyBytes;
         using var buffered = new MemoryStream();
-        peStream.CopyTo(buffered);
-        if (buffered.Length > _options.Memory.MaxAssemblyBytes)
-            throw new OperationNotAllowedException(
-                $"LoadAssembly の入力が上限を超えています (実 {buffered.Length:N0} バイト, 上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        var copyBuffer = new byte[81920];
+        while (true) {
+            var n = peStream.Read(copyBuffer, 0, copyBuffer.Length);
+            if (n == 0)
+                break; // EOF
+            if (buffered.Position + n > maxBytes)
+                throw new OperationNotAllowedException(
+                    $"LoadAssembly の入力が上限を超えています (上限 {maxBytes:N0} バイト。読込途中で打ち切りました)。");
+            buffered.Write(copyBuffer, 0, n);
+        }
         var image = AssemblyImage.Parse(buffered.ToArray(), limits: _options.Memory);
         image.SourcePath = sourcePath;
         var loader = new TypeLoader(image);

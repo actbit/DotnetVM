@@ -24,6 +24,7 @@ public sealed class VirtualMachine : IDisposable {
     private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
     private readonly VmAssemblyContext _context;
+    private readonly VmSharedState _sharedState = new();
     private Interpreter? _interpreter;
     private VmCoreLibSurfaces? _coreLibSurfaces;
     private VmClassType? _stringType;
@@ -290,9 +291,26 @@ public sealed class VirtualMachine : IDisposable {
         throw new ArgumentException($"型 '{type.FullName}' にインスタンスメソッド '{methodName}' (引数 {paramCount} 個) が見つかりません。");
     }
 
+    /// <summary>VM ごとの共有状態 (仮想環境変数ストア / last system error)。
+    /// static 共有にしない (VM ごとに分離する)。</summary>
+    public VmSharedState SharedState => _sharedState;
+
+    /// <summary>仮想環境変数を設定する (Kernel32.GetEnvironmentVariable 面が読む VM ごとのストア)。
+    /// value が null なら削除する。host の実環境変数には触れない。</summary>
+    public void SetVirtualEnvironmentVariable(string name, string? value) {
+        if (value is null)
+            _sharedState.VirtualEnvironment.TryRemove(name, out _);
+        else
+            _sharedState.VirtualEnvironment[name] = value;
+    }
+
+    /// <summary>仮想環境変数を取得する (未定義なら null)。</summary>
+    public string? GetVirtualEnvironmentVariable(string name) =>
+        _sharedState.VirtualEnvironment.TryGetValue(name, out var value) ? value : null;
+
     private Interpreter GetInterpreter() =>
         _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
-            _network, _storage, Tracer, _coreLibSurfaces, _stringType);
+            _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState);
 
     /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
     /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>
@@ -451,14 +469,16 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     /// <summary>CoreLib 実型の System.Decimal (統合された VmClassType) を探す。
-    /// Context に登録された画像から CoreLib の TypeDef / System.Decimal を解決
-    /// (CoreLib の画像を優先。C2 型ユニフィケーションの統一規約と同一)。</summary>
+    /// trusted CoreLib 画像に限定する (fake System.Decimal への誤結合防止)。</summary>
     private static VmClassType? FindDecimalType(TypeLoader loader) {
         foreach (var candidate in loader.Context?.Loaders ?? []) {
+            if (!candidate.IsTrustedCoreLib)
+                continue;
             if (candidate.FindTypeByFullName("System.Decimal") is not VmClassType cls)
                 continue;
             if (candidate.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true)
                 return cls;
+            return cls;
         }
         return null;
     }

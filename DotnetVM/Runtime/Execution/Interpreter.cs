@@ -38,6 +38,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     private readonly Diagnostics.ExecutionTracer? _tracer;
     private readonly VmCoreLibSurfaces? _coreLibSurfaces;
     private readonly VmType? _stringType;
+    private readonly VmSharedState _shared;
     private readonly InterpreterServices _services;
     private readonly MethodPreparer _preparer;
     private readonly ObjectEngine _objectEngine;
@@ -67,7 +68,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
         NetworkGateway? network = null, StorageGateway? storage = null, Diagnostics.ExecutionTracer? tracer = null,
-        VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null) {
+        VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null, VmSharedState? shared = null) {
         _memory = memory;
         _intrinsics = intrinsics;
         _console = console;
@@ -77,6 +78,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         _tracer = tracer;
         _coreLibSurfaces = coreLibSurfaces;
         _stringType = stringType;
+        _shared = shared ?? new VmSharedState();
         var strings = new VmStringPool(heap);
         var primary = CreateEngines(loader, strings);
         _services = primary.Services;
@@ -108,6 +110,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             Types = loader,
             Network = _network,
             Storage = _storage,
+            Shared = _shared,
         };
         var services = new InterpreterServices(loader, _intrinsics, _console, _memory, _heap, strings,
             intrinsicContext, _tracer, _coreLibSurfaces) {

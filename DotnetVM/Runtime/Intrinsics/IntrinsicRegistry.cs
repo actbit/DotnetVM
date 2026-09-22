@@ -44,6 +44,10 @@ public sealed class IntrinsicContext {
     /// <summary>ストレージゲートウェイ (ポリシー検証済みの I/O のみ可。null = 全拒否)。</summary>
     public StorageGateway? Storage { get; init; }
 
+    /// <summary>VM ごとの共有状態 (仮想環境変数ストア / last system error)。
+    /// static 共有にしない (VM ごとに分離する)。</summary>
+    public required DotnetVM.Runtime.Execution.VmSharedState Shared { get; init; }
+
     /// <summary>
     /// 呼出ゲート (Interpreter.Call) が設定する「今回の呼出の宣言上のパラメータ型名」。
     /// i4 スロットに統合される char / bool / int 等のオーバーロードを intrinsic 側で

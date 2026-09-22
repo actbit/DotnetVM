@@ -121,6 +121,10 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
     public BindingKey WithAnyParams() =>
         new(TypeFullName, MethodName, AnyParamsSignature, ReturnTypeName, HasThis, Domain);
 
+    /// <summary>同一面の domain 違いキー (trusted caller が特権面と汎用面の双方を照合する用)。</summary>
+    public BindingKey WithDomain(BindingDomain domain) =>
+        new(TypeFullName, MethodName, ParamSignature, ReturnTypeName, HasThis, domain);
+
     /// <summary>戻り型をワイルドカードに緩めたキー (実引数キーで不成立時の再照合用)。</summary>
     public BindingKey WithAnyReturn() =>
         new(TypeFullName, MethodName, ParamSignature, AnyReturn, HasThis, Domain);

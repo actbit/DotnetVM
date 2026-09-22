@@ -23,8 +23,11 @@ public sealed record TypeSpecSignature(SigType Type);
 /// トークンから実際の型への解決は行わない (型システムの担当)。
 /// </summary>
 public static class SignatureDecoder {
-    /// <summary>MethodDef/MethodRef/StandAloneSig のメソッド署名をデコードする。</summary>
-    public static MethodSignature DecodeMethodSignature(ReadOnlySpan<byte> blob) {
+    /// <summary>MethodDef/MethodRef/StandAloneSig のメソッド署名をデコードする。
+    /// maxSignatureDepth は署名再帰の深さ上限、maxGenericNestingDepth は GenericInst の
+    /// ネスト上限 (hostile 署名の再帰でホストスタックを枯渇させない)。</summary>
+    public static MethodSignature DecodeMethodSignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
         var callingConv = reader.ReadByte();
 
@@ -38,41 +41,45 @@ public static class SignatureDecoder {
 
         var genericParamCount = isGeneric ? (int)reader.ReadCompressedUInt32() : 0;
         var paramCount = (int)reader.ReadCompressedUInt32();
-        var returnType = DecodeType(ref reader);
+        var returnType = DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth);
         var paramTypes = new SigType[paramCount];
         for (var i = 0; i < paramCount; i++)
-            paramTypes[i] = DecodeType(ref reader);
+            paramTypes[i] = DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth);
 
         return new MethodSignature(hasThis, isVarArg, genericParamCount, returnType, paramTypes);
     }
 
-    public static FieldSignature DecodeFieldSignature(ReadOnlySpan<byte> blob) {
+    public static FieldSignature DecodeFieldSignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
         var callingConv = reader.ReadByte();
         if (callingConv != 0x06)
             throw new BadImageFormatException($"フィールド署名の呼び出し規約が不正です (0x{callingConv:X2})。");
-        return new FieldSignature(DecodeType(ref reader));
+        return new FieldSignature(DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth));
     }
 
     /// <summary>Property 署名 = Field 署名と同一形式 (先頭が 0x08)。</summary>
-    public static FieldSignature DecodePropertySignature(ReadOnlySpan<byte> blob) {
+    public static FieldSignature DecodePropertySignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
         var callingConv = reader.ReadByte();
         if (callingConv != 0x08)
             throw new BadImageFormatException($"プロパティ署名の呼び出し規約が不正です (0x{callingConv:X2})。");
         reader.ReadCompressedUInt32(); // ParamCount
-        return new FieldSignature(DecodeType(ref reader));
+        return new FieldSignature(DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth));
     }
 
     /// <summary>TypeSpec (II.23.2.14) をデコードする。</summary>
-    public static TypeSpecSignature DecodeTypeSpecSignature(ReadOnlySpan<byte> blob) {
+    public static TypeSpecSignature DecodeTypeSpecSignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
-        return new TypeSpecSignature(DecodeType(ref reader));
+        return new TypeSpecSignature(DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth));
     }
 
     /// <summary>MethodSpec の Instantiation (II.23.2.15) をデコードする。
     /// 形式: GENERICINST (0x0A) &lt;argCount&gt; &lt;type...&gt;。</summary>
-    public static SigType[] DecodeMethodSpecInstantiation(ReadOnlySpan<byte> blob) {
+    public static SigType[] DecodeMethodSpecInstantiation(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
         var kind = reader.ReadByte();
         if (kind != 0x0A)
@@ -80,12 +87,13 @@ public static class SignatureDecoder {
         var count = (int)reader.ReadCompressedUInt32();
         var args = new SigType[count];
         for (var i = 0; i < count; i++)
-            args[i] = DecodeType(ref reader);
+            args[i] = DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth);
         return args;
     }
 
     /// <summary>ローカル変数署名 (StandAloneSig、II.23.2.10) をデコードする。</summary>
-    public static SigType[] DecodeLocalsSignature(ReadOnlySpan<byte> blob) {
+    public static SigType[] DecodeLocalsSignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
         var callingConv = reader.ReadByte();
         if (callingConv != 0x07)
@@ -93,13 +101,14 @@ public static class SignatureDecoder {
         var count = (int)reader.ReadCompressedUInt32();
         var locals = new SigType[count];
         for (var i = 0; i < count; i++)
-            locals[i] = DecodeType(ref reader);
+            locals[i] = DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth);
         return locals;
     }
 
-    public static SigType DecodeType(ReadOnlySpan<byte> blob) {
+    public static SigType DecodeType(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
         var reader = new SpanReader(blob);
-        return DecodeType(ref reader);
+        return DecodeType(ref reader, 0, 0, maxSignatureDepth, maxGenericNestingDepth);
     }
 
     /// <summary>
@@ -116,7 +125,14 @@ public static class SignatureDecoder {
         return ((uint)table << 24) | (encoded >> 2);
     }
 
-    private static SigType DecodeType(ref SpanReader reader) {
+    private static SigType DecodeType(ref SpanReader reader, int depth, int genericDepth,
+        int maxSignatureDepth, int maxGenericNestingDepth) {
+        if (depth > maxSignatureDepth)
+            throw new BadImageFormatException(
+                $"署名のネスト深さ {depth:N0} が上限 {maxSignatureDepth:N0} を超えています。");
+        if (genericDepth > maxGenericNestingDepth)
+            throw new BadImageFormatException(
+                $"ジェネリックのネスト深さ {genericDepth:N0} が上限 {maxGenericNestingDepth:N0} を超えています。");
         var kind = reader.ReadByte();
         switch (kind) {
             // 単純型
@@ -140,11 +156,11 @@ public static class SignatureDecoder {
             case 0x16: return new SigType(SigKind.TypedByRef);
 
             case 0x0F: // PTR <type>
-                return new SigType(SigKind.Pointer, Inner: DecodeType(ref reader));
+                return new SigType(SigKind.Pointer, Inner: DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth));
             case 0x10: // BYREF <type>
-                return new SigType(SigKind.ByRef, Inner: DecodeType(ref reader));
+                return new SigType(SigKind.ByRef, Inner: DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth));
             case 0x1D: // SZARRAY <type>
-                return new SigType(SigKind.SzArray, Inner: DecodeType(ref reader));
+                return new SigType(SigKind.SzArray, Inner: DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth));
 
             case 0x11: // VALUETYPE <TypeDefOrRefOrSpecEncoded>
             case 0x12: // CLASS <TypeDefOrRefOrSpecEncoded>
@@ -163,12 +179,12 @@ public static class SignatureDecoder {
                 var argCount = (int)reader.ReadCompressedUInt32();
                 var args = new SigType[argCount];
                 for (var i = 0; i < argCount; i++)
-                    args[i] = DecodeType(ref reader);
+                    args[i] = DecodeType(ref reader, depth + 1, genericDepth + 1, maxSignatureDepth, maxGenericNestingDepth);
                 return new SigType(SigKind.GenericInst, Token: token, Args: args);
             }
 
             case 0x14: { // ARRAY <type> <rank> <sizes...> <lobounds...>
-                var inner = DecodeType(ref reader);
+                var inner = DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
                 var rank = (int)reader.ReadCompressedUInt32();
                 var numSizes = (int)reader.ReadCompressedUInt32();
                 for (var i = 0; i < numSizes; i++)
@@ -181,10 +197,10 @@ public static class SignatureDecoder {
 
             case 0x1F or 0x20: // CMOD_REQD / CMOD_OPT <token> <type>
                 reader.ReadCompressedUInt32();
-                return DecodeType(ref reader);
+                return DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
 
             case 0x45: // PINNED <type> (ローカル変数のみ)
-                return DecodeType(ref reader);
+                return DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
 
             case 0x1B: // FNPTR <method sig> — 未対応 (MethodSignature は返せない)
                 throw new NotSupportedException("関数ポインタ (FNPTR) の署名は対応していません。");

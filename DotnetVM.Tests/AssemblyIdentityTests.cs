@@ -77,4 +77,58 @@ public class AssemblyIdentityTests {
         Assert.True(strongNamed > 0,
             "strong-named な AssemblyRef が 1 件も解析されませんでした (公開鍵トークン解析の失敗)。");
     }
+
+    /// <summary>同じ FullName の型を持つ別 identity assembly が先にロード済みでも誤解決しない。
+    /// FakeLib (Vm.Mis.Foo.Who()=>1) を先に、RealLib (同 FullName.Who()=>2) を後にロードし、
+    /// RealLib を参照する Main の呼出が RealLib (2) に解決される (global 統合の先勝ちで FakeLib に
+    /// 誤結合しない)。identity 確定を先に行う解決順の回帰。</summary>
+    [Fact]
+    public void SameFullName_DifferentIdentity_DoesNot_Misresolve() {
+        const string fakeSource = """
+            namespace Vm.Mis {
+                public static class Foo {
+                    public static int Who() => 1;
+                }
+            }
+            """;
+        const string realSource = """
+            namespace Vm.Mis {
+                public static class Foo {
+                    public static int Who() => 2;
+                }
+            }
+            """;
+        var fakeBytes = TestAssemblyCompiler.CompileToBytes(fakeSource, "MisFakeLib");
+        var realBytes = TestAssemblyCompiler.CompileToBytes(realSource, "MisRealLib");
+
+        // Main は RealLib を参照して Vm.Mis.Foo.Who() を呼ぶ (AssemblyRef は RealLib)。
+        var realTempPath = Path.Combine(Path.GetTempPath(), "MisRealLib.compileref.dll");
+        File.WriteAllBytes(realTempPath, realBytes);
+        try {
+            var mainBytes = TestAssemblyCompiler.CompileToBytes(
+                """
+                namespace Vm.MisMain {
+                    public static class Ops {
+                        public static int Run() => Vm.Mis.Foo.Who();
+                    }
+                }
+                """, "MisMain", extraReferences: [
+                    Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(realTempPath),
+                ]);
+
+            using var vm = new VirtualMachine(new VmHostOptions());
+            // わざと Fake を先にロードする (旧 global 統合なら Fake に誤結合して 1 を返す)。
+            using var fakeStream = new MemoryStream(fakeBytes);
+            using var realStream = new MemoryStream(realBytes);
+            using var mainStream = new MemoryStream(mainBytes);
+            vm.LoadAssembly(fakeStream);
+            vm.LoadAssembly(realStream);
+            vm.LoadAssembly(mainStream);
+
+            var result = (int)vm.Invoke("Vm.MisMain.Ops", "Run")!;
+            Assert.Equal(2, result);
+        } finally {
+            File.Delete(realTempPath);
+        }
+    }
 }

@@ -18,8 +18,10 @@ public sealed class MetadataRoot {
 
     public string VersionString { get; private init; } = "";
 
-    /// <summary>CLI ヘッダが指すメタデータ領域 (RVA + size) を解析する。</summary>
-    public static MetadataRoot Parse(PEImage pe, CliHeader cli) {
+    /// <summary>CLI ヘッダが指すメタデータ領域 (RVA + size) を解析する。
+    /// limits を渡すと各ストリームを受理する前に MaxMetadataStreamBytes を強制する
+    /// (巨大 #Blob / #Strings 等を丸ごと受理する前に拒否する)。</summary>
+    public static MetadataRoot Parse(PEImage pe, CliHeader cli, Host.MemoryPolicy? limits = null) {
         var root = pe.GetSegment(cli.MetadataRva, cli.MetadataSize);
 
         if (root.Length < 16 || root[0] != (byte)'B' || root[1] != (byte)'S'
@@ -59,6 +61,9 @@ public sealed class MetadataRoot {
 
             if (streamOffset < 0 || streamOffset + streamSize > root.Length)
                 throw new BadImageFormatException($"ストリーム '{name}' がメタデータ領域を超えています。");
+            if (limits is not null && streamSize > limits.MaxMetadataStreamBytes)
+                throw new BadImageFormatException(
+                    $"メタデータストリーム '{name}' のサイズ {streamSize:N0} が上限 {limits.MaxMetadataStreamBytes:N0} を超えています。");
             var data = root.Slice(streamOffset, streamSize).ToArray();
 
             switch (name) {

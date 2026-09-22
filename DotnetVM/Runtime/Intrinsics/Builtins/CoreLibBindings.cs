@@ -764,9 +764,13 @@ internal static class CoreLibBindings {
             BindingOrigin.InternalCall);
         // static abstract char IUtfChar<T>.CastFrom(T)  ([Intrinsic]: 実 IL はダミー throw。
         // String/span IL が T(char)→char の面を経由するため、char 系 T の値を i4 スロットで透過)
-        r.RegisterBinding(BindingKey.StaticAnyParams("System.IUtfChar`1", "CastFrom"),
-            static (_, a) => StackSlot.OfInt32(a[0].AsInt32),
-            BindingOrigin.InternalCall);
+        // .NET 10 の既知署名 (IUtfChar<TSelf>.CastFrom の 5 overload) を列挙する
+        foreach (var castFromParam in new[] {
+            "System.Byte", "System.Char", "System.Int32", "System.UInt32", "System.UInt64",
+        })
+            r.RegisterBinding(BindingKey.Static("System.IUtfChar`1", "CastFrom", castFromParam),
+                static (_, a) => StackSlot.OfInt32(a[0].AsInt32),
+                BindingOrigin.InternalCall);
     }
 
     // ---- System.TimeSpan / System.DateTime (culture 依存 IL 面の不変カルチャ委譲) ----
@@ -953,18 +957,20 @@ internal static class CoreLibBindings {
         // VM にはスレッドがなく同期ブロックもないため、常に即時取得・競合なしで即解放する:
         //   TryEnter_FastPath(obj)              → true (競合しないので FastPath で取得成功。
         //                                                  bool 返し (Enter IL が brtrue で分岐))
-        //   TryEnter_FastPath_WithTimeout(...)  → true (待ちなしで取得成功)
-        //   Exit_FastPath(obj)                  → void (保持解除は no-op)
+        //   TryEnter_FastPath_WithTimeout(...)  → Entered (待ちなしで取得成功。
+        //                                                  EnterHelperResult enum の int 値 1)
+        //   Exit_FastPath(obj)                  → None (保持解除は no-op。
+        //                                                  LeaveHelperAction enum の int 値 0)
         //   IsEnteredNative(obj)                → false (ロックを保持しないモデルと整合)
-        // パラメータ構成は CoreLib のバージョンで揺れうるため、面名ごとの全引数一致キーにする
+        // .NET 10 の既知署名を列挙する (戻りが enum struct の面も int スロットで同等提供)
         const string T = "System.Threading.Monitor";
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "TryEnter_FastPath"),
+        r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath", "System.Object"),
             static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "TryEnter_FastPath_WithTimeout"),
+        r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath_WithTimeout", "System.Object", "System.Int32"),
             static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Exit_FastPath"),
-            static (_, _) => null, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "IsEnteredNative"),
+        r.RegisterBinding(BindingKey.Static(T, "Exit_FastPath", "System.Object"),
+            static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(T, "IsEnteredNative", "System.Object"),
             static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
     }
 
@@ -1157,24 +1163,51 @@ internal static class CoreLibBindings {
     private const string UnsafeType = "System.Runtime.CompilerServices.Unsafe";
 
     private static void RegisterStringInternals(IntrinsicRegistry r) {
-        // internal static extern string String.FastAllocateString(int charCount)
+        // internal static string String.FastAllocateString(nint charCount)
         // CoreLib の InternalCall 面。実 CLR の確保点 (FastAllocateString) と同じ位置で
-        // VmString の可変 char バッファを VmHeap 会計つきで確保する
-        r.RegisterBinding(BindingKey.StaticAnyParams("System.String", "FastAllocateString"),
+        // VmString の可変 char バッファを VmHeap 会計つきで確保する。
+        // .NET 10 の既知署名 2 件を列挙する (単引数面と MethodTable 付き面。後者の長さは第 2 引数)
+        r.RegisterBinding(BindingKey.Static("System.String", "FastAllocateString", "System.IntPtr"),
             static (ctx, a) => StackSlot.OfObject(ctx.Strings.Allocate(a[0].AsInt32)),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("System.String", "FastAllocateString",
+                "System.Runtime.CompilerServices.MethodTable*", "System.IntPtr"),
+            static (ctx, a) => StackSlot.OfObject(ctx.Strings.Allocate(a[1].AsInt32)),
             BindingOrigin.InternalCall);
         // static void Buffer.Memmove<T>(ref T destination, ref T source, nuint elementCount)
         // String 構築 IL (InternalSubString 等) が ref char で呼ぶ。実 CLR では JIT intrinsic だが
-        // VM はバイト実体 (VmString.Bytes / VmLocallocMemory) 間の memmove として同等意味論を提供する
-        r.RegisterBinding(BindingKey.StaticAnyParams("System.Buffer", "Memmove"),
+        // VM はバイト実体 (VmString.Bytes / VmLocallocMemory) 間の memmove として同等意味論を提供する。
+        // ジェネリック面のため開いたキー (!!0) で 1 件登録し、T は実行時の具体名で判別する
+        r.RegisterBinding(BindingKey.Static("System.Buffer", "Memmove", "!!0&", "!!0&", "System.UIntPtr"),
             static (ctx, a) => MemmoveImpl(ctx, a), BindingOrigin.InternalCall);
         // Unsafe.* ([Intrinsic]: 実 CLR も JIT が IL を置き換える面。CoreLib IL 内では
-        // ref 値の byte 単位のアドレス演算として現れるため、バイト実体ポインタで同等に提供する)
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "Add"),
-            static (ctx, a) => AddImpl(ctx, a, elementStride: true), BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "AddByteOffset"),
-            static (ctx, a) => AddImpl(ctx, a, elementStride: false), BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "As"),
+        // ref 値の byte 単位のアドレス演算として現れるため、バイト実体ポインタで同等に提供する)。
+        // .NET 10 の既知署名を列挙する (ジェネリック面は開いたキー !!0 で 1 件ずつ)。
+        // 呼出側の具体名 (例: System.Char&) は CallEngine の開いたキー照合で解決される
+        foreach (var addParams in new[] {
+            new[] { "!!0&", "System.Int32" },
+            new[] { "!!0&", "System.IntPtr" },
+            new[] { "!!0&", "System.UIntPtr" },
+            new[] { "System.Void*", "System.Int32" },
+        })
+            r.RegisterBinding(BindingKey.Static(UnsafeType, "Add", addParams),
+                static (ctx, a) => AddImpl(ctx, a, elementStride: true), BindingOrigin.InternalCall);
+        foreach (var addByteOffsetParams in new[] {
+            new[] { "!!0&", "System.IntPtr" },
+            new[] { "!!0&", "System.UIntPtr" },
+        })
+            r.RegisterBinding(BindingKey.Static(UnsafeType, "AddByteOffset", addByteOffsetParams),
+                static (ctx, a) => AddImpl(ctx, a, elementStride: false), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "As", "System.Object"),
+            // static T Unsafe.As<T>(object source): 参照の型視点再解釈 (アドレス不変)
+            static (_, a) => {
+                var (native, slotRef) = ResolvePointerBase(a[0], "Unsafe.As");
+                if (native is not null)
+                    return StackSlot.OfObject(native);
+                return StackSlot.OfByRef(slotRef!);
+            },
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "As", "!!0&"),
             // static TTo Unsafe.As<TFrom, TTo>(ref TFrom source): 参照の型視点再解釈
             // (アドレス不変)。バイト実体ポインタは素通り、スロット列参照 (string 内部 char
             // 配列等の配列データ面) も同一アドレスとして素通りさせる — decimal 演算面の
@@ -1186,38 +1219,60 @@ internal static class CoreLibBindings {
                 return StackSlot.OfByRef(slotRef!);
             },
             BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "AreSame"),
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "AreSame", "!!0&", "!!0&"),
             static (_, a) => StackSlot.OfInt32(AreSameImpl(a) ? 1 : 0), BindingOrigin.InternalCall);
-        // ref TTo Unsafe.AsRef<T>(void*) / ref readonly T Unsafe.AsRef<T>(in T)
-        // ([Intrinsic]: ReadOnlySpan(in T&) ctor の IL が呼ぶ。実 IL はダミーで
-        // PlatformNotSupportedException を投げるため、参照をそのまま透過させる同等意味論を提供する)
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "AsRef"),
-            static (_, a) =>
-                a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef
-                    ? StackSlot.OfByRef(byRef)
-                    : throw new InvalidOperationException(
-                        $"Unsafe.AsRef の引数をスロット列参照として解釈できませんでした ({a[0].Kind})。"),
-            BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "SizeOf"),
+        // ref T Unsafe.AsRef<T>(in T) ([Intrinsic]: ReadOnlySpan(in T&) ctor の IL が呼ぶ。
+        // 実 IL はダミーで PlatformNotSupportedException を投げるため、参照をそのまま透過させる同等意味論を提供する)。
+        // .NET 10 の既知署名 2 件 (ref 面と void* 面) を列挙する
+        foreach (var asRefParams in new[] {
+            new[] { "!!0&" },
+            new[] { "System.Void*" },
+        })
+            r.RegisterBinding(BindingKey.Static(UnsafeType, "AsRef", asRefParams),
+                static (_, a) =>
+                    a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef
+                        ? StackSlot.OfByRef(byRef)
+                        : a[0].Kind == StackKind.Object && a[0].ObjectValue is VmNativePointer native
+                            ? StackSlot.OfObject(native)
+                            : throw new InvalidOperationException(
+                                $"Unsafe.AsRef の引数をスロット列参照として解釈できませんでした ({a[0].Kind})。"),
+                BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "SizeOf"),
             static (ctx, _) => StackSlot.OfInt32(SlotStride(ctx.ParamAt(0))), BindingOrigin.InternalCall);
         // static TTo Unsafe.BitCast<TFrom, TTo>(TFrom from)
         // ([Intrinsic]: 実 IL はダミー throw。same-size 値型のビット再解釈として同等意味論を
-        // 提供する。Math.Abs(double) の IL が BitConverter.DoubleToUInt64Bits 経由で呼ぶ)
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "BitCast"),
+        // 提供する。Math.Abs(double) の IL が BitConverter.DoubleToUInt64Bits 経由で呼ぶ)。
+        // ジェネリック面のため開いたキー (!!0) で登録する
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "BitCast", "!!0"),
             static (ctx, a) => BitCastImpl(ctx.ParamAt(0), a[0]), BindingOrigin.InternalCall);
-        // static void Unsafe.CopyBlockUnaligned(ref byte destination, ref byte source, nuint byteCount)
+        // static void Unsafe.CopyBlockUnaligned(ref byte destination, ref byte source, uint byteCount)
         // ([Intrinsic]: 実 IL はダミー throw = JIT intrinsic。String / Span IL がバイト実体コ
-        // ピーに使うため Buffer.Memmove 相当の memmove で同等意味論を提供する)
-        r.RegisterBinding(BindingKey.StaticAnyParams(UnsafeType, "CopyBlockUnaligned"),
-            static (ctx, a) => MemmoveImpl(ctx, a, strideOverride: 1), BindingOrigin.InternalCall);
+        // ピーに使うため Buffer.Memmove 相当の memmove で同等意味論を提供する)。
+        // .NET 10 の既知署名 2 件 (ref byte 面と void* 面) を列挙する
+        foreach (var copyParams in new[] {
+            new[] { "System.Byte&", "System.Byte&", "System.UInt32" },
+            new[] { "System.Void*", "System.Void*", "System.UInt32" },
+        })
+            r.RegisterBinding(BindingKey.Static(UnsafeType, "CopyBlockUnaligned", copyParams),
+                static (ctx, a) => MemmoveImpl(ctx, a, strideOverride: 1), BindingOrigin.InternalCall);
         // ref T MemoryMarshal.GetArrayDataReference<T>(T[] array) / ref byte (Array array)
         // ([Intrinsic]: 実 IL は配列データ先頭へのランタイム内部参照。IL を実行させると
         // 同名オーバーロードへの自己再帰に落ちるため、VM は要素格納列の先頭スロットへの
-        // VmByRef で同等意味論を提供する (Span<T> 構築 IL の GetArrayDataReference 面用)
-        r.RegisterBinding(BindingKey.StaticAnyParams("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference"),
+        // VmByRef で同等意味論を提供する (Span<T> 構築 IL の GetArrayDataReference 面用))。
+        // .NET 10 の既知署名 2 件 (ジェネリック面は開いたキー !!0[] で登録)
+        r.RegisterBinding(BindingKey.Static("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference", "System.Array"),
             static (_, a) => {
                 // 配列は通常 Object スロットで来るが、呼出側が配列ローカルを ldarga する
                 // 形 (ByRef スロット経由) もあるため展開して受ける
+                var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
+                return value.ObjectValue is VmArray array
+                    ? StackSlot.OfByRef(new VmByRef(array.Elements, 0))
+                    : throw new InvalidOperationException(
+                        $"MemoryMarshal.GetArrayDataReference の引数が配列ではありません ({value.Kind})。");
+            },
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference", "!!0[]"),
+            static (_, a) => {
                 var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
                 return value.ObjectValue is VmArray array
                     ? StackSlot.OfByRef(new VmByRef(array.Elements, 0))
@@ -1492,8 +1547,8 @@ internal static class CoreLibBindings {
         // ジェネリック ラッパー IsReferenceOrContainsReferences<T>() (MethodSpec 面)。
         // 実 IL がランタイム内部表現に直接依存するため IL 実行させず、T の実引数型名
         // (MethodSpec 解決で置換される。未解決なら開いた名 !!0) から VM 型モデルで判定する。
-        // 正確なキーが先に照合され、この AnyParams 面は generic ラッパー (キー不一致) のみ受ける
-        r.RegisterBinding(BindingKey.StaticAnyParams(RuntimeHelpersType, "IsReferenceOrContainsReferences"),
+        // 値パラメータ 0 個のため無引数の正確キーで登録する (AnyParams 不要)
+        r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "IsReferenceOrContainsReferences"),
             static (ctx, _) => {
                 // ジェネリック ラッパーは値パラメータ 0 個のため T はメソッド型実引数で来る
                 var name = ctx.MethodTypeArgAt(0);
@@ -1506,8 +1561,9 @@ internal static class CoreLibBindings {
         // static T? IsBitwiseEquatable<T>()  ([Intrinsic]: 実 IL はダミー throw = JIT intrinsic)。
         // SpanHelpers.SequenceEqual 等が T を bitwise 比較可能か判定する面 (typeof(T) の呼び出し
         // はメソッド型実引数で判別可能)。プリミティブ数値 / char / bool 系のみ true (Span IL の
-        // 早抜け経路に誘導。非 primitive は false = 比較 delegate 経路にフォールバック)
-        r.RegisterBinding(BindingKey.StaticAnyParams(RuntimeHelpersType, "IsBitwiseEquatable"),
+        // 早抜け経路に誘導。非 primitive は false = 比較 delegate 経路にフォールバック)。
+        // 値パラメータ 0 個のため無引数の正確キーで登録する
+        r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "IsBitwiseEquatable"),
             static (ctx, _) => {
                 var name = ctx.MethodTypeArgAt(0);
                 var primitive = name is "System.Byte" or "System.SByte" or "System.Char" or "System.Int16"
@@ -1519,10 +1575,17 @@ internal static class CoreLibBindings {
             BindingOrigin.InternalCall);
         // static bool IsKnownConstant<T>(T value)  ([Intrinsic]):
         // 本家 IL はダミー throw の JIT intrinsic。VM は JIT 定数畳み込みを持たないため false を返す
-        // (未定義でも呼出 IL の fallback 分岐が動くが、false 固定にして恒常経路に誘導する)
-        r.RegisterBinding(BindingKey.StaticAnyParams(RuntimeHelpersType, "IsKnownConstant"),
-            static (_, _) => StackSlot.OfInt32(0),
-            BindingOrigin.InternalCall);
+        // (未定義でも呼出 IL の fallback 分岐が動くが、false 固定にして恒常経路に誘導する)。
+        // .NET 10 の既知署名 4 件を列挙する (非ジェネリック 3 overload + ジェネリック面は開いたキー)
+        foreach (var knownConstantParams in new[] {
+            new[] { "System.Char" },
+            new[] { "System.String" },
+            new[] { "System.Type" },
+            new[] { "!!0" },
+        })
+            r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "IsKnownConstant", knownConstantParams),
+                static (_, _) => StackSlot.OfInt32(0),
+                BindingOrigin.InternalCall);
     }
 
     // ---- System.Runtime.Intrinsics.Vector64/128/256/512 (JIT intrinsic 判定面) ----
@@ -1550,22 +1613,19 @@ internal static class CoreLibBindings {
     // ---- System.Runtime.InteropServices.Marshal / Interop+Kernel32 (環境取得起動面) ----
 
     /// <summary>VM 代替の last system error (Marshal.SetLastSystemError / GetLastSystemError 面)。
-    /// 実 CLR の per-thread TLS スロットの代わりにスレッドローカルの単一値で模倣する。
+    /// 実 CLR の per-thread TLS スロットの代わりに VM ごとの共有状態 (VmSharedState) で模倣する。
     /// CultureInfo.InvariantCulture 初期化 (GlobalizationMode → GetEnvironmentVariableCore)
     /// が GetLastSystemError() &lt; ERROR_ENVVAR_NOT_FOUND(203) で成功判定に使う。
     /// (タスク 2 hardening: これらの面は TrustedCoreLib domain に属し、trusted CoreLib IL
-    /// からの呼出のみ照合される。)</summary>
-    [ThreadStatic]
-    private static int _lastSystemError;
+    /// からの呼出のみ照合される。呼出元は caller loader 基準で判定する。)</summary>
 
-    /// <summary>VM ごとの仮想環境変数ストア (タスク 2 hardening)。
+    /// <summary>VM ごとの仮想環境変数ストアは VmSharedState.VirtualEnvironment を使う
+    /// (static 共有にしない。VM ごとに分離する)。
     /// Kernel32.GetEnvironmentVariable 面は host の Environment.GetEnvironmentVariable を
     /// 直接呼ばず、この VM ごとの仮想環境のみを参照する (host 環境の読み替えを遮断し、
     /// trusted CoreLib domain 呼出でのみ到達する特権面に)。
     /// 既定は空 (GlobalizationMode::get_Invariant を true 固定にする呼出経路が
     /// DOTNET_SYSTEM_GLOBALIZATION_INVARIANT の実環境読み取りに依存しない)。</summary>
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> VirtualEnvironment =
-        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>本家 CultureInfo::.cctor → CultureData.get_Invariant → GlobalizationMode の
     /// IL は AppContextConfigHelper → Environment.GetEnvironmentVariableCore を辿り、その
@@ -1576,35 +1636,37 @@ internal static class CoreLibBindings {
     /// バッファへは Win32 規約 (戻り = 終端 null 除くコピー文字数 / 不足時は終端含む
     /// 必要文字数を返すのみ、未定義なら 0 + lastError = 203) で書き込む。
     /// Marshal の 4 面は IL 実体が下請け P/Invoke shim 呼びのみのため
-    /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定)。</summary>
+    /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定。
+    /// 状態は ctx.Shared の VM インスタンス状態)。</summary>
     private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
         const string MarshalType = "System.Runtime.InteropServices.Marshal";
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastSystemError", "System.Int32"),
-            static (_, a) => {
-                _lastSystemError = a[0].AsInt32;
+            static (ctx, a) => {
+                ctx.Shared.LastSystemError = a[0].AsInt32;
                 return null;
             },
             BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "GetLastSystemError"),
-            static (_, _) => StackSlot.OfInt32(_lastSystemError),
+            static (ctx, _) => StackSlot.OfInt32(ctx.Shared.LastSystemError),
             BindingOrigin.InternalCall);
         // SystemError/PInvokeError は実 CLR でも同一 TLS スロットの alias 面
         // (SetLastSystemError/GetLastSystemError の IL 実体が呼ぶ下請け)
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastPInvokeError", "System.Int32"),
-            static (_, a) => {
-                _lastSystemError = a[0].AsInt32;
+            static (ctx, a) => {
+                ctx.Shared.LastSystemError = a[0].AsInt32;
                 return null;
             },
             BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "GetLastPInvokeError"),
-            static (_, _) => StackSlot.OfInt32(_lastSystemError),
+            static (ctx, _) => StackSlot.OfInt32(ctx.Shared.LastSystemError),
             BindingOrigin.InternalCall);
         // Kernel32.GetEnvironmentVariable は trusted CoreLib (GlobalizationMode 経路) からの
-        // 起動面としてのみ有効な特権面。BindingDomain.TrustedCoreLib で鍵化し、トレース
-        // 時 (CallEngine の callerDomain 判定) は trusted CoreLib IL からの呼出のみ照合する
+        // 起動面としてのみ有効な特権面。BindingDomain.TrustedCoreLib で鍵化し、
+        // 呼出元 loader 基準 (CallEngine.CallerDomainOf) で trusted CoreLib IL からの
+        // 呼出のみ照合する
         r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "GetEnvironmentVariable",
                 "System.String", "System.Char&", "System.UInt32"),
-            static (_, a) => GetEnvironmentVariableImpl(a),
+            static (ctx, a) => GetEnvironmentVariableImpl(ctx, a),
             BindingOrigin.PInvokeReplacement);
         // GlobalizationMode+Settings::get_Invariant を true 固定にする (VM 規約: culture は
         // 不変カルチャ固定)。本家の DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論
@@ -1782,14 +1844,14 @@ internal static class CoreLibBindings {
             static (_, _) => null, BindingOrigin.InternalCall);
     }
 
-    private static StackSlot GetEnvironmentVariableImpl(StackSlot[] a) {
+    private static StackSlot GetEnvironmentVariableImpl(IntrinsicContext ctx, StackSlot[] a) {
         var name = (a[0].ObjectValue as VmString)?.Value;
         var (native, slotRef) = ResolvePointerBase(a[1], "Interop+Kernel32.GetEnvironmentVariable");
         if (name is null || (native is null && slotRef is null))
             throw new UnhandledGuestException("System.NullReferenceException", null);
-        // host Environment への直接委譲を廃止: VM ごとの仮想環境変数ストアを読む
-        var value = VirtualEnvironment.GetValueOrDefault(name);
-        _lastSystemError = value is null ? 203 /* ERROR_ENVVAR_NOT_FOUND */ : 0;
+        // host Environment への直接委譲を廃止: VM ごとの仮想環境変数ストア (ctx.Shared) を読む
+        var value = ctx.Shared.VirtualEnvironment.TryGetValue(name, out var found) ? found : null;
+        ctx.Shared.LastSystemError = value is null ? 203 /* ERROR_ENVVAR_NOT_FOUND */ : 0;
         if (string.IsNullOrEmpty(value))
             return StackSlot.OfInt32(0);
         // バッファ不足 (nSize <= 文字数): 書き込みは行わず終端含む必要文字数を返す

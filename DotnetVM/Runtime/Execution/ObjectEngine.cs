@@ -28,8 +28,34 @@ internal sealed class ObjectEngine(
     private readonly UnifiedStaticStorage? _unifiedStaticStorage = unifiedStaticStorage;
 
     private readonly HashSet<VmType> _initializedTypes = [];
-    // 構築ジェネリック型の .cctor 起動済み集合 (CLR と同じく実引数ごとに 1 回)
-    private readonly HashSet<string> _initializedConstructedTypes = [];
+    // 構築ジェネリック型の .cctor 起動済み集合 (CLR と同じく実引数ごとに 1 回。
+    // FullName 文字列ではなく定義参照 + 型引数参照列で鍵化する)
+    private readonly HashSet<ConstructedIdentity> _initializedConstructedTypes = [];
+
+    private readonly struct ConstructedIdentity : IEquatable<ConstructedIdentity> {
+        public readonly VmType Definition;
+        public readonly VmType[] TypeArguments;
+        public ConstructedIdentity(VmType definition, VmType[] typeArguments) {
+            Definition = definition;
+            TypeArguments = [.. typeArguments];
+        }
+        public bool Equals(ConstructedIdentity other) {
+            if (!ReferenceEquals(Definition, other.Definition) || TypeArguments.Length != other.TypeArguments.Length)
+                return false;
+            for (var i = 0; i < TypeArguments.Length; i++)
+                if (!ReferenceEquals(TypeArguments[i], other.TypeArguments[i]))
+                    return false;
+            return true;
+        }
+        public override bool Equals(object? obj) => obj is ConstructedIdentity other && Equals(other);
+        public override int GetHashCode() {
+            var hash = new HashCode();
+            hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Definition));
+            foreach (var arg in TypeArguments)
+                hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(arg));
+            return hash.ToHashCode();
+        }
+    }
     /// <summary>intrinsic 型の静的フィールドのストレージ (トークンごとに 1 スロット。例: String.Empty)。GC ルート源。</summary>
     private readonly Dictionary<int, StackSlot[]> _intrinsicStaticFields = [];
     /// <summary>静的 FieldRVA データフィールドのアドレス (トークンごとに 1 つ。例: Char.Latin1CharInfo の
@@ -258,13 +284,14 @@ internal sealed class ObjectEngine(
                         $"intrinsic 型 {typeName} の静的フィールド {fieldName} は未登録です。");
             }
             if (parent.Table == TableKind.TypeSpec) {
-                // 構築型の静的フィールド。CLR と同じく値型実引数ごとに別ストレージを持ち、
-                // .cctor も実引数ごとに 1 回走る (参照型実引数でもストレージは共有しない)
+                // 構築型の静的フィールド。CLR と同じく実引数ごとに別ストレージを持ち、
+                // .cctor も実引数ごとに 1 回走る。キーは定義参照 + 型引数参照列 (FullName 文字列不使用)。
                 var constructed = ResolveConstructedParent(parent.Rid, context);
                 var definition = (VmClassType)constructed.Definition;
                 EnsureConstructedInitialized(constructed);
                 var storage = _objects.GetOrCreateStaticStorage(constructed.FullName, definition, _loader,
-                    new GenericContext { ClassArgs = constructed.TypeArguments }, _unifiedStaticStorage);
+                    new GenericContext { ClassArgs = constructed.TypeArguments }, _unifiedStaticStorage,
+                    constructed.TypeArguments);
                 return new VmByRef(storage, ObjectModel.StaticFieldIndex(definition,
                     ResolveFieldToken(token, context)));
             }
@@ -284,7 +311,7 @@ internal sealed class ObjectEngine(
             return new VmByRef(storage, 0);
         }
         EnsureInitialized(owner);
-        var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader, null, _unifiedStaticStorage);
+        var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader, null, _unifiedStaticStorage, null);
         return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));
     }
 
@@ -299,9 +326,10 @@ internal sealed class ObjectEngine(
             invoker.Invoke(cctor, [], null);
     }
 
-    /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回)。</summary>
+    /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回。
+    /// 定義参照 + 型引数参照列で鍵化し、FullName 文字列は使わない)。</summary>
     public void EnsureConstructedInitialized(VmConstructedType type) {
-        if (!_initializedConstructedTypes.Add(type.FullName))
+        if (!_initializedConstructedTypes.Add(new ConstructedIdentity(type.Definition, type.TypeArguments)))
             return;
         var definition = (VmClassType)type.Definition;
         var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
@@ -424,7 +452,9 @@ internal sealed class ObjectEngine(
             if (parent.Table == TableKind.TypeSpec)
                 return NewConstructedObject(token, rid, parent.Rid, caller);
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(rid).ToArray());
+                _loader.Image.GetMemberRefSignature(rid).ToArray(),
+                _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+                _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var facadeParamCount = signature.ParamTypes.Length;
             var name = _loader.GetMemberRefName(rid);
             var typeName = _loader.GetMemberRefParentTypeName(rid);
@@ -535,7 +565,9 @@ internal sealed class ObjectEngine(
     private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
         var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
         var signature = SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetMemberRefSignature(memberRefRid).ToArray());
+            _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+            _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+            _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
         var paramCount = signature.ParamTypes.Length;
         var ctorName = _loader.GetMemberRefName(memberRefRid);
         var context = new GenericContext { ClassArgs = constructed.TypeArguments };

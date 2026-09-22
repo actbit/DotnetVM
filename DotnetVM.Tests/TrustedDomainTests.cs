@@ -5,21 +5,19 @@ using Xunit;
 namespace DotnetVM.Tests;
 
 /// <summary>
-/// タスク 2 (hardening) の回帰テスト集:
-/// fake System.* 型 (Marshal 偽装) から特権 binding が到達しないこと (TrustedCoreLib domain 遮断)、
-/// same-FullName 型の静的ストレージを identity レベルで分離すること。
+/// trusted domain 遮断の回帰テスト集:
+/// - ゲストから実 CoreLib の特権面 (Marshal) を直接参照しても binding が拒否される
+/// - fake 型は trusted 面に到達せず自実装が実行される (厳格な成功条件)
+/// - 同一 FullName 型を別 assembly 2 個に定義しても静的ストレージを共有しない
+/// - VM ごとの仮想環境ストア分離
 /// </summary>
 public class TrustedDomainTests {
-    /// <summary>fake System.Runtime.InteropServices.Marshal を宣言するゲスト。
-    /// 型名は実在 Marshal と同一 (統合辞書経由で実 Marshal 定義にも到達し得ることに注意)、
-    /// ゲストが宣言した型から GetLastSystemError を呼び出しても trusted CoreLib domain で
-    /// はなく、実在 Marshal 面への統合解決は trusted CoreLib loader 由来の IL しか通らない。</summary>
+    /// <summary>ゲスト側 fake Marshal (実在 Marshal とは別 FullName)。
+    /// trusted 特権面に差し替えられず自実装 (42) が実行される。</summary>
     private const string FakeMarshalSource = """
         namespace Vm.TrustFake {
             using System;
 
-            // ゲスト側 fake Marshal (型名は System.Runtime.InteropServices.Marshal ではなく
-            // Vm.TrustFake.Marshal — 完全名が異なるため統合で上書きされない)
             public static class FakeMarshal {
                 public static int GetLastSystemError() => 42;
             }
@@ -35,47 +33,89 @@ public class TrustedDomainTests {
         using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
         using var stream = new MemoryStream(TestAssemblyCompiler.CompileToBytes(FakeMarshalSource, "TrustFake"));
         vm.LoadAssembly(stream);
-        // ゲストの fake Marshal.GetLastSystemError は trusted CoreLib binding (VM lastError)
-        // に差し替えられない: guest の FakeMarshal 型は intrinsic 未登録のため
-        // CallingConsistency = runtime-representation (VM 最上位は 42 を返す)
+        // fake 型は intrinsic 未登録のためゲスト IL そのままが実行され、自実装の 42 を返す。
+        // trusted CoreLib の特権 binding (VM lastError 初期値 0) に差し替えられていたら 0 になる。
         var result = (int)vm.Invoke("Vm.TrustFake.Ops", "Run")!;
-        // fake 型が実在 Marshal 面に到達できないこと (0 以外の偽値 42 は trusted 面ではなく
-        // ゲスト実装が返した値 = trusted CoreLib domain 特権面と同一ではない)
-        // trusted binding と値が紐付いていない場合 (数的に異なる) のみ Green
-        Assert.True(result == 42 || result == 0,
-            $"fake Marshal が trusted CoreLib domain の特権面に到達しました (返値 {result}。" +
-            "trusted CoreLib 呼出に限定した domain 遮断を確認してください。");
+        Assert.Equal(42, result);
     }
 
-    /// <summary>同一 FullName 型を fake アセンブリで宣言しても、trusted CoreLib の細胞症状と
-    /// 静的ストレージが共有しない (identity 参照の統合辞書)。fake Marshal.GetLastSystemError の
-    /// 返値が trusted CoreLib 実装と別経路であることの回帰。</summary>
+    /// <summary>ゲストから実在の特権面 (Marshal.GetLastSystemError) を直接参照しても
+    /// caller が guest のため TrustedCoreLib binding に到達できず OperationNotAllowed になる。</summary>
     [Fact]
-    public void SameFullName_Types_Keep_Separate_Static_Storage() {
+    public void GuestDirect_PrivilegedMarshal_IsRejected() {
         using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
         using var stream = new MemoryStream(TestAssemblyCompiler.CompileToBytes(
             """
-            namespace Vm.TrustFake2 {
+            namespace Vm.TrustPriv {
+                using System.Runtime.InteropServices;
+
+                public static class Ops {
+                    public static int RunGet() => Marshal.GetLastSystemError();
+                    public static int RunSet() {
+                        Marshal.SetLastSystemError(123);
+                        return Marshal.GetLastSystemError();
+                    }
+                }
+            }
+            """, "TrustPriv"));
+        vm.LoadAssembly(stream);
+        // 特権面へのゲスト直接呼出は domain 遮断で拒否される (InternalCall 未登録とは区別する)。
+        var exGet = Assert.Throws<OperationNotAllowedException>(() => vm.Invoke("Vm.TrustPriv.Ops", "RunGet"));
+        Assert.Contains("trusted", exGet.Message, StringComparison.OrdinalIgnoreCase);
+        var exSet = Assert.Throws<OperationNotAllowedException>(() => vm.Invoke("Vm.TrustPriv.Ops", "RunSet"));
+        Assert.Contains("trusted", exSet.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>同一 FullName 型を別 assembly 2 個に定義しても静的ストレージを共有しない。
+    /// 各 loader の型は別 identity であり、Hit() はそれぞれ 1 から始まる。</summary>
+    [Fact]
+    public void SameFullName_TwoAssemblies_Keep_Separate_Static_Storage() {
+        const string sharedSource = """
+            namespace Vm.Shared {
                 public static class Counter {
                     public static int Hits;
                     public static int Hit() => ++Counter.Hits;
                 }
-                public static class Metadata {
-                    public static int TryCount(int other) {
-                        // 別アセンブリの同 FullName 型 (Counter) を宣言しても (fake と配置される)
-                        // trusted CoreLib domain の静的ストレージは共有しない
-                        return Counter.Hit() * 1;
-                    }
-                }
             }
-            """, "VTFakeStatic"));
-        vm.LoadAssembly(stream);
-        // ゲスト側 Counter.Hits の静的ストレージが trusted CoreLib と共有しないこと
-        // (同一 FullName の別アセンブリでも identity 参照が別 = 静的値を共有しない)。
-        // ここでは Rune が trusted CoreLib domain から遠ざかることの検証。
-        // trusted CoreLib 型の System.DateTime Dickens 静的ストレージ等の値が
-        // fake の ldsfld で読めないかは CoreLib 側の状態/generated 型の直値で驗証される
-        var count = (int)vm.Invoke("Vm.TrustFake2.Counter", "Hit")!;
-        Assert.Equal(1, count);
+            """;
+        using var vm = new VirtualMachine(new VmHostOptions());
+        var bytesA = TestAssemblyCompiler.CompileToBytes(sharedSource, "SharedA");
+        var bytesB = TestAssemblyCompiler.CompileToBytes(sharedSource, "SharedB");
+        using var streamA = new MemoryStream(bytesA);
+        using var streamB = new MemoryStream(bytesB);
+        vm.LoadAssembly(streamA);
+        vm.LoadAssembly(streamB);
+
+        Assert.Equal(2, vm.Loaders.Count);
+        var loaderA = vm.Loaders[0];
+        var loaderB = vm.Loaders[1];
+        var typeA = loaderA.FindTypeByFullName("Vm.Shared.Counter");
+        var typeB = loaderB.FindTypeByFullName("Vm.Shared.Counter");
+        Assert.NotNull(typeA);
+        Assert.NotNull(typeB);
+        Assert.False(ReferenceEquals(typeA, typeB));
+
+        var methodA = typeA!.Methods.First(m => m.Name == "Hit");
+        var methodB = typeB!.Methods.First(m => m.Name == "Hit");
+        // 各 assembly の静的ストレージは独立: どちらも初回は 1 を返す (共有なら 1,2 になる)。
+        var rA1 = vm.Execute(methodA);
+        var rB1 = vm.Execute(methodB);
+        var rA2 = vm.Execute(methodA);
+        Assert.Equal(1, rA1.ReturnValue);
+        Assert.Equal(1, rB1.ReturnValue);
+        Assert.Equal(2, rA2.ReturnValue);
+    }
+
+    /// <summary>VM ごとの仮想環境ストアは分離する (static 共有にしない)。</summary>
+    [Fact]
+    public void VirtualEnvironment_Is_Isolated_Per_Vm() {
+        using var vm1 = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
+        using var vm2 = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
+        vm1.SetVirtualEnvironmentVariable("VM_ISOLATION_PROBE", "one");
+        Assert.Equal("one", vm1.GetVirtualEnvironmentVariable("VM_ISOLATION_PROBE"));
+        Assert.Null(vm2.GetVirtualEnvironmentVariable("VM_ISOLATION_PROBE"));
+        vm2.SetVirtualEnvironmentVariable("VM_ISOLATION_PROBE", "two");
+        Assert.Equal("one", vm1.GetVirtualEnvironmentVariable("VM_ISOLATION_PROBE"));
+        Assert.Equal("two", vm2.GetVirtualEnvironmentVariable("VM_ISOLATION_PROBE"));
     }
 }

@@ -21,7 +21,9 @@ internal sealed class MethodPreparer(TypeLoader loader) {
             if (table != TableKind.StandAloneSig)
                 throw new BadImageFormatException($"ローカル変数署名トークン 0x{body.LocalVarSigToken:X8} が不正です。");
             localTypes = SignatureDecoder.DecodeLocalsSignature(
-                loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)).ToArray());
+                loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)).ToArray(),
+                loader.Image.Limits?.MaxSignatureDepth ?? 64,
+                loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
         }
 
         var prepared = new PreparedMethod(localTypes) {

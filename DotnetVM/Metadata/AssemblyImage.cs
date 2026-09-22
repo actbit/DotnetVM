@@ -32,12 +32,15 @@ public sealed class AssemblyImage {
     /// <summary>ファイルからロードした場合の元パス (依存アセンブリの同一ディレクトリ探索に使う。ストリームロードは null)。</summary>
     public string? SourcePath { get; internal set; }
 
+    /// <summary>ロード時に適用した上限 (署名デコード / メソッド本体の遅延読み込みで再利用する)。</summary>
+    public MemoryPolicy? Limits { get; private init; }
+
     /// <summary>NestedClass テーブルの逆引き索引 (Nested rid → Enclosing rid。遅延構築)。</summary>
     private Dictionary<int, int>? _nestedToEnclosing;
 
     private AssemblyImage(PEImage pe, CliHeader cli, MetadataRoot root, MetadataTables tables,
                           StringHeap strings, UserStringHeap userStrings, BlobHeap blobs, GuidHeap guids,
-                          string name) {
+                          string name, MemoryPolicy? limits) {
         PE = pe;
         Cli = cli;
         Root = root;
@@ -47,6 +50,7 @@ public sealed class AssemblyImage {
         Blobs = blobs;
         Guids = guids;
         Name = name;
+        Limits = limits;
     }
 
     public static AssemblyImage Parse(ReadOnlyMemory<byte> image) => Parse(image, limits: null);
@@ -58,7 +62,7 @@ public sealed class AssemblyImage {
     public static AssemblyImage Parse(ReadOnlyMemory<byte> image, MemoryPolicy? limits) {
         var pe = PEImage.Parse(image);
         var cli = CliHeader.ParseFrom(pe);
-        var root = MetadataRoot.Parse(pe, cli);
+        var root = MetadataRoot.Parse(pe, cli, limits);
         var tables = new MetadataTables(root.TablesStream);
         var strings = new StringHeap(root.StringsStream);
         var userStrings = new UserStringHeap(root.UserStringsStream);
@@ -86,7 +90,7 @@ public sealed class AssemblyImage {
         else
             name = strings.GetString(tables.GetRowIndex(TableKind.Module, 1, 1));
 
-        return new AssemblyImage(pe, cli, root, tables, strings, userStrings, blobs, guids, name);
+        return new AssemblyImage(pe, cli, root, tables, strings, userStrings, blobs, guids, name, limits);
     }
 
     // ---- 文字列/ブロブ/ボディ取得ヘルパー ----
@@ -100,10 +104,11 @@ public sealed class AssemblyImage {
     /// <summary>#Blob ヒープからブロブを取得。</summary>
     public ReadOnlySpan<byte> GetBlob(int blobIndex) => Blobs.GetBlob(blobIndex);
 
-    /// <summary>MethodDef のメソッド本体。RVA = 0 (abstract/pinvoke) は null。</summary>
+    /// <summary>MethodDef のメソッド本体。RVA = 0 (abstract/pinvoke) は null。
+    /// MaxMethodBodyBytes (Limits) を読み込み時に強制する。</summary>
     public MethodBodyBlock? GetMethodBody(int methodDefRid) {
         var rva = (int)Tables.GetCell(TableKind.MethodDef, methodDefRid, 0);
-        return MethodBodyBlock.FromRva(PE, rva);
+        return MethodBodyBlock.FromRva(PE, rva, Limits?.MaxMethodBodyBytes);
     }
 
     // ---- トークン → 行アクセスの簡易ヘルパー ----

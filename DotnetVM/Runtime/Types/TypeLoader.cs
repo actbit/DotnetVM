@@ -245,7 +245,9 @@ public sealed class TypeLoader {
             FieldSignature signature;
             try {
                 signature = SignatureDecoder.DecodeFieldSignature(
-                    _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)).ToArray());
+                    _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)).ToArray(),
+                    _image.Limits?.MaxSignatureDepth ?? 64,
+                    _image.Limits?.MaxGenericNestingDepth ?? 64);
             } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {
                 continue;
             }
@@ -270,7 +272,9 @@ public sealed class TypeLoader {
             MethodSignature signature;
             try {
                 signature = SignatureDecoder.DecodeMethodSignature(
-                    _image.GetMethodSignature(rid).ToArray());
+                    _image.GetMethodSignature(rid).ToArray(),
+                    _image.Limits?.MaxSignatureDepth ?? 64,
+                    _image.Limits?.MaxGenericNestingDepth ?? 64);
             } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {
                 continue;
             }
@@ -336,7 +340,7 @@ public sealed class TypeLoader {
             // <module> 型等 (Extends = null)。System.Object 自身は基底を持たない
             // (実型に統合した場合の自己参照循環を断つ)
             if (type.FullName != "System.Object") {
-                type.SetBaseType(TryResolveUnifiedType("System.Object")
+                type.SetBaseType(TryResolveTrustedUnifiedType("System.Object")
                     ?? FindIntrinsicType("System.Object"));
             } else {
                 type.SetBaseType(null);
@@ -366,17 +370,17 @@ public sealed class TypeLoader {
         GenericSubstitutor.Substitute(ResolveToken(sigType), context);
 
     /// <summary>署名中の型を VmType に解決する。ジェネリックパラメータは置換コンテキストがないため
-    /// VmGenericParameterType をそのまま返す (インタプリタは ResolveToken(sigType, context) を使う)。</summary>
-    public VmType ResolveToken(SigType sigType) => sigType.Kind switch {
+    /// VmGenericParameterType をそのまま返す (インタプリタは ResolveToken(sigType, context) を使う)。
+    /// GenericInst の解決時にもネスト上限を強制する (TypeSpec 連鎖の再帰対策)。</summary>
+    public VmType ResolveToken(SigType sigType) => ResolveTokenWithDepth(sigType, 0);
+
+    private VmType ResolveTokenWithDepth(SigType sigType, int genericDepth) => sigType.Kind switch {
         SigKind.TypeToken => ResolveTypeDefOrRefToken(sigType.Token),
-        SigKind.GenericInst => new VmConstructedType {
-            Definition = ResolveTypeDefOrRefToken(sigType.Token),
-            TypeArguments = sigType.Args!.Select(ResolveToken).ToArray(),
-        },
-        SigKind.SzArray => ArrayWithBase(new VmArrayType { ElementType = ResolveToken(sigType.Inner!) }),
-        SigKind.Array => ArrayWithBase(new VmMultiDimArrayType { ElementType = ResolveToken(sigType.Inner!), Rank = sigType.Rank }),
-        SigKind.ByRef => new VmByRefType { ElementType = ResolveToken(sigType.Inner!) },
-        SigKind.Pointer => new VmByRefType { ElementType = ResolveToken(sigType.Inner!) }, // ポインタは ByRef と同様に扱う (未対応扱い)
+        SigKind.GenericInst => ResolveGenericInst(sigType, genericDepth),
+        SigKind.SzArray => ArrayWithBase(new VmArrayType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) }),
+        SigKind.Array => ArrayWithBase(new VmMultiDimArrayType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth), Rank = sigType.Rank }),
+        SigKind.ByRef => new VmByRefType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) },
+        SigKind.Pointer => new VmByRefType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) }, // ポインタは ByRef と同様に扱う (未対応扱い)
         SigKind.GenericVar => new VmGenericParameterType { IsMethodParameter = false, Number = sigType.VarNumber },
         SigKind.GenericMethodVar => new VmGenericParameterType { IsMethodParameter = true, Number = sigType.VarNumber },
         SigKind.Boolean => RequiredIntrinsic("System.Boolean"),
@@ -399,6 +403,17 @@ public sealed class TypeLoader {
         SigKind.Void => RequiredIntrinsic("System.Void"),
         _ => throw new NotSupportedException($"未対応の署名型です: {sigType}"),
     };
+
+    private VmType ResolveGenericInst(SigType sigType, int genericDepth) {
+        var max = _image.Limits?.MaxGenericNestingDepth ?? 64;
+        if (genericDepth + 1 > max)
+            throw new BadImageFormatException(
+                $"ジェネリックのネスト深さ {genericDepth + 1:N0} が上限 {max:N0} を超えています。");
+        return new VmConstructedType {
+            Definition = ResolveTypeDefOrRefToken(sigType.Token),
+            TypeArguments = sigType.Args!.Select(a => ResolveTokenWithDepth(a, genericDepth + 1)).ToArray(),
+        };
+    }
 
     /// <summary>配列型に System.Array (実型またはファサード) を基底として接続する。</summary>
     private VmType ArrayWithBase(VmType arrayType) {
@@ -425,11 +440,34 @@ public sealed class TypeLoader {
         };
     }
 
-    /// <summary>TypeSpec rid を解決する (ジェネリックパラメータは context の実引数で置換)。</summary>
+    /// <summary>TypeSpec rid を解決する (ジェネリックパラメータは context の実引数で置換)。
+    /// GenericInst のネスト深度は署名デコード時と解決時の双方で強制する。</summary>
     public VmType ResolveTypeSpec(int typeSpecRid, GenericContext? context = null) {
         var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
-        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray()).Type;
+        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray(),
+            _image.Limits?.MaxSignatureDepth ?? 64,
+            _image.Limits?.MaxGenericNestingDepth ?? 64).Type;
+        CheckGenericNestingDepth(sigType, 0);
         return GenericSubstitutor.Substitute(ResolveToken(sigType), context);
+    }
+
+    /// <summary>解決済み SigType の GenericInst ネストが上限を超えていないか検査する
+    /// (デコード時は blob 再帰、解決時は TypeSpec 連鎖の双方があり得るため)。</summary>
+    private void CheckGenericNestingDepth(SigType type, int depth) {
+        var max = _image.Limits?.MaxGenericNestingDepth ?? 64;
+        if (type.Kind == SigKind.GenericInst) {
+            depth++;
+            if (depth > max)
+                throw new BadImageFormatException(
+                    $"ジェネリックのネスト深さ {depth:N0} が上限 {max:N0} を超えています。");
+            foreach (var arg in type.Args!)
+                CheckGenericNestingDepth(arg, depth);
+        } else if (type.Inner is not null) {
+            CheckGenericNestingDepth(type.Inner, depth);
+        } else if (type.Args is not null) {
+            foreach (var arg in type.Args)
+                CheckGenericNestingDepth(arg, depth);
+        }
     }
 
     /// <summary>TypeRef rid を解決する。解決順:
@@ -483,22 +521,54 @@ public sealed class TypeLoader {
             ? $"同一ディレクトリ ({Path.GetDirectoryName(Path.GetFullPath(path))})"
             : "同一ディレクトリ (Stream ロードのため探索なし。依存は明示 resolver / LoadAssembly(path) でのロードが必要)";
 
-    /// <summary>AssemblyRef スコープの TypeRef を解決する。優先順: ①Context 配下の実 TypeDef
-    /// (ユニフィケーション: CoreLib 実装が正。参照アセンブリ経由の BCL 型をここで統合する) →
-    /// ②自分自身への参照は自己画像 → ③依存アセンブリの TypeDef。
-    /// 解決できない場合は null (呼び出し側で fail-closed する)。</summary>
+    /// <summary>AssemblyRef スコープの TypeRef を解決する。優先順:
+    /// ①自分自身への参照は自己画像 (identity 照合) → ②依存アセンブリを identity で確定し、
+    /// その loader 内の TypeDef を解決する (ExportedType forwarder 経由を含む) →
+    /// ③trusted assembly (IsTrustedCoreLib) に限定した FullName 統合 (BCL ref→実装の解決)。
+    /// global な FullName 探索を先に行わない (同名別 identity への誤結合防止)。</summary>
     private VmType? ResolveViaAssemblyRef(string fullName, int assemblyRefRid) {
-        // ① 型統合: 同名の実 TypeDef が Context 配下 (CoreLib 等) にあればそれが正
-        if (TryResolveUnifiedType(fullName) is { } unified)
-            return unified;
-        // ② 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)。
-        //    identity (Name + 公開鍵トークン) で照合する
         var refIdentity = _image.GetAssemblyRefIdentity(assemblyRefRid);
+        // ① 自分自身への参照は自己画像で解決する (単一画像ロード時の自己参照 TypeRef)。
+        //    identity (Name + 公開鍵トークン) で照合する
         if (refIdentity.Matches(_image.Identity))
-            return FindTypeByFullName(fullName);
-        // ③ 依存アセンブリ (identity 照合: 同名別 identity へ誤結合しない)
+            return FindTypeByFullName(fullName) ?? ResolveForwarderIn(_image, fullName);
+        // ② 依存アセンブリを identity で確定し、その loader 内で解決する
         var target = Context!.TryResolveAssembly(refIdentity, _image);
-        return target?.FindTypeByFullName(fullName);
+        if (target is not null) {
+            if (target.FindTypeByFullName(fullName) is { } direct)
+                return direct;
+            // TypeForwarder: global 探索ではなく対象画像の ExportedType で転送先を辿る
+            if (ResolveForwarderIn(target.Image, fullName) is { } forwarded)
+                return forwarded;
+        }
+        // ③ trusted assembly に限定した FullName 統合 (BCL の参照アセンブリ→実装の解決)。
+        // 例: ゲストが System.Runtime (ref) を参照し、実装が trusted System.Private.CoreLib に
+        // ある場合。非 trusted なゲスト画像同士では統合しない (fake 混入防止)。
+        return TryResolveTrustedUnifiedType(fullName);
+    }
+
+    /// <summary>画像の ExportedType テーブルに FullName の転送宣言があれば転送先を解決する
+    /// (TypeForwardedTo 相当。global FullName 探索はしない)。</summary>
+    private VmType? ResolveForwarderIn(AssemblyImage image, string fullName) {
+        var count = image.Tables.GetRowCount(TableKind.ExportedType);
+        for (var rid = 1; rid <= count; rid++) {
+            var typeName = image.GetString(image.Tables.GetRowIndex(TableKind.ExportedType, rid, 2));
+            var typeNs = image.GetString(image.Tables.GetRowIndex(TableKind.ExportedType, rid, 3));
+            var candidate = string.IsNullOrEmpty(typeNs) ? typeName : typeNs + "." + typeName;
+            if (!string.Equals(candidate, fullName, StringComparison.Ordinal))
+                continue;
+            var impl = image.Tables.DecodeCoded(TableKind.ExportedType, rid, 4, CodedIndexKind.Implementation);
+            if (impl.Table == TableKind.AssemblyRef) {
+                var fwdIdentity = image.GetAssemblyRefIdentity(impl.Rid);
+                var fwdTarget = Context?.TryResolveAssembly(fwdIdentity, image);
+                if (fwdTarget?.FindTypeByFullName(fullName) is { } fwdType)
+                    return fwdType;
+                // 転送先が未ロードでも trusted 統合で拾える場合はそちらへ (BCL forwarder の救済)
+                if (TryResolveTrustedUnifiedType(fullName) is { } trusted)
+                    return trusted;
+            }
+        }
+        return null;
     }
 
     /// <summary>TypeRef rid を解決した結果を返す (intrinsic ファサードまたは実 VmClassType)。
@@ -638,9 +708,10 @@ public sealed class TypeLoader {
         _image.GetString(_image.Tables.GetRowIndex(TableKind.MemberRef, memberRefRid, 1));
 
     /// <summary>SigKind 直引きの既知型 (プリミティブ/Object/String 等) を解決する。
-    /// CoreLib ロード時は実 TypeDef が優先 (型同一性の統合)、無ければ intrinsic ファサード。</summary>
+    /// trusted 実型 (CoreLib) があれば優先し、無ければ intrinsic ファサード。
+    /// 非 trusted なゲスト画像の同名型には統合しない (fake 混入防止)。</summary>
     private VmType RequiredIntrinsic(string fullName) =>
-        TryResolveUnifiedType(fullName) ?? _intrinsicTypes[fullName];
+        TryResolveTrustedUnifiedType(fullName) ?? _intrinsicTypes[fullName];
 
     // ---- 仮想/インターフェースディスパッチ表 (C3) ----
 
@@ -671,7 +742,9 @@ public sealed class TypeLoader {
 
     /// <summary>完全名を Context 配下の全画像 (ロード順 = CoreLib 優先) の実 TypeDef に解決する。
     /// 見つからなければ null (ファサード等のフォールバックは呼び出し側)。実体化に失敗する型
-    /// (未対応の署角度を含む画像固有の型) はその画像をスキップする。</summary>
+    /// (未対応の署角度を含む画像固有の型) はその画像をスキップする。
+    /// 注意: 非 trusted 画像を含む global 統合は新規コードでは使わないこと。
+    /// 新規は TryResolveTrustedUnifiedType (trusted 限定) を使う。</summary>
     public VmType? TryResolveUnifiedType(string fullName) {
         if (_unifiedTypes.TryGetValue(fullName, out var cached))
             return cached;
@@ -693,8 +766,35 @@ public sealed class TypeLoader {
         return null;
     }
 
+    /// <summary>完全名を trusted 画像 (IsTrustedCoreLib) の実 TypeDef に限定して解決する。
+    /// BCL の参照アセンブリ→実装の統合はここに限定する (非 trusted なゲスト画像同士は
+    /// 統合しない)。プリミティブ等の既知型や ResolveViaAssemblyRef の最終救済に使う。</summary>
+    public VmType? TryResolveTrustedUnifiedType(string fullName) {
+        if (_unifiedTypes.TryGetValue(fullName, out var cached) && cached is VmClassType cachedCls &&
+            cachedCls.Loader?.IsTrustedCoreLib == true)
+            return cached;
+        if (Context is not { } context)
+            return null;
+        foreach (var loader in context.Loaders) {
+            if (!loader.IsTrustedCoreLib)
+                continue;
+            VmClassType? real;
+            try {
+                real = loader.FindTypeByFullName(fullName);
+            } catch (Exception ex) when (ex is VmExecutionException or NotSupportedException
+                or BadImageFormatException or InvalidOperationException) {
+                continue;
+            }
+            if (real is not null) {
+                _unifiedTypes[fullName] = real;
+                return real;
+            }
+        }
+        return null;
+    }
+
     /// <summary>既知型 (プリミティブ/String/Object/Array 等) を実型またはファサードで解決する
-    /// (ホスト境界のボックス化や配列基底型の接続に使う)。</summary>
+    /// (ホスト境界のボックス化や配列基底型の接続に使う。trusted 実型に限定)。</summary>
     public VmType ResolveWellKnownType(string fullName) =>
-        TryResolveUnifiedType(fullName) ?? _intrinsicTypes[fullName];
+        TryResolveTrustedUnifiedType(fullName) ?? _intrinsicTypes[fullName];
 }

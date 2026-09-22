@@ -426,15 +426,16 @@ public sealed class ObjectModel {
         return fields;
     }
 
-    /// <summary>静的フィールドのストレージ。identity は canonical VmType 参照 + 構築文脈キー
-    /// (非構築型は storageKey = FullName、構築型は構築 FullName)。world を渡すと VM 単位の
-    /// 共有テーブル (UnifiedStaticStorage) に「VmType identity 参照」で置く — 同一 FullName の
-    /// 別アセンブリ型 (identity が別) ではストレージを共有しない (タスク 2 hardening)。
-    /// ローカル (world null) 経路は従来どおり画像内辞書 ( FullName) を使う。</summary>
+    /// <summary>静的フィールドのストレージ。world を渡すと VM 単位の共有テーブル
+    /// (UnifiedStaticStorage) に「定義 VmType 参照 + 型引数 VmType identity 列」で置く —
+    /// 同一 FullName の別アセンブリ型 (identity が別) や同一 FullName でも別 identity の
+    /// 型引数を持つ構築型ではストレージを共有しない。FullName 文字列はキーに使わない。
+    /// ローカル (world null) 経路は従来どおり画像内辞書 (FullName) を使う
+    /// (画像内では FullName が一意のため)。</summary>
     public StackSlot[] GetOrCreateStaticStorage(string storageKey, VmClassType type, TypeLoader loader,
-        GenericContext? context = null, UnifiedStaticStorage? world = null) {
+        GenericContext? context = null, UnifiedStaticStorage? world = null, VmType[]? typeArguments = null) {
         if (world is not null)
-            return world.GetOrCreate(type, storageKey, () => BuildStaticStorage(type, loader, context));
+            return world.GetOrCreate(type, typeArguments, () => BuildStaticStorage(type, loader, context));
         if (StaticStorage.TryGetValue(storageKey, out var existing))
             return existing;
         var storage = BuildStaticStorage(type, loader, context);

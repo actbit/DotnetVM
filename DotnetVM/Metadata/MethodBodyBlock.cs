@@ -31,8 +31,10 @@ public sealed class MethodBodyBlock {
 
     private MethodBodyBlock() { }
 
-    /// <summary>RVA 位置のメソッド本体を解析する。RVA = 0 の場合は null。</summary>
-    public static MethodBodyBlock? FromRva(PEImage pe, int rva) {
+    /// <summary>RVA 位置のメソッド本体を解析する。RVA = 0 の場合は null。
+    /// maxMethodBodyBytes を渡すと IL コードサイズを読み込み時に強制する
+    /// (巨大メソッド本体を確保する前に拒否する)。</summary>
+    public static MethodBodyBlock? FromRva(PEImage pe, int rva, int? maxMethodBodyBytes = null) {
         if (rva == 0)
             return null;
         var image = pe.GetSegmentToEnd(rva);
@@ -45,6 +47,9 @@ public sealed class MethodBodyBlock {
             case 0b10: {
                 // tiny ヘッダ: 上位 6 ビット = コードサイズ
                 var codeSize = firstByte >> 2;
+                if (maxMethodBodyBytes.HasValue && codeSize > maxMethodBodyBytes.Value)
+                    throw new BadImageFormatException(
+                        $"メソッド本体 (tiny) のサイズ {codeSize:N0} が上限 {maxMethodBodyBytes.Value:N0} を超えています。");
                 return new MethodBodyBlock {
                     MaxStack = 8,
                     LocalVarSigToken = 0,
@@ -62,6 +67,9 @@ public sealed class MethodBodyBlock {
                 var maxStack = (ushort)(span[2] | (span[3] << 8));
                 var codeSize = (int)(uint)(span[4] | (span[5] << 8) | (span[6] << 16) | (span[7] << 24));
                 var localVarSigToken = (int)(uint)(span[8] | (span[9] << 8) | (span[10] << 16) | (span[11] << 24));
+                if (maxMethodBodyBytes.HasValue && codeSize > maxMethodBodyBytes.Value)
+                    throw new BadImageFormatException(
+                        $"メソッド本体 (fat) のサイズ {codeSize:N0} が上限 {maxMethodBodyBytes.Value:N0} を超えています。");
                 if (headerSize > span.Length || codeSize > span.Length - headerSize)
                     throw new BadImageFormatException("fat メソッド本体が範囲外です。");
 

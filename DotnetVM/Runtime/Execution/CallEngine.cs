@@ -31,6 +31,8 @@ internal sealed class CallEngine(
         // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
         // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
         var target = ResolveCallTarget(token, caller.Context, throwOnMissingIntrinsic: false);
+        // 特権判定は callee ではなく実際の呼出元 loader 基準 (caller.Method.Loader)。
+        var callerDomain = CallerDomainOf(caller);
 
         // 引数はスタック上では逆順
         var args = new StackSlot[target.Arity];
@@ -92,7 +94,7 @@ internal sealed class CallEngine(
                 if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
                     // 優先順位 ①: override が実型 (CoreLib TypeDef) の場合、IL 実行の前に
                     // ランタイムバインド (署名キー) を試す (culture / 表現境界に依存する面の委譲)
-                    if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var overrideBound))
+                    if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var overrideBound, callerDomain))
                         return overrideBound;
                     var context = BuildCallContext(target, guestOverride, args[0]);
                     var guestRet = invoker.Invoke(guestOverride, args, context);
@@ -140,7 +142,7 @@ internal sealed class CallEngine(
 
         // 解決未了 (未登録 intrinsic): レシーバへの仮想ディスパッチを最終試行してから拒否
         if (target.Method is null)
-            return FailOrDispatchLate(target, isCallvirt, args);
+            return FailOrDispatchLate(target, isCallvirt, args, callerDomain);
 
         // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)。
         // constrained. 値型レシーバは ByRef/ValueType スロットで来るためディスパッチがそのまま適用される
@@ -154,7 +156,8 @@ internal sealed class CallEngine(
 
         // 優先順位 ①: ランタイムバインド (署名照合) を最優先で解決する。
         // 構築型の実引数 (ClassArgs) もキー化に使う (IComparable`1<uint> の !0 等)
-        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, target.ClassArgs))
+        // callerDomain は呼出元フレーム基準 (特権面の callee 基準判定はしない)。
+        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, callerDomain, target.ClassArgs))
             return bound;
 
         // callvirt で宣言どおりに着地した (実行時型で override が見つからなかった) 場合、
@@ -217,12 +220,12 @@ internal sealed class CallEngine(
 
     /// <summary>解決未了の呼出 (未登録 intrinsic) の最終処理。callvirt ならレシーバの実行時型に
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
-    /// 無ければ未登録 intrinsic として拒否する。</summary>
-    private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args) {
+    /// 無ければ未登録 intrinsic として拒否する。callerDomain は呼出元フレーム基準。</summary>
+    private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args, BindingDomain callerDomain) {
         if (isCallvirt && target.HasThis) {
             if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
                 // 優先順位 ①: IL 実行の前にランタイムバインドを試す (上の intrinsic 経路と同じ)
-                if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var lateBound))
+                if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var lateBound, callerDomain))
                     return lateBound;
                 var context = BuildCallContext(target, guestOverride, args[0]);
                 var ret = invoker.Invoke(guestOverride, args, context);
@@ -487,34 +490,62 @@ internal sealed class CallEngine(
 
     // ---- ランタイムバインド (優先順位 ① / legacy 救済 ③) ----
 
+    /// <summary>呼出元フレームの loader から caller domain を求める。
+    /// 特権 binding (TrustedCoreLib) の可否は callee (method.Loader) ではなく
+    /// 実際に呼んだ側 (caller.Method.Loader) で判定する。</summary>
+    private static BindingDomain CallerDomainOf(InterpreterFrame? caller) =>
+        caller?.Method?.Loader?.IsTrustedCoreLib == true
+            ? BindingDomain.TrustedCoreLib : BindingDomain.Guest;
+
+    /// <summary>呼出元 loader から caller domain を求める (ResolveCallTarget 経路用。
+    /// ResolveCallTarget を実行する CallEngine インスタンスは呼出元メソッド所属の
+    /// エンジンであり _loader が呼出元 loader そのもの)。</summary>
+    private BindingDomain CallerDomainOfLoader() =>
+        _loader.IsTrustedCoreLib ? BindingDomain.TrustedCoreLib : BindingDomain.Guest;
+
+    /// <summary>caller domain を考慮したバインド照合。trusted caller は特権面を優先し、
+    /// 汎用面にも到達できる。guest caller は汎用面のみ (特権面は遮断)。</summary>
+    private bool TryGetBindingWithCaller(BindingKey guestKey, BindingDomain callerDomain, out IntrinsicImpl impl) {
+        if (callerDomain == BindingDomain.TrustedCoreLib) {
+            var trustedKey = guestKey.WithDomain(BindingDomain.TrustedCoreLib);
+            if (_intrinsics.TryGetBinding(trustedKey, out impl, out _, callerDomain))
+                return true;
+        }
+        return _intrinsics.TryGetBinding(guestKey, out impl, out _, callerDomain);
+    }
+
     /// <summary>呼出解決地点 (TypeRef / 構築ファサード親) でのランタイムバインド照合。
     /// 型名 + 宣言パラメータ型名から署名キーを組み、完全一致 → 全引数一致面の順で解決する。
-    /// 型名が解決できていないパラメータ (空文字列) が混ざる場合は照合しない。</summary>
-    private bool TryGetResolvedBinding(string typeName, string name, bool hasThis, string[] paramTypeNames, out IntrinsicImpl impl) {
+    /// 型名が解決できていないパラメータ (空文字列) が混ざる場合は照合しない。
+    /// callerDomain は呼出元 loader から明示的に渡す (callee 基準にしない)。</summary>
+    private bool TryGetResolvedBinding(string typeName, string name, bool hasThis, string[] paramTypeNames,
+        BindingDomain callerDomain, out IntrinsicImpl impl) {
         impl = null!;
         if (paramTypeNames.Any(string.IsNullOrEmpty))
             return false;
         var key = hasThis ? BindingKey.Instance(typeName, name, paramTypeNames)
                           : BindingKey.Static(typeName, name, paramTypeNames);
-        return _intrinsics.TryGetBinding(key, out impl, out _);
+        return TryGetBindingWithCaller(key, callerDomain, out impl);
     }
 
     /// <summary>解決済みメソッドをランタイムバインド (署名キー) で呼び出す (優先順位 ①)。
     /// パラメータ型名は「そのメソッドを定義したローダ」で解決する (TypeToken は自画像の
     /// TypeDef rid を指すため)。ジェネリック変数は MethodSpec の実引数で置換し、実引数が無い
-    /// 場合は開いた名 (!n / !!n) のままキー化する (登録側の開いたキーと一致)。</summary>
+    /// 場合は開いた名 (!n / !!n) のままキー化する (登録側の開いたキーと一致)。
+    /// callerDomain は呼出元フレームの loader から明示的に渡す (callee 基準にしない)。</summary>
     private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result,
-        VmType[]? classArgs = null) {
+        BindingDomain callerDomain, VmType[]? classArgs = null) {
         result = null;
         var names = ParamTypeNamesOf(method, methodArgs, classArgs);
         if (names is null || names.Any(string.IsNullOrEmpty)) {
             // ジェネリック未解決 (!!) 等で正確キーが構築できない場合でも、全引数一致面
             // (AnyParams バインド) は引数型名なしで受けられる (Interlocked.CompareExchange<T>
             // 等、JIT intrinsic ダミー IL を持つ面を ② IL 実行に落とさないための救済)
+            // callerDomain を明示する (trusted 特権 AnyParams があれば trusted caller のみ)。
             var anyKey = method.Signature.HasThis
                 ? BindingKey.InstanceAnyParams(method.DeclaringType.FullName, method.Name)
                 : BindingKey.StaticAnyParams(method.DeclaringType.FullName, method.Name);
-            if (!_intrinsics.TryGetBinding(anyKey, out var anyImpl, out _))
+            if (!TryGetBindingWithCaller(anyKey, callerDomain, out var anyImpl))
                 return false;
             NormalizeByRefReceiver(method, args);
             _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
@@ -529,19 +560,92 @@ internal sealed class CallEngine(
         var key = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(declaringName, method.Name, returnName, names)
             : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);
-        // 呼出 domain の実判定 (タスク 2 hardening): 呼出元 (declaring method を宣言した
-        // loader) が trusted CoreLib 画像なら TrustedCoreLib domain で照合する。
-        // ゲスト画像からの呼出は TrustedCoreLib domain の特権 binding に到達しない
-        var callerDomain = method.Loader?.IsTrustedCoreLib == true
-            ? BindingDomain.TrustedCoreLib : BindingDomain.Guest;
-        if (!_intrinsics.TryGetBinding(key, out var impl, out _, callerDomain) &&
-            (returnName.Length == 0 || !_intrinsics.TryGetBinding(key.WithAnyReturn(), out impl, out _, callerDomain)))
+        // callerDomain は呼出元フレーム基準 (引数で明示)。trusted caller は特権面を優先し、
+        // 汎用面にも到達できる。guest caller は汎用面のみ。
+        if (!TryGetBindingWithCaller(key, callerDomain, out var impl) &&
+            (returnName.Length == 0 || !TryGetBindingWithCaller(key.WithAnyReturn(), callerDomain, out impl)) &&
+            !TryInvokeOpenGenericBinding(method, methodArgs, names, returnName, callerDomain, args, out impl)) {
+            // 特権面が存在するのに guest から呼ばれた場合は fail-closed を明示する
+            // (InternalCall 未登録との区別 = 監査性のため OperationNotAllowed)。
+            if (callerDomain == BindingDomain.Guest && HasTrustedBinding(method, methodArgs, names, returnName, classArgs))
+                throw new OperationNotAllowedException(
+                    $"面 {declaringName}::{method.Name} は trusted CoreLib 専用の特権面であり、ゲストからの直接呼出は許可されていません。");
             return false;
+        }
         NormalizeByRefReceiver(method, args);
         // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の
         // ジェネリック面でも T を判別できるようにする)
         _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
         result = InvokeDelegated(impl, names, args);
+        return true;
+    }
+
+    /// <summary>guest から呼ばれたが trusted 特権面が存在するかを調べる
+    /// (fail-closed の監査性: 未登録 InternalCall と特権遮断を区別する)。</summary>
+    private bool HasTrustedBinding(VmMethod method, VmType[]? methodArgs, string[] concreteNames,
+        string concreteReturn, VmType[]? classArgs) {
+        var trustedDomain = BindingDomain.TrustedCoreLib;
+        var declaringName = method.DeclaringType.FullName;
+        var key = method.Signature.HasThis
+            ? BindingKey.InstanceWithReturn(declaringName, method.Name, concreteReturn, concreteNames)
+            : BindingKey.StaticWithReturn(declaringName, method.Name, concreteReturn, concreteNames);
+        if (_intrinsics.TryGetBinding(key.WithDomain(trustedDomain), out _, out _, trustedDomain))
+            return true;
+        if (concreteReturn.Length != 0 &&
+            _intrinsics.TryGetBinding(key.WithAnyReturn().WithDomain(trustedDomain), out _, out _, trustedDomain))
+            return true;
+        // 開いたジェネリック面の特権有無も確認する
+        var loader = method.Loader;
+        if (loader is null)
+            return false;
+        var openNames = new string[concreteNames.Length];
+        for (var i = 0; i < openNames.Length; i++) {
+            var open = DescribeBindingType(method.Signature.ParamTypes[i], null, null, loader);
+            if (open is null)
+                return false;
+            openNames[i] = open;
+        }
+        var openReturn = DescribeBindingType(method.Signature.ReturnType, null, null, loader) ?? "";
+        var openKey = method.Signature.HasThis
+            ? BindingKey.InstanceWithReturn(declaringName, method.Name, openReturn, openNames)
+            : BindingKey.StaticWithReturn(declaringName, method.Name, openReturn, openNames);
+        if (_intrinsics.TryGetBinding(openKey.WithDomain(trustedDomain), out _, out _, trustedDomain))
+            return true;
+        return openReturn.Length != 0 &&
+            _intrinsics.TryGetBinding(openKey.WithAnyReturn().WithDomain(trustedDomain), out _, out _, trustedDomain);
+    }
+
+    /// <summary>開いたジェネリックキー (!!0 / !0) へのフォールバック照合 (優先順位 ① の救済)。
+    /// ジェネリック面 (Unsafe.Add&lt;T&gt; 等) は開いたキーで 1 件登録し、呼出側の具体名
+    /// (例: System.Char&amp;) とは一致しないため、実引数なしの開いた名で再照合する。
+    /// 実行時の判別は具体名 (ParameterTypeNames) とメソッド型実引数で行う。
+    /// AnyParams ワイルドカードを使わず既知のオーバーロード形状のみに限定するための機構。</summary>
+    private bool TryInvokeOpenGenericBinding(VmMethod method, VmType[]? methodArgs, string[] concreteNames,
+        string concreteReturn, BindingDomain callerDomain, StackSlot[] args, out IntrinsicImpl impl) {
+        impl = null!;
+        var loader = method.Loader;
+        if (loader is null || method.Signature.ParamTypes.Length != concreteNames.Length)
+            return false;
+        // 開いた名を構築し、具体名と同一 (非ジェネリック面) なら再照合は無駄
+        var openNames = new string[concreteNames.Length];
+        var differs = false;
+        for (var i = 0; i < openNames.Length; i++) {
+            var open = DescribeBindingType(method.Signature.ParamTypes[i], null, null, loader);
+            if (open is null)
+                return false;
+            openNames[i] = open;
+            if (!string.Equals(open, concreteNames[i], StringComparison.Ordinal))
+                differs = true;
+        }
+        if (!differs)
+            return false;
+        var openReturn = DescribeBindingType(method.Signature.ReturnType, null, null, loader) ?? "";
+        var openKey = method.Signature.HasThis
+            ? BindingKey.InstanceWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames)
+            : BindingKey.StaticWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames);
+        if (!TryGetBindingWithCaller(openKey, callerDomain, out impl) &&
+            (openReturn.Length == 0 || !TryGetBindingWithCaller(openKey.WithAnyReturn(), callerDomain, out impl)))
+            return false;
         return true;
     }
 
@@ -599,6 +703,7 @@ internal sealed class CallEngine(
     /// 置換する (例: IComparable`1&lt;uint&gt;::CompareTo の !0 → System.UInt32)。
     /// トークンは「そのメソッドを定義したローダ」で解決する (署名の解決は定義ローダの原則)。</summary>
     private static string? DescribeBindingType(SigType type, VmType[]? methodArgs, VmType[]? classArgs, TypeLoader loader) => type.Kind switch {
+        SigKind.Void => "System.Void",
         SigKind.Boolean => "System.Boolean",
         SigKind.Char => "System.Char",
         SigKind.I1 => "System.SByte",
@@ -649,7 +754,9 @@ internal sealed class CallEngine(
         if (table != TableKind.StandAloneSig)
             throw new BadImageFormatException($"calli のオペランド 0x{token:X8} は StandAloneSig ではありません。");
         return SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetBlob(_loader.Image.Tables.GetRowIndex(TableKind.StandAloneSig, rid, 0)).ToArray());
+            _loader.Image.GetBlob(_loader.Image.Tables.GetRowIndex(TableKind.StandAloneSig, rid, 0)).ToArray(),
+            _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+            _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
     }
 
     /// <summary>呼出トークンを解決する (Arity = 引数個数、インスタンスは this 込み)。
@@ -674,7 +781,9 @@ internal sealed class CallEngine(
             case TableKind.MemberRef: {
                 // MemberRef 署名から hasThis/引数個数を得る
                 var signature = SignatureDecoder.DecodeMethodSignature(
-                    _loader.Image.GetMemberRefSignature(rid).ToArray());
+                    _loader.Image.GetMemberRefSignature(rid).ToArray(),
+                    _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+                    _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
                 var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
                 var name = _loader.GetMemberRefName(rid);
 
@@ -683,8 +792,9 @@ internal sealed class CallEngine(
                 var paramNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
                 if (parent.Table == TableKind.TypeRef) {
                     var typeName = _loader.GetMemberRefParentTypeName(rid)!;
-                    // 優先順位 ①: ランタイムバインド (署名照合)
-                    if (TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, out var bound)) {
+                    // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
+                    var callerDomain = CallerDomainOfLoader();
+                    if (TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound)) {
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = bound,
@@ -816,8 +926,8 @@ internal sealed class CallEngine(
         // 構築ファサード型 (BCL 汎用インターフェース等) → ランタイムバインド / intrinsic 面
         if (constructed.Definition is VmIntrinsicType facade) {
             var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
-            // 優先順位 ①: ランタイムバインド (署名照合)
-            if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, out var boundImpl)) {
+            // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
+            if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, CallerDomainOfLoader(), out var boundImpl)) {
                 return new CallTarget {
                     Arity = arity,
                     Intrinsic = boundImpl,
@@ -877,7 +987,9 @@ internal sealed class CallEngine(
             TableKind.MethodSpec, methodSpecRid, 0, CodedIndexKind.MethodDefOrRef);
         var instantiationBlobIndex = _loader.Image.Tables.GetRowIndex(TableKind.MethodSpec, methodSpecRid, 1);
         var methodArgs = SignatureDecoder.DecodeMethodSpecInstantiation(
-            _loader.Image.GetBlob(instantiationBlobIndex).ToArray())
+            _loader.Image.GetBlob(instantiationBlobIndex).ToArray(),
+            _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+            _loader.Image.Limits?.MaxGenericNestingDepth ?? 64)
             .Select(t => _loader.ResolveToken(t, context))
             .ToArray();
 
@@ -899,7 +1011,9 @@ internal sealed class CallEngine(
         if (underlying.Table == TableKind.MemberRef) {
             var memberRefRid = underlying.Rid;
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(memberRefRid).ToArray());
+                _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+                _loader.Image.Limits?.MaxSignatureDepth ?? 64,
+                _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var name = _loader.GetMemberRefName(memberRefRid);
             var parent = _loader.Image.Tables.DecodeCoded(
                 TableKind.MemberRef, memberRefRid, 0, CodedIndexKind.MemberRefParent);
@@ -913,12 +1027,14 @@ internal sealed class CallEngine(
                 var specArity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
                 // 優先順位 ①: ランタイムバインド (署名照合)。実引数を置換したキー → 開いたキー (!!n / !n)
                 // の順に照合する (登録側は開いたキーで 1 件、実引数は実行時の宣言型名で判別)
+                // callerDomain は呼出元 loader 基準で明示する。
                 var concreteParams = signature.ParamTypes
                     .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray();
                 var openParams = signature.ParamTypes
                     .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
-                if (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, out var boundImpl) ||
-                    TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, out boundImpl)) {
+                var methodSpecCaller = CallerDomainOfLoader();
+                if (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, methodSpecCaller, out var boundImpl) ||
+                    TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl)) {
                     return new CallTarget {
                         Arity = specArity,
                         Intrinsic = boundImpl,

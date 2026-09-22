@@ -407,7 +407,7 @@ internal static class CoreLibSurfaceAudit {
 
         // ---- DefaultIntrinsics: Interlocked (計算 + バリア) ----
         var interlockedJ = JitIntrinsic + " (単一スレッド逐次実行で計算面は CLR 同一、バリアは no-op)";
-        // ① バインド (CoreLibBindings.RegisterInterlockedBindings) は統合面 (AnyParams)。
+        // ① バインド (CoreLibBindings.RegisterInterlockedBindings) は .NET 10 既知署名の列挙面。
         // 本家 IL 本体が JIT intrinsic ダミー (typeof(T); throw) のため ② IL 実行に落ちないよう
         // ① で受ける必要がある (探査テストで発掘: CultureInfo::get_InvariantCulture 経路)
         Add("System.Threading.Interlocked", "CompareExchange", CoreLibSurfaceKind.RuntimeInternal, interlockedJ, hasThis: false, paramCount: null);

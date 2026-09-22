@@ -23,6 +23,10 @@ public sealed class VmHeap {
     private readonly List<Func<IEnumerable<VmObject?>>> _rootObjectSources = [];
     private readonly List<Func<IEnumerable<StackSlot[]>>> _rootSlotSources = [];
     private long _totalAllocated;
+    /// <summary>ホスト側の一時アロケーション (ヒープ管理外) の累計 (HostTemp quota)。</summary>
+    private long _hostTempAllocated;
+    /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget)。</summary>
+    private long _hostWorkSpent;
     private long _liveBytes;
     private long _allocatedSinceGc;
     private int _collectionCount;
@@ -135,11 +139,29 @@ public sealed class VmHeap {
     /// ホスト側の一時バッファ (DefaultInterpolatedStringHandler 内部の StringBuilder 等、
     /// VM heap 外のホストメモリ) を概算計上する。GC 管理外で解放されないため
     /// 累計上限への計上のみ (保守的 = 安全側)。ハンドラ等の append 系 intrinsic で呼ぶ。
+    /// HostTempAllocationByteLimit (タスク 2: ホスト側一時メモリも quota 対象) を計上する。
     /// </summary>
     public void ChargeHostBuffer(int charCount) {
         var size = 24 + 2L * charCount;
+        // HostTemp quota (ゲスト操作の結果で VM ヒープ外に生じるホスト確保分)
+        if (_hostTempAllocated + size > _memory.HostTempAllocationByteLimit)
+            throw new MemoryQuotaExceededException(
+                $"ホスト側一時アロケーション上限 {_memory.HostTempAllocationByteLimit:N0} バイトを超過しました (buffers " +
+                $"(+{size:N0}) 内 {charCount:N0} 文字)。\n残 {_hostTempAllocated:N0} / 上限 {_memory.HostTempAllocationByteLimit:N0}。");
+        _hostTempAllocated += size;
         CheckQuota(size);
         _totalAllocated += size;
+    }
+
+    /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget タスク 2)。bc/intrinsic 毎に
+    /// 重い host 処理 (InvariantCulture 比較 / formatting / encoding 等) の発生に対して
+    /// 見積ったコストを積み上げる。budget中超過はメモリ系例外で VM に伝播 (ゲスト catch 外)。</summary>
+    public void ChargeHostWork(long costUnits) {
+        if (_hostWorkSpent + costUnits > _memory.HostWorkBudget)
+            throw new MemoryQuotaExceededException(
+                $"host 側作業予算 (HostWorkBudget) {_memory.HostWorkBudget:N0} を超えました。" +
+                $"+{costUnits:N0} ユニットで累計 {_hostWorkSpent + costUnits:N0}。");
+        _hostWorkSpent += costUnits;
     }
 
     /// <summary>オブジェクトをヒープに登録し、サイズを計上する。上限超過は拒否。</summary>

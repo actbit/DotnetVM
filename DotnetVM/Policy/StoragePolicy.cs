@@ -24,7 +24,11 @@ public sealed class StoragePolicy {
 /// </summary>
 public interface IStorageBridge {
     bool Exists(string path);
-    byte[] Read(string path);
+
+    /// <summary>ファイルを読む (maxBytes が示すバイト数までで止める、タスク 2 hardening)。
+    /// host 側で巨大ファイルを丸ご読み込んで VM で拒否する増幅を防ぐため、VM は取得前に
+    /// 許容する最大バイト数を伝える。ブリッジ側はこの上限までチャンクで縮めた応答を返す。</summary>
+    byte[] Read(string path, long maxBytes);
     void Write(string path, ReadOnlyMemory<byte> contents);
     void Delete(string path);
 }
@@ -56,7 +60,8 @@ public sealed class StorageGateway {
 
     public byte[] Read(string path) {
         RequireBridge();
-        var contents = _bridge!.Read(RequirePath(path));
+        // maxBytes を事前に伝える (host 側の巨大バッファ増幅の回避)
+        var contents = _bridge!.Read(RequirePath(path), _policy.MaxBytesPerOperation);
         Charge(contents.LongLength, "読み取り");
         return contents;
     }

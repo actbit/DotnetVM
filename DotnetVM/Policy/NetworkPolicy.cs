@@ -24,6 +24,11 @@ public sealed class NetworkRequest {
 
     /// <summary>ボディ有無の簡易フラグ (取得系なら false)。</summary>
     public bool HasBody => Body.Length > 0;
+
+    /// <summary>応答側が許される最大バイト数 (VM が事前に上限を伝える、タスク 2 hardening)。
+    /// ブリッジはこの上限HOST側で丸めた応答バッファを作るべきであり、
+    /// host scopeの巨大応答を先にホスト RAM に作って VM で拒否、という増幅を防ぐ。</summary>
+    public long MaxResponseBytes { get; init; } = long.MaxValue;
 }
 
 /// <summary>
@@ -33,7 +38,9 @@ public sealed class NetworkRequest {
 /// 合成されないため、ゲストには通信面が存在しない (fail-closed)。
 /// </summary>
 public interface INetworkBridge {
-    /// <summary>要求を送信し、応答ボディを返す。拒否する場合はホスト実装が例外を投げる。</summary>
+    /// <summary>要求を送信し、応答ボディを返す。拒否する場合はホスト実装が例外を投げる。
+    /// 応答は MaxResponseBytes を超えないようブリッジ側で丸める (上限超過分は捨てるか
+    /// チャンク分割 — ブリッジが保有する上限判断に従う)。</summary>
     byte[] Request(NetworkRequest request);
 }
 
@@ -75,7 +82,12 @@ public sealed class NetworkGateway {
             throw new NetworkQuotaExceededException(
                 $"送信バイト数 {requestBytes:N0} が 1 要求上限 {_policy.MaxBytesPerRequest:N0} を超過しました。");
 
-        var response = _bridge.Request(new NetworkRequest { Url = uri, Body = body });
+        // 応答上限を事前にブリッジへ伝える (host 側で巨大バッファを作ってから拒否する形を避ける)
+        var response = _bridge.Request(new NetworkRequest {
+            Url = uri,
+            Body = body,
+            MaxResponseBytes = _policy.MaxBytesPerRequest,
+        });
         var transferred = (long)requestBytes + response.LongLength;
         if (transferred > _policy.MaxBytesPerRequest)
             throw new NetworkQuotaExceededException(

@@ -225,10 +225,16 @@ internal sealed class VmCoreLibSurfaces {
 
     /// <summary>Interpreter.Invoke 用: 実在 CoreLib 由来のメソッドが置換面に載っていれば
     /// DotnetVM.CoreLib 側の実装へ差し替える。面キーはメソッドごとにキャッシュ
-    /// (Invoke は頻出するため署名再解決を繰り返さない)。</summary>
+    /// (Invoke は頻出するため署名再解決を繰り返さない)。
+    /// 置換元は trusted CoreLib 画像に限定する (タスク 2 hardening):
+    /// 「DotnetVM.CoreLib 自身でなければ置換候補」から「System.Private.CoreLib 実装画像
+    /// (identity 照合) 由来のみ」へ。ゲスト画像やその他の依存画像が同名型 / 同名メソッドを
+    /// 宣言していても FaceKey に一致しても置換されない (特権置換面の呼出元限定)。</summary>
     public VmMethod? Substitute(VmMethod method) {
         if (ReferenceEquals(method.Loader, _coreLibLoader))
             return null; // 置換先 (DotnetVM.CoreLib) 自身の IL はこれ以上置換しない
+        if (!IsTrustedCoreLibLoader(method.Loader))
+            return null; // 実在 System.Private.CoreLib 由来のみを置換対象にする (identity 照合)
         if (!_faceKeyByMethod.TryGetValue(method, out var key)) {
             var paramNames = method.Loader?.TryResolveSlotParams(method.Signature.ParamTypes);
             key = paramNames is null
@@ -238,6 +244,26 @@ internal sealed class VmCoreLibSurfaces {
             _faceKeyByMethod[method] = key;
         }
         return key is not null && _substituteByFace.TryGetValue(key, out var substitute) ? substitute : null;
+    }
+
+    /// <summary>trusted CoreLib (System.Private.CoreLib 実装画像) 由来かの identity 照合。
+    /// Create 時に trusted loader を確定しておく (構築 VM にロード済み画像から
+    /// SourcePath / アセンブリ名で System.Private.CoreLib を探す。类型 identity は
+    /// 「画像が CoreLib を宣言する」ことを許可付きの判定のみ信頼する)。</summary>
+    private readonly HashSet<TypeLoader> _trustedCoreLibLoaders = [];
+
+    private bool IsTrustedCoreLibLoader(TypeLoader? loader) =>
+        loader is not null && _trustedCoreLibLoaders.Contains(loader);
+
+    /// <summary>trusted CoreLib 画像 (System.Private.CoreLib.dll) を identity で登録する。
+    /// VM 構築時 (LoadHostCoreLib) のみ呼ぶ。ゲスト側からは呼べない (internal)。</summary>
+    internal void MarkTrustedCoreLib(TypeLoader loader) {
+        var isCoreLib = loader.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll",
+            StringComparison.OrdinalIgnoreCase) == true;
+        if (!isCoreLib)
+            throw new InvalidOperationException(
+                $"trusted CoreLib として登録しようとした画像が System.Private.CoreLib ではありません ({loader.Image.Name})。");
+        _trustedCoreLibLoaders.Add(loader);
     }
 
     private static string FaceKey(string typeFullName, string methodName, string[] paramTypeNames) =>

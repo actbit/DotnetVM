@@ -9,10 +9,31 @@ public enum BindingOrigin {
     Managed,
     /// <summary>CoreLib の InternalCall 面に対する VM 代替実装。</summary>
     InternalCall,
-    /// <summary>P/Invoke 面に対する代替実装 (ネイティブ実行の代わり。未登録は fail-closed 拒否)。</summary>
+    /// <summary>P/Invoke 面に対する代替実装 (ネイティブ実行の代替。未登録は fail-closed 拒否)。</summary>
     PInvokeReplacement,
     /// <summary>仮想デバイス面 (System.Console → VmConsole 等)。</summary>
     Device,
+}
+
+/// <summary>
+/// ランタイムバインドの呼出面の domain (タスク 2 hardening: 特権面の呼出元を限定する)。
+/// バインドを TrustedCoreLib domain に限定したものは、CoreLib (identity で確認) からの
+/// 呼出でだけ解決される。Device domain はデバイス面の intrinsic (params 呼出含む) が属し、
+/// HostContract domain はホスト API 契約として受けられる面、Guest domain はゲストが
+/// 直接呼べる面 (既定値) に分ける。
+/// </summary>
+public enum BindingDomain {
+    /// <summary>ゲスト (任意アセンブリ) から呼べる面 (既定。既存のすべての登録面はこれ)。</summary>
+    Guest,
+    /// <summary>trusted CoreLib (identity が確認された System.Private.CoreBase 画像) の
+    /// IL 内からしか呼べない特権面。External コール面 (BeginInit / MemoryMarshal 等) は
+    /// ワイルドカード signature を持つがゲストからの直接呼出は拒否する (trusted CoreLib 限定)。</summary>
+    TrustedCoreLib,
+    /// <summary>仮想デバイス / ゲートウェイ面 (コンソール出力等)。</summary>
+    Device,
+    /// <summary>ホスト API 契約面 ((Command / Storage 等のゲートウェイは Guest から呼べるが、
+    /// 特定引数形状が許可される面)。</summary>
+    HostContract,
 }
 
 /// <summary>
@@ -32,12 +53,13 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
     /// <summary>戻り型を問わない (ワイルドカード) 戻り型名。</summary>
     public const string AnyReturn = "";
 
-    private BindingKey(string typeFullName, string methodName, string paramSignature, string returnTypeName, bool hasThis) {
+    private BindingKey(string typeFullName, string methodName, string paramSignature, string returnTypeName, bool hasThis, BindingDomain domain) {
         TypeFullName = typeFullName;
         MethodName = methodName;
         ParamSignature = paramSignature;
         ReturnTypeName = returnTypeName;
         HasThis = hasThis;
+        Domain = domain;
     }
 
     public string TypeFullName { get; }
@@ -52,45 +74,63 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
 
     public bool HasThis { get; }
 
+    /// <summary>バインドの所属 domain (既定 = Guest)。TrustedCoreLib に属する面は
+    /// identity で確認された CoreLib 画像からの呼出でのみ照合される (特権 binding)。</summary>
+    public BindingDomain Domain { get; }
+
     /// <summary>全引数一致面のキーか。</summary>
     public bool IsAnyParams => ParamSignature == AnyParamsSignature;
 
     public static BindingKey Static(string typeFullName, string methodName, params string[] paramTypeNames) =>
-        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, false);
+        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, false, BindingDomain.Guest);
 
     public static BindingKey Instance(string typeFullName, string methodName, params string[] paramTypeNames) =>
-        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, true);
+        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, true, BindingDomain.Guest);
 
     /// <summary>戻り型を含む静的キー (op_Implicit / op_Explicit 等の戻り型で区別される面用)。
     /// 既存の params 形資生成と引数個数が衝突しないよう専用名で提供する。</summary>
     public static BindingKey StaticWithReturn(string typeFullName, string methodName, string returnTypeName, string[] paramTypeNames) =>
-        new(typeFullName, methodName, Normalize(paramTypeNames), returnTypeName, false);
+        new(typeFullName, methodName, Normalize(paramTypeNames), returnTypeName, false, BindingDomain.Guest);
 
     /// <summary>戻り型を含むインスタンスキー。</summary>
     public static BindingKey InstanceWithReturn(string typeFullName, string methodName, string returnTypeName, string[] paramTypeNames) =>
-        new(typeFullName, methodName, Normalize(paramTypeNames), returnTypeName, true);
+        new(typeFullName, methodName, Normalize(paramTypeNames), returnTypeName, true, BindingDomain.Guest);
 
     /// <summary>全引数一致面 (デバイス面の統合オーバーロード等) の静的キー。</summary>
     public static BindingKey StaticAnyParams(string typeFullName, string methodName) =>
-        new(typeFullName, methodName, AnyParamsSignature, AnyReturn, false);
+        new(typeFullName, methodName, AnyParamsSignature, AnyReturn, false, BindingDomain.Guest);
 
     /// <summary>全引数一致面のインスタンスキー。</summary>
     public static BindingKey InstanceAnyParams(string typeFullName, string methodName) =>
-        new(typeFullName, methodName, AnyParamsSignature, AnyReturn, true);
+        new(typeFullName, methodName, AnyParamsSignature, AnyReturn, true, BindingDomain.Guest);
+
+    /// <summary>trusted CoreLib 限定特権面の静的キー (domain = TrustedCoreLib)。
+    /// identity で確認された System.Private.CoreLib 画像の IL からの呼出のみ照合される。</summary>
+    public static BindingKey TrustedStatic(string typeFullName, string methodName, params string[] paramTypeNames) =>
+        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, false, BindingDomain.TrustedCoreLib);
+
+    /// <summary>trusted CoreLib 限定のインスタンスキー。</summary>
+    public static BindingKey TrustedInstance(string typeFullName, string methodName, params string[] paramTypeNames) =>
+        new(typeFullName, methodName, Normalize(paramTypeNames), AnyReturn, true, BindingDomain.TrustedCoreLib);
+
+    /// <summary>trusted CoreLib 限定の全引数一致静的キー (メソッド演算面等)。</summary>
+    public static BindingKey TrustedStaticAnyParams(string typeFullName, string methodName) =>
+        new(typeFullName, methodName, AnyParamsSignature, AnyReturn, false, BindingDomain.TrustedCoreLib);
 
     /// <summary>同一面の全引数一致キー (ワイルドカード照合用)。</summary>
     public BindingKey WithAnyParams() =>
-        new(TypeFullName, MethodName, AnyParamsSignature, ReturnTypeName, HasThis);
+        new(TypeFullName, MethodName, AnyParamsSignature, ReturnTypeName, HasThis, Domain);
 
     /// <summary>戻り型をワイルドカードに緩めたキー (実引数キーで不成立時の再照合用)。</summary>
     public BindingKey WithAnyReturn() =>
-        new(TypeFullName, MethodName, ParamSignature, AnyReturn, HasThis);
+        new(TypeFullName, MethodName, ParamSignature, AnyReturn, HasThis, Domain);
 
     private static string Normalize(string[] paramTypeNames) =>
         paramTypeNames is { Length: > 0 } ? string.Join(",", paramTypeNames) : "";
 
     public bool Equals(BindingKey other) =>
         HasThis == other.HasThis &&
+        Domain == other.Domain &&
         string.Equals(TypeFullName, other.TypeFullName, StringComparison.Ordinal) &&
         string.Equals(MethodName, other.MethodName, StringComparison.Ordinal) &&
         string.Equals(ParamSignature, other.ParamSignature, StringComparison.Ordinal) &&
@@ -99,12 +139,13 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
     public override bool Equals(object? obj) => obj is BindingKey other && Equals(other);
 
     public override int GetHashCode() =>
-        System.HashCode.Combine(TypeFullName, MethodName, ParamSignature, ReturnTypeName, HasThis);
+        System.HashCode.Combine(TypeFullName, MethodName, ParamSignature, ReturnTypeName, HasThis, Domain);
 
     public override string ToString() {
         var ret = ReturnTypeName.Length == 0 ? "" : ReturnTypeName + " ";
+        var domain = Domain == BindingDomain.Guest ? "" : " [" + Domain + "]";
         return (HasThis ? "instance " : "static ") + ret + TypeFullName + "::" + MethodName + "(" +
-        (IsAnyParams ? "*" : ParamSignature) + ")";
+        (IsAnyParams ? "*" : ParamSignature) + ")" + domain;
     }
 
     public static bool operator ==(BindingKey left, BindingKey right) => left.Equals(right);

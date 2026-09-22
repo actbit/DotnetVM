@@ -56,7 +56,14 @@ public sealed class VirtualMachine : IDisposable {
             throw new InvalidOperationException(
                 $"VM CoreLib ({vmCoreLibPath}) が見つかりません。DotnetVM.CoreLib.dll を DotnetVM.dll と同じディレクトリに配置してください。");
         LoadAssembly(vmCoreLibPath);
-        _coreLibSurfaces = VmCoreLibSurfaces.Create(_loaders[^1]);
+        // 置換対象 (Substitute の呼出元) を trusted System.Private.CoreLib 画像に限定する
+        // (タスク 2 hardening: ゲスト画像や依存画像が同名面を宣言しても置換されない)
+        var surfaces = VmCoreLibSurfaces.Create(_loaders[^1]);
+        foreach (var loader in _loaders) {
+            if (loader.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true)
+                surfaces.MarkTrustedCoreLib(loader);
+        }
+        _coreLibSurfaces = surfaces;
         // VmString の型同一性を System.String 実型 (CoreLib TypeDef) に接続する
         // (castclass IConvertible / インターフェースディスパッチ / String IL 面)。
         // VM 単位の状態として Interpreter へ渡す (静的に持つと並列実行する VM 間で
@@ -121,11 +128,20 @@ public sealed class VirtualMachine : IDisposable {
         return LoadAssembly(stream, Path.GetFullPath(path));
     }
 
-    /// <summary>DLL アセンブリをストリームからロードする。</summary>
+    /// <summary>DLL アセンブリをストリームからロードする。
+    /// Stream ロードは依存アセンブリの同一ディレクトリ探索を行わない (SourcePath を設定
+    /// しない = 探索ヒントなし): ゲストが提供する stream の依存関係は、ホストが明示的に
+    /// LoadAssembly(path) / LoadDependencyAssembly で解決するか、resolver を登録する。
+    /// host current directory への暗黙フォールバック (SourcePath ?? ".") を廃止した (タスク 2)。</summary>
     public AssemblyImage LoadAssembly(Stream peStream, string? sourcePath = null) {
+        // 入力サイズ上限 (loader hardening): Assembly バイト総量 > MaxAssemblyBytes はロード拒否
+        var maxBytes = _options.Memory.MaxAssemblyBytes;
         using var buffered = new MemoryStream();
         peStream.CopyTo(buffered);
-        var image = AssemblyImage.Parse(buffered.ToArray());
+        if (buffered.Length > _options.Memory.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"LoadAssembly の入力が上限を超えています (実 {buffered.Length:N0} バイト, 上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        var image = AssemblyImage.Parse(buffered.ToArray(), limits: _options.Memory);
         image.SourcePath = sourcePath;
         var loader = new TypeLoader(image);
         // 界面の再現制御: ブリッジが設定されている場合のみ対応する I/O ファサード型を合成する。

@@ -23,6 +23,11 @@ public sealed class VmString {
 
     private readonly byte[] _bytes;
     private VmLocallocMemory? _pointerMemory;
+    /// <summary>ホスト文字列のキャッシュ (Value の呼び出しごとのデコードを避ける、タスク 2)。
+    /// 文字列は不変というゲスト規約の下で安全 (CoreLib IL による length / first-char 書込後の
+    /// 再キャッシュは WriteStringLength / WriteFirstChar の呼び出し側で削除される)。</summary>
+    private string? _cachedValue;
+    private int _cachedForLength = -1;
 
     /// <summary>ホスト文字列から作る (ldstr / intrinsic 境界からの正規化用)。</summary>
     public VmString(string value) {
@@ -30,6 +35,8 @@ public sealed class VmString {
         _bytes = new byte[HeaderByteCount + value.Length * 2];
         BinaryPrimitives.WriteInt32LittleEndian(_bytes, value.Length);
         Encoding.Unicode.GetBytes(value, 0, value.Length, _bytes, CharDataByteOffset);
+        _cachedForLength = value.Length;
+        _cachedValue = value;
     }
 
     /// <summary>CoreLib 表現のバッファから作る (FastAllocateString 相当。ヘッダはキャパシティから算出)。</summary>
@@ -41,8 +48,22 @@ public sealed class VmString {
     /// <summary>char 数 (CoreLib IL が ldfld する _stringLength と同一の値)。</summary>
     public int Length => BinaryPrimitives.ReadInt32LittleEndian(_bytes);
 
-    /// <summary>ホスト文字列としての内容 (同一性比較 / ホスト境界の入出力用)。</summary>
-    public string Value => Encoding.Unicode.GetString(_bytes, CharDataByteOffset, Length * 2);
+    /// <summary>ホスト文字列としての内容 (同一性比較 / ホスト境界の入出力用)。
+    /// バイト実体の (length, bytes) スナップショットでホスト変換をキャッシュする
+    /// (CoreLib String IL の ldfld 経由の読み出しが繰り返しホスト文字列を要求するため、
+    /// 毎呼び出しの Unicode デコードを避ける)。バッファ書込後は誤キャッシュを避けるため
+    /// WriteStringLength / WriteFirstChar で取り消す。</summary>
+    public string Value {
+        get {
+            var len = Length;
+            if (_cachedValue is { } cached && _cachedForLength == len)
+                return cached;
+            var decoded = Encoding.Unicode.GetString(_bytes, CharDataByteOffset, len * 2);
+            _cachedForLength = len;
+            _cachedValue = decoded;
+            return decoded;
+        }
+    }
 
     /// <summary>生バッファ (Buffer.Memmove / Unsafe.* / GetRawStringData の参照先)。</summary>
     internal byte[] Bytes => _bytes;
@@ -63,7 +84,10 @@ public sealed class VmString {
     }
 
     /// <summary>_stringLength への書込 (stfld 相当)。ヘッダ 4 バイトに書く。</summary>
-    internal void WriteStringLength(int value) => BinaryPrimitives.WriteInt32LittleEndian(_bytes, value);
+    internal void WriteStringLength(int value) {
+        BinaryPrimitives.WriteInt32LittleEndian(_bytes, value);
+        _cachedValue = null; // バッファ書込後は誤キャッシュを無効化
+    }
 
     /// <summary>_firstChar への書込 (stfld 相当)。先頭 char の 2 バイトに書く。</summary>
     internal void WriteFirstChar(char value) {
@@ -71,6 +95,7 @@ public sealed class VmString {
             _bytes[CharDataByteOffset] = (byte)value;
             _bytes[CharDataByteOffset + 1] = (byte)((ushort)value >> 8);
         }
+        _cachedValue = null;
     }
 
     public override string ToString() => Value;
@@ -99,8 +124,19 @@ public sealed class VmStringPool {
         return created;
     }
 
-    /// <summary>既に同一内容がプール済みならそれを返し、無ければ新規オブジェクトを作る (演算結果用)。</summary>
-    public VmString GetOrNew(string value) => Get(value);
+    /// <summary>既に同一内容がプール済みならそれを返す (演算結果用)。
+    /// CLR 規約では ldstr (リテラル) のみがインタニングを保証し、演算結果文字列は
+    /// 別インスタンスになりうる (string.Intern と同義論)。タスク 2 hardening:
+    /// 「runtime 生成 string と interned string を分離する」のため、ここでプールに
+    /// 戻さず新しい独立オブジェクトを返す (interned に寄せたい経路は Get を使う)。</summary>
+    public VmString GetOrNew(string value) {
+        _heap?.ChargeString(value.Length);
+        return new VmString(value);
+    }
+
+    /// <summary>リテラル (ldstr / 例外文言) 用のインタニング入口。既存の「同一内容は
+    /// 同一 VmString を共有する」意味論を維持する。</summary>
+    public VmString Intern(string value) => Get(value);
 
     /// <summary>FastAllocateString 相当: charCount 文字分のゼロ初期化バッファを確保する。
     /// リテラルと違い構築途中の可変バッファなのでプールには入らない。アロケーションは

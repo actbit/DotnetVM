@@ -1,3 +1,4 @@
+using DotnetVM.Host;
 using DotnetVM.PE;
 
 namespace DotnetVM.Metadata;
@@ -39,7 +40,13 @@ public sealed class AssemblyImage {
         Name = name;
     }
 
-    public static AssemblyImage Parse(ReadOnlyMemory<byte> image) {
+    public static AssemblyImage Parse(ReadOnlyMemory<byte> image) => Parse(image, limits: null);
+
+    /// <summary>PE / メタデータの解析 (loader hardening の検証平面相当)。limits を渡すと
+    /// ロード時検証 (validation phase) が入る: 画像総量 / メタデータ行数 / 各ストリーム
+    /// サイズを MemoryPolicy の上限と比較して超過はロード拒否 (OperationNotAllowed) にする。
+    /// hostile 画像は実行の前にここで落ちる (タスク 2 hardening)。</summary>
+    public static AssemblyImage Parse(ReadOnlyMemory<byte> image, MemoryPolicy? limits) {
         var pe = PEImage.Parse(image);
         var cli = CliHeader.ParseFrom(pe);
         var root = MetadataRoot.Parse(pe, cli);
@@ -48,6 +55,21 @@ public sealed class AssemblyImage {
         var userStrings = new UserStringHeap(root.UserStringsStream);
         var blobs = new BlobHeap(root.BlobStream);
         var guids = new GuidHeap(root.GuidStream);
+
+        if (limits is not null) {
+            // ロード時検証 (実行前拒否): メタデータ総行数 / ストリームサイズ
+            long rowTotal = 0;
+            foreach (TableKind table in Enum.GetValues<TableKind>()) {
+                var rows = (long)tables.GetRowCount(table);
+                rowTotal += rows;
+                if (rows > limits.MaxMetadataRows)
+                    throw new BadImageFormatException(
+                        $"メタデータテーブル {table} の行数 {rows:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
+            }
+            if (rowTotal > limits.MaxMetadataRows)
+                throw new BadImageFormatException(
+                    $"メタデータ行の合計 {rowTotal:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
+        }
 
         string name;
         if (tables.GetRowCount(TableKind.Assembly) > 0)

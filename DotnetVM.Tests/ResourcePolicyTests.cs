@@ -119,7 +119,7 @@ public class ResourcePolicyTests {
         public Func<string, byte[]>? OnRead { get; set; } // 設定されていればプロキシ側の判断として優先
 
         public bool Exists(string path) => Files.ContainsKey(path);
-        public byte[] Read(string path) =>
+        public byte[] Read(string path, long maxBytes) =>
             OnRead is not null ? OnRead(path)
             : Files.TryGetValue(path, out var v) ? v
             : throw new StorageQuotaExceededException($"ファイルが見つかりません: {path}");

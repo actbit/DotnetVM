@@ -36,7 +36,19 @@ internal static class CoreLibBindings {
         RegisterSystemSr(r);
     }
 
-    // ---- System.Decimal (演算・変換・解析面) ----
+    
+    // ---- host 側 CPU コストの面共費 (タスク 2 hardening #7)。culture 比較 / TextInfo 書式面 /
+    //      number formatting が intrinsic 内で走る際に、文字列の文字数近似での host work 予算
+    //      (HostWorkBudget) を消費させる。budget 超過は MemoryQuotaExceededException (ゲスト外)。
+    private static void ChargeHostWork(this IntrinsicContext ctx, long costUnits) =>
+        ctx.Heap.ChargeHostWork(costUnits);
+
+    // ---- host 側 CPU コストの計上 (タスク 2 hardening #7/#9)。culture / 書式面の
+    // 重いホスト演算 (CompareInfo / TextInfo / Number.Formatting) を HostWorkBudget
+    // (VmHeap.ChargeHostWork) に計上する (符号の作業量を文字数近似での計上)。
+    // charge を 1 箇所で集中管理し、従来「intrinsic 毎に Sculptor」だった経路を統一。
+    private static long HostWorkChars(string? a, string? b) => (long)a?.Length + b?.Length ?? 0;
+// ---- System.Decimal (演算・変換・解析面) ----
 
     /// <summary>decimal の演算 / 変換 / 解析面。
     /// 本家 IL 本体は Decimal 構造体と内部 DecCalc 構造体の Unsafe.As 参照再解釈
@@ -980,7 +992,10 @@ internal static class CoreLibBindings {
         static VmString Str(StackSlot[] a, int i) =>
             a[i].ObjectValue as VmString ?? throw new UnhandledGuestException("System.NullReferenceException", null);
         r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String"),
-            static (_, a) => StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.InvariantCulture)),
+            static (ctx, a) => {
+                ctx.Heap.ChargeHostWork(HostWorkChars(Ns(a, 0), Ns(a, 1)));
+                return StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.InvariantCulture));
+            },
             BindingOrigin.Managed);
         // Equals(String, String) (op_Equality の呼び先): 本家 IL 末尾が SpanHelpers.SequenceEqual
         // (ref byte, ref byte, nuint) で、その scalar フォールバック自体が GSJA 抽象化
@@ -1617,7 +1632,77 @@ internal static class CoreLibBindings {
                 _ => x.Int64Value == y.Int64Value,
             };
         }
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "CompareExchange"), static (_, a) => {
+        // ---- Interlocked 面 (タスク 2 hardening: AnyParams → .NET 10 既知署名の列挙)。
+        // 本家 CoreLib v10 の Interlocked 公開面を実署名列挙で登録する (wildecard 廃止)。
+        // パラメータ型名は VM 表現と CoreLib 署名の実型 (統合後) 完全名で鍵化する。
+        // i4 統合面 (byte/sbyte/short/ushort/bool/char/int が i4 スロットに載る) は 1 面で受け、
+        // i8 / float / double / nint / nuint は別キーで鍵化
+        static string[] I(string t) => [t];
+        const string I4 = "System.Int32", I8 = "System.Int64", R4 = "System.Single", R8 = "System.Double";
+        const string Ref1 = "&";
+        void InstanceFace(string name, string[] paramTypes, IntrinsicImpl impl) =>
+            r.RegisterBinding(BindingKey.StaticWithReturn(T, name, paramTypes[0].TrimEnd('&'), paramTypes), impl, BindingOrigin.InternalCall);
+
+        // Increment(ref T) / Decrement(ref T): (ref int,int) と (ref long,long) の両面.
+        foreach (var (ty, tyName) in new[] { (I4, "System.Int32"), (I8, "System.Int64") }) {
+            var vt = tyName;
+            r.RegisterBinding(BindingKey.StaticWithReturn(T, "Increment", vt, [vt + Ref1]), static (_, a) => {
+                var loc = Location(a[0], "Increment");
+                var updated = loc.Slot.Kind == StackKind.Int64
+                    ? StackSlot.OfInt64(loc.Slot.Int64Value + 1)
+                    : StackSlot.OfInt32((int)loc.Slot.Int64Value + 1);
+                loc.Slot = updated;
+                return updated;
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.StaticWithReturn(T, "Decrement", vt, [vt + Ref1]), static (_, a) => {
+                var loc = Location(a[0], "Decrement");
+                var updated = loc.Slot.Kind == StackKind.Int64
+                    ? StackSlot.OfInt64(loc.Slot.Int64Value - 1)
+                    : StackSlot.OfInt32((int)loc.Slot.Int64Value - 1);
+                loc.Slot = updated;
+                return updated;
+            }, BindingOrigin.InternalCall);
+        }
+        // Exchange / CompareExchange / Add / And / Or: int / long / uint / ulong / float / double / nint / nuint 面水準
+        static void RegExchangeFamily(IntrinsicRegistry reg, string type, IntrinsicImpl exchange, IntrinsicImpl compareExchange, IntrinsicImpl add)
+        {
+            foreach (var param in new[] {
+                // ref int, int
+                new[] { "System.Int32&", "System.Int32" },
+                new[] { "System.Int64&", "System.Int64" },
+                new[] { "System.UInt32&", "System.UInt32" },
+                new[] { "System.UInt64&", "System.UInt64" },
+                new[] { "System.Single&", "System.Single" },
+                new[] { "System.Double&", "System.Double" },
+            }) {
+                reg.RegisterBinding(BindingKey.StaticWithReturn(T, "Exchange", param[0].TrimEnd('&'), param), exchange, BindingOrigin.InternalCall);
+            }
+            foreach (var param in new[] {
+                new[] { "System.Int32&", "System.Int32", "System.Int32" },
+                new[] { "System.Int64&", "System.Int64", "System.Int64" },
+                new[] { "System.UInt32&", "System.UInt32", "System.UInt32" },
+                new[] { "System.UInt64&", "System.UInt64", "System.UInt64" },
+                new[] { "System.Single&", "System.Single", "System.Single" },
+                new[] { "System.Double&", "System.Double", "System.Double" },
+            }) {
+                reg.RegisterBinding(BindingKey.StaticWithReturn(T, "CompareExchange", param[0].TrimEnd('&'), param), compareExchange, BindingOrigin.InternalCall);
+            }
+            foreach (var param in new[] {
+                new[] { "System.Int32&", "System.Int32" },
+                new[] { "System.Int64&", "System.Int64" },
+                new[] { "System.UInt32&", "System.UInt32" },
+                new[] { "System.UInt64&", "System.UInt64" },
+            }) {
+                reg.RegisterBinding(BindingKey.StaticWithReturn(T, "Add", param[0].TrimEnd('&'), param), add, BindingOrigin.InternalCall);
+            }
+        }
+        var exchangeImpl = (IntrinsicImpl)((_, a) => {
+            var loc = Location(a[0], "Exchange");
+            var original = loc.Slot;
+            loc.Slot = a[1];
+            return original;
+        });
+        var compareExchange = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "CompareExchange");
             var original = loc.Slot;
             var equal = SlotEquals(original, a[2]);
@@ -1626,14 +1711,8 @@ internal static class CoreLibBindings {
             if (a.Length >= 4 && a[3].ObjectValue is VmByRef succeeded)
                 succeeded.Slot = StackSlot.OfInt32(equal ? 1 : 0);
             return original;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Exchange"), static (_, a) => {
-            var loc = Location(a[0], "Exchange");
-            var original = loc.Slot;
-            loc.Slot = a[1];
-            return original;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Add"), static (_, a) => {
+        });
+        var addImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "Add");
             StackSlot updated;
             if (loc.Slot.Kind == StackKind.Int64) {
@@ -1646,45 +1725,43 @@ internal static class CoreLibBindings {
             }
             loc.Slot = updated;
             return updated;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Increment"), static (_, a) => {
-            var loc = Location(a[0], "Increment");
-            var updated = loc.Slot.Kind == StackKind.Int64
-                ? StackSlot.OfInt64(loc.Slot.Int64Value + 1)
-                : StackSlot.OfInt32((int)loc.Slot.Int64Value + 1);
-            loc.Slot = updated;
-            return updated;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Decrement"), static (_, a) => {
-            var loc = Location(a[0], "Decrement");
-            var updated = loc.Slot.Kind == StackKind.Int64
-                ? StackSlot.OfInt64(loc.Slot.Int64Value - 1)
-                : StackSlot.OfInt32((int)loc.Slot.Int64Value - 1);
-            loc.Slot = updated;
-            return updated;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "And"), static (_, a) => {
+        });
+        RegExchangeFamily(r, T, exchangeImpl, compareExchange, addImpl);
+
+        static void RegAndOrFamily(IntrinsicRegistry reg, string type, string method, IntrinsicImpl impl)
+        {
+            foreach (var param in new[] {
+                new[] { "System.Int32&", "System.Int32" },
+                new[] { "System.Int64&", "System.Int64" },
+                new[] { "System.UInt32&", "System.UInt32" },
+                new[] { "System.UInt64&", "System.UInt64" },
+            }) {
+                reg.RegisterBinding(BindingKey.StaticWithReturn(T, method, param[0].TrimEnd('&'), param), impl, BindingOrigin.InternalCall);
+            }
+        }
+        var andImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "And");
             var original = loc.Slot;
             loc.Slot = original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value & a[1].Int64Value)
                 : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32);
             return original;
-        }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Or"), static (_, a) => {
+        });
+        var orImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "Or");
             var original = loc.Slot;
             loc.Slot = original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value | a[1].Int64Value)
                 : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32);
             return original;
-        }, BindingOrigin.InternalCall);
-        // 単一スレッド実行のためフェンスは意味論上ノーオペレーション
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "MemoryBarrier"),
+        });
+        RegAndOrFamily(r, T, "And", andImpl);
+        RegAndOrFamily(r, T, "Or", orImpl);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "MemoryBarrier", "System.Void", Array.Empty<string>()),
             static (_, _) => null, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "ReadMemoryBarrier"),
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "ReadMemoryBarrier", "System.Void", []),
             static (_, _) => null, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "WriteMemoryBarrier"),
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "WriteMemoryBarrier", "System.Void", []),
             static (_, _) => null, BindingOrigin.InternalCall);
     }
 
@@ -1754,3 +1831,4 @@ internal static class CoreLibBindings {
         return false;
     }
 }
+

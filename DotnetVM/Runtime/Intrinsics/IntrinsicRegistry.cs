@@ -221,10 +221,23 @@ public sealed class IntrinsicRegistry {
 
     /// <summary>
     /// 署名キーでランタイムバインドを解決する (完全一致 → 全引数一致面の順)。由来も返す。
+    /// 呼出 domain の制約: 完全一致キーの domain が TrustedCoreLib で callerDomain が
+    /// TrustedCoreLib でない (trusted CoreLib 画像の IL 外からの呼出) 場合は照合しない
+    /// (特権面の呼出元限定、タスク 2 hardening)。
     /// </summary>
-    public bool TryGetBinding(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin) {
-        if (_bindings.TryGetValue(key, out var entry) ||
-            (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParams(), out entry))) {
+    public bool TryGetBinding(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin,
+        BindingDomain callerDomain = BindingDomain.Guest) {
+        // 完全一致 (domain も含めて照合)
+        if (_bindings.TryGetValue(key, out var entry) &&
+            (key.Domain != BindingDomain.TrustedCoreLib || callerDomain == BindingDomain.TrustedCoreLib ||
+             key.Domain == callerDomain)) {
+            impl = entry.Impl;
+            origin = entry.Origin;
+            return true;
+        }
+        // 全引数一致面 (AnyParams) へのフォールバック: 同一 domain の面のみ照合する
+        if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParams(), out entry) &&
+            key.Domain != BindingDomain.TrustedCoreLib) {
             impl = entry.Impl;
             origin = entry.Origin;
             return true;
@@ -234,7 +247,8 @@ public sealed class IntrinsicRegistry {
         return false;
     }
 
-    /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。</summary>
+    /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。
+    /// domain は BindingKey 側に保持されるためここでは origin のみを返す。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings =>
         [.. _bindings.Select(kv => (kv.Key, kv.Value.Origin))];
 

@@ -465,10 +465,18 @@ public sealed class TypeLoader {
             if (context?.TryResolveAssembly(refName, _image) is null)
                 throw new AssemblyDependencyNotFoundException(refName,
                     $"参照アセンブリ '{refName}' (型 '{fullName}' の解決に必要) がロード済みでも" +
-                    $"同一ディレクトリ ({Path.GetDirectoryName(Path.GetFullPath(_image.SourcePath ?? "."))}) にも見つかりません。");
+                    $"同一ディレクトリ ({LoaderDependencyDirectoryHint()}) にも見つかりません。");
         }
         throw new NotSupportedException($"型参照 '{fullName}' を解決できません (スコープ {scopeTable})。");
     }
+
+    /// <summary>依存アセンブリ同一ディレクトリ探索のヒント文言。Stream ロード (SourcePath 無し)
+    /// の場合は「同一ディレクトリ探索も行われない (明示 resolver でのロードが必須)」と示す。
+    /// host current directory への暗黙フォールバック (SourcePath ?? ".") を廃止した。</summary>
+    private string LoaderDependencyDirectoryHint() =>
+        _image.SourcePath is { } path
+            ? $"同一ディレクトリ ({Path.GetDirectoryName(Path.GetFullPath(path))})"
+            : "同一ディレクトリ (Stream ロードのため探索なし。依存は明示 resolver / LoadAssembly(path) でのロードが必要)";
 
     /// <summary>AssemblyRef スコープの TypeRef を解決する。優先順: ①Context 配下の実 TypeDef
     /// (ユニフィケーション: CoreLib 実装が正。参照アセンブリ経由の BCL 型をここで統合する) →

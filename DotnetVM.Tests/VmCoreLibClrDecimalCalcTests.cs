@@ -216,7 +216,9 @@ public class VmCoreLibClrDecimalCalcTests {
                     Assert.Fail($"Divide({d}, {o}) clr={clrDiv}/{(clrDiv == "ok" ? (d / o).ToString() : "")} vm={vmDiv}/{(vmDiv == "ok" ? DecimalCalc.Divide(d, o).ToString() : "")}");
             }
         }
-        Assert.Fail("Add/Divide 全部一致");
+        // 不一致が無ければこの診断テストは成功する (Add/Divide 全境界一致)。
+        // かつては診断のため無条件 Assert.Fail していたが、移植バグ修正後に
+        // 実クロスチェックとして機能するよう修正した
     }
 
     [Fact]

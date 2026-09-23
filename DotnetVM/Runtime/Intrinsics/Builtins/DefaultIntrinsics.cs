@@ -133,7 +133,9 @@ public static class DefaultIntrinsics {
             StackKind.Object => slot.ObjectValue switch {
                 null => "", // CLR も null は空文字列化する
                 VmString s => s.Value,
-                VmBoxedValue b => FormatBoxed(b),
+                VmBoxedValue b => b.Type is VmClassType { IsEnum: true }
+                    ? CoreLibBindings.FormatEnumForConcat(b)
+                    : FormatBoxed(b),
                 VmRuntimeObject t => t.Target.FullName,
                 VmRuntimeMethod m => m.Target.ToString() ?? "",
                 VmExceptionObject e => FormatExceptionText(e.Type.FullName, e.Message),
@@ -353,9 +355,16 @@ public static class DefaultIntrinsics {
     private static string ApplyAlignment(string text, int alignment) =>
         alignment > 0 ? text.PadLeft(alignment) : alignment < 0 ? text.PadRight(-alignment) : text;
 
-    /// <summary>System.Type ファサードの実体を生成する (typeof(X) / GetType() の戻り値)。</summary>
-    internal static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) =>
-        StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeObject { Target = type }));
+    /// <summary>System.Type ファサードの実体を生成する (typeof(X) / GetType() の戻り値)。
+    /// 実 CLR の RuntimeType と同じく型ごとに単一実体 (VM 単位でインターンする)。
+    /// CoreLib IL が bne.un 等の参照同一性で型分岐するため、都度 new では誤分岐する。</summary>
+    internal static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) {
+        if (!ctx.Shared.TypeFacades.TryGetValue(type, out var facade)) {
+            facade = ctx.Heap.Allocate(new VmRuntimeObject { Target = type });
+            ctx.Shared.TypeFacades[type] = facade;
+        }
+        return StackSlot.OfObject(facade);
+    }
 
     /// <summary>オブジェクトの実行時型ファサードをスロットで返す (Object.GetType() /
     /// RuntimeHelpers::GetMethodTable 等の共通面)。</summary>

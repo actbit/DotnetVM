@@ -86,9 +86,15 @@ public sealed class TypeLoader {
             "OverflowException", "InvalidCastException", "ArrayTypeMismatchException",
             "FormatException", "StackOverflowException", "OutOfMemoryException",
             "NotSupportedException", "OperationCanceledException", "TimeoutException",
-            "NotImplementedException",
+            "NotImplementedException", "RankException",
         })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false, Parent = systemException });
+        // Activator.CreateInstance の失敗分類 (CLR の継承鎖どおり MemberAccess ← MissingMember ← MissingMethod)
+        var memberAccess = new VmIntrinsicType { Namespace = "System", Name = "MemberAccessException", IsValue = false, Parent = systemException };
+        Add(memberAccess);
+        var missingMember = new VmIntrinsicType { Namespace = "System", Name = "MissingMemberException", IsValue = false, Parent = memberAccess };
+        Add(missingMember);
+        Add(new VmIntrinsicType { Namespace = "System", Name = "MissingMethodException", IsValue = false, Parent = missingMember });
         Add(new VmIntrinsicType { Namespace = "System", Name = "ObjectDisposedException", IsValue = false, Parent = _intrinsicTypes["System.InvalidOperationException"] });
 
         // プリミティブはすべて ValueType の派生
@@ -579,38 +585,73 @@ public sealed class TypeLoader {
     public string GetAssemblyRefName(int assemblyRefRid) =>
         _image.GetString(_image.Tables.GetRowIndex(TableKind.AssemblyRef, assemblyRefRid, 6));
 
-    /// <summary>ネスト型 TypeRef を TypeDef のネスト構造 (NestedClass) と名前照合で解決する。</summary>
+    /// <summary>ネスト型 TypeRef を TypeDef のネスト構造 (NestedClass) と名前照合で解決する。
+    /// 終端スコープが AssemblyRef の場合は identity で対象画像を確定してから (自画像の
+    /// 場合は自己解決)、その画像内で包含チェーンを辿る。BCL 参照 (System.Runtime 等) は
+    /// trusted 実装画像への統合で救済する (global 探索ではなく identity 起点)。</summary>
     private VmClassType? ResolveNestedTypeRef(int typeRefRid) {
         // TypeRef のスコープチェーン (内側 → 外側) を名前として集める
         var names = new List<string>();
         var current = typeRefRid;
+        var (terminalTable, terminalRid) = (TableKind.Module, 0);
         while (true) {
             var (_, nestedName, nestedScope) = _image.GetTypeRefName(current);
             names.Insert(0, nestedName);
-            var (scopeTable, scopeRid) = nestedScope;
-            if (scopeTable != TableKind.TypeRef)
+            (terminalTable, terminalRid) = nestedScope;
+            if (terminalTable != TableKind.TypeRef)
                 break;
-            current = scopeRid;
+            current = terminalRid;
         }
 
-        var owner = FindTypeByName(names[0]);
-        if (owner is null)
+        // 終端スコープの画像を確定する
+        TypeLoader targetLoader = this;
+        if (terminalTable == TableKind.AssemblyRef) {
+            var refIdentity = _image.GetAssemblyRefIdentity(terminalRid);
+            if (refIdentity.Matches(_image.Identity)) {
+                targetLoader = this;
+            } else if (Context?.TryResolveAssembly(refIdentity, _image) is { } resolved) {
+                targetLoader = resolved;
+            } else {
+                // BCL 参照アセンブリ (System.Runtime 等) のネスト型は trusted 実装で救済する
+                var unified = TryResolveTrustedUnifiedType(names[0]);
+                if (unified is VmClassType unifiedClass)
+                    return WalkNested(unifiedClass, names, 1);
+                return null;
+            }
+        } else if (terminalTable != TableKind.Module) {
             return null;
-        for (var i = 1; i < names.Count; i++) {
+        }
+
+        var owner = targetLoader.FindTypeByFullName(names[0]) ?? targetLoader.FindTypeByName(names[0]);
+        if (owner is null) {
+            // 自画像に無く BCL 統合で拾える場合 (参照アセンブリ経由の BCL ネスト型)
+            if (targetLoader == this && TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
+                return WalkNested(unifiedClass, names, 1);
+            return null;
+        }
+        return WalkNested(owner, names, 1);
+    }
+
+    /// <summary>包含型からネスト名列を辿る (対象画像の NestedClass で解決する)。</summary>
+    private VmClassType? WalkNested(VmClassType owner, List<string> names, int start) {
+        var ownerLoader = owner.Loader ?? this;
+        for (var i = start; i < names.Count; i++) {
             VmClassType? child = null;
-            var typeDefs = _image.Tables.GetRowCount(TableKind.TypeDef);
+            var image = ownerLoader.Image;
+            var typeDefs = image.Tables.GetRowCount(TableKind.TypeDef);
             for (var rid = 1; rid <= typeDefs; rid++) {
-                if (_image.GetEnclosingTypeDef(rid) != owner.TypeDefRid)
+                if (image.GetEnclosingTypeDef(rid) != owner.TypeDefRid)
                     continue;
-                var (_, childName) = _image.GetTypeDefName(rid);
+                var (_, childName) = image.GetTypeDefName(rid);
                 if (childName == names[i]) {
-                    child = GetTypeDef(rid);
+                    child = ownerLoader.GetTypeDef(rid);
                     break;
                 }
             }
             if (child is null)
                 return null;
             owner = child;
+            ownerLoader = owner.Loader ?? ownerLoader;
         }
         return owner;
     }
@@ -694,13 +735,29 @@ public sealed class TypeLoader {
     public string GetMemberRefFieldName(int memberRefRid) =>
         _image.GetString(_image.Tables.GetRowIndex(TableKind.MemberRef, memberRefRid, 1));
 
-    /// <summary>MemberRef rid から親型名 (TypeRef 親のフルネーム。TypeRef 以外は null) を得る。</summary>
+    /// <summary>MemberRef rid から親型名 (TypeRef 親のフルネーム。TypeRef 以外は null) を得る。
+    /// ネスト型親 (Interop+BCrypt 等) は包含チェーンを辿って CLR 規約の '+' 連結完全名にする
+    /// (単純末尾名ではバインド照合できないため)。</summary>
     public string? GetMemberRefParentTypeName(int memberRefRid) {
         var parent = _image.Tables.DecodeCoded(TableKind.MemberRef, memberRefRid, 0, CodedIndexKind.MemberRefParent);
         if (parent.Table != TableKind.TypeRef)
             return null;
-        var (ns, name, _) = _image.GetTypeRefName(parent.Rid);
-        return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
+        // 内側→外側へ辿り、名前を集めると同時に名前空間を持つ最外要素を探す
+        // (ネスト型自体の Namespace 列は空のため)
+        var names = new List<string>();
+        string? ns = null;
+        var current = parent.Rid;
+        while (true) {
+            var (innerNs, innerName, scope) = _image.GetTypeRefName(current);
+            names.Insert(0, innerName);
+            if (!string.IsNullOrEmpty(innerNs))
+                ns = innerNs;
+            if (scope.Table != TableKind.TypeRef)
+                break;
+            current = scope.Rid;
+        }
+        var full = string.Join("+", names);
+        return string.IsNullOrEmpty(ns) ? full : ns + "." + full;
     }
 
     /// <summary>MemberRef rid のメソッド名。</summary>

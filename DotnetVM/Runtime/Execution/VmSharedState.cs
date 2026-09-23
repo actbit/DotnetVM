@@ -15,4 +15,12 @@ public sealed class VmSharedState {
     /// <summary>VM 代替の last system error (Marshal.SetLastSystemError / GetLastSystemError 面)。
     /// 実 CLR の per-thread TLS スロットの代わりの VM 単位の単一値。</summary>
     public int LastSystemError;
+
+    /// <summary>RuntimeType ファサード (typeof / GetType 結果) のインターン表。
+    /// 実 CLR の RuntimeType は型ごとに単一実体であり、CoreLib IL は bne.un 等の
+    /// 参照同一性で比較する (Convert.DefaultToType の型分岐等)。ラッパ都度の new では
+    /// 誤分岐するため、同一 VmType には同一 VmRuntimeObject を返す。
+    /// VM 単位 (loader をまたいで共有する。VmType はローダ横断で同一参照のため安全)。</summary>
+    internal readonly System.Collections.Generic.Dictionary<DotnetVM.Runtime.Types.VmType, DotnetVM.Runtime.Objects.VmRuntimeObject> TypeFacades = new();
 }
+

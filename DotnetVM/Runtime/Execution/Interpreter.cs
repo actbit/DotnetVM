@@ -121,6 +121,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);
+        // Activator.CreateInstance 等が .ctor を実行するためのフック
+        intrinsicContext.NewInstanceHook = objects.CreateInstanceByCtor;
         // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
         intrinsicContext.ToStringHook = calls.InvokeToStringSlot;
         // MethodBase.GetCurrentMethod() 用の現在メソッドフック
@@ -617,24 +619,84 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
                 // ---- オブジェクト/値型のコピー ----
                 case ILOp.Ldobj: {
-                    var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
+                    var address = frame.Stack.Pop();
+                    if (address.ObjectValue is VmNativePointer ldNative) {
+                        // unmanaged ポインタ先からの読み出し (Guid 解析等の RawData 経路)。
+                        // 型のバイト幅で LE 読みし VM スロットへ展開する
+                        var ldType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context);
+                        var ldSize = MemoryOps.SizeOfType(ldType);
+                        if (ldNative.ByteOffset < 0 || (long)ldNative.ByteOffset + ldSize > ldNative.Bytes.Length)
+                            throw new InvalidOperationException(
+                                $"ldobj がブロック外を参照します (offset={ldNative.ByteOffset}, {ldSize} バイト)。");
+                        frame.Stack.Push(MemoryOps.ValueFromBytes(
+                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize).ToArray(), ldType, ldSize));
+                        break;
+                    }
+                    var byref = (VmByRef)address.ObjectValue!;
                     frame.Stack.Push(SlotOps.PushCopyOfValue(byref.Slot));
                     break;
                 }
                 case ILOp.Stobj: {
                     var value = frame.Stack.Pop();
-                    var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
+                    var stAddress = frame.Stack.Pop();
+                    if (stAddress.ObjectValue is VmNativePointer stNative) {
+                        var stType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context);
+                        var stSize = MemoryOps.SizeOfType(stType);
+                        if (stNative.ByteOffset < 0 || (long)stNative.ByteOffset + stSize > stNative.Bytes.Length)
+                            throw new InvalidOperationException(
+                                $"stobj がブロック外を参照します (offset={stNative.ByteOffset}, {stSize} バイト)。");
+                        var stBytes = MemoryOps.BytesOfValue(value, stType, stSize);
+                        Array.Copy(stBytes, 0, stNative.Bytes, stNative.ByteOffset, stSize);
+                        break;
+                    }
+                    var byref = (VmByRef)stAddress.ObjectValue!;
                     byref.Slot = SlotOps.StoreCopyOfValue(value);
                     break;
                 }
                 case ILOp.Cpobj: {
-                    var src = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    var dst = (VmByRef)frame.Stack.Pop().ObjectValue!;
-                    dst.Slot = SlotOps.StoreCopyOfValue(src.Slot);
+                    var src = frame.Stack.Pop();
+                    var dst = frame.Stack.Pop();
+                    var cpType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context);
+                    var cpSize = MemoryOps.SizeOfType(cpType);
+                    if (src.ObjectValue is VmNativePointer srcNative && dst.ObjectValue is VmNativePointer dstNative) {
+                        if ((long)srcNative.ByteOffset + cpSize > srcNative.Bytes.Length ||
+                            (long)dstNative.ByteOffset + cpSize > dstNative.Bytes.Length)
+                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                        Array.Copy(srcNative.Bytes, srcNative.ByteOffset, dstNative.Bytes, dstNative.ByteOffset, cpSize);
+                        break;
+                    }
+                    if (src.ObjectValue is VmNativePointer srcOnly) {
+                        if (srcOnly.ByteOffset < 0 || (long)srcOnly.ByteOffset + cpSize > srcOnly.Bytes.Length)
+                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                        var value = MemoryOps.ValueFromBytes(
+                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
+                        ((VmByRef)dst.ObjectValue!).Slot = SlotOps.StoreCopyOfValue(value);
+                        break;
+                    }
+                    if (dst.ObjectValue is VmNativePointer dstOnly) {
+                        var srcValue = ((VmByRef)src.ObjectValue!).Slot;
+                        var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
+                        if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
+                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                        Array.Copy(dstBytes, 0, dstOnly.Bytes, dstOnly.ByteOffset, cpSize);
+                        break;
+                    }
+                    var srcRef = (VmByRef)src.ObjectValue!;
+                    var dstRef = (VmByRef)dst.ObjectValue!;
+                    dstRef.Slot = SlotOps.StoreCopyOfValue(srcRef.Slot);
                     break;
                 }
                 case ILOp.Initobj: {
-                    var byref = (VmByRef)frame.Stack.Pop().ObjectValue!;
+                    var initAddress = frame.Stack.Pop();
+                    if (initAddress.ObjectValue is VmNativePointer initNative) {
+                        var initType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context);
+                        var initSize = MemoryOps.SizeOfType(initType);
+                        if (initNative.ByteOffset < 0 || (long)initNative.ByteOffset + initSize > initNative.Bytes.Length)
+                            throw new InvalidOperationException("initobj がブロック外を参照します。");
+                        Array.Clear(initNative.Bytes, initNative.ByteOffset, initSize);
+                        break;
+                    }
+                    var byref = (VmByRef)initAddress.ObjectValue!;
                     byref.Slot = engines.Services.Objects.DefaultForType(
                         objects.ResolveTypeToken(instruction.IntOperand, frame.Context), loader);
                     break;

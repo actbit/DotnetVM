@@ -202,7 +202,8 @@ public class InterpreterTests {
 
     [Fact]
     public void UnboundedRecursion_IsRejectedBeforeHostStackOverflow() {
-        using var vm = CreateVm(maxRecursionDepth: 64);
+        // 各 VM 呼出がホスト側の実行/EH フレームも積むため、安全に拒否できる深さで確認する。
+        using var vm = CreateVm(maxRecursionDepth: 32);
         var ex = Assert.Throws<UnhandledGuestException>(() => vm.Invoke("Vm.Calc", "Deep", 0));
         Assert.Equal("System.StackOverflowException", ex.ExceptionTypeName);
     }

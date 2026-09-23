@@ -364,6 +364,12 @@ internal static class SlotOps {
         // unmanaged ポインタの恒等変換 (p + n の add 前後に出る conv.i / conv.u)
         if (op is ILOp.Conv_I or ILOp.Conv_U && value.ObjectValue is VmNativePointer)
             return value;
+        // マネージポインタ (ByRef: fixed / ldloca 由来) の conv.i / conv.u も参照を
+        // 維持して素通しする (整数化で null 化すると指し先が失われ後続 stind 等が NRE に
+        // 落ちる。参照先アクセスは ldind/stind/Add の ByRef 対応で受ける)
+        if (op is ILOp.Conv_I or ILOp.Conv_U && value.Kind == StackKind.ByRef &&
+            value.ObjectValue is VmByRef)
+            return value;
         // ソース値を i8 (または f8) に統一してから切り詰める
         var isFloatSrc = value.Kind == StackKind.Float;
         var f = isFloatSrc ? value.DoubleValue : 0.0;

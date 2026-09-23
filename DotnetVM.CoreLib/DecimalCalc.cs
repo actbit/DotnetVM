@@ -37,9 +37,11 @@ public static class DecimalCalc {
         1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u,
     ];
 
-    /// <summary>本家 UInt64Powers10 (10^0..10^19)。</summary>
+    /// <summary>本家 UInt64Powers10 (10^1..10^19)。添字 i は 10^(i+1) を表す
+    /// (本家コメント "Fast access for 10^n where n is 1-19" のとおり。VarDecMul の
+    /// scale 縮小が power = UInt64Powers10[scale] で 10^(scale+1) を期待する)。</summary>
     private static readonly ulong[] UInt64Powers10 = [
-        1ul, 10ul, 100ul, 1000ul, 10000ul, 100000ul, 1000000ul, 10000000ul, 100000000ul,
+        10ul, 100ul, 1000ul, 10000ul, 100000ul, 1000000ul, 10000000ul, 100000000ul,
         1000000000ul, 10000000000ul, 100000000000ul, 1000000000000ul, 10000000000000ul,
         100000000000000ul, 1000000000000000ul, 10000000000000000ul, 100000000000000000ul,
         1000000000000000000ul, 10000000000000000000ul,
@@ -492,9 +494,14 @@ public static class DecimalCalc {
             if (scale < MaxInt32Scale)
                 power = UInt32Powers10[scale];
             var tmp64 = 0ul;
-            for (var cur = 0u; ; cur++) {
+            // 本家: for (uint cur = 0; ;) { tmp64 += BigMul(rgulNum[cur], power);
+            // rgulNum[cur] = (uint)tmp64; cur++; tmp64 >>= 32; if (cur > hiProd) break; }
+            // cur の増分と判定の順序が意味を持つ (hiProd の要素まで処理してから脱出する)
+            var cur = 0u;
+            while (true) {
                 tmp64 += (ulong)buf[cur] * power;
                 buf[cur] = (uint)tmp64;
+                cur++;
                 tmp64 >>= 32;
                 if (cur > hiProd)
                     break;
@@ -520,15 +527,19 @@ public static class DecimalCalc {
                 high--;
                 if (high < numHigh)
                     goto NoCarry; // 借りが上位に波及しない → ScaleResult へ (本家どおり)
-                // Carry the subtraction into the higher bits.
+            } else if (high <= numHigh) {
+                goto NoCarry; // 借りが上位に波及しない → ScaleResult へ (本家どおり)
+            }
+            // Carry the subtraction into the higher bits.
+            // (本家は if/else-if の外側で実行する。low64 <= numLo かつ high > numHigh の
+            //  場合もここへ落ちる)
+            {
                 var cur = 3u;
                 while (buf[cur]-- == 0) {
                     cur++;
                 }
                 if (buf[hiProd] == 0 && --hiProd <= 2)
                     goto ReturnResult;
-            } else if (high <= numHigh) {
-                goto NoCarry; // 借りが上位に波及しない → ScaleResult へ (本家どおり)
             }
         } else {
             // Signs the same, add.
@@ -969,11 +980,13 @@ public static class DecimalCalc {
     private static uint Div96By32(uint[] bufNum, uint den) {
         var low64 = ((ulong)bufNum[0]) | ((ulong)bufNum[1] << 32);
         if (bufNum[2] != 0) {
-            var tmp = ((ulong)bufNum[1] << 32) | bufNum[2];
+            // 本家 bufNum.High64 = U1 | ((ulong)U2 << 32) (Buf12 の offset 4 オーバーレイ)。
+            // High64 = div は U1 = 下位 32 ビット / U2 = 上位 32 ビットの代入
+            var tmp = bufNum[1] | ((ulong)bufNum[2] << 32);
             var div = tmp / den;
             var rem = (uint)(tmp % den);
-            bufNum[2] = (uint)div;
-            bufNum[1] = (uint)(div >> 32);
+            bufNum[1] = (uint)div;
+            bufNum[2] = (uint)(div >> 32);
 
             tmp = ((ulong)rem << 32) | bufNum[0];
             if (tmp == 0)
@@ -993,11 +1006,12 @@ public static class DecimalCalc {
         return remainder;
     }
 
-    /// <summary>本家 Div64By32 (非 X86 経路)。</summary>
-    private static uint Div64By32(ulong dividend, uint den, out uint quotient) {
+    /// <summary>本家 Div64By32 (非 X86 経路)。商を返し、余りを out で返す
+    /// (本家タプル (Quotient, Remainder) と同順)。</summary>
+    private static uint Div64By32(ulong dividend, uint den, out uint remainder) {
         var quo = (uint)(dividend / den);
-        quotient = quo;
-        return (uint)dividend - quo * den;
+        remainder = (uint)dividend - quo * den;
+        return quo;
     }
 
     /// <summary>本家 Div96By64。96 ビット値 (u2 + low64) ÷ den (64 ビット、den &gt; u2 前提)。
@@ -1036,7 +1050,8 @@ public static class DecimalCalc {
         }
 
         // Hardware divide won't overflow
-        var num64 = ((ulong)bufNum[1] << 32) | num2;
+        // 本家 bufNum.High64 = U1 | ((ulong)U2 << 32) (Buf12 の offset 4 オーバーレイ)
+        var num64 = bufNum[1] | ((ulong)num2 << 32);
         if (num64 < denHigh32)
             // Result is zero.  Entire dividend is remainder.
             return 0;
@@ -1098,7 +1113,8 @@ public static class DecimalCalc {
             return quo;
         }
 
-        var num64 = ((ulong)bufNum[offset + 1] << 32) | num2;
+        // 本家 bufNum.High64 = U1 | ((ulong)U2 << 32) (Buf12 の offset 4 オーバーレイ)
+        var num64 = bufNum[offset + 1] | ((ulong)num2 << 32);
         if (num64 < denHigh32)
             return 0;
 
@@ -1277,7 +1293,7 @@ public static class DecimalCalc {
                     goto ThrowOverflow;
 
                 var num = (ulong)remainder * power; // 本家 Math.BigMul(remainder, power) = 64 ビット積
-                var rem2 = Div64By32(num, den, out var div32);
+                var div32 = Div64By32(num, den, out var rem2);
 
                 if (!Add32To96(bufQuo, div32)) {
                     scale = OverflowUnscale(bufQuo, scale, rem2 != 0);
@@ -1365,8 +1381,11 @@ public static class DecimalCalc {
 
                 // The remainder (currently 96 bits spread over 4 uints) will be < divisor.
                 var q = Div128By96(bufRem, bufDivisor);
-                bufQuo[0] = (uint)q;
-                bufQuo[1] = (uint)(q >> 32);
+                // 本家は bufQuo.Low64 = Div128By96(...) (uint → ulong のゼロ拡張)。
+                // q は 32 ビット商なので上位 32 ビットは必ず 0 (q >> 32 は uint では
+                // シフト量がマスクされ no-op になるため使わない)
+                bufQuo[0] = q;
+                bufQuo[1] = 0;
                 bufQuo[2] = 0;
 
                 while (true) {
@@ -1712,6 +1731,11 @@ public static class DecimalCalc {
             if (n == 0) {
                 var tmp64 = ((ulong)mid << 32) | lo;
                 if (tmp64 == 0) {
+                    // 本家は除算ごとに d.Low64/d.uhi を書き換えるため、早期 done でも
+                    // 除算済みの値が残る。ポートはローカル→ref を checkRemainder で
+                    // まとめて書き戻すため、この早期 done の前に書き戻す必要がある
+                    low64 = ((ulong)lo) | ((ulong)mid << 32);
+                    high = hi;
                     if (mode <= MidpointRounding.ToZero)
                         goto done;
                     remainder = 0;

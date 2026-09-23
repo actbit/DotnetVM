@@ -207,7 +207,8 @@ internal sealed class ObjectEngine(
         }
     }
 
-    /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。</summary>
+    /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。
+    /// 構築ジェネリック型は定義に解いてレイアウトを取る (VmClassInstance/ボックス/構造体の全経路)。</summary>
     public VmByRef FieldLocation(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
             case StackKind.Object when objSlot.ObjectValue is null:
@@ -222,11 +223,7 @@ internal sealed class ObjectEngine(
                 return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field));
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed: {
                 // ボックス化ジェネリック構造体 (構築型) は定義型に解いてレイアウトを取る
-                VmClassType? bt = boxed.Type switch {
-                    VmClassType cls => cls,
-                    VmConstructedType constructed => constructed.Definition as VmClassType,
-                    _ => null,
-                };
+                var bt = DefinitionOf(boxed.Type);
                 return bt is not null
                     ? new VmByRef(boxed.Fields, GetInstanceFieldIndex(bt, field))
                     : new VmByRef(boxed.Fields, 0);
@@ -235,18 +232,25 @@ internal sealed class ObjectEngine(
                 // 構造体ローカル/引数へのフィールド書込 (ldloca → ldfld/stfld)
                 var target = outer.Slot;
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
-                    sv.StructType is VmClassType st)
+                    DefinitionOf(sv.StructType) is VmClassType st)
                     return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field));
                 if (target.ObjectValue is VmClassInstance nested)
                     return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field));
                 break;
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&
-                direct.StructType is VmClassType dt:
+                DefinitionOf(direct.StructType) is VmClassType dt:
                 return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field));
         }
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }
+
+    /// <summary>値型の定義型 (構築型は定義に解く。ファサード等の非クラス型は null)。</summary>
+    private static VmClassType? DefinitionOf(VmType type) => type switch {
+        VmClassType cls => cls,
+        VmConstructedType constructed => constructed.Definition as VmClassType,
+        _ => null,
+    };
 
     private int GetInstanceFieldIndex(VmClassType type, VmField field) {
         var layout = _objects.GetLayout(type);
@@ -310,6 +314,19 @@ internal sealed class ObjectEngine(
             }
             return new VmByRef(storage, 0);
         }
+        // ジェネリック定義の静的フィールドを Field トークン直接で触る場合
+        // (.cctor / get_Default 等の自型内アクセス)、呼出元文脈の型引数が個数一致すれば
+        // 構築型として扱う (定義共有ストレージ + null 文脈 .cctor では T ごとに別物に
+        // ならないため。型外からの Field 直接参照は稀で、個数不一致時は従来動作に残す)。
+        // 定義 .cctor より先に判定し、null 文脈での誤初期化を避ける
+        if (owner.GenericParamCount > 0 && context?.ClassArgs is { } classArgs &&
+            classArgs.Length == owner.GenericParamCount) {
+            var constructed = new VmConstructedType { Definition = owner, TypeArguments = classArgs };
+            EnsureConstructedInitialized(constructed);
+            var constructedStorage = _objects.GetOrCreateStaticStorage(constructed.FullName, owner, _loader,
+                new GenericContext { ClassArgs = classArgs }, _unifiedStaticStorage, classArgs);
+            return new VmByRef(constructedStorage, ObjectModel.StaticFieldIndex(owner, field));
+        }
         EnsureInitialized(owner);
         var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader, null, _unifiedStaticStorage, null);
         return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));
@@ -335,6 +352,28 @@ internal sealed class ObjectEngine(
         var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
         if (cctor?.Body is not null)
             invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
+    }
+
+    /// <summary>intrinsic からのインスタンス生成 (Activator.CreateInstance 用フック実体)。
+    /// 確保＋型初期化＋指定 .ctor 実行まで行う (.ctor 本体は invoker 経由で IL 実行)。
+    /// type が構築型の場合は実引数を記録し、フィールド型の !0 はそれで解決する。</summary>
+    public VmClassInstance CreateInstanceByCtor(VmType type, VmMethod ctor, StackSlot[] ctorArgs, GenericContext? context) {
+        var definition = type is VmConstructedType constructed ? (VmClassType)constructed.Definition
+            : (VmClassType)type;
+        var typeArgs = type is VmConstructedType ct ? ct.TypeArguments : null;
+        var effectiveContext = context ?? (typeArgs is { Length: > 0 } ? new GenericContext { ClassArgs = typeArgs } : null);
+        if (type is VmConstructedType ctype)
+            EnsureConstructedInitialized(ctype);
+        else
+            EnsureInitialized(definition);
+        var instance = _heap.Allocate(new VmClassInstance(definition,
+            _objects.CreateInstanceStorage(definition, _loader, effectiveContext), typeArgs ?? []));
+        var args = new StackSlot[ctorArgs.Length + 1];
+        args[0] = StackSlot.OfObject(instance);
+        ctorArgs.CopyTo(args, 1);
+        if (ctor.Body is not null)
+            invoker.Invoke(ctor, args, effectiveContext);
+        return instance;
     }
 
     // ---- オブジェクト生成 (newobj) ----
@@ -425,6 +464,120 @@ internal sealed class ObjectEngine(
         }
     }
 
+    /// <summary>Guid::.ctor の構築面。該当 overload のみホスト解析 + Guid 構造体値で受け、
+    /// 非該当は null を返して通常の実体解決フローへ流す。
+    /// 本家 .ctor 実 IL は span 16 進解析の生ポインタ演算 (VM のスロット表現に落ちない)
+    /// で構成されるため (string / byte[] / (int,short,short,byte[]) / 11 引数面)。</summary>
+    private StackSlot? TryNewGuidFromCtor(MethodSignature signature, InterpreterFrame caller) {
+        var kinds = signature.ParamTypes.Select(t => t.Kind).ToArray();
+        Guid value;
+        if (kinds is [SigKind.String]) {
+            var args = new StackSlot[1];
+            args[0] = caller.Stack.Pop();
+            var s = (args[0].ObjectValue as VmString)?.Value;
+            if (s is null)
+                throw new UnhandledGuestException("System.ArgumentNullException", null);
+            try {
+                value = new Guid(s);
+            } catch (FormatException) {
+                throw new UnhandledGuestException("System.FormatException", null);
+            } catch (OverflowException) {
+                throw new UnhandledGuestException("System.OverflowException", null);
+            }
+        } else if (kinds is [SigKind.SzArray]) {
+            var args = new StackSlot[1];
+            args[0] = caller.Stack.Pop();
+            if (args[0].ObjectValue is not VmArray array)
+                throw new UnhandledGuestException("System.ArgumentNullException", null);
+            try {
+                value = new Guid(ReadBytes(array));
+            } catch (ArgumentException ex) {
+                throw new UnhandledGuestException("System." + ex.GetType().Name, null);
+            }
+        } else if (kinds is [SigKind.I4, SigKind.I2, SigKind.I2, SigKind.SzArray]) {
+            var args = new StackSlot[4];
+            for (var i = 4; i >= 1; i--)
+                args[i - 1] = caller.Stack.Pop();
+            var d = args[3].ObjectValue as VmArray
+                ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
+            try {
+                value = new Guid(args[0].AsInt32, (short)args[1].AsInt32, (short)args[2].AsInt32, ReadBytes(d));
+            } catch (ArgumentException ex) {
+                throw new UnhandledGuestException("System." + ex.GetType().Name, null);
+            }
+        } else if (kinds.Length == 11 && kinds[0] == SigKind.I4) {
+            var args = new StackSlot[11];
+            for (var i = 11; i >= 1; i--)
+                args[i - 1] = caller.Stack.Pop();
+            try {
+                value = new Guid(args[0].AsInt32, (short)args[1].AsInt32, (short)args[2].AsInt32,
+                    (byte)args[3].AsInt32, (byte)args[4].AsInt32, (byte)args[5].AsInt32,
+                    (byte)args[6].AsInt32, (byte)args[7].AsInt32, (byte)args[8].AsInt32,
+                    (byte)args[9].AsInt32, (byte)args[10].AsInt32);
+            } catch (ArgumentException ex) {
+                throw new UnhandledGuestException("System." + ex.GetType().Name, null);
+            }
+        } else {
+            return null;
+        }
+        gate.ConsumeInstruction();
+        gate.CheckSafepoint();
+        return BuildGuidStruct(value) is { } sv
+            ? StackSlot.OfValueType(sv)
+            : null;
+    }
+
+    private static byte[] ReadBytes(VmArray array) {
+        var data = new byte[array.Length];
+        for (var i = 0; i < array.Length; i++) {
+            var element = array.Elements[i];
+            if (element.Kind != StackKind.Int32 || element.Int64Value is < 0 or > 255)
+                throw new InvalidOperationException($"byte 配列の要素 {i} が不正です (Kind={element.Kind})。");
+            data[i] = (byte)element.Int64Value;
+        }
+        return data;
+    }
+
+    /// <summary>ホスト Guid から CoreLib Guid 構造体値を構築する (_a.._k の 11 フィールド、
+    /// フィールド名で対応付け)。CoreLib 画像 (呼出元画像でなく) から型を引く。
+    /// 非該当の面は通常フローへ流すため型解決できない場合は null。</summary>
+    private VmStructValue? BuildGuidStruct(Guid value) {
+        VmClassType? cls = null;
+        foreach (var loader in _loader.Context?.Loaders ?? (IReadOnlyList<TypeLoader>)[_loader]) {
+            if (loader.FindTypeByFullName("System.Guid") is not VmClassType candidate)
+                continue;
+            if (loader.Image.SourcePath?.EndsWith("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase) == true) {
+                cls = candidate;
+                break;
+            }
+            cls ??= candidate;
+        }
+        if (cls is null)
+            return null;
+        var bytes = value.ToByteArray();
+        var layout = _objects.GetLayout(cls);
+        var fields = new StackSlot[layout.Count == 0 ? 0 : layout.Values.Max() + 1];
+        foreach (var field in cls.Fields) {
+            if (field.IsStatic || field.IsLiteral || !layout.TryGetValue(field, out var index))
+                continue;
+            fields[index] = field.Name switch {
+                "_a" => StackSlot.OfInt32(BitConverter.ToInt32(bytes, 0)),
+                "_b" => StackSlot.OfInt32(BitConverter.ToInt16(bytes, 4)),
+                "_c" => StackSlot.OfInt32(BitConverter.ToInt16(bytes, 6)),
+                "_d" => StackSlot.OfInt32(bytes[8]),
+                "_e" => StackSlot.OfInt32(bytes[9]),
+                "_f" => StackSlot.OfInt32(bytes[10]),
+                "_g" => StackSlot.OfInt32(bytes[11]),
+                "_h" => StackSlot.OfInt32(bytes[12]),
+                "_i" => StackSlot.OfInt32(bytes[13]),
+                "_j" => StackSlot.OfInt32(bytes[14]),
+                "_k" => StackSlot.OfInt32(bytes[15]),
+                _ => StackSlot.OfInt32(0),
+            };
+        }
+        return new VmStructValue(cls, fields);
+    }
+
     private static VmArray RequireCharArray(StackSlot slot) =>
         slot.ObjectValue as VmArray
         ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
@@ -465,6 +618,13 @@ internal sealed class ObjectEngine(
                 // 直接の new string(...) もここに着地する
                 if (typeName == "System.String" && name == ".ctor")
                     return NewStringFromCtor(facadeParamCount, caller);
+                // Guid の構築面 (new Guid(string) / (byte[]) 等):
+                // 本家 .ctor 実 IL は span 16 進解析の生ポインタ演算 (単一スロットへの
+                // バイト単位 Add 等、VM のスロット表現に落ちない) で構成されるため、
+                // ホスト解析 + CoreLib Guid 構造体値の直接構築で受ける
+                if (typeName == "System.Guid" && name == ".ctor" &&
+                    TryNewGuidFromCtor(signature, caller) is { } guidSlot)
+                    return guidSlot;
                 var facadeType = _loader.FindIntrinsicType(typeName);
                 if (facadeType is not null) {
                     // デリゲートファサード (Action/Func/Predicate 等) の newobj (object, native int)

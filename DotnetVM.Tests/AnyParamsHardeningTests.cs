@@ -83,6 +83,7 @@ public class AnyParamsHardeningTests {
             S("System.IUtfChar`1", "CastFrom", "System.Int32"),
             S("System.IUtfChar`1", "CastFrom", "System.UInt32"),
             S("System.IUtfChar`1", "CastFrom", "System.UInt64"),
+            S("System.IUtfChar`1", "CastToUInt32", "!0"),
         ];
         var missing = required.Where(k => !keys.Contains(k)).Select(k => k.ToString()).ToList();
         Assert.True(missing.Count == 0,

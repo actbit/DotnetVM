@@ -10,7 +10,7 @@ public abstract class VmType {
 
     /// <summary>名前空間を除いた型名 (FullName の最後の '.' / '+' 以降)。
     /// ネスト型の FullName は CLR 規約どおり '+' 区切り (例: Vm.Compat+Box) なので両方を見る。</summary>
-    public string Name {
+    public virtual string Name {
         get {
             var fullName = FullName;
             var cut = System.Math.Max(fullName.LastIndexOf('.'), fullName.LastIndexOf('+'));
@@ -228,6 +228,9 @@ public sealed class VmConstructedType : VmType {
 
     public override string FullName =>
         $"{Definition.FullName}<{string.Join(", ", TypeArguments.Select(t => t.FullName))}>";
+
+    /// <summary>Type.Name は構築型の型引数を含まず、ジェネリック定義名を返す。</summary>
+    public override string Name => Definition.Name;
 
     /// <summary>定義の基底型に型引数を適用したもの (例: Sub`1&lt;int&gt; → Base`1&lt;!0&gt; → Base`1&lt;int&gt;)。</summary>
     public override VmType? BaseType {

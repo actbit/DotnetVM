@@ -101,8 +101,14 @@ internal sealed class CallEngine(
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
                 }
                 // ファサード インターフェースの明示的実装 (EII) を実行時型の InterfaceMap で解決する
-                // (明示的実装はメソッド名が規定名と異なるため名前照合では見つからない)
+                // (明示的実装はメソッド名が規定名と異なるため名前照合では見つからない)。
+                // EII 本体にも優先順位 ① (ランタイムバインド) を照合する (Enum の
+                // IFormattable EII 等の culture/表現境界面の委譲のため)。EII 本体名は
+                // ドット付きのため短名バインドへの誤ヒットは無い
                 if (TryDispatchInterfaceKey(target.DeclaringType, target.Name!, target.ParamTypeNames, args[0]) is { } explicitImpl) {
+                    if (TryInvokeBinding(explicitImpl, target.MethodArgs, args, out var explicitBound,
+                            callerDomain, target.ClassArgs))
+                        return explicitBound;
                     var context = BuildCallContext(target, explicitImpl, args[0]);
                     var guestRet = invoker.Invoke(explicitImpl, args, context);
                     return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? guestRet : null;
@@ -137,6 +143,14 @@ internal sealed class CallEngine(
             gate.CheckSafepoint();
             // 宣言上のパラメータ型名を渡す (char/bool/int 等、i4 統合面のオーバーロード判別用)
             _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
+            // メソッド型実引数も渡す (IsBitwiseEquatable<T>() 等の値パラメータ 0 個の面が
+            // T を判別するため。MethodSpec 経由の解決では CallTarget が保持している)。
+            // クラス型実引数も同様 (構築型経由の面のため)。
+            // 無い場合は空にして前回呼出の残留 (stale) を残さない)
+            _intrinsicContext.MethodTypeArgumentNames =
+                target.MethodArgs?.Select(t => t.FullName).ToArray() ?? [];
+            _intrinsicContext.ClassTypeArgumentNames =
+                target.ClassArgs?.Select(t => t.FullName).ToArray() ?? [];
             return intrinsic(_intrinsicContext, args);
         }
 
@@ -178,10 +192,20 @@ internal sealed class CallEngine(
 
         if (method.Body is null) {
             // 本体の無い面 (InternalCall / P/Invoke / 抽象宣言) はバインドが無い限り IL 実行できない。
-            // callvirt の場合のみレシーバ実行時型への最終救済 (EII) を試してから legacy intrinsic へ
+            // 配列レシーバのインターフェース面 (IEnumerable<T> 等) は SZArrayHelper 経由で
+            // 先に合成する (CLR のコンパイラ支援と同一)
+            if (isCallvirt && method.Signature.HasThis &&
+                TryInvokeArrayInterface(method.DeclaringType.FullName, method.Name,
+                    method.Signature.ParamTypes.Length, target.ClassArgs, target.MethodArgs, args) is { } arrayResult)
+                return arrayResult;
+            // callvirt の場合のみレシーバ実行時型への最終救済 (EII) を試してから legacy intrinsic へ。
+            // EII 本体にも ① を照合する (intrinsic 分岐と同一)
             if (isCallvirt && method.Signature.HasThis &&
                 TryDispatchInterfaceKey(method.DeclaringType.FullName, method.Name,
                     ParamTypeNamesOf(method, target.MethodArgs), args[0]) is { } explicitImpl) {
+                if (TryInvokeBinding(explicitImpl, target.MethodArgs, args, out var explicitBound,
+                        callerDomain, target.ClassArgs))
+                    return explicitBound;
                 var implContext = BuildCallContext(target, explicitImpl, args[0]);
                 var implRet = invoker.Invoke(explicitImpl, args, implContext);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? implRet : null;
@@ -222,6 +246,12 @@ internal sealed class CallEngine(
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
     /// 無ければ未登録 intrinsic として拒否する。callerDomain は呼出元フレーム基準。</summary>
     private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args, BindingDomain callerDomain) {
+        // 配列レシーバのインターフェース面 (IEnumerable<T>.GetEnumerator 等) は
+        // SZArrayHelper 経由で合成する (CLR と同一のコンパイラ支援面)
+        if (isCallvirt && target.HasThis && TryInvokeArrayInterface(
+                target.DeclaringType, target.Name, target.ParamCount,
+                target.ClassArgs, target.MethodArgs, args) is { } arrayResult)
+            return arrayResult;
         if (isCallvirt && target.HasThis) {
             if (TryDispatchVirtual(target.Name!, target.ParamCount, args[0]) is { } guestOverride) {
                 // 優先順位 ①: IL 実行の前にランタイムバインドを試す (上の intrinsic 経路と同じ)
@@ -231,8 +261,12 @@ internal sealed class CallEngine(
                 var ret = invoker.Invoke(guestOverride, args, context);
                 return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
             }
-            // ファサード インターフェースの明示的実装 (EII) もここで救済する
+            // ファサード インターフェースの明示的実装 (EII) もここで救済する。
+            // EII 本体にも ① を照合する (intrinsic 分岐と同一)
             if (TryDispatchInterfaceKey(target.DeclaringType, target.Name!, target.ParamTypeNames, args[0]) is { } explicitImpl) {
+                if (TryInvokeBinding(explicitImpl, target.MethodArgs, args, out var explicitBound,
+                        callerDomain, target.ClassArgs))
+                    return explicitBound;
                 var context = BuildCallContext(target, explicitImpl, args[0]);
                 var ret = invoker.Invoke(explicitImpl, args, context);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? ret : null;
@@ -374,6 +408,69 @@ internal sealed class CallEngine(
                 return best;
         }
         return FindMethodByScanThroughChain(receiverType, name, paramCount);
+    }
+
+    /// <summary>配列レシーバのインターフェース面を SZArrayHelper 経由で合成する。
+    /// CLR では SZArray が IList&lt;T&gt; 等を暗黙実装し、呼出は SZArrayHelper の実体へ
+    /// 振り分けられる (コンパイラ支援)。VM も同一に振り分ける:
+    /// GetEnumerator (IEnumerable/IEnumerable&lt;T&gt;) は SZArrayHelper.GetEnumerator&lt;T&gt; の
+    /// 実 IL を実行し、get_Count (ICollection 系) は配列長を直接返す。
+    /// 非該当 (非配列レシーバ等) は null (従来フローへ)。</summary>
+    private StackSlot? TryInvokeArrayInterface(string? declaringTypeName, string? name, int paramCount,
+        VmType[]? classArgs, VmType[]? methodArgs, StackSlot[] args) {
+        _ = classArgs;
+        _ = methodArgs;
+        if (declaringTypeName is null || name is null || args.Length == 0 ||
+            args[0].ObjectValue is not VmArray array)
+            return null;
+        var isEnumerable = declaringTypeName is "System.Collections.IEnumerable"
+            or "System.Collections.Generic.IEnumerable`1";
+        var isCountable = declaringTypeName is "System.Collections.ICollection"
+            or "System.Collections.Generic.ICollection`1"
+            or "System.Collections.Generic.IReadOnlyCollection`1";
+        if (name == "GetEnumerator" && paramCount == 0 && isEnumerable) {
+            var helper = FindSZArrayHelper();
+            if (helper is null)
+                return null;
+            // SZArrayHelper.GetEnumerator<T>() はインスタンス面 (0 引数。this が配列)。
+            // 本体が ldarg.0 から T[] を取り出して SZArrayEnumerator<T> を構築する
+            var elementType = array.ArrayType.ElementType;
+            var method = helper.Methods.FirstOrDefault(m =>
+                m.Name == "GetEnumerator" && m.Signature.HasThis &&
+                m.Signature.GenericParamCount == 1 &&
+                m.Signature.ParamTypes.Length == 0 && m.Body is not null);
+            if (method is null)
+                return null;
+            var context = GenericContext.Of(null, [elementType]);
+            var result = invoker.Invoke(method, [args[0]], context);
+            return SlotOps.SignatureReturnsValue(method.Signature) ? result : null;
+        }
+        if (name == "get_Count" && paramCount == 0 && isCountable)
+            return StackSlot.OfInt32(array.Length);
+        return null;
+    }
+
+    /// <summary>SZArrayHelper の TypeDef を探す (CoreLib 実装画像を優先)。</summary>
+    private VmClassType? FindSZArrayHelper() {
+        const string name = "System.SZArrayHelper";
+        try {
+            if (_loader.FindTypeByFullName(name) is VmClassType direct)
+                return direct;
+        } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+            or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+        }
+        if (_loader.Context is { } context) {
+            foreach (var loader in context.Loaders) {
+                try {
+                    if (loader.FindTypeByFullName(name) is VmClassType found)
+                        return found;
+                } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+                    or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+                    continue;
+                }
+            }
+        }
+        return null;
     }
 
     /// <summary>ファサード インターフェースの明示的実装 (EII) 用: 宣言型名 + パラメータ型名から
@@ -574,8 +671,10 @@ internal sealed class CallEngine(
         }
         NormalizeByRefReceiver(method, args);
         // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の
-        // ジェネリック面でも T を判別できるようにする)
+        // ジェネリック面でも T を判別できるようにする)。クラス型実引数 (!0 等) も同様に
+        // 渡す (EqualityComparer<T>.get_Default 等のクラスジェネリック面のため)
         _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
+        _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
         result = InvokeDelegated(impl, names, args);
         return true;
     }
@@ -626,7 +725,8 @@ internal sealed class CallEngine(
         var loader = method.Loader;
         if (loader is null || method.Signature.ParamTypes.Length != concreteNames.Length)
             return false;
-        // 開いた名を構築し、具体名と同一 (非ジェネリック面) なら再照合は無駄
+        // 開いた名を構築する。パラメータ名だけでなく戻り型がジェネリック変数 (!!0 等)
+        // の場合も実引数で具体化されているため、開いた戻り型キーを照合する必要がある。
         var openNames = new string[concreteNames.Length];
         var differs = false;
         for (var i = 0; i < openNames.Length; i++) {
@@ -637,9 +737,9 @@ internal sealed class CallEngine(
             if (!string.Equals(open, concreteNames[i], StringComparison.Ordinal))
                 differs = true;
         }
-        if (!differs)
-            return false;
         var openReturn = DescribeBindingType(method.Signature.ReturnType, null, null, loader) ?? "";
+        if (!differs && string.Equals(openReturn, concreteReturn, StringComparison.Ordinal))
+            return false;
         var openKey = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames)
             : BindingKey.StaticWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames);
@@ -909,7 +1009,7 @@ internal sealed class CallEngine(
                 throw new NotSupportedException($"MemberRef 親テーブル {parent.Table} は未対応です。");
             }
             case TableKind.MethodSpec:
-                return ResolveMethodSpecTarget(token, rid, context);
+                return ResolveMethodSpecTarget(token, rid, context, throwOnMissingIntrinsic);
             default:
                 throw new BadImageFormatException($"呼出トークン 0x{token:X8} のテーブル 0x{(int)table:X2} が不正です。");
         }
@@ -982,7 +1082,7 @@ internal sealed class CallEngine(
 
     /// <summary>ジェネリックメソッド (MethodSpec) を解決する。Instantiation blob からメソッド型引数を取り出す。
     /// 例: call !!0 class Generics::First&lt;!!0&gt;(!!0[])</summary>
-    private CallTarget ResolveMethodSpecTarget(int token, int methodSpecRid, GenericContext? context) {
+    private CallTarget ResolveMethodSpecTarget(int token, int methodSpecRid, GenericContext? context, bool throwOnMissingIntrinsic = true) {
         var underlying = _loader.Image.Tables.DecodeCoded(
             TableKind.MethodSpec, methodSpecRid, 0, CodedIndexKind.MethodDefOrRef);
         var instantiationBlobIndex = _loader.Image.Tables.GetRowIndex(TableKind.MethodSpec, methodSpecRid, 1);
@@ -1044,6 +1144,38 @@ internal sealed class CallEngine(
                         HasThis = signature.HasThis,
                         // !!n を MethodSpec の実引数で置換した宣言型名 (char/bool 等 i4 統合面の判別に必要)
                         ParamTypeNames = concreteParams,
+                        // メソッド型実引数も保持する (IsBitwiseEquatable<T>() 等の値パラメータ
+                        // 0 個の面が T を判別するため。Call 側で IntrinsicContext へ設定する)
+                        MethodArgs = methodArgs,
+                    };
+                }
+                // 実ジェネリックメソッド (CoreLib の managed IL) を legacy より先に解決する
+                // (優先順位 ② > ③。Join<T> 等の実体を持つ面が名前+引数個数の legacy 救済に
+                // 誤経由するのを防ぐ。バインド (①) は上で優先済み。ファサード型には実体が
+                // 無いため対象外。表現境界の型・可変状態をローカルに持つ構造体ファサード
+                // (DefaultInterpolatedStringHandler 等) は legacy を維持する)。
+                // legacy (③) は実体の無い面の救済として残す
+                VmMethod? realMethodEarly = null;
+                try {
+                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClassEarly &&
+                        !DelegateContinuingSurfaces.Contains(realClassEarly.FullName) &&
+                        !PreservesByRefReceiver(realClassEarly.FullName))
+                        realMethodEarly = FindMethodThroughChain(realClassEarly, name, signature.ParamTypes);
+                } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+                    or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+                    // 依存欠落等の解決不能は legacy 救済・拒否へ流す (ここで落とさない)
+                }
+                if (realMethodEarly is { Body: not null }) {
+                    if (realMethodEarly.Signature.GenericParamCount != methodArgs.Length)
+                        throw new BadImageFormatException(
+                            $"MethodSpec 0x{token:X8} の型引数は {methodArgs.Length} 個ですが、{realMethodEarly} は {realMethodEarly.Signature.GenericParamCount} 個を要求します。");
+                    return new CallTarget {
+                        Arity = specArity,
+                        Method = realMethodEarly,
+                        Name = realMethodEarly.Name,
+                        ParamCount = realMethodEarly.Signature.ParamTypes.Length,
+                        HasThis = realMethodEarly.Signature.HasThis,
+                        MethodArgs = methodArgs,
                     };
                 }
                 if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, specArity, signature.HasThis), out var impl) ||
@@ -1060,6 +1192,19 @@ internal sealed class CallEngine(
                             .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
                     };
                 }
+                // 実体の無い面の legacy 救済の後に実 IL フォールバックは不要 (上で解決済み)。
+                // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返すこともある
+                // (constrained callvirt ではレシーバの実行時型にゲスト実装があるため。
+                // Call 側で最終ディスパッチが失敗した時点で改めて例外にする)
+                if (!throwOnMissingIntrinsic)
+                    return new CallTarget {
+                        Arity = specArity,
+                        DeclaringType = typeName,
+                        Name = name,
+                        ParamCount = signature.ParamTypes.Length,
+                        HasThis = signature.HasThis,
+                        MethodArgs = methodArgs,
+                    };
                 throw new OperationNotAllowedException(
                     $"intrinsic {typeName}::{name} (引数 {specArity} 個) は未登録です (MethodSpec 経由)。");
             }

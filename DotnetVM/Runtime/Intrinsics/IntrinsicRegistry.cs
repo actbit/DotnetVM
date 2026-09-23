@@ -60,6 +60,15 @@ public sealed class IntrinsicContext {
     /// 0 個の面) で T を判別するために使う。</summary>
     public string[] MethodTypeArgumentNames { get; internal set; } = [];
 
+    /// <summary>呼出ゲートが設定する「今回の呼出のクラス型実引数名」 (構築型の !0 等)。
+    /// EqualityComparer&lt;T&gt;.get_Default 等の値パラメータ 0 個のクラスジェネリック面で
+    /// T を判別するために使う (MethodSpec の !!n とは別軸)。</summary>
+    public string[] ClassTypeArgumentNames { get; internal set; } = [];
+
+    /// <summary>クラス型実引数のインデックス名 (範囲外は空文字列)。</summary>
+    public string ClassTypeArgAt(int i) =>
+        i >= 0 && i < ClassTypeArgumentNames.Length ? ClassTypeArgumentNames[i] : "";
+
     /// <summary>メソッド型実引数のインデックス名 (範囲外は空文字列)。</summary>
     public string MethodTypeArgAt(int i) =>
         i >= 0 && i < MethodTypeArgumentNames.Length ? MethodTypeArgumentNames[i] : "";
@@ -75,6 +84,12 @@ public sealed class IntrinsicContext {
 
     /// <summary>MethodBase.GetCurrentMethod() 用の現在メソッド取得フック (Interpreter が設定)。</summary>
     internal Func<VmMethod?>? CurrentMethodHook { get; set; }
+
+    /// <summary>インスタンス生成フック (Activator.CreateInstance 等が .ctor を実行する用)。
+    /// 定義型 + 実行する .ctor + 引数 + ジェネリック文脈を受け、確保＋初期化＋.ctor 実行済みの
+    /// インスタンスを返す。ゲートは呼出側 intrinsic が既に通過済みで、.ctor 本体は
+    /// Interpreter.Invoke 経由 (クォータ/再帰深度の対象) で実行される。</summary>
+    internal Func<VmType, VmMethod, StackSlot[], DotnetVM.Runtime.Types.GenericContext?, DotnetVM.Runtime.Objects.VmClassInstance>? NewInstanceHook { get; set; }
 
     /// <summary>オブジェクトの CLR 互換文字列化 (ゲストの ToString override を仮想ディスパッチ)。</summary>
     public VmString? InvokeToString(in StackSlot slot) =>

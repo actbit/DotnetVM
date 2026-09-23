@@ -219,7 +219,24 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Type", "IsSubclassOf", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
         // Enum ToString (culture-dependent type-face IL): enum Face文化 CultureData文化 culture IL CultureCulture文化 representation
         Add("System.Enum", "ToString", CoreLibSurfaceKind.RuntimeInternal,
-            RuntimeRepresentation + " (本家 IL は FormatFeatures / CultureInfo 面を辿る culture 機構 depende の G 書式面。VM enum box の value__ 基底型生値をホストの同名 enum (CoreLib typedef 同名照合) で文字列化)", hasThis: true, paramCount: 0);
+            RuntimeRepresentation + " (本家 IL は FormatFeatures / CultureInfo 面を辿る culture 機構依存。リテラル表から G 書式名を解決)", hasThis: true, paramCount: 0);
+        Add("System.Enum", "ToString", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (G/D/X/F 書式面。castclass RuntimeType + 生ポインタの実 IL のためリテラル表で直接提供。不正書式は FormatException)", hasThis: true, paramCount: 1);
+        Add("System.Enum", "ToString", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (EII 本体。Join 等の要素書式が辿る。ToString(string) と同一意味論)", hasThis: true, paramCount: 2);
+        // Enum.Parse / TryParse / GetNames / GetValues / IsDefined / GetName:
+        // 本家 IL は RuntimeType リフレクション (GetFields 等) のため VM 表現境界。
+        // リテラル表 (Constant) + 基底型幅で同一意味論を提供する
+        var enumParseJ = RuntimeRepresentation +
+            " (本家 IL は RuntimeType.GetFields 等のリフレクション。リテラル表で名前⇔値の同一意味論を提供。数値面・ignoreCase 面を含む)";
+        Add("System.Enum", "Parse", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 1);
+        Add("System.Enum", "Parse", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 2);
+        Add("System.Enum", "TryParse", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 2);
+        Add("System.Enum", "TryParse", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 3);
+        Add("System.Enum", "GetNames", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 0);
+        Add("System.Enum", "GetValues", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 0);
+        Add("System.Enum", "IsDefined", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 2);
+        Add("System.Enum", "GetName", CoreLibSurfaceKind.RuntimeInternal, enumParseJ, hasThis: false, paramCount: 2);
         // Unsafe.CopyBlockUnaligned 群: jit intrinsic (byte copy 裏の memmove 面)
         Add("System.Runtime.CompilerServices.Unsafe", "CopyBlockUnaligned", CoreLibSurfaceKind.RuntimeInternal,
             JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。String / Span IL が バイト実体コピー (byteCount) に Talent → Buffer.Memmove 相当の memmove で同等提供)", hasThis: false);
@@ -231,6 +248,87 @@ internal static class CoreLibSurfaceAudit {
         // IUtfChar<T> の jit intrinsic 面 (string/span char genericIL が辿る T(char) 再解釈面)
         Add("System.IUtfChar`1", "CastFrom", CoreLibSurfaceKind.RuntimeInternal,
             JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。T(char) 系の i4 スロット再解釈で透過)", hasThis: false);
+        Add("System.IUtfChar`1", "CastToUInt32", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。Guid 16 進解析等の T→uint 再解釈。クラス変数の開いたキーで 1 件)", hasThis: false);
+        // IEqualityOperators<TSelf,TOther,TResult>.op_Equality (static abstract)。
+        // GenericEqualityComparer<T>.Equals 等が constrained 呼出で辿る。VM に static abstract
+        // ディスパッチが無いため == の観測意味論を直接提供する (NaN は == 規約どおり false)
+        Add("System.Numerics.IEqualityOperators`3", "op_Equality", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (本家 IL はダミー抽象。GenericEqualityComparer 等の等値判定が依存)", hasThis: false);
+        Add("System.Numerics.IEqualityOperators`3", "op_Inequality", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (== の否定。Guid 比較等が依存)", hasThis: false);
+        // ISpanFormattable.TryFormat (JoinCore 等の要素書式面。本家 IL は Number.TryFormat* の
+        // char* / culture 機構で VM 表現境界のため、ホスト不変カルチャ書式 + span 書込で提供)
+        foreach (var t in new[] { "System.Int32", "System.UInt32", "System.Int64", "System.UInt64",
+            "System.Single", "System.Double" }) {
+            Add(t, "TryFormat", CoreLibSurfaceKind.RuntimeInternal,
+                RuntimeRepresentation + " (本家 IL は Number.TryFormat の char* 内部 + culture 機構。ホスト不変カルチャ書式を span へ書く。provider は規約どおり無視)", hasThis: true, paramCount: 4);
+        }
+        // 検証ヘルパー ThrowIfNegative<T> (本家 IL は constrained T + INumberBase<T>.IsNegative
+        // の static abstract 呼出。VM に static abstract ディスパッチが無いため検証意味論を直接提供)
+        Add("System.ArgumentOutOfRangeException", "ThrowIfNegative", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (本家 IL は INumberBase static abstract 依存。負値の ArgumentOutOfRangeException 送出のみが観測意味論のため直接提供。-0.0 の符号ビットも CLR どおり負判定)", hasThis: false);
+        // Array コア面 (全 Sort/Reverse/IndexOf/Copy overload がここへ集約される。
+        // 本家実 IL は introsort / 比較子生成 / MethodTable 内部表現で VM 表現境界)
+        var arrayCoreJ = RuntimeRepresentation +
+            " (既定順序はプリミティブ数値 + 文字列不変カルチャのホスト比較と同一順序。カスタム IComparer 面はゲスト委譲機構が無いため fail-closed。多次元は RankException)";
+        Add("System.Array", "Sort", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 5);
+        Add("System.Array", "Sort", CoreLibSurfaceKind.RuntimeInternal,
+            arrayCoreJ + " (ジェネリック面は開いたキーで 1 件。比較子生成のランタイム内部を迂回する)", hasThis: false, paramCount: 1);
+        Add("System.Array", "Sort", CoreLibSurfaceKind.RuntimeInternal,
+            arrayCoreJ + " (ジェネリック面は開いたキーで 1 件。呼出文脈の型変数綴り !!0 / !0 の両形)", hasThis: false, paramCount: 4);
+        Add("System.Array", "Reverse", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 3);
+        Add("System.Array", "IndexOf", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 4);
+        Add("System.Array", "Copy", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 5);
+        Add("System.Array", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
+            arrayCoreJ + " (ジェネリック面は開いたキーで 1 件。SpanHelpers の SIMD/static-abstract 依存を迂回する)", hasThis: false, paramCount: 4);
+        // EqualityComparer<T>.get_Default (本家は .cctor → ComparerHelpers 連鎖で比較子実体を
+        // 選択する。VM 型モデルで同一振分 (string/enum/Nullable/既定) を直接行い、実体は
+        // 公開無引数 .ctor を IL 実行する。T はクラス型実引数で判別する)
+        Add("System.Collections.Generic.EqualityComparer`1", "get_Default", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (本家 IL は RuntimeType 内部表現・MakeGenericType 連鎖。VM 型モデルで同一振分)", hasThis: false, paramCount: 0);
+        // ArrayPool<T> (ValueStringBuilder 等の作業域。TlsOverPerCore + ETW 診断で VM 表現境界。
+        // プールは性能機構のため要求長どおり新規確保で代替し Return は no-op。Shared 実体は不透明)
+        var poolJ = RuntimeRepresentation +
+            " (本家はスレッド局所プール + EventSource 診断。要求長確保 + Return no-op が同一意味論。貸出配列は new T[] 同様ゼロ初期化で決定的)";
+        Add("System.Buffers.ArrayPool`1", "get_Shared", CoreLibSurfaceKind.RuntimeInternal, poolJ, hasThis: false, paramCount: 0);
+        Add("System.Buffers.ArrayPool`1", "Rent", CoreLibSurfaceKind.RuntimeInternal, poolJ, hasThis: true, paramCount: 1);
+        Add("System.Buffers.ArrayPool`1", "Return", CoreLibSurfaceKind.RuntimeInternal, poolJ + " (bool 面と .NET 10 追加の lengthToClear 面の両形)", hasThis: true, paramCount: 2);
+        // Type 解決・生成面 (IsAssignableFrom / get_IsInterface / GetType(string) /
+        // Activator.CreateInstance(Type) / CreateInstanceForAnotherGenericParameter)。
+        // 本家実 IL は RuntimeType 内部表現・QCall・メソッドテーブルキャッシュを辿るため
+        // VM 型モデルで同一意味論を提供する
+        var typeResolveJ = RuntimeRepresentation +
+            " (本家 IL は RuntimeType 内部表現へ直接アクセス。VM 型モデル (VmType) から同一要素を提示する)";
+        Add("System.Type", "IsAssignableFrom", CoreLibSurfaceKind.RuntimeInternal, typeResolveJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "get_IsInterface", CoreLibSurfaceKind.RuntimeInternal, typeResolveJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "GetType", CoreLibSurfaceKind.RuntimeInternal,
+            typeResolveJ + " (型名文字列→VM 型の解決。アセンブリ指定はその画像内、単純名は trusted 優先。未解決は CLR どおり null)", hasThis: false, paramCount: 1);
+        Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (値型は既定値の box、参照型は公開無引数 .ctor を IL 実行。抽象等の失敗分類は CLR と同一)", hasThis: false, paramCount: 1);
+        // Convert (Base64) / BitConverter (純粋変換面。本家 IL は byte* / Span 内部で VM 表現境界)
+        var convertBinaryJ = RuntimeRepresentation +
+            " (本家 IL は byte* 生ポインタ + Span 内部。ホスト同一意味論へ委譲。不正入力の FormatException 分類も同一)";
+        Add("System.Convert", "ToBase64String", CoreLibSurfaceKind.RuntimeInternal, convertBinaryJ, hasThis: false, paramCount: 1);
+        Add("System.Convert", "FromBase64String", CoreLibSurfaceKind.RuntimeInternal, convertBinaryJ, hasThis: false, paramCount: 1);
+        Add("System.BitConverter", "GetBytes", CoreLibSurfaceKind.RuntimeInternal, convertBinaryJ, hasThis: false, paramCount: 1);
+        Add("System.BitConverter", "ToString", CoreLibSurfaceKind.RuntimeInternal, convertBinaryJ, hasThis: false, paramCount: 1);
+        // Guid (解析・書式・比較面。本家 IL は span 16 進解析 + SIMD フォーマットで表現境界。
+        // 書式に culture 要素が無いためホスト委譲で完全一致。不正入力の分類も同一)
+        var guidJ = RuntimeRepresentation +
+            " (本家 IL は span 16 進解析 + SIMD フォーマット。ホスト同一意味論へ委譲。VM 表現は _a.._k 構造体値に正規化)";
+        Add("System.Guid", "Parse", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 1);
+        Add("System.Guid", "TryParse", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 2);
+        Add("System.Guid", "ToString", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 0);
+        Add("System.Guid", "ToString", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 1);
+        Add("System.Guid", "ToString", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 2);
+        Add("System.Guid", "Equals", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 1);
+        Add("System.Guid", "CompareTo", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 1);
+        Add("System.Guid", "GetHashCode", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 0);
+        Add("System.Guid", "op_Equality", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 2);
+        Add("System.Guid", "op_Inequality", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 2);
+        Add("System.RuntimeTypeHandle", "CreateInstanceForAnotherGenericParameter", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (比較子等の未初期化実体。GetUninitializedObject と同一の確保のみ)", hasThis: false, paramCount: 2);
 
         // ---- CoreLibBindings: System.SR (CoreLib 内部リソース文字列) ----
         // 実 IL が例外生成時に SR.Overflow_Int32 等を辿る先。culture 機構 (ResourceManager) 依存
@@ -313,6 +411,14 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.CompilerServices.Unsafe", "AsRef", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "SizeOf", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "BitCast", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "WriteUnaligned", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。BitConverter.TryWriteBytes 等が Span へのプリミティブ書込に使う。Read 対称面と同等提供)", hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "ReadUnaligned", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。Write 対称面)", hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "SkipInit", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (実 IL はダミー throw = JIT intrinsic。実 CLR も何もしないため no-op が同一意味論)", hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "IsNullRef", CoreLibSurfaceKind.RuntimeInternal,
+            JitIntrinsic + " (本家 IL は AsPointer 比較だが AsPointer 自体がダミー throw のため null 参照表現の直接判定で提供)", hasThis: false);
         Add("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference", CoreLibSurfaceKind.RuntimeInternal,
             JitIntrinsic + " (配列データ先頭スロットへの VmByRef で同等提供)", hasThis: false);
 
@@ -323,6 +429,15 @@ internal static class CoreLibSurfaceAudit {
             RuntimeRepresentation + " (VM 型モデルで参照含有を再帰判定)", hasThis: false, paramCount: 1);
         Add("System.Runtime.CompilerServices.RuntimeHelpers", "IsReferenceOrContainsReferences", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (ジェネリック ラッパー面。メソッド型実引数から判定)", hasThis: false);
+        // RuntimeHelpers.CreateSpan<T>(RuntimeFieldHandle): FieldRVA 静的テーブル
+        // (HashHelpers の素数表等) から ReadOnlySpan<T> を直接構築する (GetSpanDataFrom の
+        // MethodTable 内部表現を迂回する)。ldtoken Field の初期データ列が真実源
+        Add("System.Runtime.CompilerServices.RuntimeHelpers", "CreateSpan", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (本家 IL は GetSpanDataFrom のランタイム内部表現依存。FieldRVA 初期データから同一 span を構築)", hasThis: false, paramCount: 1);
+        // RuntimeHelpers.GetRawData(object): box/インスタンス先頭への生参照。
+        // 本家 IL は生ポインタ + Unsafe.As 幅別読みのため VM 表現境界
+        Add("System.Runtime.CompilerServices.RuntimeHelpers", "GetRawData", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (box/実体の先頭スロットへの ByRef、文字列はバイト実体で提供)", hasThis: false, paramCount: 1);
 
         // ---- CoreLibBindings: Vector64/128/256/512 ----
         // VM は SIMD 値型の inline 表現を持たないため true にすると SpanHelpers 等が
@@ -334,6 +449,20 @@ internal static class CoreLibSurfaceAudit {
         foreach (var t in new[] { "System.Runtime.Intrinsics.Vector64", "System.Runtime.Intrinsics.Vector128", "System.Runtime.Intrinsics.Vector256", "System.Runtime.Intrinsics.Vector512" }) {
             Add(t, "get_IsHardwareAccelerated", CoreLibSurfaceKind.RuntimeInternal, vectorJ, hasThis: false, paramCount: 0);
         }
+        // X86.Sse2.get_IsSupported もダミー自己再帰 IL。SpanHelpers.IndexOfValueType 等が
+        // PackedSpanHelpers 経由で参照するため false で scalar フォールバックへ誘導する
+        // (Vector 面と同一方針。Sse41/Avx2 等の他面は到達次第 fail-driven で追加する)
+        Add("System.Runtime.Intrinsics.X86.Sse2", "get_IsSupported", CoreLibSurfaceKind.RuntimeInternal, vectorJ, hasThis: false, paramCount: 0);
+        foreach (var x86Type in new[] {
+            "System.Runtime.Intrinsics.X86.Avx2",
+            "System.Runtime.Intrinsics.X86.Lzcnt",
+        }) {
+            Add(x86Type, "get_IsSupported", CoreLibSurfaceKind.RuntimeInternal, vectorJ,
+                hasThis: false, paramCount: 0);
+        }
+        Add("System.Type", "GetEnumUnderlyingType", CoreLibSurfaceKind.RuntimeInternal,
+            RuntimeRepresentation + " (Type.GetFields の RuntimeType 表現依存を VM enum 定義の value__ フィールド参照で置換)",
+            hasThis: true, paramCount: 0);
 
         // ---- CoreLibBindings: 環境 / Marshal lastError / GlobalizationMode (C5.5 探査テスト継続) ----
         var marshalLastErrorJ = InternalCall +
@@ -345,6 +474,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
         Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
+        Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
+            "pinvoke-replacement: 乱数源 P/Invoke の代替実装を決定論的ゼロ埋めで委譲 (VM 決定論規約。ネイティブ実行はしない。ハッシュ利用面の観測意味論は同一)", hasThis: false, paramCount: 4);
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
             InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 

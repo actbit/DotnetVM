@@ -17,6 +17,15 @@ internal static class TypeChecks {
         DotnetVM.Runtime.Objects.VmExceptionObject e => e.ExceptionType.IsAssignableTo(target),
         VmString => target.FullName is "System.String" or "System.Object" ||
             (stringType is { } st && st.IsAssignableTo(target)),
+        // typeof(X) / GetType() の結果は CLR では System.RuntimeType の実体。
+        // VM の VmRuntimeObject を同一視する (Enum.ToString(string) 等の実 IL が
+        // castclass System.RuntimeType する経路のため。fake 型との混同は起きない —
+        // 参照自体が VM 型系へのポインタであり別アセンブリの型実体ではない)。
+        VmRuntimeObject => target.FullName is "System.RuntimeType"
+            or "System.Type" or "System.Object" or "System.Reflection.MemberInfo",
+        // MethodBase.GetCurrentMethod() 等の結果は CLR では System.Reflection.RuntimeMethodInfo の実体。
+        VmRuntimeMethod => target.FullName is "System.Reflection.RuntimeMethodInfo"
+            or "System.Reflection.MethodBase" or "System.Reflection.MemberInfo" or "System.Object",
         VmArray array => target switch {
             VmArrayType other => array.ArrayType.ElementType.IsAssignableTo(other.ElementType),
             _ => target.FullName is "System.Array" or "System.Object" or "System.ICloneable"

@@ -71,6 +71,15 @@ internal sealed class TypeInitializationTracker {
             return entry.Status;
     }
 
+    /// <summary>ALC アンロード時に、その型またはその型引数を含む初期化状態を破棄する。</summary>
+    internal void RemoveForContext(VmAssemblyContext context) {
+        foreach (var pair in _entries) {
+            if (!pair.Key.IsOwnedBy(context))
+                continue;
+            _entries.TryRemove(pair.Key, out _);
+        }
+    }
+
     private sealed class Entry {
         public readonly object Gate = new();
         public TypeInitializationStatus Status;
@@ -92,6 +101,9 @@ internal sealed class TypeInitializationTracker {
             VmConstructedType constructed => new(constructed.Definition, [.. constructed.TypeArguments]),
             _ => new(type, []),
         };
+
+        public bool IsOwnedBy(VmAssemblyContext context) =>
+            context.OwnsType(_definition) || _arguments.Any(context.OwnsType);
 
         public bool Equals(TypeInitializationKey other) {
             if (!ReferenceEquals(_definition, other._definition) || _arguments.Length != other._arguments.Length)

@@ -528,6 +528,7 @@ public static class DefaultIntrinsics {
         if (ctx.MemoryPolicy is { } policy && bytes.Length > policy.MaxAssemblyBytes)
             throw new OperationNotAllowedException(
                 $"Assembly.Load の入力が上限を超えています (上限 {policy.MaxAssemblyBytes:N0} バイト)。");
+        ctx.Heap.ChargeHostBuffer(bytes.Length);
         var imageBytes = ctx.ReadByteArray(args[0]);
         var loader = ctx.LoadAssemblyFromBytes?.Invoke(imageBytes)
             ?? throw new OperationNotAllowedException("Assembly.Load は VM の動的ローダーから利用できません。");

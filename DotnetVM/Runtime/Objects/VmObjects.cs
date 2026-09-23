@@ -310,6 +310,8 @@ public sealed class VmAssemblyLoadContext : VmObject {
     internal void Unload() {
         if (IsDefault)
             throw new InvalidOperationException("AssemblyLoadContext.Default はアンロードできません。");
+        if (!IsCollectible)
+            throw new InvalidOperationException("collectible ではない AssemblyLoadContext はアンロードできません。");
         if (IsUnloaded)
             return;
         UnloadAction?.Invoke();
@@ -345,9 +347,12 @@ public sealed class VmMemoryStreamObject : VmObject {
     public static readonly VmIntrinsicType StreamFacade =
         new() { Namespace = "System.IO", Name = "Stream", IsValue = false };
 
-    public required byte[] Bytes { get; init; }
+    private byte[] _bytes = [];
+    public required byte[] Bytes { get => _bytes; init => _bytes = value; }
     public int Position { get; internal set; }
     public VmType? DeclaredType { get; init; }
+
+    internal void ReplaceBytes(byte[] bytes) => _bytes = bytes;
 
     public override VmType Type => DeclaredType ?? MemoryStreamFacade;
 }

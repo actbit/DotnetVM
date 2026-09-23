@@ -336,6 +336,7 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
             System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
                 code.AsSpan(position, sizeof(int)), target - basePosition);
         }
+        ValidateDynamicCode(code);
         return _method = new VmMethod {
             DeclaringType = DynamicMethodType,
             MethodDefRid = 0,
@@ -348,6 +349,103 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
             DynamicTokens = _references.ToDictionary(pair => pair.Key, pair => pair.Value),
             Loader = Loader,
         };
+    }
+
+    /// <summary>生成 IL を実行可能にする前に命令境界・分岐・引数/ローカル・token をまとめて検証する。</summary>
+    private void ValidateDynamicCode(byte[] code) {
+        var instructions = IlDecoder.Decode(code);
+        foreach (var instruction in instructions) {
+            if (TryGetShortLocalIndex(instruction.Op, out var fixedLocal))
+                ValidateLocal(fixedLocal, instruction);
+            else if (instruction.Op is ILOp.Ldloc_S or ILOp.Ldloca_S or ILOp.Stloc_S or
+                     ILOp.Ldloc or ILOp.Ldloca or ILOp.Stloc)
+                ValidateLocal(instruction.IntOperand, instruction);
+
+            if (TryGetShortArgumentIndex(instruction.Op, out var fixedArgument))
+                ValidateArgument(fixedArgument, instruction);
+            else if (instruction.Op is ILOp.Ldarg_S or ILOp.Ldarga_S or ILOp.Starg_S or
+                     ILOp.Ldarg or ILOp.Ldarga or ILOp.Starg)
+                ValidateArgument(instruction.IntOperand, instruction);
+
+            if (instruction.OperandKind is IlOperandKind.Method or IlOperandKind.Field or
+                IlOperandKind.Type or IlOperandKind.String or IlOperandKind.Token)
+                ValidateToken(instruction);
+        }
+    }
+
+    private void ValidateToken(DecodedInstruction instruction) {
+        var token = unchecked((uint)instruction.IntOperand);
+        if (instruction.OperandKind == IlOperandKind.String) {
+            if (!_strings.ContainsKey(token))
+                throw new BadImageFormatException($"DynamicMethod の string token 0x{token:X8} が登録されていません。");
+            return;
+        }
+
+        if (_references.TryGetValue(token, out var reference)) {
+            var valid = instruction.OperandKind switch {
+                IlOperandKind.Method => reference is VmMethod,
+                IlOperandKind.Field => reference is VmField,
+                IlOperandKind.Type => reference is VmType,
+                IlOperandKind.Token => reference is VmMethod or VmField or VmType,
+                _ => false,
+            };
+            if (!valid)
+                throw new BadImageFormatException(
+                    $"DynamicMethod の {instruction.OperandKind} token 0x{token:X8} に不正な参照型があります。");
+            return;
+        }
+
+        var metadataToken = new Token(token);
+        var allowedTables = instruction.OperandKind switch {
+            IlOperandKind.Method => new[] { TableKind.MethodDef, TableKind.MemberRef, TableKind.MethodSpec },
+            IlOperandKind.Field => new[] { TableKind.Field, TableKind.MemberRef },
+            IlOperandKind.Type => new[] { TableKind.TypeDef, TableKind.TypeRef, TableKind.TypeSpec },
+            IlOperandKind.Token => new[] {
+                TableKind.TypeDef, TableKind.TypeRef, TableKind.TypeSpec,
+                TableKind.Field, TableKind.MethodDef, TableKind.MemberRef, TableKind.MethodSpec,
+            },
+            _ => [],
+        };
+        if (metadataToken.Rid < 1 || !allowedTables.Contains(metadataToken.Table) ||
+            metadataToken.Rid > Loader.Image.Tables.GetRowCount(metadataToken.Table))
+            throw new BadImageFormatException(
+                $"DynamicMethod の {instruction.OperandKind} token 0x{token:X8} は不正です。");
+    }
+
+    private void ValidateLocal(int index, DecodedInstruction instruction) {
+        if ((uint)index >= (uint)_locals.Count)
+            throw new BadImageFormatException(
+                $"DynamicMethod のローカル番号 {index} が範囲外です (ローカル数 {_locals.Count}, IL_{instruction.Offset:X4})。");
+    }
+
+    private void ValidateArgument(int index, DecodedInstruction instruction) {
+        if ((uint)index >= (uint)ParameterTypes.Length)
+            throw new BadImageFormatException(
+                $"DynamicMethod の引数番号 {index} が範囲外です (引数数 {ParameterTypes.Length}, IL_{instruction.Offset:X4})。");
+    }
+
+    private static bool TryGetShortLocalIndex(ILOp op, out int index) {
+        var value = (ushort)op;
+        if (value >= (ushort)ILOp.Ldloc_0 && value <= (ushort)ILOp.Ldloc_3) {
+            index = value - (ushort)ILOp.Ldloc_0;
+            return true;
+        }
+        if (value >= (ushort)ILOp.Stloc_0 && value <= (ushort)ILOp.Stloc_3) {
+            index = value - (ushort)ILOp.Stloc_0;
+            return true;
+        }
+        index = 0;
+        return false;
+    }
+
+    private static bool TryGetShortArgumentIndex(ILOp op, out int index) {
+        var value = (ushort)op;
+        if (value >= (ushort)ILOp.Ldarg_0 && value <= (ushort)ILOp.Ldarg_3) {
+            index = value - (ushort)ILOp.Ldarg_0;
+            return true;
+        }
+        index = 0;
+        return false;
     }
 
     private static readonly VmIntrinsicType DynamicMethodType =

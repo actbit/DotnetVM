@@ -19,6 +19,7 @@ public sealed class VmAssemblyContext(
     private readonly HashSet<string> _loading = new(StringComparer.OrdinalIgnoreCase);
     private readonly VmAssemblyContext? _parent = parent;
     private readonly Func<string, bool> _pathExists = pathExists ?? File.Exists;
+    internal Guid Identity { get; } = Guid.NewGuid();
 
     /// <summary>ロード済みアセンブリの TypeLoader 一覧 (ロード順)。</summary>
     public IReadOnlyList<TypeLoader> Loaders { get { lock (_gate) return _loaders.ToArray(); } }
@@ -31,6 +32,25 @@ public sealed class VmAssemblyContext(
         return _parent?.FindBySimpleName(simpleName);
     }
 
+    /// <summary>ロード済みアセンブリを完全な AssemblyName identity で取得する。</summary>
+    public TypeLoader? FindByIdentity(AssemblyIdentity identity) {
+        foreach (var loader in Loaders)
+            if (identity.MatchesExactly(loader.Image.Identity))
+                return loader;
+        return _parent?.FindByIdentity(identity);
+    }
+
+    /// <summary>型がこの ALC の画像、またはそれを含む構築型由来かを調べる。</summary>
+    internal bool OwnsType(VmType type) => type switch {
+        VmClassType cls => cls.Loader?.LoadContextIdentity == Identity,
+        VmConstructedType constructed => OwnsType(constructed.Definition) ||
+            constructed.TypeArguments.Any(OwnsType),
+        VmArrayType array => OwnsType(array.ElementType),
+        VmMultiDimArrayType array => OwnsType(array.ElementType),
+        VmByRefType byRef => OwnsType(byRef.ElementType),
+        _ => false,
+    };
+
     /// <summary>アセンブリをコンテキストに登録する (VirtualMachine.LoadAssembly から呼ぶ)。</summary>
     internal void Register(TypeLoader loader) {
         lock (_gate) {
@@ -38,6 +58,7 @@ public sealed class VmAssemblyContext(
                 return;
             _loaders.Add(loader);
             loader.Context = this;
+            loader.LoadContextIdentity = Identity;
             // 同一単純名の再ロードは最初のものを優先 (CLR のアセンブリ統合と同じ先行勝ち)
             _bySimpleName.TryAdd(loader.Image.Name, loader);
         }

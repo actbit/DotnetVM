@@ -150,7 +150,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>ゲスト ALC の依存アセンブリをストレージブリッジから読み込む。</summary>
     private TypeLoader LoadDependencyAssemblyFromStorage(string path, VmAssemblyContext context) {
-        var bytes = _storage.Read(path);
+        var bytes = _storage.Read(path, _options.Memory.MaxAssemblyBytes);
         if (bytes.Length > _options.Memory.MaxAssemblyBytes)
             throw new OperationNotAllowedException(
                 $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
@@ -160,7 +160,7 @@ public sealed class VirtualMachine : IDisposable {
         return RegisterAssemblyImage(image, context);
     }
 
-    /// <summary>ゲスト ALC に byte[] を VM アセンブリとして登録する。</summary>
+    /// <summary>ゲスト ALC に byte[] を VM アセンブリとして解析・登録する。入力コピーの quota は intrinsic 側で事前計上済み。</summary>
     private TypeLoader LoadAssemblyBytesInContext(VmAssemblyLoadContext loadContext, ReadOnlyMemory<byte> bytes) {
         ThrowIfDisposed();
         if (loadContext.IsUnloaded)
@@ -168,7 +168,6 @@ public sealed class VirtualMachine : IDisposable {
         if (bytes.Length > _options.Memory.MaxAssemblyBytes)
             throw new OperationNotAllowedException(
                 $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
-        _heap.ChargeHostBuffer(bytes.Length);
         var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
         return RegisterAssemblyImage(image, loadContext.Context);
     }
@@ -182,7 +181,7 @@ public sealed class VirtualMachine : IDisposable {
             throw new OperationNotAllowedException(
                 "AssemblyLoadContext.LoadFromAssemblyPath はストレージブリッジが設定されている場合のみ利用できます。");
         var fullPath = Path.GetFullPath(path);
-        var bytes = _storage.Read(fullPath);
+        var bytes = _storage.Read(fullPath, _options.Memory.MaxAssemblyBytes);
         if (bytes.Length > _options.Memory.MaxAssemblyBytes)
             throw new OperationNotAllowedException(
                 $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
@@ -193,6 +192,10 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     private void UnloadAssemblyLoadContext(VmAssemblyContext context) {
+        // VmType のキャッシュキーから TypeLoader に到達できるため、Unregister で所属情報を外す前に除去する。
+        _sharedState.RemoveAssemblyContextCaches(context);
+        lock (_interpreterGate)
+            _interpreter?.RemoveAssemblyContextCaches(context);
         lock (_assemblyGate) {
             foreach (var loader in context.Loaders)
                 _loaders.Remove(loader);
@@ -290,13 +293,12 @@ public sealed class VirtualMachine : IDisposable {
         return RegisterAssemblyImage(image, context);
     }
 
-    /// <summary>Assembly.Load(byte[]) 用の画像登録。入力は VM loader で解析し、ホスト CLR にはロードしない。</summary>
+    /// <summary>Assembly.Load(byte[]) 用の画像登録。入力コピーの quota は intrinsic 側で事前計上し、ここでは VM loader で解析する。</summary>
     private TypeLoader LoadAssemblyBytes(ReadOnlyMemory<byte> bytes) {
         ThrowIfDisposed();
         if (bytes.Length > _options.Memory.MaxAssemblyBytes)
             throw new OperationNotAllowedException(
                 $"Assembly.Load の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
-        _heap.ChargeHostBuffer(bytes.Length); // 画像バイト列は loader が保持する host 側メモリ
         var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
         return RegisterAssemblyImage(image, _context);
     }

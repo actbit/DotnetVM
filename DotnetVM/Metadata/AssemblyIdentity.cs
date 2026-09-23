@@ -34,6 +34,32 @@ public readonly record struct AssemblyIdentity(
         return true;
     }
 
+    /// <summary>AssemblyLoadContext.LoadFromAssemblyName 用の完全 identity 照合。</summary>
+    public bool MatchesExactly(AssemblyIdentity candidate) =>
+        string.Equals(Name, candidate.Name, StringComparison.OrdinalIgnoreCase) &&
+        Version.Equals(candidate.Version) &&
+        string.Equals(NormalizeCulture(Culture), NormalizeCulture(candidate.Culture), StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(PublicKeyToken, candidate.PublicKeyToken, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>AssemblyName.FullName を VM が扱う identity に変換する。</summary>
+    public static AssemblyIdentity ParseFullName(string fullName) {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fullName);
+        var parsed = new System.Reflection.AssemblyName(fullName);
+        var name = parsed.Name;
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("アセンブリ名が空です。", nameof(fullName));
+        return new AssemblyIdentity(
+            name,
+            parsed.Version ?? new Version(0, 0, 0, 0),
+            NormalizeCulture(parsed.CultureName),
+            Convert.ToHexString(parsed.GetPublicKeyToken() ?? []).ToLowerInvariant());
+    }
+
+    private static string NormalizeCulture(string? culture) =>
+        string.IsNullOrEmpty(culture) || string.Equals(culture, "neutral", StringComparison.OrdinalIgnoreCase)
+            ? ""
+            : culture;
+
     public override string ToString() {
         var token = IsStrongNamed ? ", PublicKeyToken=" + PublicKeyToken : "";
         var culture = IsNeutralCulture ? ", Culture=neutral" : ", Culture=" + Culture;

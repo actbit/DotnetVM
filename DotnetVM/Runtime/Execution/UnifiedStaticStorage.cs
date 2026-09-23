@@ -74,6 +74,20 @@ public sealed class UnifiedStaticStorage {
         }
     }
 
+    /// <summary>ALC アンロード時に、そのコンテキストの型を含む静的フィールド表を破棄する。</summary>
+    internal void RemoveForContext(VmAssemblyContext context) {
+        lock (_gate) {
+            var removed = new HashSet<StackSlot[]>(ReferenceEqualityComparer.Instance);
+            foreach (var key in Table.Keys.ToArray()) {
+                if (!context.OwnsType(key.Definition) && !key.TypeArguments.Any(context.OwnsType))
+                    continue;
+                removed.Add(Table[key]);
+                Table.Remove(key);
+            }
+            Registry.RemoveAll(removed.Contains);
+        }
+    }
+
     internal IEnumerable<StackSlot[]> EnumerateRoots() {
         lock (_gate)
             return Registry.ToArray();

@@ -1,4 +1,5 @@
 using DotnetVM.Policy;
+using DotnetVM.Metadata;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Intrinsics;
 using DotnetVM.Runtime.Objects;
@@ -121,15 +122,7 @@ internal static class AssemblyLoadContextRuntime {
         });
         r.Register(IntrinsicKey.Instance(t, "LoadFromAssemblyName", 1), static (ctx, a) => {
             var loadContext = RequireActive(a[0]);
-            var name = a[1].ObjectValue switch {
-                VmAssemblyNameObject assemblyName => assemblyName.Name,
-                VmString text => SimpleName(text.Value),
-                _ => throw new UnhandledGuestException("System.ArgumentNullException", null),
-            };
-            var loader = loadContext.Context.FindBySimpleName(name)
-                ?? throw new UnhandledGuestException("System.IO.FileNotFoundException",
-                    $"アセンブリ '{name}' が見つかりません。");
-            return Assembly(ctx, loader);
+            return LoadByName(ctx, loadContext, a[1]);
         });
         r.Register(IntrinsicKey.Instance(t, "LoadFromStream", 1), static (ctx, a) =>
             LoadFromStream(ctx, RequireActive(a[0]), a[1]));
@@ -139,6 +132,8 @@ internal static class AssemblyLoadContextRuntime {
         // LoadFromAssemblyBytes として明示的に提供する。実際の CLR シグネチャとは衝突しない。
         r.Register(IntrinsicKey.Instance(t, "LoadFromAssemblyBytes", 1), static (ctx, a) => {
             var loadContext = RequireActive(a[0]);
+            var length = CheckAssemblyByteArray(ctx, a[1]);
+            ctx.Heap.ChargeHostBuffer(length);
             var bytes = ctx.ReadByteArray(a[1]);
             var loader = ctx.LoadAssemblyInContext?.Invoke(loadContext, bytes)
                 ?? throw new OperationNotAllowedException("AssemblyLoadContext の動的ローダーは VM ホストから利用できません。");
@@ -146,12 +141,7 @@ internal static class AssemblyLoadContextRuntime {
         });
         r.Register(IntrinsicKey.Instance(t, "Load", 1), static (ctx, a) => {
             var loadContext = RequireActive(a[0]);
-            var name = a[1].ObjectValue as VmAssemblyNameObject
-                ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
-            var loader = loadContext.Context.FindBySimpleName(name.Name)
-                ?? throw new UnhandledGuestException("System.IO.FileNotFoundException",
-                    $"アセンブリ '{name.Name}' が見つかりません。");
-            return Assembly(ctx, loader);
+            return LoadByName(ctx, loadContext, a[1]);
         });
         r.Register(IntrinsicKey.Instance(t, "Unload", 0), static (_, a) => {
             var loadContext = Require(a[0]);
@@ -189,6 +179,7 @@ internal static class AssemblyLoadContextRuntime {
             return null;
         });
         r.Register(IntrinsicKey.Instance(t, ".ctor", 1), static (ctx, a) => {
+            ctx.Heap.ChargeHostBuffer(ctx.GetByteArrayLength(a[1]));
             SetStreamBytes(a, ctx.ReadByteArray(a[1]));
             return null;
         });
@@ -223,10 +214,11 @@ internal static class AssemblyLoadContextRuntime {
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyNameObject { FullName = fullName }));
         }
         if (typeName == MemoryStreamType) {
-            var bytes = args.Length > 1 && args[1].ObjectValue is VmArray
-                ? ctx.ReadByteArray(args[1])
-                : [];
-            ctx.Heap.ChargeHostBuffer(bytes.Length);
+            var bytes = Array.Empty<byte>();
+            if (args.Length > 1 && args[1].ObjectValue is VmArray) {
+                ctx.Heap.ChargeHostBuffer(ctx.GetByteArrayLength(args[1]));
+                bytes = ctx.ReadByteArray(args[1]);
+            }
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmMemoryStreamObject { Bytes = bytes }));
         }
         throw new NotSupportedException($"特殊 intrinsic 構築型 {typeName} は未対応です。");
@@ -278,7 +270,11 @@ internal static class AssemblyLoadContextRuntime {
     private static StackSlot LoadFromStream(IntrinsicContext ctx, VmAssemblyLoadContext loadContext, StackSlot streamSlot) {
         var stream = streamSlot.ObjectValue as VmMemoryStreamObject
             ?? throw new UnhandledGuestException("System.NotSupportedException", "VM では MemoryStream のみ AssemblyLoadContext に渡せます。");
-        var bytes = stream.Bytes.AsMemory(stream.Position).ToArray();
+        var remaining = stream.Bytes.Length - stream.Position;
+        CheckAssemblySize(ctx, remaining);
+        // MemoryStream の backing array は構築時に host buffer quota へ計上済み。
+        // stream 部分を ReadOnlyMemory として直接渡し、上限検査前の全量コピーを作らない。
+        var bytes = stream.Bytes.AsMemory(stream.Position, remaining);
         var loader = ctx.LoadAssemblyInContext?.Invoke(loadContext, bytes)
             ?? throw new OperationNotAllowedException("AssemblyLoadContext の動的ローダーは VM ホストから利用できません。");
         stream.Position = stream.Bytes.Length;
@@ -292,10 +288,7 @@ internal static class AssemblyLoadContextRuntime {
     private static void SetStreamBytes(StackSlot[] args, byte[] bytes) {
         if (args[0].ObjectValue is not VmMemoryStreamObject stream)
             throw new InvalidOperationException("MemoryStream の構築状態が不正です。");
-        stream.Bytes.AsSpan().Clear();
-        if (bytes.Length != stream.Bytes.Length)
-            throw new InvalidOperationException("MemoryStream の構築バッファ長が不正です。");
-        bytes.CopyTo(stream.Bytes, 0);
+        stream.ReplaceBytes(bytes);
     }
 
     private static StackSlot Read(IntrinsicContext ctx, StackSlot[] args) {
@@ -340,14 +333,38 @@ internal static class AssemblyLoadContextRuntime {
     }
 
     private static StackSlot LoadByName(IntrinsicContext ctx, VmAssemblyLoadContext loadContext, StackSlot slot) {
-        var name = slot.ObjectValue switch {
-            VmAssemblyNameObject assemblyName => assemblyName.Name,
-            VmString text => SimpleName(text.Value),
+        var fullName = slot.ObjectValue switch {
+            VmAssemblyNameObject assemblyName => assemblyName.FullName,
+            VmString text => text.Value,
             _ => throw new UnhandledGuestException("System.ArgumentNullException", null),
         };
-        var loader = loadContext.Context.FindBySimpleName(name)
-            ?? throw new UnhandledGuestException("System.IO.FileNotFoundException",
-                $"アセンブリ '{name}' が見つかりません。");
+        TypeLoader? loader;
+        if (fullName.Contains(',')) {
+            AssemblyIdentity identity;
+            try {
+                identity = AssemblyIdentity.ParseFullName(fullName);
+            } catch (Exception ex) when (ex is ArgumentException or FileLoadException) {
+                throw new UnhandledGuestException("System.ArgumentException", ex.Message);
+            }
+            loader = loadContext.Context.FindByIdentity(identity);
+        } else {
+            loader = loadContext.Context.FindBySimpleName(SimpleName(fullName));
+        }
+        if (loader is null)
+            throw new UnhandledGuestException("System.IO.FileNotFoundException",
+                $"アセンブリ '{fullName}' が見つかりません。");
         return Assembly(ctx, loader);
+    }
+
+    private static int CheckAssemblyByteArray(IntrinsicContext ctx, in StackSlot slot) {
+        var length = ctx.GetByteArrayLength(slot);
+        CheckAssemblySize(ctx, length);
+        return length;
+    }
+
+    private static void CheckAssemblySize(IntrinsicContext ctx, long length) {
+        if (ctx.MemoryPolicy is { } policy && length > policy.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"AssemblyLoadContext の入力が上限を超えています (上限 {policy.MaxAssemblyBytes:N0} バイト)。");
     }
 }

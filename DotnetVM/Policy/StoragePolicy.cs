@@ -59,13 +59,25 @@ public sealed class StorageGateway {
     }
 
     public byte[] Read(string path) {
+        return Read(path, long.MaxValue);
+    }
+
+    /// <summary>呼び出し元固有の上限も適用してファイルを読む。</summary>
+    public byte[] Read(string path, long callerMaxBytes) {
         RequireBridge();
-        // maxBytes を事前に伝える: 1 操作上限と累計残量の min (タスク 2 hardening)。
-        // 両者の min を bridge に渡すことで host 側の巨大バッファ増幅を避ける
-        var maxBytes = Math.Min(_policy.MaxBytesPerOperation, _totalBytes < 0
+        if (callerMaxBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(callerMaxBytes));
+        // maxBytes を事前に伝える: 呼び出し元上限、1 操作上限、累計残量の min。
+        // 呼び出し元上限と storage 側の両上限を bridge に渡し、host 側の巨大バッファ増幅を避ける
+        var remainingTotal = _totalBytes < 0
             ? _policy.TotalByteLimit
-            : Math.Max(0, _policy.TotalByteLimit - _totalBytes));
+            : Math.Max(0, _policy.TotalByteLimit - _totalBytes);
+        var maxBytes = Math.Min(callerMaxBytes,
+            Math.Min(_policy.MaxBytesPerOperation, remainingTotal));
         var contents = _bridge!.Read(RequirePath(path), maxBytes);
+        if (contents.LongLength > maxBytes)
+            throw new StorageQuotaExceededException(
+                $"読み取りバイト数 {contents.LongLength:N0} が要求上限 {maxBytes:N0} を超過しました。");
         Charge(contents.LongLength, "読み取り");
         return contents;
     }

@@ -1,4 +1,5 @@
 using DotnetVM.Runtime.Objects;
+using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
 
@@ -80,6 +81,14 @@ public sealed class VmSharedState : IDisposable {
 
     /// <summary>RuntimeType ファサードを GC の直接ルートとして列挙する。</summary>
     internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values;
+
+    /// <summary>ALC 由来の VM-wide 型初期化状態と RuntimeType ファサードを解放する。</summary>
+    internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
+        TypeInitialization.RemoveForContext(context);
+        foreach (var type in TypeFacades.Keys)
+            if (context.OwnsType(type))
+                TypeFacades.TryRemove(type, out _);
+    }
 
     public void Dispose() {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

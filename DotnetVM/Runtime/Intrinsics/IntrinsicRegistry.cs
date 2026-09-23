@@ -179,8 +179,7 @@ public sealed class IntrinsicContext {
 
     /// <summary>VM オブジェクト (VmArray) を byte 配列として読み取る。</summary>
     public byte[] ReadByteArray(in StackSlot slot) {
-        if (slot.Kind != StackKind.Object || slot.ObjectValue is not VmArray array)
-            throw new InvalidOperationException($"byte[] を期待しましたが {slot.Kind} が来ました。");
+        var array = RequireByteArray(slot);
         var data = new byte[array.Length];
         for (var i = 0; i < array.Length; i++) {
             var element = array.Elements[i];
@@ -190,6 +189,14 @@ public sealed class IntrinsicContext {
         }
         return data;
     }
+
+    /// <summary>byte[] の長さをコピーせずに取得する。</summary>
+    public int GetByteArrayLength(in StackSlot slot) => RequireByteArray(slot).Length;
+
+    private static VmArray RequireByteArray(in StackSlot slot) =>
+        slot.Kind == StackKind.Object && slot.ObjectValue is VmArray array
+            ? array
+            : throw new InvalidOperationException($"byte[] を期待しましたが {slot.Kind} が来ました。");
 
     /// <summary>オブジェクト同一性ハッシュ (Object.GetHashCode 相当)。生存中は対象を弱参照で保持する。</summary>
     public int IdentityHash(object? value) {

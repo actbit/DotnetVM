@@ -93,6 +93,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         public required ObjectEngine Objects { get; init; }
         public required CallEngine Calls { get; init; }
         public required ExceptionDispatcher Exceptions { get; init; }
+        public required Func<IEnumerable<StackSlot[]>> StaticStorageRoots { get; init; }
+        public required Func<IEnumerable<StackSlot[]>> IntrinsicStaticRoots { get; init; }
     }
 
     internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
@@ -235,9 +237,33 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             _heap.AddRootSlotSource(() => _unifiedStaticStorage?.EnumerateRoots().ToArray() ?? []);
             _enginesRegisteredRootKey = true;
         }
-        _heap.AddRootSlotSource(services.Objects.EnumerateStaticStorage);
-        _heap.AddRootSlotSource(() => objects.IntrinsicStaticFields.ToArray());
-        return new LoaderEngines { Services = services, Preparer = preparer, Objects = objects, Calls = calls, Exceptions = exceptions };
+        Func<IEnumerable<StackSlot[]>> staticStorageRoots = services.Objects.EnumerateStaticStorage;
+        Func<IEnumerable<StackSlot[]>> intrinsicStaticRoots = () => objects.IntrinsicStaticFields.ToArray();
+        _heap.AddRootSlotSource(staticStorageRoots);
+        _heap.AddRootSlotSource(intrinsicStaticRoots);
+        return new LoaderEngines {
+            Services = services,
+            Preparer = preparer,
+            Objects = objects,
+            Calls = calls,
+            Exceptions = exceptions,
+            StaticStorageRoots = staticStorageRoots,
+            IntrinsicStaticRoots = intrinsicStaticRoots,
+        };
+    }
+
+    /// <summary>アンロード対象 ALC のローダー別エンジンと VM-wide 静的キャッシュを解放する。</summary>
+    internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
+        _unifiedStaticStorage.RemoveForContext(context);
+        lock (_enginesGate) {
+            foreach (var loader in context.Loaders) {
+                // Interpreter の primary engine は VM の公開呼出し面が直接保持している。
+                if (ReferenceEquals(loader, _services.Loader) || !_engines.Remove(loader, out var engines))
+                    continue;
+                _heap.RemoveRootSlotSource(engines.StaticStorageRoots);
+                _heap.RemoveRootSlotSource(engines.IntrinsicStaticRoots);
+            }
+        }
     }
     /// <summary>文字列プール (VM ファサードから参照用)。</summary>
     public VmStringPool Strings => _services.Strings;

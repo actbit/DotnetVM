@@ -26,6 +26,9 @@ public sealed class TypeLoader {
     /// <summary>所属する多アセンブリ コンテキスト (依存解決に使用。未所属 = null)。</summary>
     public VmAssemblyContext? Context { get; internal set; }
 
+    /// <summary>最後に登録されたロードコンテキストの識別子。Unregister 後も型の由来判定に使う。</summary>
+    internal Guid? LoadContextIdentity { get; set; }
+
     private readonly Dictionary<int, VmClassType> _typeDefs = [];
     private readonly Dictionary<string, VmIntrinsicType> _intrinsicTypes = [];
     private readonly Dictionary<int, VmMethod> _methods = [];

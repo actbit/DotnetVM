@@ -23,12 +23,19 @@ public sealed class VirtualMachine : IDisposable {
     private readonly NetworkGateway _network;
     private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
+    private readonly object _assemblyGate = new();
     private readonly VmAssemblyContext _context;
+    private readonly VmAssemblyLoadContext _defaultAssemblyLoadContext;
     private readonly VmSharedState _sharedState;
     private readonly object _interpreterGate = new();
+    private readonly object _lifetimeGate = new();
     private Interpreter? _interpreter;
     private VmCoreLibSurfaces? _coreLibSurfaces;
     private VmClassType? _stringType;
+    private readonly Func<IEnumerable<VmObject?>> _handleRoots;
+    private readonly Func<IEnumerable<VmObject?>> _typeFacadeRoots;
+    private readonly Func<IEnumerable<VmObject?>> _guestThreadRoots;
+    private readonly Func<IEnumerable<StackSlot[]>> _guestTaskRoots;
     private int _disposed;
 
     public VirtualMachine(VmHostOptions? options = null) {
@@ -46,13 +53,23 @@ public sealed class VirtualMachine : IDisposable {
         _sharedState = new VmSharedState(_options.MaxGuestThreads, _options.MaxTaskWorkers,
             _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds);
         _heap = new VmHeap(_options.Memory, _options.Gc);
-        _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
-        _heap.AddRootObjectSource(_sharedState.EnumerateRoots);
-        _heap.AddRootObjectSource(_sharedState.GuestThreads.EnumerateRoots);
-        _heap.AddRootSlotSource(_sharedState.GuestTasks.EnumerateRoots);
+        _handleRoots = _handles.EnumerateRoots;
+        _heap.AddRootObjectSource(_handleRoots); // ホスト保持参照 (GCHandle 相当) をルートに
+        _typeFacadeRoots = _sharedState.EnumerateRoots;
+        _guestThreadRoots = _sharedState.GuestThreads.EnumerateRoots;
+        _guestTaskRoots = _sharedState.GuestTasks.EnumerateRoots;
+        _heap.AddRootObjectSource(_typeFacadeRoots);
+        _heap.AddRootObjectSource(_guestThreadRoots);
+        _heap.AddRootSlotSource(_guestTaskRoots);
         _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
         _context = new VmAssemblyContext(LoadDependencyAssembly);
+        _defaultAssemblyLoadContext = new VmAssemblyLoadContext {
+            Context = _context,
+            Name = "Default",
+            IsCollectible = false,
+            IsDefault = true,
+        };
         DefaultIntrinsics.RegisterAll(_intrinsics);
         CoreLibBindings.RegisterAll(_intrinsics); // ランタイムバインド (InternalCall / デバイス / 代替面)
         if (_options.LoadHostCoreLib)
@@ -66,7 +83,9 @@ public sealed class VirtualMachine : IDisposable {
         if (string.IsNullOrEmpty(coreLibPath))
             throw new InvalidOperationException("ホストの System.Private.CoreLib.dll の場所を特定できません (Single-file 発行等)。");
         LoadAssembly(coreLibPath);
-        var coreLibLoader = _loaders[0]; // trusted CoreLib loader (LoadHostCoreLib の取得した参照)
+        TypeLoader coreLibLoader;
+        lock (_assemblyGate)
+            coreLibLoader = _loaders.First(l => l.Image.Identity.Name == "System.Private.CoreLib");
         // VM CoreLib (置換面の managed IL 実装) を DotnetVM.dll と同じディレクトリからロードし、
         // 実在 CoreLib の面 → DotnetVM.CoreLib IL の置換辞書を構築する (欠面は fail-closed)
         var vmCoreLibPath = Path.Combine(
@@ -90,7 +109,10 @@ public sealed class VirtualMachine : IDisposable {
         // 置換対象 (Substitute の呼出元) を trusted System.Private.CoreLib 画像に限定する
         // (タスク 2 hardening: ゲスト画像や依存画像が同名面を宣言しても置換されない)。
         // ファイル名照合でなく loader 参照 (identity) でマークする
-        var surfaces = VmCoreLibSurfaces.Create(_loaders[^1]);
+        TypeLoader vmCoreLibLoader;
+        lock (_assemblyGate)
+            vmCoreLibLoader = _loaders[^1];
+        var surfaces = VmCoreLibSurfaces.Create(vmCoreLibLoader);
         surfaces.MarkTrustedCoreLib(coreLibLoader);
         _coreLibSurfaces = surfaces;
         // VmString の型同一性を System.String 実型 (CoreLib TypeDef) に接続する
@@ -105,8 +127,78 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>VmAssemblyContext が依存アセンブリの同一ディレクトリ探索で見つけた DLL をロードする。</summary>
     private TypeLoader LoadDependencyAssembly(string path) {
-        LoadAssembly(path);
-        return _loaders[^1];
+        using var stream = File.OpenRead(path);
+        return LoadAssemblyLoader(stream, Path.GetFullPath(path));
+    }
+
+    /// <summary>ゲスト AssemblyLoadContext 用の名前付き VM ローダーを生成する。</summary>
+    private VmAssemblyLoadContext CreateAssemblyLoadContext(string? name, bool isCollectible) {
+        VmAssemblyContext? context = null;
+        context = new VmAssemblyContext(
+            path => LoadDependencyAssemblyFromStorage(path, context!),
+            _context,
+            path => _storage.IsEnabled && _storage.Exists(path));
+        var loadContext = new VmAssemblyLoadContext {
+            Context = context,
+            Name = string.IsNullOrWhiteSpace(name) ? null : name,
+            IsCollectible = isCollectible,
+            IsDefault = false,
+            UnloadAction = () => UnloadAssemblyLoadContext(context),
+        };
+        return loadContext;
+    }
+
+    /// <summary>ゲスト ALC の依存アセンブリをストレージブリッジから読み込む。</summary>
+    private TypeLoader LoadDependencyAssemblyFromStorage(string path, VmAssemblyContext context) {
+        var bytes = _storage.Read(path);
+        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        _heap.ChargeHostBuffer(bytes.Length);
+        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+        image.SourcePath = Path.GetFullPath(path);
+        return RegisterAssemblyImage(image, context);
+    }
+
+    /// <summary>ゲスト ALC に byte[] を VM アセンブリとして登録する。</summary>
+    private TypeLoader LoadAssemblyBytesInContext(VmAssemblyLoadContext loadContext, ReadOnlyMemory<byte> bytes) {
+        ThrowIfDisposed();
+        if (loadContext.IsUnloaded)
+            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
+        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        _heap.ChargeHostBuffer(bytes.Length);
+        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+        return RegisterAssemblyImage(image, loadContext.Context);
+    }
+
+    /// <summary>ゲスト ALC のパスロード。ホストファイル API ではなくストレージブリッジを使う。</summary>
+    private TypeLoader LoadAssemblyPathInContext(VmAssemblyLoadContext loadContext, string path) {
+        ThrowIfDisposed();
+        if (loadContext.IsUnloaded)
+            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
+        if (!_storage.IsEnabled)
+            throw new OperationNotAllowedException(
+                "AssemblyLoadContext.LoadFromAssemblyPath はストレージブリッジが設定されている場合のみ利用できます。");
+        var fullPath = Path.GetFullPath(path);
+        var bytes = _storage.Read(fullPath);
+        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        _heap.ChargeHostBuffer(bytes.Length);
+        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+        image.SourcePath = fullPath;
+        return RegisterAssemblyImage(image, loadContext.Context);
+    }
+
+    private void UnloadAssemblyLoadContext(VmAssemblyContext context) {
+        lock (_assemblyGate) {
+            foreach (var loader in context.Loaders)
+                _loaders.Remove(loader);
+            foreach (var loader in context.Loaders)
+                context.Unregister(loader);
+        }
     }
 
     /// <summary>仮想コンソールデバイス (出力購読/入力バインド/実装差し替え)。</summary>
@@ -125,10 +217,13 @@ public sealed class VirtualMachine : IDisposable {
     internal StorageGateway Storage => _storage;
 
     /// <summary>GC を起動し統計を返す (通常はアロケーション間隔で自動起動。明示起動はホスト用)。</summary>
-    public GcStatistics CollectGarbage() => RunGuest(() => GetInterpreter().CollectGarbage());
+    public GcStatistics CollectGarbage() {
+        ThrowIfDisposed();
+        return RunGuest(() => GetInterpreter().CollectGarbage());
+    }
 
     /// <summary>ロード済みアセンブリの型ローダ。</summary>
-    public IReadOnlyList<TypeLoader> Loaders => _loaders;
+    public IReadOnlyList<TypeLoader> Loaders { get { lock (_assemblyGate) return _loaders.ToArray(); } }
 
     /// <summary>多アセンブリ ロード コンテキスト (AssemblyRef 依存解決)。</summary>
     public VmAssemblyContext Context => _context;
@@ -138,13 +233,13 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>intrinsic を起動前に追加登録する (実行開始後は不可)。</summary>
     public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         _intrinsics.Register(key, impl);
     }
 
     /// <summary>ランタイムバインドを起動前に追加登録する (実行開始後は不可。P/Invoke 代替等)。</summary>
     public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         _intrinsics.RegisterBinding(key, impl, origin);
     }
 
@@ -157,9 +252,9 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
     /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>
     public AssemblyImage LoadAssembly(string path) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         using var stream = File.OpenRead(path);
-        return LoadAssembly(stream, Path.GetFullPath(path));
+        return LoadAssemblyLoader(stream, Path.GetFullPath(path)).Image;
     }
 
     /// <summary>DLL アセンブリをストリームからロードする。
@@ -168,7 +263,14 @@ public sealed class VirtualMachine : IDisposable {
     /// LoadAssembly(path) / LoadDependencyAssembly で解決するか、resolver を登録する。
     /// host current directory への暗黙フォールバック (SourcePath ?? ".") を廃止した (タスク 2)。</summary>
     public AssemblyImage LoadAssembly(Stream peStream, string? sourcePath = null) {
-        _sharedState.ThrowIfDisposed();
+        return LoadAssemblyLoader(peStream, sourcePath).Image;
+    }
+
+    private TypeLoader LoadAssemblyLoader(Stream peStream, string? sourcePath) =>
+        LoadAssemblyLoader(peStream, sourcePath, _context);
+
+    private TypeLoader LoadAssemblyLoader(Stream peStream, string? sourcePath, VmAssemblyContext context) {
+        ThrowIfDisposed();
         // 入力サイズ上限 (loader hardening): 読み込み途中で強制する (非 seekable な入力も含め、
         // 上限を超えた時点で打ち切って拒否する。巨大 stream を丸ごと buffer してから判定しない)
         var maxBytes = _options.Memory.MaxAssemblyBytes;
@@ -185,6 +287,23 @@ public sealed class VirtualMachine : IDisposable {
         }
         var image = AssemblyImage.Parse(buffered.ToArray(), limits: _options.Memory);
         image.SourcePath = sourcePath;
+        return RegisterAssemblyImage(image, context);
+    }
+
+    /// <summary>Assembly.Load(byte[]) 用の画像登録。入力は VM loader で解析し、ホスト CLR にはロードしない。</summary>
+    private TypeLoader LoadAssemblyBytes(ReadOnlyMemory<byte> bytes) {
+        ThrowIfDisposed();
+        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+            throw new OperationNotAllowedException(
+                $"Assembly.Load の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+        _heap.ChargeHostBuffer(bytes.Length); // 画像バイト列は loader が保持する host 側メモリ
+        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+        return RegisterAssemblyImage(image, _context);
+    }
+
+    private TypeLoader RegisterAssemblyImage(AssemblyImage image, VmAssemblyContext? context = null) {
+        ThrowIfDisposed();
+        context ??= _context;
         var loader = new TypeLoader(image);
         // 界面の再現制御: ブリッジが設定されている場合のみ対応する I/O ファサード型を合成する。
         // 未設定ならゲストはその型を解決できず、ロード/呼出の時点で fail-closed になる
@@ -192,10 +311,20 @@ public sealed class VirtualMachine : IDisposable {
             loader.AddIoFacade("WebClient");
         if (_options.StorageBridge is not null)
             loader.AddIoFacade("File");
-        loader.CompletePendingTypes();
-        _context.Register(loader);
-        _loaders.Add(loader);
-        return image;
+        lock (_assemblyGate) {
+            context.Register(loader);
+            _loaders.Add(loader);
+        }
+        try {
+            loader.CompletePendingTypes();
+        } catch {
+            lock (_assemblyGate) {
+                context.Unregister(loader);
+                _loaders.Remove(loader);
+            }
+            throw;
+        }
+        return loader;
     }
 
     /// <summary>
@@ -203,7 +332,7 @@ public sealed class VirtualMachine : IDisposable {
     /// 対応しているのは静的メソッド (インスタンスメソッドは CreateInstance + CallInstance を使用)。
     /// </summary>
     public object? Invoke(string typeFullName, string methodName, params object?[] args) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         var method = FindMethod(typeFullName, methodName, args);
         return RunGuest(() => Execute(method, args).ReturnValue);
     }
@@ -222,7 +351,7 @@ public sealed class VirtualMachine : IDisposable {
     /// 戻り値は VM オブジェクト (CallInstance のレシーバや Invoke の引数に使える)。
     /// </summary>
     public VmClassInstance CreateInstance(string typeFullName, params object?[] args) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         var type = FindType(typeFullName);
         var ctor = FindConstructor(type, args.Length);
         var interpreter = GetInterpreter();
@@ -235,7 +364,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>インスタンスメソッドを明示指定して呼び出す (仮想メソッドは最派生実装を実行)。</summary>
     public object? CallInstance(VmClassInstance instance, string methodName, params object?[] args) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         var method = FindInstanceMethod(instance.ClassType, methodName, args.Length);
         var interpreter = GetInterpreter();
         using var operation = interpreter.EnterHostOperation();
@@ -251,7 +380,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>メソッドを実行し、戻り値・コンソール出力スナップショット・命令数を返す。</summary>
     public ExecutionResult Execute(VmMethod method, params object?[] args) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         if (!method.IsStatic)
             throw new NotSupportedException($"インスタンスメソッド {method} はオブジェクトモデル (M3) 以降に対応します。静的メソッドを指定してください。");
         var signature = method.Signature;
@@ -292,12 +421,15 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     private VmClassType FindType(string typeFullName) {
-        if (_loaders.Count == 0)
-            throw new InvalidOperationException("アセンブリがロードされていません。先に LoadAssembly を呼んでください。");
-        return _loaders
-            .Select(l => l.FindTypeByFullName(typeFullName) ?? l.FindTypeByName(typeFullName))
-            .FirstOrDefault(t => t is not null)
-            ?? throw new ArgumentException($"型 '{typeFullName}' がロード済みアセンブリに見つかりません。");
+        ThrowIfDisposed();
+        lock (_assemblyGate) {
+            if (_loaders.Count == 0)
+                throw new InvalidOperationException("アセンブリがロードされていません。先に LoadAssembly を呼んでください。");
+            return _loaders
+                .Select(l => l.FindTypeByFullName(typeFullName) ?? l.FindTypeByName(typeFullName))
+                .FirstOrDefault(t => t is not null)
+                ?? throw new ArgumentException($"型 '{typeFullName}' がロード済みアセンブリに見つかりません。");
+        }
     }
 
     /// <summary>コンストラクタを解決する (引数個数 + 変換可能性で最良候補)。</summary>
@@ -328,7 +460,7 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>仮想環境変数を設定する (Kernel32.GetEnvironmentVariable 面が読む VM ごとのストア)。
     /// value が null なら削除する。host の実環境変数には触れない。</summary>
     public void SetVirtualEnvironmentVariable(string name, string? value) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         if (value is null)
             _sharedState.VirtualEnvironment.TryRemove(name, out _);
         else
@@ -337,16 +469,18 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>仮想環境変数を取得する (未定義なら null)。</summary>
     public string? GetVirtualEnvironmentVariable(string name) {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         return _sharedState.VirtualEnvironment.TryGetValue(name, out var value) ? value : null;
     }
 
     private Interpreter GetInterpreter() {
-        _sharedState.ThrowIfDisposed();
+        ThrowIfDisposed();
         lock (_interpreterGate) {
-            _sharedState.ThrowIfDisposed();
+            ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
-                _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState);
+                _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
+                _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
+                LoadAssemblyPathInContext);
         }
     }
 
@@ -355,9 +489,11 @@ public sealed class VirtualMachine : IDisposable {
     public Diagnostics.ExecutionTracer Tracer { get; } = new();
 
     private TypeLoader GetPrimaryLoader() {
-        if (_loaders.Count == 0)
-            throw new InvalidOperationException("アセンブリがロードされていません。");
-        return _loaders[^1];
+        lock (_assemblyGate) {
+            if (_loaders.Count == 0)
+                throw new InvalidOperationException("アセンブリがロードされていません。");
+            return _loaders[^1];
+        }
     }
 
     // ---- ホスト値 ↔ VM スロット変換 ----
@@ -541,11 +677,29 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     public void Dispose() {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            return;
-        _sharedState.Dispose();
-        lock (_interpreterGate)
-            _interpreter = null;
-        _loaders.Clear();
+        lock (_lifetimeGate) {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            _sharedState.Dispose();
+            lock (_interpreterGate) {
+                _interpreter?.Dispose();
+                _interpreter = null;
+            }
+            _heap.RemoveRootObjectSource(_handleRoots);
+            _heap.RemoveRootObjectSource(_typeFacadeRoots);
+            _heap.RemoveRootObjectSource(_guestThreadRoots);
+            _heap.RemoveRootSlotSource(_guestTaskRoots);
+            lock (_assemblyGate) {
+                foreach (var loader in _loaders.ToArray())
+                    _context.Unregister(loader);
+                _loaders.Clear();
+            }
+        }
+    }
+
+    private void ThrowIfDisposed() {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(VirtualMachine));
     }
 }

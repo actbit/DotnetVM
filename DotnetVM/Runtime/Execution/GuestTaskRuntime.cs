@@ -18,6 +18,7 @@ internal sealed class GuestTaskRuntime(
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
+    private readonly ConcurrentDictionary<VmTaskObject, byte> _knownTasks = new();
     private readonly ConcurrentDictionary<int, Thread> _workers = new();
     private readonly object _lifetimeGate = new();
     private readonly int _maxWorkers = maxWorkers;
@@ -37,6 +38,7 @@ internal sealed class GuestTaskRuntime(
         lock (_lifetimeGate)
             ThrowIfDisposed();
         var task = new VmTaskObject(type);
+        _knownTasks[task] = 0;
         if (completed)
             task.SetResult(result);
         else
@@ -126,7 +128,7 @@ internal sealed class GuestTaskRuntime(
         _continuationRoots[id] = [StackSlot.OfObject(awaited), detachedRef];
         try {
             StartWorker(null, [StackSlot.OfObject(awaited), detachedRef], () => {
-                awaited.Wait();
+                awaited.Wait(_shutdownToken);
                 _shutdownToken.ThrowIfCancellationRequested();
                 resume(detachedRef);
                 return default;
@@ -173,10 +175,13 @@ internal sealed class GuestTaskRuntime(
                 } catch (Exception ex) {
                     failure = ex;
                 } finally {
-                    _workers.TryRemove(workerId, out _);
-                    Interlocked.Decrement(ref _activeWorkers);
-                    _workerBudget.Release();
-                    onFinished?.Invoke();
+                    try {
+                        onFinished?.Invoke();
+                    } finally {
+                        _workers.TryRemove(workerId, out _);
+                        Interlocked.Decrement(ref _activeWorkers);
+                        _workerBudget.Release();
+                    }
                 }
                 if (cancelled)
                     return;

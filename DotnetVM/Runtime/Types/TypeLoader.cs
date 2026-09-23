@@ -73,9 +73,39 @@ public sealed class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System", Name = "Convert", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Array", IsValue = false, Parent = @object });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Type", IsValue = false, Parent = @object });
+        var memberInfo = new VmIntrinsicType { Namespace = "System.Reflection", Name = "MemberInfo", IsValue = false, Parent = @object };
+        Add(memberInfo);
+        var methodBase = new VmIntrinsicType { Namespace = "System.Reflection", Name = "MethodBase", IsValue = false, Parent = memberInfo };
+        Add(methodBase);
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "MethodInfo", IsValue = false, Parent = methodBase });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "ConstructorInfo", IsValue = false, Parent = methodBase });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "FieldInfo", IsValue = false, Parent = memberInfo });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "PropertyInfo", IsValue = false, Parent = memberInfo });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "Assembly", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "AssemblyName", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.Loader", Name = "AssemblyLoadContext", IsValue = false, Parent = @object });
+        var stream = new VmIntrinsicType { Namespace = "System.IO", Name = "Stream", IsValue = false, Parent = @object };
+        Add(stream);
+        Add(new VmIntrinsicType { Namespace = "System.IO", Name = "MemoryStream", IsValue = false, Parent = stream });
+        var expression = new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "Expression", IsValue = false, Parent = @object };
+        Add(expression);
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "Expression`1", IsValue = false, Parent = expression }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "LambdaExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "ParameterExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "BinaryExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "ConstantExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "DynamicMethod", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "ILGenerator", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "Label", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "LocalBuilder", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "OpCodes", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "OpCode", IsValue = true, Parent = valueType });
         // 例外階層のファサード (ECMA-335 / CLR の SystemException 配下)。VM 内部例外もここから実体化する
         var systemException = new VmIntrinsicType { Namespace = "System", Name = "SystemException", IsValue = false, Parent = _intrinsicTypes["System.Exception"] };
         Add(systemException);
+        var ioException = new VmIntrinsicType { Namespace = "System.IO", Name = "IOException", IsValue = false, Parent = systemException };
+        Add(ioException);
+        Add(new VmIntrinsicType { Namespace = "System.IO", Name = "FileNotFoundException", IsValue = false, Parent = ioException });
         Add(new VmIntrinsicType { Namespace = "System", Name = "InvalidOperationException", IsValue = false, Parent = systemException });
         var argumentException = new VmIntrinsicType { Namespace = "System", Name = "ArgumentException", IsValue = false, Parent = systemException };
         Add(argumentException);
@@ -86,7 +116,7 @@ public sealed class TypeLoader {
             "NullReferenceException", "IndexOutOfRangeException", "DivideByZeroException",
             "OverflowException", "InvalidCastException", "ArrayTypeMismatchException",
             "FormatException", "StackOverflowException", "OutOfMemoryException",
-            "NotSupportedException", "OperationCanceledException", "TimeoutException",
+            "NotSupportedException", "OperationCanceledException", "TimeoutException", "TypeLoadException",
             "NotImplementedException", "RankException",
         })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false, Parent = systemException });

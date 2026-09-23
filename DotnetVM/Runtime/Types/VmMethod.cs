@@ -16,6 +16,8 @@ public sealed class VmMethod {
     public required MethodBodyBlock? Body { get; init; }
     /// <summary>このメソッドを定義したアセンブリのローダ (多アセンブリ実行で token 解決先を決める)。</summary>
     public TypeLoader? Loader { get; internal set; }
+    internal IReadOnlyDictionary<uint, string>? DynamicStrings { get; init; }
+    internal IReadOnlyDictionary<uint, object>? DynamicTokens { get; init; }
 
     private string? _slotKey;
 

@@ -58,6 +58,8 @@ internal sealed class VmExecutionCoordinator {
         return new ResumeLease(_world, readDepth, instructionDepth, this);
     }
 
+    public void Dispose() => _world.Dispose();
+
     private sealed class ReadLease(ReaderWriterLockSlim world, Action? onExit) : IDisposable {
         private ReaderWriterLockSlim? _world = world;
 

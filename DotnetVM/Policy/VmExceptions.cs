@@ -34,7 +34,7 @@ public sealed class InstructionQuotaExceededException : ResourceExhaustedExcepti
     public InstructionQuotaExceededException(string message) : base(message) { }
 }
 
-/// <summary>guest Thread/Task worker または Task.Delay Timer の同時実行上限を超過した。</summary>
+/// <summary>guest Thread / Task worker / pending Timer の VM 上限を超過した。</summary>
 public sealed class GuestConcurrencyLimitExceededException : ResourceExhaustedException {
     public GuestConcurrencyLimitExceededException(string message) : base(message) { }
 }

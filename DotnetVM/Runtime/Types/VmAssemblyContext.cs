@@ -8,25 +8,54 @@ namespace DotnetVM.Runtime.Types;
 /// 同一ディレクトリの同名 DLL (ホストが見つけた明示パスの同一配置探索) → ③見つからなければ
 /// 呼び出し側に null を返し、型解決は fail-closed で拒否される。VM 側で任意のディスク走査はしない。
 /// </summary>
-public sealed class VmAssemblyContext(Func<string, TypeLoader> loaderFactory) {
+public sealed class VmAssemblyContext(
+    Func<string, TypeLoader> loaderFactory,
+    VmAssemblyContext? parent = null,
+    Func<string, bool>? pathExists = null) {
+    private readonly object _gate = new();
     private readonly List<TypeLoader> _loaders = [];
     private readonly Dictionary<string, TypeLoader> _bySimpleName = new(StringComparer.OrdinalIgnoreCase);
     // 依存解決の再入 (A→B→A の循環参照) で同じファイルを二重ロードしないための排他セット
     private readonly HashSet<string> _loading = new(StringComparer.OrdinalIgnoreCase);
+    private readonly VmAssemblyContext? _parent = parent;
+    private readonly Func<string, bool> _pathExists = pathExists ?? File.Exists;
 
     /// <summary>ロード済みアセンブリの TypeLoader 一覧 (ロード順)。</summary>
-    public IReadOnlyList<TypeLoader> Loaders => _loaders;
+    public IReadOnlyList<TypeLoader> Loaders { get { lock (_gate) return _loaders.ToArray(); } }
 
     /// <summary>ロード済みアセンブリを単純名で取得 (無ければ null)。</summary>
-    public TypeLoader? FindBySimpleName(string simpleName) =>
-        _bySimpleName.GetValueOrDefault(simpleName);
+    public TypeLoader? FindBySimpleName(string simpleName) {
+        lock (_gate)
+            if (_bySimpleName.TryGetValue(simpleName, out var loader))
+                return loader;
+        return _parent?.FindBySimpleName(simpleName);
+    }
 
     /// <summary>アセンブリをコンテキストに登録する (VirtualMachine.LoadAssembly から呼ぶ)。</summary>
     internal void Register(TypeLoader loader) {
-        _loaders.Add(loader);
-        loader.Context = this;
-        // 同一単純名の再ロードは最初のものを優先 (CLR のアセンブリ統合と同じ先行勝ち)
-        _bySimpleName.TryAdd(loader.Image.Name, loader);
+        lock (_gate) {
+            if (_loaders.Contains(loader))
+                return;
+            _loaders.Add(loader);
+            loader.Context = this;
+            // 同一単純名の再ロードは最初のものを優先 (CLR のアセンブリ統合と同じ先行勝ち)
+            _bySimpleName.TryAdd(loader.Image.Name, loader);
+        }
+    }
+
+    internal void Unregister(TypeLoader loader) {
+        lock (_gate) {
+            _loaders.Remove(loader);
+            if (_bySimpleName.TryGetValue(loader.Image.Name, out var current) && ReferenceEquals(current, loader)) {
+                _bySimpleName.Remove(loader.Image.Name);
+                var replacement = _loaders.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Image.Name, loader.Image.Name, StringComparison.OrdinalIgnoreCase));
+                if (replacement is not null)
+                    _bySimpleName[loader.Image.Name] = replacement;
+            }
+            if (ReferenceEquals(loader.Context, this))
+                loader.Context = null;
+        }
     }
 
     /// <summary>
@@ -37,9 +66,12 @@ public sealed class VmAssemblyContext(Func<string, TypeLoader> loaderFactory) {
     /// 見つからなければ null (fail-closed は呼び出し側の型解決が行う)。
     /// </summary>
     public TypeLoader? TryResolveAssembly(string simpleName, AssemblyImage requesting) {
-        if (_bySimpleName.TryGetValue(simpleName, out var loaded))
+        TypeLoader? loaded;
+        lock (_gate)
+            loaded = _bySimpleName.GetValueOrDefault(simpleName);
+        if (loaded is not null)
             return loaded;
-        return TryDiscoverFromDirectory(simpleName, requesting);
+        return TryDiscoverFromDirectory(simpleName, requesting) ?? _parent?.TryResolveAssembly(simpleName, requesting);
     }
 
     /// <summary>
@@ -50,13 +82,15 @@ public sealed class VmAssemblyContext(Func<string, TypeLoader> loaderFactory) {
     /// </summary>
     public TypeLoader? TryResolveAssembly(AssemblyIdentity reference, AssemblyImage requesting) {
         // ① ロード済みアセンブリを identity で照合 (ロード数は小さいため線形で十分)
-        foreach (var loader in _loaders) {
+        foreach (var loader in Loaders) {
             if (reference.Matches(loader.Image.Identity))
                 return loader;
         }
         // ② 同一ディレクトリの同名 DLL をロードし、identity で照合する
         var discovered = TryDiscoverFromDirectory(reference.Name, requesting);
-        return discovered is not null && reference.Matches(discovered.Image.Identity) ? discovered : null;
+        if (discovered is not null && reference.Matches(discovered.Image.Identity))
+            return discovered;
+        return _parent?.TryResolveAssembly(reference, requesting);
     }
 
     /// <summary>参照元と同一ディレクトリの同名 DLL を探索してロードする (SourcePath 無しは探索しない)。</summary>
@@ -71,20 +105,24 @@ public sealed class VmAssemblyContext(Func<string, TypeLoader> loaderFactory) {
         if (sourceDir is null)
             return null;
         var candidatePath = Path.Combine(sourceDir, simpleName + ".dll");
-        if (!File.Exists(candidatePath))
+        if (!_pathExists(candidatePath))
             return null;
 
         var fullPath = Path.GetFullPath(candidatePath);
         // 循環参照 (依存ロード中に同じ依存へ逆参照) 時はロード中のため null は返せない。
         // ロード完了まで待つのではなく、単純名辞書への登録は Register が行うので、
         // ここでは二重ロードを避けるためロード中マークを置いて再入を検知したら null を返す
-        if (!_loading.Add(fullPath))
-            return null;
+        lock (_gate) {
+            if (!_loading.Add(fullPath))
+                return null;
+        }
         try {
-            var loader = loaderFactory(fullPath);
-            return _bySimpleName.GetValueOrDefault(simpleName, loader);
+            // 同一 simple name の別 identity が既に辞書にあっても、今回 identity 照合のために
+            // 実際にロードした loader を返す。辞書の先頭へ戻すと正しい依存先を隠してしまう。
+            return loaderFactory(fullPath);
         } finally {
-            _loading.Remove(fullPath);
+            lock (_gate)
+                _loading.Remove(fullPath);
         }
     }
 }

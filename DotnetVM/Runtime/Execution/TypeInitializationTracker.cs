@@ -14,7 +14,6 @@ internal enum TypeInitializationStatus : byte {
 
 /// <summary>
 /// VM 単位の型初期化状態表。
-///
 /// 状態遷移だけを短いロックで保護し、guest の .cctor 本体はロックの外で実行する。
 /// 初期化中の型へ同じ実行フローから再入した場合だけ待たずに通過し、別スレッドは完了を待つ。
 /// 失敗は ExceptionDispatchInfo として保存し、後続の呼出元にも同じ失敗を返す。
@@ -29,7 +28,7 @@ internal sealed class TypeInitializationTracker {
         var entry = _entries.GetOrAdd(TypeInitializationKey.For(type), static _ => new Entry());
         lock (entry.Gate) {
             while (entry.Status == TypeInitializationStatus.Initializing) {
-                // .cctor 内の静的メンバ参照による同一スレッド再入は CLR と同様に許可する。
+                // CLR の型初期化は同一実行フローからの再入を許す。
                 if (entry.OwnerThreadId == Environment.CurrentManagedThreadId)
                     return;
                 Monitor.Wait(entry.Gate);
@@ -47,7 +46,7 @@ internal sealed class TypeInitializationTracker {
         }
 
         try {
-            // 重要: guest IL 実行中は entry.Gate を保持しない。
+            // guest IL 実行中は entry.Gate も VM-wide gate も保持しない。
             initializer();
             lock (entry.Gate) {
                 entry.Status = TypeInitializationStatus.Completed;

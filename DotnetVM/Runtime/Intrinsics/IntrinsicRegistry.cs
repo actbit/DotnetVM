@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using DotnetVM.Devices;
+using DotnetVM.Host;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Heap;
@@ -56,6 +57,24 @@ public sealed class IntrinsicContext {
     /// <summary>VM ごとの共有状態 (仮想環境変数ストア / last system error)。
     /// static 共有にしない (VM ごとに分離する)。</summary>
     public required DotnetVM.Runtime.Execution.VmSharedState Shared { get; init; }
+
+    /// <summary>ゲスト Assembly.Load(byte[]) の内容を VM ローダーへ登録するフック。</summary>
+    internal Func<ReadOnlyMemory<byte>, TypeLoader>? LoadAssemblyFromBytes { get; init; }
+
+    /// <summary>ゲスト Assembly.Load(byte[]) の PE 入力上限に使うポリシー。</summary>
+    internal MemoryPolicy? MemoryPolicy { get; init; }
+
+    /// <summary>ゲスト AssemblyLoadContext.Default の VM ハンドル。</summary>
+    internal VmAssemblyLoadContext? DefaultAssemblyLoadContext { get; init; }
+
+    /// <summary>ゲストが名前付き AssemblyLoadContext を生成するフック。</summary>
+    internal Func<string?, bool, VmAssemblyLoadContext>? CreateAssemblyLoadContext { get; init; }
+
+    /// <summary>指定 AssemblyLoadContext に byte[] を登録するフック。</summary>
+    internal Func<VmAssemblyLoadContext, ReadOnlyMemory<byte>, TypeLoader>? LoadAssemblyInContext { get; init; }
+
+    /// <summary>指定 AssemblyLoadContext にストレージ経由でパスを登録するフック。</summary>
+    internal Func<VmAssemblyLoadContext, string, TypeLoader>? LoadAssemblyFromPath { get; init; }
 
     /// <summary>
     /// 呼出ゲート (Interpreter.Call) が設定する「今回の呼出の宣言上のパラメータ型名」。
@@ -285,6 +304,14 @@ public sealed class IntrinsicRegistry {
         if (_bindings.TryGetValue(key, out var entry) &&
             (key.Domain != BindingDomain.TrustedCoreLib || callerDomain == BindingDomain.TrustedCoreLib ||
              key.Domain == callerDomain)) {
+            impl = entry.Impl;
+            origin = entry.Origin;
+            return true;
+        }
+        // 型名を実行時に確定できる面でも、宣言引数個数だけを固定した登録を許可する。
+        // AnyParams (= 引数個数も無制限) とは別キーなので、監査上の無制限 wildcard にはならない。
+        if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParamTypes(), out entry) &&
+            key.Domain != BindingDomain.TrustedCoreLib) {
             impl = entry.Impl;
             origin = entry.Origin;
             return true;

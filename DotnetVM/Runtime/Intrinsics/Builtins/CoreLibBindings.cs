@@ -44,6 +44,10 @@ internal static class CoreLibBindings {
         RegisterArrayPool(r);
         RegisterConvertBinary(r);
         RegisterGuid(r);
+        RegisterAssembly(r);
+        AssemblyLoadContextRuntime.RegisterBindings(r);
+        RegisterExpressionTrees(r);
+        RegisterReflectionEmit(r);
     }
 
     
@@ -570,6 +574,339 @@ internal static class CoreLibBindings {
             byRef.Write(StackSlot.OfInt32(value));
         else
             throw new InvalidOperationException("TryFormat の out 引数が参照ではありません。");
+    }
+
+    /// <summary>Assembly.Load(byte[]) は CLR にロードせず、必ず同じ VM の PE loader に通す。</summary>
+    private static void RegisterAssembly(IntrinsicRegistry r) {
+        const string T = "System.Reflection.Assembly";
+        r.RegisterBinding(BindingKey.Static(T, "Load", "System.Byte[]"),
+            static (ctx, a) => DefaultIntrinsics.LoadAssembly(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Load", "System.Byte[]", "System.Byte[]"),
+            static (ctx, a) => DefaultIntrinsics.LoadAssembly(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Load", "System.Reflection.AssemblyName"),
+            static (ctx, a) => DefaultIntrinsics.LoadAssembly(ctx, a), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "get_FullName"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(
+                ((VmAssemblyObject)a[0].ObjectValue!).Loader.Image.Identity.ToString())), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "get_Location"),
+            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(
+                ((VmAssemblyObject)a[0].ObjectValue!).Loader.Image.SourcePath ?? "")), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "GetType", "System.String"),
+            static (ctx, a) => {
+                var assembly = (VmAssemblyObject)a[0].ObjectValue!;
+                var name = (a[1].ObjectValue as VmString)?.Value
+                    ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
+                return assembly.Loader.FindTypeByFullName(name) is { } type
+                    ? DefaultIntrinsics.MakeRuntimeObject(ctx, type) : StackSlot.Null;
+            }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "GetType", "System.String", "System.Boolean"),
+            static (ctx, a) => {
+                var assembly = (VmAssemblyObject)a[0].ObjectValue!;
+                var name = (a[1].ObjectValue as VmString)?.Value
+                    ?? throw new UnhandledGuestException("System.ArgumentNullException", null);
+                if (assembly.Loader.FindTypeByFullName(name) is { } type)
+                    return DefaultIntrinsics.MakeRuntimeObject(ctx, type);
+                if (a[2].AsInt32 != 0)
+                    throw new UnhandledGuestException("System.TypeLoadException", $"型 '{name}' が見つかりません。");
+                return StackSlot.Null;
+            }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "GetTypes"),
+            static (ctx, a) => {
+                var loader = ((VmAssemblyObject)a[0].ObjectValue!).Loader;
+                var values = new List<StackSlot>();
+                for (var rid = 1; rid <= loader.Image.Tables.GetRowCount(TableKind.TypeDef); rid++) {
+                    var type = loader.GetTypeDef(rid);
+                    if (type.FullName != "<Module>")
+                        values.Add(DefaultIntrinsics.MakeRuntimeObject(ctx, type));
+                }
+                var elementType = (VmType?)ctx.Types.FindTypeByFullName("System.Type")
+                    ?? ctx.Types.FindIntrinsicType("System.Type")
+                    ?? throw new InvalidOperationException("System.Type が解決できません。");
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmArray(
+                    new VmArrayType { ElementType = elementType }, values.ToArray())));
+            }, BindingOrigin.Managed);
+    }
+
+    /// <summary>Expression.Compile は小さな式ノードを VM 側で評価する delegate として返す。</summary>
+    private static void RegisterExpressionTrees(IntrinsicRegistry r) {
+        const string T = "System.Linq.Expressions.Expression";
+        static VmExpressionObject Node(StackSlot slot) => slot.ObjectValue as VmExpressionObject
+            ?? throw new UnhandledGuestException("System.ArgumentException", "引数は VM 式木ノードである必要があります。");
+        static VmType TargetType(StackSlot slot) => slot.ObjectValue is VmRuntimeObject runtimeType
+            ? runtimeType.Target
+            : throw new UnhandledGuestException("System.ArgumentException", "Type 引数は VM の型情報である必要があります。");
+        static StackSlot ConstantValue(StackSlot slot) => slot.ObjectValue is VmBoxedValue boxed && boxed.Fields.Length == 1
+            ? boxed.Fields[0] : slot;
+        void BindByArity(string name, int[] arities, IntrinsicImpl impl) {
+            foreach (var arity in arities)
+                r.RegisterBinding(BindingKey.StaticByArity(T, name, arity), impl, BindingOrigin.Managed);
+        }
+
+        r.RegisterBinding(BindingKey.Static(T, "Constant", "System.Object"),
+            static (ctx, a) => {
+                var value = ConstantValue(a[0]);
+                var type = value.ObjectValue is null
+                    ? ctx.Types.FindIntrinsicType("System.Object")!
+                    : DefaultIntrinsics.RuntimeTypeOf(ctx, value);
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = VmExpressionKind.Constant, Constant = value, ResultType = type,
+                }));
+            }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Constant", "System.Object", "System.Type"),
+            static (ctx, a) => StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Constant, Constant = ConstantValue(a[0]), ResultType = TargetType(a[1]),
+            })), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Parameter", "System.Type"),
+            static (ctx, a) => StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Parameter, ResultType = TargetType(a[0]),
+            })), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Parameter", "System.Type", "System.String"),
+            static (ctx, a) => StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Parameter, ResultType = TargetType(a[0]),
+            })), BindingOrigin.Managed);
+
+        void Binary(string name, VmExpressionKind kind) =>
+            r.RegisterBinding(BindingKey.Static(T, name, "System.Linq.Expressions.Expression", "System.Linq.Expressions.Expression"),
+                (ctx, a) => StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = kind, Left = Node(a[0]), Right = Node(a[1]), ResultType = Node(a[0]).ResultType,
+                })), BindingOrigin.Managed);
+        Binary("Add", VmExpressionKind.Add);
+        Binary("Subtract", VmExpressionKind.Subtract);
+        Binary("Multiply", VmExpressionKind.Multiply);
+        Binary("Divide", VmExpressionKind.Divide);
+        foreach (var (name, kind) in new[] {
+            ("AddChecked", VmExpressionKind.Add), ("SubtractChecked", VmExpressionKind.Subtract),
+            ("MultiplyChecked", VmExpressionKind.Multiply), ("Modulo", VmExpressionKind.Modulo),
+            ("And", VmExpressionKind.And), ("Or", VmExpressionKind.Or),
+            ("ExclusiveOr", VmExpressionKind.ExclusiveOr), ("AndAlso", VmExpressionKind.AndAlso),
+            ("OrElse", VmExpressionKind.OrElse), ("Equal", VmExpressionKind.Equal),
+            ("NotEqual", VmExpressionKind.NotEqual), ("GreaterThan", VmExpressionKind.GreaterThan),
+            ("GreaterThanOrEqual", VmExpressionKind.GreaterThanOrEqual), ("LessThan", VmExpressionKind.LessThan),
+            ("LessThanOrEqual", VmExpressionKind.LessThanOrEqual),
+        })
+            BindByArity(name, [2], (ctx, a) =>
+                StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = kind, Left = Node(a[0]), Right = Node(a[1]), ResultType = Node(a[0]).ResultType,
+                })));
+        foreach (var (name, kind) in new[] {
+            ("Negate", VmExpressionKind.Negate), ("NegateChecked", VmExpressionKind.Negate),
+            ("Not", VmExpressionKind.Not),
+        })
+            BindByArity(name, [1], (ctx, a) =>
+                StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = kind, Left = Node(a[0]), ResultType = Node(a[0]).ResultType,
+                })));
+        BindByArity("Convert", [1, 2], (ctx, a) => {
+            var node = Node(a[0]);
+            var target = a.Length > 1 && a[1].ObjectValue is VmRuntimeObject type ? type.Target : node.ResultType;
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Convert, Left = node, ResultType = target,
+            }));
+        });
+        foreach (var (name, kind) in new[] { ("TypeIs", VmExpressionKind.TypeIs), ("TypeAs", VmExpressionKind.TypeAs) })
+            BindByArity(name, [1, 2], (ctx, a) => {
+                var operand = Node(a[0]);
+                var target = TargetType(a[1]);
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = kind, Left = operand, NewType = target,
+                    ResultType = kind == VmExpressionKind.TypeIs ? ctx.Types.FindIntrinsicType("System.Boolean") : target,
+                }));
+            });
+        BindByArity("ArrayIndex", [1, 2], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.ArrayIndex, Left = Node(a[0]), Right = Node(a[1]), ResultType = Node(a[0]).ResultType,
+            })));
+        BindByArity("ArrayLength", [1], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.ArrayLength, Left = Node(a[0]), ResultType = ctx.Types.FindIntrinsicType("System.Int32"),
+            })));
+        BindByArity("Condition", [1, 3], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Conditional, Left = Node(a[0]), IfTrue = Node(a[1]), IfFalse = Node(a[2]), ResultType = Node(a[1]).ResultType,
+            })));
+        BindByArity("Assign", [1, 2], (ctx, a) => {
+            var target = Node(a[0]);
+            var value = Node(a[1]);
+            if (target.Kind != VmExpressionKind.Parameter)
+                throw new UnhandledGuestException("System.ArgumentException", "Expression.Assign の左辺は ParameterExpression である必要があります。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Assign, Left = target, Right = value, ResultType = value.ResultType,
+            }));
+        });
+        BindByArity("Variable", [1, 2], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Parameter, ResultType = TargetType(a[0]), IsVariable = true,
+            })));
+        BindByArity("Default", [1], (ctx, a) => {
+            var type = TargetType(a[0]);
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Default, ResultType = type, NewType = type,
+            }));
+        });
+        BindByArity("Quote", [1], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Quote, Object = Node(a[0]), ResultType = Node(a[0]).ResultType,
+            })));
+        BindByArity("ArrayAccess", [1, 2], (ctx, a) => {
+            var indexes = Nodes(a[^1]);
+            if (indexes.Length != 1)
+                throw new UnhandledGuestException("System.NotSupportedException", "式木の多次元配列アクセスは未対応です。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.ArrayIndex, Left = Node(a[0]), Right = indexes[0],
+                ResultType = Node(a[0]).ResultType,
+            }));
+        });
+        static VmExpressionObject[] Nodes(StackSlot slot) => slot.ObjectValue switch {
+            VmArray array => array.Elements.Select(Node).ToArray(),
+            null => [],
+            _ => throw new UnhandledGuestException("System.ArgumentException", "式木引数配列が不正です。"),
+        };
+        BindByArity("Block", [1, 2], (ctx, a) => {
+            var expressions = a.Length == 0 ? [] : Nodes(a[^1]);
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Block, Expressions = expressions,
+                ResultType = expressions.Length == 0 ? ctx.Types.FindIntrinsicType("System.Void") : expressions[^1].ResultType,
+            }));
+        });
+        foreach (var name in new[] { "NewArrayInit", "NewArrayBounds" })
+            BindByArity(name, [1, 2], (ctx, a) => {
+                var elementType = TargetType(a[0]);
+                var values = a.Length > 1 ? Nodes(a[^1]) : [];
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = VmExpressionKind.NewArray, NewType = elementType, Arguments = values,
+                    NewArrayBounds = name == "NewArrayBounds",
+                    ResultType = new VmArrayType { ElementType = elementType },
+                }));
+            });
+        BindByArity("Call", [1, 2, 3], (ctx, a) => {
+            VmExpressionObject? receiver = null;
+            if (a[0].ObjectValue is not VmRuntimeMethod) receiver = Node(a[0]);
+            var methodSlot = receiver is null ? a[0] : a[1];
+            var method = methodSlot.ObjectValue is VmRuntimeMethod runtimeMethod
+                ? runtimeMethod.Target : throw new UnhandledGuestException("System.ArgumentException", "MethodInfo が必要です。");
+            var firstArgs = receiver is null ? (a.Length > 1 ? Nodes(a[^1]) : []) : (a.Length > 2 ? Nodes(a[^1]) : []);
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Call, Object = receiver, Method = method, Arguments = firstArgs,
+                ResultType = ctx.Types.FindIntrinsicType("System.Object"),
+            }));
+        });
+        BindByArity("New", [1, 2], (ctx, a) => {
+            var ctor = a[0].ObjectValue is VmRuntimeMethod runtimeMethod
+                ? runtimeMethod.Target
+                : throw new UnhandledGuestException("System.ArgumentException", "ConstructorInfo が必要です。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.New, Method = ctor, NewType = ctor.DeclaringType,
+                Arguments = a.Length > 1 ? Nodes(a[^1]) : [], ResultType = ctor.DeclaringType,
+            }));
+        });
+        BindByArity("Invoke", [1, 2], (ctx, a) =>
+            StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Invoke, Object = Node(a[0]), Arguments = a.Length > 1 ? Nodes(a[^1]) : [],
+                ResultType = ctx.Types.FindIntrinsicType("System.Object"),
+            })));
+        BindByArity("Field", [1, 2], (ctx, a) => {
+            var receiver = a.Length > 1 && a[0].ObjectValue is VmExpressionObject ? Node(a[0]) : null;
+            var ownerType = receiver?.ResultType ?? (a.Length > 1 && a[0].ObjectValue is VmRuntimeObject type ? type.Target : null);
+            var field = a[^1].ObjectValue is VmRuntimeField runtimeField
+                ? runtimeField.Target
+                : ownerType is { } owner && a[^1].ObjectValue is VmString fieldName
+                    ? (DefaultIntrinsics.MakeFieldObject(ctx, owner, fieldName.Value).ObjectValue as VmRuntimeField)?.Target
+                    : null;
+            if (field is null)
+                throw new UnhandledGuestException("System.ArgumentException", "FieldInfo が必要です。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.MemberAccess, Object = receiver, Field = field, ResultType = field.FieldType,
+            }));
+        });
+        BindByArity("Property", [1, 2], (ctx, a) => {
+            var receiver = a.Length > 1 && a[0].ObjectValue is VmExpressionObject ? Node(a[0]) : null;
+            var ownerType = receiver?.ResultType ?? (a.Length > 1 && a[0].ObjectValue is VmRuntimeObject type ? type.Target : null);
+            var property = a[^1].ObjectValue as VmRuntimeProperty;
+            if (property is null && a[^1].ObjectValue is VmString propertyName && ownerType is { } owner)
+                property = DefaultIntrinsics.MakePropertyObject(ctx, owner, propertyName.Value).ObjectValue as VmRuntimeProperty;
+            if (property is null)
+                throw new UnhandledGuestException("System.ArgumentException", "PropertyInfo が必要です。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.MemberAccess, Object = receiver, Property = property,
+                ResultType = ctx.Types.FindIntrinsicType("System.Object"),
+            }));
+        });
+
+        r.RegisterBinding(BindingKey.Static(T, "Lambda", "System.Linq.Expressions.Expression", "System.Linq.Expressions.ParameterExpression[]"),
+            static (ctx, a) => {
+                if (ctx.MethodTypeArguments.Length != 1)
+                    throw new UnhandledGuestException("System.ArgumentException", "Lambda<TDelegate> は delegate 型引数が必要です。");
+                var body = Node(a[0]);
+                var parameters = a[1].ObjectValue switch {
+                    VmArray array => array.Elements.Select(Node).ToArray(),
+                    null => [],
+                    _ => throw new UnhandledGuestException("System.ArgumentException", "parameters は ParameterExpression[] である必要があります。"),
+                };
+                if (parameters.Any(p => p.Kind != VmExpressionKind.Parameter))
+                    throw new UnhandledGuestException("System.ArgumentException", "lambda の引数は ParameterExpression である必要があります。");
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                    Kind = VmExpressionKind.Lambda, Body = body, Parameters = parameters,
+                    DelegateType = ctx.MethodTypeArguments[0], ResultType = ctx.MethodTypeArguments[0],
+                }));
+            }, BindingOrigin.Managed);
+        BindByArity("Lambda", [2, 3], (ctx, a) => {
+            var genericDelegate = ctx.MethodTypeArguments.Length == 1 ? ctx.MethodTypeArguments[0] : null;
+            var explicitDelegate = genericDelegate is null && a.Length > 0 && a[0].ObjectValue is VmRuntimeObject
+                ? TargetType(a[0]) : null;
+            var delegateType = genericDelegate ?? explicitDelegate
+                ?? throw new UnhandledGuestException("System.ArgumentException", "Lambda には delegate 型が必要です。");
+            var bodyIndex = explicitDelegate is null ? 0 : 1;
+            var body = Node(a[bodyIndex]);
+            var parameters = a.Length > bodyIndex + 1 ? Nodes(a[^1]) : [];
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
+                Kind = VmExpressionKind.Lambda, Body = body, Parameters = parameters,
+                DelegateType = delegateType, ResultType = delegateType,
+            }));
+        });
+
+        StackSlot Compile(IntrinsicContext ctx, StackSlot[] args) {
+            var lambda = Node(args[0]);
+            if (lambda.Kind != VmExpressionKind.Lambda || lambda.Body is null || lambda.DelegateType is null)
+                throw new UnhandledGuestException("System.InvalidOperationException", "式木 Lambda が不正です。");
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmDelegate {
+                DeclaredType = lambda.DelegateType, ExpressionLambda = lambda,
+            }));
+        }
+        foreach (var type in new[] { "System.Linq.Expressions.LambdaExpression", "System.Linq.Expressions.Expression`1" }) {
+            r.RegisterBinding(BindingKey.Instance(type, "Compile"), (ctx, args) => Compile(ctx, args), BindingOrigin.Managed);
+            r.RegisterBinding(BindingKey.Instance(type, "Compile", "System.Boolean"), (ctx, args) => Compile(ctx, args), BindingOrigin.Managed);
+        }
+    }
+
+    private static void RegisterReflectionEmit(IntrinsicRegistry r) {
+        const string dynamicMethod = "System.Reflection.Emit.DynamicMethod";
+        const string generator = "System.Reflection.Emit.ILGenerator";
+        r.RegisterBinding(BindingKey.Instance(dynamicMethod, "GetILGenerator"),
+            (ctx, args) => ReflectionEmitRuntime.GetILGenerator(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(dynamicMethod, "GetILGenerator", "System.Int32"),
+            (ctx, args) => ReflectionEmitRuntime.GetILGenerator(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(dynamicMethod, "CreateDelegate", "System.Type"),
+            (ctx, args) => ReflectionEmitRuntime.CreateDelegate(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(dynamicMethod, "CreateDelegate", "System.Type", "System.Object"),
+            (ctx, args) => ReflectionEmitRuntime.CreateDelegate(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "DefineLabel"),
+            (ctx, args) => ReflectionEmitRuntime.DefineLabel(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "MarkLabel", "System.Reflection.Emit.Label"),
+            (ctx, args) => ReflectionEmitRuntime.MarkLabel(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "DeclareLocal", "System.Type"),
+            (ctx, args) => ReflectionEmitRuntime.DeclareLocal(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "DeclareLocal", "System.Type", "System.Boolean"),
+            (ctx, args) => ReflectionEmitRuntime.DeclareLocal(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "Emit", "System.Reflection.Emit.OpCode"),
+            (ctx, args) => ReflectionEmitRuntime.Emit(ctx, args), BindingOrigin.Managed);
+        foreach (var operand in new[] { "System.Byte", "System.SByte", "System.Int16", "System.Int32", "System.Int64", "System.Single", "System.Double" })
+            r.RegisterBinding(BindingKey.Instance(generator, "Emit", "System.Reflection.Emit.OpCode", operand),
+                (ctx, args) => ReflectionEmitRuntime.Emit(ctx, args), BindingOrigin.Managed);
+        foreach (var operand in new[] { "System.Reflection.Emit.Label", "System.Reflection.Emit.Label[]", "System.Reflection.Emit.LocalBuilder", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo", "System.Reflection.FieldInfo", "System.Type", "System.String" })
+            r.RegisterBinding(BindingKey.Instance(generator, "Emit", "System.Reflection.Emit.OpCode", operand),
+                (ctx, args) => ReflectionEmitRuntime.Emit(ctx, args), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(generator, "EmitCall", "System.Reflection.Emit.OpCode", "System.Reflection.MethodInfo", "System.Type[]"),
+            (ctx, args) => ReflectionEmitRuntime.EmitCall(ctx, args), BindingOrigin.Managed);
     }
 
     // ---- System.Enum ([Intrinsic] 面: 実 CLR も JIT が IL を置き換えるため VM もバインドで提供) ----
@@ -1551,6 +1888,45 @@ internal static class CoreLibBindings {
                 ? StackSlot.OfInt32(rt.Target.IsInterface ? 1 : 0)
                 : throw new InvalidOperationException("Type::get_IsInterface の this が Type ファサードではありません。"),
             BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetMethod", "System.String"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt &&
+                a[1].ObjectValue is VmString name
+                    ? DefaultIntrinsics.MakeMethodObject(ctx, rt.Target, name.Value, null)
+                    : throw new UnhandledGuestException("System.ArgumentNullException", null),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetMethod", "System.String", "System.Type[]"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt &&
+                a[1].ObjectValue is VmString name
+                    ? DefaultIntrinsics.MakeMethodObject(ctx, rt.Target, name.Value, a[2])
+                    : throw new UnhandledGuestException("System.ArgumentNullException", null),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetConstructor", "System.Type[]"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt
+                ? DefaultIntrinsics.MakeMethodObject(ctx, rt.Target, ".ctor", a[1])
+                : throw new InvalidOperationException("Type::GetConstructor の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetMethods"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt
+                ? DefaultIntrinsics.MakeMethodArray(ctx, rt.Target)
+                : throw new InvalidOperationException("Type::GetMethods の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetField", "System.String"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt &&
+                a[1].ObjectValue is VmString name
+                    ? DefaultIntrinsics.MakeFieldObject(ctx, rt.Target, name.Value)
+                    : throw new UnhandledGuestException("System.ArgumentNullException", null),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetProperty", "System.String"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt &&
+                a[1].ObjectValue is VmString name
+                    ? DefaultIntrinsics.MakePropertyObject(ctx, rt.Target, name.Value)
+                    : throw new UnhandledGuestException("System.ArgumentNullException", null),
+            BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Type", "GetFields"),
+            static (ctx, a) => a[0].ObjectValue is VmRuntimeObject rt
+                ? DefaultIntrinsics.MakeFieldArray(ctx, rt.Target)
+                : throw new InvalidOperationException("Type::GetFields の this が Type ファサードではありません。"),
+            BindingOrigin.InternalCall);
         // Enum書式などで Type.GetEnumUnderlyingType が本家 GetFields 実装へ降りるが、
         // RuntimeType のフィールド反映は VM の Type ファサードに存在しないため、
         // enum 定義の value__ フィールドから基底型を直接返す。
@@ -2465,10 +2841,10 @@ internal static class CoreLibBindings {
         const string T = "System.Threading.Monitor";
         r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath", "System.Object"),
             static (ctx, a) => { SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))); return StackSlot.OfInt32(1); }, BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath_WithTimeout", "System.Object", "System.Int32"),
-            static (ctx, a) => SuspendHostWait(ctx, () => Monitor.TryEnter(
-                ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")))
-                ? StackSlot.OfInt32(1) : StackSlot.OfInt32(2), BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath_WithTimeout", "System.Object", "System.Int32"),
+                static (ctx, a) => SuspendHostWait(ctx, () => Monitor.TryEnter(
+                    ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")))
+                ? StackSlot.OfInt32(1) : StackSlot.OfInt32(0), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "Exit_FastPath", "System.Object"),
             static (ctx, a) => { ExitMonitor(ctx, a[0]); return StackSlot.OfInt32(0); }, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "IsEnteredNative", "System.Object"),
@@ -2637,7 +3013,7 @@ internal static class CoreLibBindings {
                 });
             RegisterBinding(registry, BindingKey.Instance(typeName, "Wait"),
                 static (ctx, a) => { SuspendHostWait(ctx, AsTask(a[0]).Wait); return null; });
-            RegisterBinding(registry, BindingKey.Instance(typeName, "Wait", "System.Int32"),
+            RegisterBinding(registry, BindingKey.InstanceWithReturn(typeName, "Wait", "System.Boolean", ["System.Int32"]),
                 (ctx, a) => {
                     var target = AsTask(a[0]);
                     var milliseconds = a[1].AsInt32;
@@ -2645,7 +3021,7 @@ internal static class CoreLibBindings {
                         throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "timeout");
                     return StackSlot.OfInt32(SuspendHostWait(ctx, () => target.Wait(milliseconds)) ? 1 : 0);
                 });
-            RegisterBinding(registry, BindingKey.Instance(typeName, "Wait", "System.TimeSpan"),
+            RegisterBinding(registry, BindingKey.InstanceWithReturn(typeName, "Wait", "System.Boolean", ["System.TimeSpan"]),
                 (ctx, a) => StackSlot.OfInt32(SuspendHostWait(ctx, () => AsTask(a[0]).Wait(
                     ValidateTimeout(TimeSpanMilliseconds(a[1]), "timeout"))) ? 1 : 0));
         }
@@ -2675,7 +3051,7 @@ internal static class CoreLibBindings {
         RegisterTaskType(r, taskOfT, generic: true);
         RegisterBinding(r, BindingKey.Instance(taskOfT, "get_Result"),
             static (ctx, a) => TaskResult(ctx, AsTask(a[0])));
-        RegisterBinding(r, BindingKey.Static(task, "get_CompletedTask"),
+        RegisterBinding(r, BindingKey.StaticWithReturn(task, "get_CompletedTask", task, []),
             static (ctx, _) => StackSlot.OfObject(NewTask(ctx, generic: false, completed: true)));
         RegisterBinding(r, BindingKey.Static(task, "Delay", "System.Int32"),
             static (ctx, a) => {

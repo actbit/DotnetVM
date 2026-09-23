@@ -85,6 +85,8 @@ public sealed class VmSharedState : IDisposable {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
         _shutdown.Cancel();
+        // Task を先に fault させて待機中の continuation / guest Thread を起こし、
+        // その後 Thread worker を interrupt する。どちらも同じ cancellation token を見る。
         GuestTasks.Dispose();
         GuestThreads.Dispose();
         _workerBudget.Dispose();

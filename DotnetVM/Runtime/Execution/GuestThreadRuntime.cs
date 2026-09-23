@@ -139,7 +139,7 @@ internal sealed class GuestThreadRuntime(
                 continue;
             try {
                 hostThread.Interrupt();
-            } catch (Exception) when (!hostThread.IsAlive) {
+            } catch (Exception) when (!hostThread.IsAlive || thread.Completed.IsSet) {
                 // 既に終了した worker との競合は無視する。
             }
         }

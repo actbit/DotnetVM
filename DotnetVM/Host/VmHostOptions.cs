@@ -87,7 +87,7 @@ public sealed class VmHostOptions {
     /// </summary>
     public bool LoadHostCoreLib { get; init; }
 
-    /// <summary>同時に開始できる guest Thread 数 (別途ホスト側の OS 制限も適用)。既定 = 64。</summary>
+    /// <summary>同時に開始できる guest Thread 数 (別途 host 側の OS 制限も適用)。既定 = 64。</summary>
     public int MaxGuestThreads { get; init; } = 64;
 
     /// <summary>同時に実行できる guest Task worker 数。Thread の上限とは別に明示する。既定 = 64。</summary>
@@ -102,6 +102,9 @@ public sealed class VmHostOptions {
     /// <summary>未完了の Task.Delay が保持できる host Timer 数。-1 の無限 Delay も 1 件として数える。</summary>
     public int MaxPendingTaskTimers { get; init; } = 1024;
 
-    /// <summary>VM.Dispose が worker の停止を待つ最大時間 (ミリ秒)。</summary>
+    /// <summary>
+    /// VM.Dispose が worker の停止を待つ最大時間 (ミリ秒)。通常は worker が
+    /// cancellation/interrupt で速やかに終了する。
+    /// </summary>
     public int ShutdownTimeoutMilliseconds { get; init; } = 5_000;
 }

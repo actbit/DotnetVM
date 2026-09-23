@@ -252,7 +252,6 @@ public static class DefaultIntrinsics {
         RegisterMethodBase(registry);
         RegisterAssembly(registry);
         AssemblyLoadContextRuntime.RegisterAll(registry);
-        RegisterExpressionTrees(registry);
         RegisterReflectionEmit(registry);
         RegisterInterpolatedStringHandler(registry);
         RegisterDisposable(registry);

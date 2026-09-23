@@ -286,6 +286,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
+        EnsureStaticMethodTypeInitialized(method, context);
         // 置換面 (C5): 実在 CoreLib 由来のメソッドのうち DotnetVM.CoreLib の managed IL が
         // 面を置換するものは、ここ (唯一の IL 実行入口) で本体を差し替える。MemberRef 解決
         // でも仮想ディスパッチでも最終的にここを通るため、CoreLib IL 内の boxed int の
@@ -338,6 +339,27 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             state.Depth--;
         }
 
+    }
+
+    /// <summary>
+    /// 静的メソッド呼出しの入口でも CLR の型初期化規約を適用する。
+    /// 静的フィールドを直接参照しない .cctor でも、明示的 static constructor は最初の
+    /// static method 呼出し前に実行される必要がある。.cctor 自身は再入を避けて除外する。
+    /// </summary>
+    private void EnsureStaticMethodTypeInitialized(VmMethod method, GenericContext? context) {
+        if (!method.IsStatic || method.Name == ".cctor" || method.DeclaringType is not VmClassType definition)
+            return;
+
+        var objects = EnginesFor(method).Objects;
+        if (definition.GenericParamCount > 0 && context?.ClassArgs is { Length: > 0 } classArgs &&
+            classArgs.Length == definition.GenericParamCount) {
+            objects.EnsureConstructedInitialized(new VmConstructedType {
+                Definition = definition,
+                TypeArguments = classArgs,
+            });
+        } else {
+            objects.EnsureInitialized(definition);
+        }
     }
 
     // サービス群からの再帰呼出入口 (循環依存をインターフェースで切る)
@@ -418,17 +440,10 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     private void ConsumeInstruction() {
         _shared.ThrowIfDisposed();
-        long count;
-        while (true) {
-            var current = Volatile.Read(ref _instructionCount);
-            if (current >= _memory.InstructionQuota)
-                throw new InstructionQuotaExceededException(
-                    $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {current:N0})。");
-            if (Interlocked.CompareExchange(ref _instructionCount, current + 1, current) == current) {
-                count = current + 1;
-                break;
-            }
-        }
+        var count = Interlocked.Increment(ref _instructionCount);
+        if (count > _memory.InstructionQuota)
+            throw new InstructionQuotaExceededException(
+                $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {count:N0})。");
         var state = CurrentState;
         state.InstructionCount++;
         if (count % SafepointInterval == 0)
@@ -438,6 +453,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
     /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
     private void CheckSafepoint() {
+        _shared.ShutdownToken.ThrowIfCancellationRequested();
         _shared.ThrowIfDisposed();
         // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
         // その場で GC せず、RunFrameCore の次の命令境界で stop-the-world 回収する。

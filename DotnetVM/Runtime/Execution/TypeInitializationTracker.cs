@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -12,10 +14,9 @@ internal enum TypeInitializationStatus : byte {
 
 /// <summary>
 /// VM 単位の型初期化状態表。
-///
-/// 状態の遷移だけを短いロックで保護し、guest の .cctor 本体はロックの外で実行する。
-/// これにより、ある型の .cctor が別の guest Thread/Task を起動して待機しても、別の型の
-/// 初期化が VM-wide gate に阻まれることはない。失敗は状態に保存し、後続の呼出元へ共有する。
+/// 状態遷移だけを短いロックで保護し、guest の .cctor 本体はロックの外で実行する。
+/// 初期化中の型へ同じ実行フローから再入した場合だけ待たずに通過し、別スレッドは完了を待つ。
+/// 失敗は ExceptionDispatchInfo として保存し、後続の呼出元にも同じ失敗を返す。
 /// </summary>
 internal sealed class TypeInitializationTracker {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<TypeInitializationKey, Entry> _entries = new();
@@ -24,14 +25,10 @@ internal sealed class TypeInitializationTracker {
         ArgumentNullException.ThrowIfNull(type);
         ArgumentNullException.ThrowIfNull(initializer);
 
-        var key = TypeInitializationKey.For(type);
-        var entry = _entries.GetOrAdd(key, static _ => new Entry());
-        var runInitializer = false;
-
+        var entry = _entries.GetOrAdd(TypeInitializationKey.For(type), static _ => new Entry());
         lock (entry.Gate) {
             while (entry.Status == TypeInitializationStatus.Initializing) {
-                // CLR の型初期化は同一実行フローからの再入を許す。ここで自分自身を
-                // 待つと、.cctor 内の静的メンバ参照が自己 deadlock になる。
+                // CLR の型初期化は同一実行フローからの再入を許す。
                 if (entry.OwnerThreadId == Environment.CurrentManagedThreadId)
                     return;
                 Monitor.Wait(entry.Gate);
@@ -39,19 +36,17 @@ internal sealed class TypeInitializationTracker {
 
             if (entry.Status == TypeInitializationStatus.Completed)
                 return;
-            if (entry.Status == TypeInitializationStatus.Failed)
-                throw entry.Failure!;
+            if (entry.Status == TypeInitializationStatus.Failed) {
+                entry.Failure!.Throw();
+                return;
+            }
 
             entry.Status = TypeInitializationStatus.Initializing;
             entry.OwnerThreadId = Environment.CurrentManagedThreadId;
-            runInitializer = true;
         }
 
-        if (!runInitializer)
-            return;
-
         try {
-            // 重要: guest IL を実行している間は entry.Gate も VM-wide gate も保持しない。
+            // guest IL 実行中は entry.Gate も VM-wide gate も保持しない。
             initializer();
             lock (entry.Gate) {
                 entry.Status = TypeInitializationStatus.Completed;
@@ -61,7 +56,7 @@ internal sealed class TypeInitializationTracker {
         } catch (Exception ex) {
             lock (entry.Gate) {
                 entry.Status = TypeInitializationStatus.Failed;
-                entry.Failure = ex;
+                entry.Failure = ExceptionDispatchInfo.Capture(ex);
                 entry.OwnerThreadId = 0;
                 Monitor.PulseAll(entry.Gate);
             }
@@ -70,17 +65,17 @@ internal sealed class TypeInitializationTracker {
     }
 
     internal TypeInitializationStatus GetStatus(VmType type) {
-        var key = TypeInitializationKey.For(type);
-        return _entries.TryGetValue(key, out var entry)
-            ? entry.Status
-            : TypeInitializationStatus.NotStarted;
+        if (!_entries.TryGetValue(TypeInitializationKey.For(type), out var entry))
+            return TypeInitializationStatus.NotStarted;
+        lock (entry.Gate)
+            return entry.Status;
     }
 
     private sealed class Entry {
         public readonly object Gate = new();
         public TypeInitializationStatus Status;
         public int OwnerThreadId;
-        public Exception? Failure;
+        public ExceptionDispatchInfo? Failure;
     }
 
     /// <summary>非構築型は定義参照、構築型は定義参照 + 型引数参照列で識別する。</summary>
@@ -111,10 +106,10 @@ internal sealed class TypeInitializationTracker {
 
         public override int GetHashCode() {
             var hash = new HashCode();
-            hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(_definition));
+            hash.Add(RuntimeHelpers.GetHashCode(_definition));
             hash.Add(_arguments.Length);
             foreach (var argument in _arguments)
-                hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(argument));
+                hash.Add(RuntimeHelpers.GetHashCode(argument));
             return hash.ToHashCode();
         }
     }

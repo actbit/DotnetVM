@@ -96,6 +96,14 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
     public static BindingKey InstanceWithReturn(string typeFullName, string methodName, string returnTypeName, string[] paramTypeNames) =>
         new(typeFullName, methodName, Normalize(paramTypeNames), returnTypeName, true, BindingDomain.Guest);
 
+    /// <summary>引数の型は問わず、宣言引数個数だけを固定したインスタンス面。</summary>
+    public static BindingKey StaticByArity(string typeFullName, string methodName, int parameterCount) =>
+        new(typeFullName, methodName, AnyTypes(parameterCount), AnyReturn, false, BindingDomain.Guest);
+
+    /// <summary>引数の型は問わず、宣言引数個数だけを固定したインスタンス面。</summary>
+    public static BindingKey InstanceByArity(string typeFullName, string methodName, int parameterCount) =>
+        new(typeFullName, methodName, AnyTypes(parameterCount), AnyReturn, true, BindingDomain.Guest);
+
     /// <summary>全引数一致面 (デバイス面の統合オーバーロード等) の静的キー。</summary>
     public static BindingKey StaticAnyParams(string typeFullName, string methodName) =>
         new(typeFullName, methodName, AnyParamsSignature, AnyReturn, false, BindingDomain.Guest);
@@ -121,6 +129,11 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
     public BindingKey WithAnyParams() =>
         new(TypeFullName, MethodName, AnyParamsSignature, ReturnTypeName, HasThis, Domain);
 
+    /// <summary>同じ引数個数で型だけをワイルドカードにした照合キー。</summary>
+    public BindingKey WithAnyParamTypes() =>
+        new(TypeFullName, MethodName, AnyTypes(ParamSignature.Length == 0 ? 0 : ParamSignature.Split(',').Length),
+            ReturnTypeName, HasThis, Domain);
+
     /// <summary>同一面の domain 違いキー (trusted caller が特権面と汎用面の双方を照合する用)。</summary>
     public BindingKey WithDomain(BindingDomain domain) =>
         new(TypeFullName, MethodName, ParamSignature, ReturnTypeName, HasThis, domain);
@@ -131,6 +144,9 @@ public readonly struct BindingKey : IEquatable<BindingKey> {
 
     private static string Normalize(string[] paramTypeNames) =>
         paramTypeNames is { Length: > 0 } ? string.Join(",", paramTypeNames) : "";
+
+    private static string AnyTypes(int count) =>
+        count == 0 ? "" : string.Join(",", Enumerable.Repeat("?", count));
 
     public bool Equals(BindingKey other) =>
         HasThis == other.HasThis &&

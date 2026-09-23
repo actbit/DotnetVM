@@ -28,7 +28,6 @@ internal sealed class ObjectEngine(
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは CLR と同じく 1 つ)。
     /// null = 単一画像実行 (既定動作の ObjectModel ローカル辞書に統一)。</summary>
     private readonly UnifiedStaticStorage? _unifiedStaticStorage = unifiedStaticStorage;
-
     private readonly TypeInitializationTracker _typeInitialization = typeInitialization ?? new();
     /// <summary>intrinsic 型の静的フィールドのストレージ (トークンごとに 1 スロット。例: String.Empty)。GC ルート源。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, StackSlot[]> _intrinsicStaticFields = new();
@@ -331,22 +330,34 @@ internal sealed class ObjectEngine(
 
     /// <summary>型初期化子 (.cctor) の起動規約: 静的フィールド初回アクセス/newobj 前に 1 回だけ実行。</summary>
     public void EnsureInitialized(VmClassType type) {
-        _typeInitialization.Ensure(type, () => {
+        EnsureInitializationOutsideExecutionLease(() => _typeInitialization.Ensure(type, () => {
             var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
                 invoker.Invoke(cctor, [], null);
-        });
+        }));
     }
 
     /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回。
     /// 定義参照 + 型引数参照列で鍵化し、FullName 文字列は使わない)。</summary>
     public void EnsureConstructedInitialized(VmConstructedType type) {
-        _typeInitialization.Ensure(type, () => {
+        EnsureInitializationOutsideExecutionLease(() => _typeInitialization.Ensure(type, () => {
             var definition = (VmClassType)type.Definition;
             var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
                 invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
-        });
+        }));
+    }
+
+    /// <summary>
+    /// 型初期化は別スレッドが同じ型を待つ可能性がある。待機中の呼出元が実行 coordinator
+    /// の read lease を保持したままだと、cctor の最初のセーフポイントが stop-the-world
+    /// write lease を取得できず循環待ちになるため、状態待ちと cctor 本体を lease の外で実行する。
+    /// </summary>
+    private void EnsureInitializationOutsideExecutionLease(Action ensure) {
+        if (_intrinsicContext.SuspendExecution is { } suspend)
+            suspend(ensure);
+        else
+            ensure();
     }
 
     /// <summary>intrinsic からのインスタンス生成 (Activator.CreateInstance 用フック実体)。

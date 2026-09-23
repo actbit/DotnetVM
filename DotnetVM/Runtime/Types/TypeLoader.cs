@@ -616,8 +616,8 @@ public sealed class TypeLoader {
         }
         // ③ trusted assembly に限定した FullName 統合 (BCL の参照アセンブリ→実装の解決)。
         // ただし単に「解決できなかった AssemblyRef」であることだけを根拠にすると、
-        // 任意の AssemblyRef が同名 CoreLib 型へ統合される。既知 framework contract identity
-        // からの参照、または上の正式な TypeForwarder 経路だけを許可する。
+        // 任意の AssemblyRef が同名 CoreLib 型へ統合される。既知の framework contract identity
+        // からの参照、または正式な TypeForwarder 経路だけを許可する。
         return IsKnownFrameworkContract(refIdentity) ? TryResolveTrustedUnifiedType(fullName) : null;
     }
 
@@ -638,7 +638,7 @@ public sealed class TypeLoader {
                 if (fwdTarget?.FindTypeByFullName(fullName) is { } fwdType)
                     return fwdType;
                 // 転送先が未ロードでも、forwarder の参照先が既知 framework contract の場合だけ
-                // trusted 統合で拾える (任意 AssemblyRef の同名統合はしない)
+                // trusted 統合で拾える (任意 AssemblyRef の同名統合はしない)。
                 if (IsKnownFrameworkContract(fwdIdentity) &&
                     TryResolveTrustedUnifiedType(fullName) is { } trusted)
                     return trusted;

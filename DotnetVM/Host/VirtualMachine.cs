@@ -252,6 +252,7 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
     /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>
     public AssemblyImage LoadAssembly(string path) {
+        ThrowIfDisposed();
         using var stream = File.OpenRead(path);
         return LoadAssemblyLoader(stream, Path.GetFullPath(path)).Image;
     }
@@ -474,11 +475,13 @@ public sealed class VirtualMachine : IDisposable {
 
     private Interpreter GetInterpreter() {
         ThrowIfDisposed();
-        lock (_interpreterGate)
+        lock (_interpreterGate) {
+            ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
                 _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
                 _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
                 LoadAssemblyPathInContext);
+        }
     }
 
     /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。

@@ -637,6 +637,10 @@ internal static class CoreLibBindings {
             : throw new UnhandledGuestException("System.ArgumentException", "Type 引数は VM の型情報である必要があります。");
         static StackSlot ConstantValue(StackSlot slot) => slot.ObjectValue is VmBoxedValue boxed && boxed.Fields.Length == 1
             ? boxed.Fields[0] : slot;
+        void BindByArity(string name, int[] arities, IntrinsicImpl impl) {
+            foreach (var arity in arities)
+                r.RegisterBinding(BindingKey.StaticByArity(T, name, arity), impl, BindingOrigin.Managed);
+        }
 
         r.RegisterBinding(BindingKey.Static(T, "Constant", "System.Object"),
             static (ctx, a) => {
@@ -680,47 +684,47 @@ internal static class CoreLibBindings {
             ("GreaterThanOrEqual", VmExpressionKind.GreaterThanOrEqual), ("LessThan", VmExpressionKind.LessThan),
             ("LessThanOrEqual", VmExpressionKind.LessThanOrEqual),
         })
-            r.RegisterBinding(BindingKey.StaticAnyParams(T, name), (ctx, a) =>
+            BindByArity(name, [2], (ctx, a) =>
                 StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                     Kind = kind, Left = Node(a[0]), Right = Node(a[1]), ResultType = Node(a[0]).ResultType,
-                })), BindingOrigin.Managed);
+                })));
         foreach (var (name, kind) in new[] {
             ("Negate", VmExpressionKind.Negate), ("NegateChecked", VmExpressionKind.Negate),
             ("Not", VmExpressionKind.Not),
         })
-            r.RegisterBinding(BindingKey.StaticAnyParams(T, name), (ctx, a) =>
+            BindByArity(name, [1], (ctx, a) =>
                 StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                     Kind = kind, Left = Node(a[0]), ResultType = Node(a[0]).ResultType,
-                })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Convert"), (ctx, a) => {
+                })));
+        BindByArity("Convert", [1, 2], (ctx, a) => {
             var node = Node(a[0]);
             var target = a.Length > 1 && a[1].ObjectValue is VmRuntimeObject type ? type.Target : node.ResultType;
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Convert, Left = node, ResultType = target,
             }));
-        }, BindingOrigin.Managed);
+        });
         foreach (var (name, kind) in new[] { ("TypeIs", VmExpressionKind.TypeIs), ("TypeAs", VmExpressionKind.TypeAs) })
-            r.RegisterBinding(BindingKey.StaticAnyParams(T, name), (ctx, a) => {
+            BindByArity(name, [1, 2], (ctx, a) => {
                 var operand = Node(a[0]);
                 var target = TargetType(a[1]);
                 return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                     Kind = kind, Left = operand, NewType = target,
                     ResultType = kind == VmExpressionKind.TypeIs ? ctx.Types.FindIntrinsicType("System.Boolean") : target,
                 }));
-            }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "ArrayIndex"), (ctx, a) =>
+            });
+        BindByArity("ArrayIndex", [1, 2], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.ArrayIndex, Left = Node(a[0]), Right = Node(a[1]), ResultType = Node(a[0]).ResultType,
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "ArrayLength"), (ctx, a) =>
+            })));
+        BindByArity("ArrayLength", [1], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.ArrayLength, Left = Node(a[0]), ResultType = ctx.Types.FindIntrinsicType("System.Int32"),
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Condition"), (ctx, a) =>
+            })));
+        BindByArity("Condition", [1, 3], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Conditional, Left = Node(a[0]), IfTrue = Node(a[1]), IfFalse = Node(a[2]), ResultType = Node(a[1]).ResultType,
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Assign"), (ctx, a) => {
+            })));
+        BindByArity("Assign", [1, 2], (ctx, a) => {
             var target = Node(a[0]);
             var value = Node(a[1]);
             if (target.Kind != VmExpressionKind.Parameter)
@@ -728,22 +732,22 @@ internal static class CoreLibBindings {
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Assign, Left = target, Right = value, ResultType = value.ResultType,
             }));
-        }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Variable"), (ctx, a) =>
+        });
+        BindByArity("Variable", [1, 2], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Parameter, ResultType = TargetType(a[0]), IsVariable = true,
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Default"), (ctx, a) => {
+            })));
+        BindByArity("Default", [1], (ctx, a) => {
             var type = TargetType(a[0]);
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Default, ResultType = type, NewType = type,
             }));
-        }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Quote"), (ctx, a) =>
+        });
+        BindByArity("Quote", [1], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Quote, Object = Node(a[0]), ResultType = Node(a[0]).ResultType,
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "ArrayAccess"), (ctx, a) => {
+            })));
+        BindByArity("ArrayAccess", [1, 2], (ctx, a) => {
             var indexes = Nodes(a[^1]);
             if (indexes.Length != 1)
                 throw new UnhandledGuestException("System.NotSupportedException", "式木の多次元配列アクセスは未対応です。");
@@ -751,21 +755,21 @@ internal static class CoreLibBindings {
                 Kind = VmExpressionKind.ArrayIndex, Left = Node(a[0]), Right = indexes[0],
                 ResultType = Node(a[0]).ResultType,
             }));
-        }, BindingOrigin.Managed);
+        });
         static VmExpressionObject[] Nodes(StackSlot slot) => slot.ObjectValue switch {
             VmArray array => array.Elements.Select(Node).ToArray(),
             null => [],
             _ => throw new UnhandledGuestException("System.ArgumentException", "式木引数配列が不正です。"),
         };
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Block"), (ctx, a) => {
+        BindByArity("Block", [1, 2], (ctx, a) => {
             var expressions = a.Length == 0 ? [] : Nodes(a[^1]);
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Block, Expressions = expressions,
                 ResultType = expressions.Length == 0 ? ctx.Types.FindIntrinsicType("System.Void") : expressions[^1].ResultType,
             }));
-        }, BindingOrigin.Managed);
+        });
         foreach (var name in new[] { "NewArrayInit", "NewArrayBounds" })
-            r.RegisterBinding(BindingKey.StaticAnyParams(T, name), (ctx, a) => {
+            BindByArity(name, [1, 2], (ctx, a) => {
                 var elementType = TargetType(a[0]);
                 var values = a.Length > 1 ? Nodes(a[^1]) : [];
                 return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
@@ -773,8 +777,8 @@ internal static class CoreLibBindings {
                     NewArrayBounds = name == "NewArrayBounds",
                     ResultType = new VmArrayType { ElementType = elementType },
                 }));
-            }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Call"), (ctx, a) => {
+            });
+        BindByArity("Call", [1, 2, 3], (ctx, a) => {
             VmExpressionObject? receiver = null;
             if (a[0].ObjectValue is not VmRuntimeMethod) receiver = Node(a[0]);
             var methodSlot = receiver is null ? a[0] : a[1];
@@ -785,8 +789,8 @@ internal static class CoreLibBindings {
                 Kind = VmExpressionKind.Call, Object = receiver, Method = method, Arguments = firstArgs,
                 ResultType = ctx.Types.FindIntrinsicType("System.Object"),
             }));
-        }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "New"), (ctx, a) => {
+        });
+        BindByArity("New", [1, 2], (ctx, a) => {
             var ctor = a[0].ObjectValue is VmRuntimeMethod runtimeMethod
                 ? runtimeMethod.Target
                 : throw new UnhandledGuestException("System.ArgumentException", "ConstructorInfo が必要です。");
@@ -794,13 +798,13 @@ internal static class CoreLibBindings {
                 Kind = VmExpressionKind.New, Method = ctor, NewType = ctor.DeclaringType,
                 Arguments = a.Length > 1 ? Nodes(a[^1]) : [], ResultType = ctor.DeclaringType,
             }));
-        }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Invoke"), (ctx, a) =>
+        });
+        BindByArity("Invoke", [1, 2], (ctx, a) =>
             StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.Invoke, Object = Node(a[0]), Arguments = a.Length > 1 ? Nodes(a[^1]) : [],
                 ResultType = ctx.Types.FindIntrinsicType("System.Object"),
-            })), BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Field"), (ctx, a) => {
+            })));
+        BindByArity("Field", [1, 2], (ctx, a) => {
             var receiver = a.Length > 1 && a[0].ObjectValue is VmExpressionObject ? Node(a[0]) : null;
             var ownerType = receiver?.ResultType ?? (a.Length > 1 && a[0].ObjectValue is VmRuntimeObject type ? type.Target : null);
             var field = a[^1].ObjectValue is VmRuntimeField runtimeField
@@ -813,8 +817,8 @@ internal static class CoreLibBindings {
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmExpressionObject {
                 Kind = VmExpressionKind.MemberAccess, Object = receiver, Field = field, ResultType = field.FieldType,
             }));
-        }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Property"), (ctx, a) => {
+        });
+        BindByArity("Property", [1, 2], (ctx, a) => {
             var receiver = a.Length > 1 && a[0].ObjectValue is VmExpressionObject ? Node(a[0]) : null;
             var ownerType = receiver?.ResultType ?? (a.Length > 1 && a[0].ObjectValue is VmRuntimeObject type ? type.Target : null);
             var property = a[^1].ObjectValue as VmRuntimeProperty;
@@ -826,7 +830,7 @@ internal static class CoreLibBindings {
                 Kind = VmExpressionKind.MemberAccess, Object = receiver, Property = property,
                 ResultType = ctx.Types.FindIntrinsicType("System.Object"),
             }));
-        }, BindingOrigin.Managed);
+        });
 
         r.RegisterBinding(BindingKey.Static(T, "Lambda", "System.Linq.Expressions.Expression", "System.Linq.Expressions.ParameterExpression[]"),
             static (ctx, a) => {
@@ -845,7 +849,7 @@ internal static class CoreLibBindings {
                     DelegateType = ctx.MethodTypeArguments[0], ResultType = ctx.MethodTypeArguments[0],
                 }));
             }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.StaticAnyParams(T, "Lambda"), static (ctx, a) => {
+        BindByArity("Lambda", [2, 3], (ctx, a) => {
             var genericDelegate = ctx.MethodTypeArguments.Length == 1 ? ctx.MethodTypeArguments[0] : null;
             var explicitDelegate = genericDelegate is null && a.Length > 0 && a[0].ObjectValue is VmRuntimeObject
                 ? TargetType(a[0]) : null;
@@ -858,7 +862,7 @@ internal static class CoreLibBindings {
                 Kind = VmExpressionKind.Lambda, Body = body, Parameters = parameters,
                 DelegateType = delegateType, ResultType = delegateType,
             }));
-        }, BindingOrigin.Managed);
+        });
 
         StackSlot Compile(IntrinsicContext ctx, StackSlot[] args) {
             var lambda = Node(args[0]);
@@ -2998,7 +3002,7 @@ internal static class CoreLibBindings {
             registry.RegisterBinding(key, impl, BindingOrigin.Managed);
 
         static void RegisterTaskType(IntrinsicRegistry registry, string typeName, bool generic) {
-            RegisterBinding(registry, BindingKey.InstanceWithReturn(typeName, "get_IsCompleted", "System.Boolean", []),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "get_IsCompleted"),
                 static (_, a) => StackSlot.OfInt32(AsTask(a[0]).IsCompleted ? 1 : 0));
             RegisterBinding(registry, BindingKey.Instance(typeName, "GetAwaiter"),
                 (ctx, a) => {
@@ -3068,10 +3072,8 @@ internal static class CoreLibBindings {
                 return StackSlot.OfObject(delayed);
             });
         RegisterBinding(r, BindingKey.Static(task, "FromResult", "!!0"),
-            static (ctx, a) => {
-                return StackSlot.OfObject(NewTask(ctx, generic: true,
-                    ResultType(ctx, fromMethod: true), completed: true, result: a[0]));
-            });
+            static (ctx, a) => StackSlot.OfObject(NewTask(ctx, generic: true,
+                ResultType(ctx, fromMethod: true), completed: true, result: a[0])));
         RegisterBinding(r, BindingKey.Static(task, "Run", "System.Action"),
             static (ctx, a) => StartTaskWorker(ctx, a, resultType: null, generic: false));
         RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<System.Threading.Tasks.Task>"),
@@ -3084,7 +3086,7 @@ internal static class CoreLibBindings {
             });
 
         foreach (var typeName in new[] { awaiter, awaiterOfT }) {
-            RegisterBinding(r, BindingKey.InstanceWithReturn(typeName, "get_IsCompleted", "System.Boolean", []),
+            RegisterBinding(r, BindingKey.Instance(typeName, "get_IsCompleted"),
                 static (_, a) => StackSlot.OfInt32(AwaitedTask(a[0]).IsCompleted ? 1 : 0));
             RegisterBinding(r, BindingKey.Instance(typeName, "GetResult"),
                 static (ctx, a) => TaskResult(ctx, AwaitedTask(a[0])));

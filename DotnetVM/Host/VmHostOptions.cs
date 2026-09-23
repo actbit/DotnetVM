@@ -103,8 +103,8 @@ public sealed class VmHostOptions {
     public int MaxPendingTaskTimers { get; init; } = 1024;
 
     /// <summary>
-    /// VM.Dispose の停止待ち時間 (ミリ秒)。null の場合は MaxPendingTaskTimers 等の既定設定を使わず
-    /// 既定値 5 秒。通常は worker が cancellation/interrupt で速やかに終了する。
+    /// VM.Dispose が worker の停止を待つ最大時間 (ミリ秒)。通常は worker が
+    /// cancellation/interrupt で速やかに終了する。
     /// </summary>
     public int ShutdownTimeoutMilliseconds { get; init; } = 5_000;
 }

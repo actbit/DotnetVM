@@ -2,11 +2,12 @@ namespace DotnetVM.Runtime.Execution;
 
 /// <summary>
 /// VM 全体で共有する guest worker の同時実行予算。
-/// Thread と Task を別々に数えると、各上限を同時に満たしたとき host thread 数が
-/// ほぼ 2 倍になるため、worker の種類をまたいで 1 つの予算を消費する。
+/// Thread と Task を別々に数えると、個別の上限を同時に満たしたとき host thread 数が
+/// 予算を越えるため、worker の種類をまたいで 1 つの予算を消費する。
 /// </summary>
-internal sealed class GuestWorkerBudget(int limit) {
+internal sealed class GuestWorkerBudget(int limit) : IDisposable {
     private readonly object _gate = new();
+    private readonly int _limit = limit;
     private int _active;
     private bool _disposed;
 
@@ -19,7 +20,7 @@ internal sealed class GuestWorkerBudget(int limit) {
 
     public bool TryAcquire() {
         lock (_gate) {
-            if (_disposed || _active >= limit)
+            if (_disposed || _active >= _limit)
                 return false;
             _active++;
             return true;

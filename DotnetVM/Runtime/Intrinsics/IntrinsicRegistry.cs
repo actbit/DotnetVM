@@ -308,6 +308,14 @@ public sealed class IntrinsicRegistry {
             origin = entry.Origin;
             return true;
         }
+        // 型名を実行時に確定できる面でも、宣言引数個数だけを固定した登録を許可する。
+        // AnyParams (= 引数個数も無制限) とは別キーなので、監査上の無制限 wildcard にはならない。
+        if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParamTypes(), out entry) &&
+            key.Domain != BindingDomain.TrustedCoreLib) {
+            impl = entry.Impl;
+            origin = entry.Origin;
+            return true;
+        }
         // 全引数一致面 (AnyParams) へのフォールバック: 同一 domain の面のみ照合する
         if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParams(), out entry) &&
             key.Domain != BindingDomain.TrustedCoreLib) {

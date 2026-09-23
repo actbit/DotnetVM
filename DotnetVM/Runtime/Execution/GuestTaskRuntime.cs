@@ -69,39 +69,46 @@ internal sealed class GuestTaskRuntime(
     }
 
     public void Delay(VmTaskObject task, int milliseconds) {
-        lock (_lifetimeGate)
+        lock (_lifetimeGate) {
             ThrowIfDisposed();
-        if (milliseconds == 0) {
-            Complete(task);
-            return;
-        }
+            if (milliseconds == 0) {
+                Complete(task);
+                return;
+            }
+            if (_timers.Count >= _maxPendingTimers) {
+                _activeRoots.TryRemove(task, out _);
+                throw new GuestConcurrencyLimitExceededException(
+                    $"未完了の Task.Delay Timer 上限 ({_maxPendingTimers}) に達しました。");
+            }
 
-        _activeRoots[task] = [StackSlot.OfObject(task)];
-        if (_timers.Count >= _maxPendingTimers) {
-            _activeRoots.TryRemove(task, out _);
-            throw new GuestConcurrencyLimitExceededException(
-                $"未完了の Task.Delay Timer 上限 ({_maxPendingTimers}) に達しました。");
-        }
-
-        var timer = new Timer(_ => Complete(task), null, Timeout.Infinite, Timeout.Infinite);
-        if (!_timers.TryAdd(task, timer)) {
-            timer.Dispose();
-            throw new InvalidOperationException("同一 Task に複数の Delay Timer を登録できません。");
-        }
-        try {
-            timer.Change(milliseconds, Timeout.Infinite);
-        } catch {
-            if (_timers.TryRemove(task, out var failedTimer))
-                failedTimer.Dispose();
-            _activeRoots.TryRemove(task, out _);
-            throw;
+            _activeRoots[task] = [StackSlot.OfObject(task)];
+            var timer = new Timer(_ => Complete(task), null, Timeout.Infinite, Timeout.Infinite);
+            if (!_timers.TryAdd(task, timer)) {
+                timer.Dispose();
+                _activeRoots.TryRemove(task, out _);
+                throw new InvalidOperationException("同一 Task に複数の Delay Timer を登録できません。");
+            }
+            try {
+                timer.Change(milliseconds, Timeout.Infinite);
+            } catch {
+                if (_timers.TryRemove(task, out var failedTimer))
+                    failedTimer.Dispose();
+                _activeRoots.TryRemove(task, out _);
+                throw;
+            }
         }
     }
 
     public void Wait(VmTaskObject task, int millisecondsTimeout) => task.Wait(millisecondsTimeout);
 
     public void Run(VmTaskObject task, StackSlot[] roots, Func<StackSlot> work) {
-        StartWorker(task, roots, () => Complete(task, work()), ex => CompleteHostException(task, ex));
+        try {
+            StartWorker(task, roots, work, result => Complete(task, result),
+                ex => CompleteHostException(task, ex));
+        } catch (Exception ex) {
+            CompleteHostException(task, ex);
+            throw;
+        }
     }
 
     public void ScheduleContinuation(VmTaskObject awaited, StackSlot stateMachine, Action<StackSlot> resume) {
@@ -119,20 +126,26 @@ internal sealed class GuestTaskRuntime(
         var detachedRef = StackSlot.OfByRef(new VmByRef(stateContainer, 0));
         var id = Interlocked.Increment(ref _nextContinuationId);
         _continuationRoots[id] = [StackSlot.OfObject(awaited), detachedRef];
-        StartWorker(null, [StackSlot.OfObject(awaited), detachedRef], () => {
-            awaited.Wait(_shutdownToken);
-            _shutdownToken.ThrowIfCancellationRequested();
-            resume(detachedRef);
-            return default;
-        }, _ => { }, () => _continuationRoots.TryRemove(id, out _));
+        try {
+            StartWorker(null, [StackSlot.OfObject(awaited), detachedRef], () => {
+                awaited.Wait(_shutdownToken);
+                _shutdownToken.ThrowIfCancellationRequested();
+                resume(detachedRef);
+                return default;
+            }, onSuccess: null, onError: _ => { },
+                onFinished: () => _continuationRoots.TryRemove(id, out _));
+        } catch {
+            _continuationRoots.TryRemove(id, out _);
+            throw;
+        }
     }
 
     private void StartWorker(VmTaskObject? trackedTask, StackSlot[] roots, Action work, Action<Exception> onError,
         Action? onFinished = null) =>
-        StartWorker(trackedTask, roots, () => { work(); return default; }, onError, onFinished);
+        StartWorker(trackedTask, roots, () => { work(); return default; }, null, onError, onFinished);
 
-    private void StartWorker(VmTaskObject? trackedTask, StackSlot[] roots, Func<StackSlot> work, Action<Exception> onError,
-        Action? onFinished = null) {
+    private void StartWorker(VmTaskObject? trackedTask, StackSlot[] roots, Func<StackSlot> work,
+        Action<StackSlot>? onSuccess, Action<Exception> onError, Action? onFinished = null) {
         int workerId;
         Thread thread;
         lock (_lifetimeGate) {
@@ -147,16 +160,20 @@ internal sealed class GuestTaskRuntime(
             if (trackedTask is not null)
                 _activeRoots[trackedTask] = roots;
             thread = new Thread(() => {
+                StackSlot result = default;
+                Exception? failure = null;
+                var cancelled = false;
                 try {
                     _shutdownToken.ThrowIfCancellationRequested();
-                    work();
+                    result = work();
                 } catch (ThreadInterruptedException) when (_shutdownToken.IsCancellationRequested) {
                     // Dispose が blocking wait を解除した。
+                    cancelled = true;
                 } catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested) {
                     // VM shutdown を worker が観測した。
+                    cancelled = true;
                 } catch (Exception ex) {
-                    if (trackedTask is not null)
-                        onError(ex);
+                    failure = ex;
                 } finally {
                     try {
                         onFinished?.Invoke();
@@ -166,6 +183,14 @@ internal sealed class GuestTaskRuntime(
                         _workerBudget.Release();
                     }
                 }
+                if (cancelled)
+                    return;
+                if (failure is not null) {
+                    if (trackedTask is not null)
+                        onError(failure);
+                    return;
+                }
+                onSuccess?.Invoke(result);
             }) { IsBackground = true, Name = "DotnetVM guest Task" };
             _workers[workerId] = thread;
         }
@@ -176,9 +201,12 @@ internal sealed class GuestTaskRuntime(
             _workers.TryRemove(workerId, out _);
             if (trackedTask is not null)
                 _activeRoots.TryRemove(trackedTask, out _);
-            onFinished?.Invoke();
-            Interlocked.Decrement(ref _activeWorkers);
-            _workerBudget.Release();
+            try {
+                onFinished?.Invoke();
+            } finally {
+                Interlocked.Decrement(ref _activeWorkers);
+                _workerBudget.Release();
+            }
             if (trackedTask is not null)
                 onError(ex);
             else

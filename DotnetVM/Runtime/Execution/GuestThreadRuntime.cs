@@ -70,12 +70,13 @@ internal sealed class GuestThreadRuntime(
                     // ゲストスレッド内の例外は Thread.Join ではなくスレッド状態に保存する。
                     thread.UnhandledException = ex;
                 } finally {
-                    thread.Completed.Set();
                     _active.TryRemove(thread.Id, out _);
                     if (thread.BudgetAcquired) {
                         thread.BudgetAcquired = false;
                         _workerBudget.Release();
                     }
+                    // Join が返る時点で active 集計と VM-wide 予算も解放済みにする。
+                    thread.Completed.Set();
                 }
             }) {
                 IsBackground = true,
@@ -138,7 +139,7 @@ internal sealed class GuestThreadRuntime(
                 continue;
             try {
                 hostThread.Interrupt();
-            } catch (Exception) when (thread.Completed.IsSet) {
+            } catch (Exception) when (!hostThread.IsAlive || thread.Completed.IsSet) {
                 // 既に終了した worker との競合は無視する。
             }
         }

@@ -585,12 +585,15 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyName", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
         Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
         Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 2);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyBytes", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "Load", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
         Add("System.Runtime.Loader.AssemblyLoadContext", "Unload", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.AssemblyName", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.AssemblyName", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
         Add("System.Reflection.AssemblyName", "get_Name", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.AssemblyName", "get_FullName", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.AssemblyName", "ToString", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.IO.MemoryStream", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
         foreach (var method in new[] { ".ctor", "get_Position", "set_Position", "get_Length", "ToArray", "Read" })
             Add("System.IO.MemoryStream", method, CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true,
                 paramCount: method switch { ".ctor" => 1, "set_Position" => 1, "Read" => 3, _ => 0 });
@@ -608,6 +611,11 @@ internal static class CoreLibSurfaceAudit {
             Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 2);
         foreach (var method in new[] { "Negate", "NegateChecked", "Not", "Convert", "TypeIs", "TypeAs", "ArrayIndex", "ArrayAccess", "ArrayLength", "Condition", "Assign", "Variable", "Default", "Quote", "Block", "NewArrayInit", "NewArrayBounds", "Call", "New", "Invoke", "Field", "Property" })
             Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 1);
+        foreach (var method in new[] { "Convert", "TypeIs", "TypeAs", "ArrayIndex", "Assign", "Variable", "ArrayAccess", "Block", "NewArrayInit", "NewArrayBounds", "Call", "New", "Invoke", "Field", "Property" })
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 2);
+        foreach (var method in new[] { "Condition", "Call" })
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 3);
+        Add("System.Linq.Expressions.Expression", "Lambda", CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 3);
         foreach (var type in new[] { "System.Linq.Expressions.LambdaExpression", "System.Linq.Expressions.Expression`1" }) {
             Add(type, "Compile", CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: true, paramCount: 0);
             Add(type, "Compile", CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: true, paramCount: 1);

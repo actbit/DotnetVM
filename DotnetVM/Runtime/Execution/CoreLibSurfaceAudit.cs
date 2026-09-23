@@ -217,6 +217,13 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Type", "IsValueTypeImpl", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
         Add("System.Type", "get_IsValueType", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
         Add("System.Type", "IsSubclassOf", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "GetMethod", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "GetMethod", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 2);
+        Add("System.Type", "GetConstructor", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "GetMethods", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
+        Add("System.Type", "GetField", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "GetProperty", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 1);
+        Add("System.Type", "GetFields", CoreLibSurfaceKind.RuntimeInternal, typeRuntimeJ, hasThis: true, paramCount: 0);
         // Enum ToString (culture-dependent type-face IL): enum Face文化 CultureData文化 culture IL CultureCulture文化 representation
         Add("System.Enum", "ToString", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (本家 IL は FormatFeatures / CultureInfo 面を辿る culture 機構依存。リテラル表から G 書式名を解決)", hasThis: true, paramCount: 0);
@@ -559,6 +566,66 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Reflection.MethodBase", "get_Name", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.MethodBase", "get_DeclaringType", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: true, paramCount: 0);
         Add("System.Reflection.MethodBase", "ToString", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: true, paramCount: 0);
+        var assemblyJ = "Assembly.Load(byte[]) は VM TypeLoader に登録し、Assembly / Type の参照情報は CLR オブジェクトを持ち込まず VM 型系から返す";
+        Add("System.Reflection.Assembly", "Load", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: false, paramCount: 2);
+        Add("System.Reflection.Assembly", "Load", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: false, paramCount: 1);
+        Add("System.Reflection.Assembly", "get_FullName", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.Assembly", "get_Location", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.Assembly", "GetType", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Assembly", "GetType", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: true, paramCount: 2);
+        Add("System.Reflection.Assembly", "GetTypes", CoreLibSurfaceKind.RuntimeInternal, assemblyJ, hasThis: true, paramCount: 0);
+        var alcJ = "AssemblyLoadContext は CLR ローダーを公開せず、VM の VmAssemblyContext に登録する (パスはストレージブリッジ経由)";
+        Add("System.Runtime.Loader.AssemblyLoadContext", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Runtime.Loader.AssemblyLoadContext", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 2);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "get_Default", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: false, paramCount: 0);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "get_Name", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "get_IsCollectible", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "get_Assemblies", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyPath", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyName", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 2);
+        Add("System.Runtime.Loader.AssemblyLoadContext", "Unload", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.AssemblyName", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.AssemblyName", ".ctor", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.AssemblyName", "get_Name", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.AssemblyName", "get_FullName", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.AssemblyName", "ToString", CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true, paramCount: 0);
+        foreach (var method in new[] { ".ctor", "get_Position", "set_Position", "get_Length", "ToArray", "Read" })
+            Add("System.IO.MemoryStream", method, CoreLibSurfaceKind.RuntimeInternal, alcJ, hasThis: true,
+                paramCount: method switch { ".ctor" => 1, "set_Position" => 1, "Read" => 3, _ => 0 });
+        var expressionJ = "対応する式木ノードを VM ヒープに保持し、Compile は CLR 動的コードではなく命令クォータ付き VM 評価 delegate を返す";
+        foreach (var method in new[] { "Constant", "Parameter" }) {
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 1);
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 2);
+        }
+        foreach (var method in new[] { "Add", "Subtract", "Multiply", "Divide", "Lambda" })
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 2);
+        foreach (var method in new[] {
+            "AddChecked", "SubtractChecked", "MultiplyChecked", "Modulo", "And", "Or", "ExclusiveOr",
+            "AndAlso", "OrElse", "Equal", "NotEqual", "GreaterThan", "GreaterThanOrEqual", "LessThan", "LessThanOrEqual",
+        })
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 2);
+        foreach (var method in new[] { "Negate", "NegateChecked", "Not", "Convert", "TypeIs", "TypeAs", "ArrayIndex", "ArrayAccess", "ArrayLength", "Condition", "Assign", "Variable", "Default", "Quote", "Block", "NewArrayInit", "NewArrayBounds", "Call", "New", "Invoke", "Field", "Property" })
+            Add("System.Linq.Expressions.Expression", method, CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: false, paramCount: 1);
+        foreach (var type in new[] { "System.Linq.Expressions.LambdaExpression", "System.Linq.Expressions.Expression`1" }) {
+            Add(type, "Compile", CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: true, paramCount: 0);
+            Add(type, "Compile", CoreLibSurfaceKind.RuntimeInternal, expressionJ, hasThis: true, paramCount: 1);
+        }
+        var emitJ = "DynamicMethod の IL を VM 命令列として保存し、CreateDelegate の呼出も VM interpreter に通す";
+        foreach (var paramCount in new[] { 3, 4, 5, 7 })
+            Add("System.Reflection.Emit.DynamicMethod", ".ctor", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: paramCount);
+        Add("System.Reflection.Emit.DynamicMethod", "GetILGenerator", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.Emit.DynamicMethod", "GetILGenerator", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Emit.DynamicMethod", "CreateDelegate", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Emit.DynamicMethod", "CreateDelegate", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 2);
+        Add("System.Reflection.Emit.ILGenerator", "DefineLabel", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 0);
+        Add("System.Reflection.Emit.ILGenerator", "MarkLabel", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Emit.ILGenerator", "DeclareLocal", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Emit.ILGenerator", "DeclareLocal", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 2);
+        Add("System.Reflection.Emit.ILGenerator", "Emit", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 1);
+        Add("System.Reflection.Emit.ILGenerator", "Emit", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 2);
+        Add("System.Reflection.Emit.ILGenerator", "EmitCall", CoreLibSurfaceKind.RuntimeInternal, emitJ, hasThis: true, paramCount: 3);
 
         // ---- DefaultIntrinsics: 仮想 I/O 面 (デバイス / ゲートウェイ) ----
         AddRange(new[] { "System.IO.File" }, "Exists", CoreLibSurfaceKind.Device, DeviceFace, hasThis: false, paramCount: 1);

@@ -27,7 +27,17 @@ internal static class TypeChecks {
             or "System.Type" or "System.Object" or "System.Reflection.MemberInfo",
         // MethodBase.GetCurrentMethod() 等の結果は CLR では System.Reflection.RuntimeMethodInfo の実体。
         VmRuntimeMethod => target.FullName is "System.Reflection.RuntimeMethodInfo"
+            or "System.Reflection.MethodInfo" or "System.Reflection.ConstructorInfo"
             or "System.Reflection.MethodBase" or "System.Reflection.MemberInfo" or "System.Object",
+        VmRuntimeField => target.FullName is "System.Reflection.RuntimeFieldInfo"
+            or "System.Reflection.FieldInfo" or "System.Reflection.MemberInfo" or "System.Object",
+        VmRuntimeProperty => target.FullName is "System.Reflection.RuntimePropertyInfo"
+            or "System.Reflection.PropertyInfo" or "System.Reflection.MemberInfo" or "System.Object",
+        VmAssemblyObject => target.FullName is "System.Reflection.Assembly" or "System.Object",
+        VmAssemblyLoadContext => target.FullName is "System.Runtime.Loader.AssemblyLoadContext" or "System.Object",
+        VmAssemblyNameObject => target.FullName is "System.Reflection.AssemblyName" or "System.Object",
+        VmMemoryStreamObject => target.FullName is "System.IO.MemoryStream" or "System.IO.Stream" or "System.Object",
+        VmExpressionObject expression => ExpressionAssignable(expression, target),
         VmArray array => target switch {
             VmArrayType other => array.ArrayType.ElementType.IsAssignableTo(other.ElementType),
             _ => target.FullName is "System.Array" or "System.Object" or "System.ICloneable"
@@ -38,6 +48,26 @@ internal static class TypeChecks {
             target.FullName is "System.Object" or "System.Delegate" or "System.MulticastDelegate",
         _ => false,
     };
+
+    private static bool ExpressionAssignable(VmExpressionObject expression, VmType target) {
+        if (target.FullName is "System.Object" or "System.Linq.Expressions.Expression")
+            return true;
+        if (target.FullName.StartsWith("System.Linq.Expressions.", StringComparison.Ordinal) &&
+            target.FullName.EndsWith("Expression", StringComparison.Ordinal))
+            return true;
+        if (expression.Kind == VmExpressionKind.Lambda) {
+            if (target.FullName == "System.Linq.Expressions.LambdaExpression")
+                return true;
+            if (target is VmConstructedType { Definition.FullName: "System.Linq.Expressions.Expression`1" } generic)
+                return expression.DelegateType?.FullName == generic.TypeArguments[0].FullName;
+            return false;
+        }
+        return expression.Kind switch {
+            VmExpressionKind.Parameter => target.FullName == "System.Linq.Expressions.ParameterExpression",
+            VmExpressionKind.Constant => target.FullName == "System.Linq.Expressions.ConstantExpression",
+            _ => target.FullName == "System.Linq.Expressions.BinaryExpression",
+        };
+    }
 
     /// <summary>型がデリゲートか (System.Delegate / MulticastDelegate 派生。ゲストのカスタム
     /// delegate 宣言と Action/Func ファサードの構築型の両方を判定する)。</summary>

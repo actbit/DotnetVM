@@ -16,6 +16,8 @@ public abstract class VmObject {
 public sealed class VmClassInstance : VmObject {
     private readonly VmClassType _classType;
     public readonly StackSlot[] Fields;
+    /// <summary>AssemblyLoadContext 派生ゲストクラスの base .ctor が接続する VM ハンドル。</summary>
+    internal VmAssemblyLoadContext? AssemblyLoadContextHandle { get; set; }
 
     public VmClassInstance(VmClassType classType, StackSlot[] fields, VmType[]? typeArguments = null) {
         _classType = classType;
@@ -118,6 +120,8 @@ public sealed class VmTaskObject : VmObject {
 
     public bool Wait(int millisecondsTimeout) => _completed.Wait(millisecondsTimeout);
 
+    internal void Wait(CancellationToken cancellationToken) => _completed.Wait(cancellationToken);
+
     public (StackSlot Result, StackSlot GuestException, Exception? HostException) Snapshot() {
         lock (_gate)
             return (_result, _guestException, _hostException);
@@ -201,6 +205,13 @@ public sealed class VmFieldRvaData : VmObject {
     public override VmType Type => HandleType;
 }
 
+/// <summary>ldtoken Field の一般形。動的 IL の FieldInfo 参照も VM 内で保持する。</summary>
+public sealed class VmFieldHandle : VmObject {
+    public static readonly VmIntrinsicType HandleType = VmFieldRvaData.HandleType;
+    public required VmField Target { get; init; }
+    public override VmType Type => HandleType;
+}
+
 /// <summary>
 /// ldtoken Type の結果ハンドル (System.RuntimeTypeHandle の VM 内表現)。
 /// System.Type::GetTypeFromHandle intrinsic が System.Type ファサードの実体へ変換する。
@@ -251,6 +262,177 @@ public sealed class VmRuntimeMethod : VmObject {
     public override VmType Type => MethodBaseFacade;
 }
 
+/// <summary>式木や Reflection.Emit から参照される VM の FieldInfo 相当。</summary>
+public sealed class VmRuntimeField : VmObject {
+    public static readonly VmIntrinsicType FieldInfoFacade =
+        new() { Namespace = "System.Reflection", Name = "RuntimeFieldInfo", IsValue = false };
+
+    public required VmField Target { get; init; }
+
+    public override VmType Type => FieldInfoFacade;
+}
+
+public sealed class VmRuntimeProperty : VmObject {
+    public static readonly VmIntrinsicType PropertyInfoFacade =
+        new() { Namespace = "System.Reflection", Name = "RuntimePropertyInfo", IsValue = false };
+    public required string Name { get; init; }
+    public required VmMethod Getter { get; init; }
+    public override VmType Type => PropertyInfoFacade;
+}
+
+/// <summary>ゲストの System.Reflection.Assembly を表す VM 側ハンドル。
+/// 中身は CLR Assembly ではなく、VM の TypeLoader だけを参照する。</summary>
+public sealed class VmAssemblyObject : VmObject {
+    public static readonly VmIntrinsicType AssemblyFacade =
+        new() { Namespace = "System.Reflection", Name = "Assembly", IsValue = false };
+
+    public required TypeLoader Loader { get; init; }
+
+    public override VmType Type => (VmType?)Loader.FindTypeByFullName("System.Reflection.Assembly") ?? AssemblyFacade;
+}
+
+/// <summary>
+/// ゲストの System.Runtime.Loader.AssemblyLoadContext を表す VM 側ハンドル。
+/// CLR の AssemblyLoadContext は公開せず、VM の AssemblyContext にロードを委譲する。
+/// </summary>
+public sealed class VmAssemblyLoadContext : VmObject {
+    public static readonly VmIntrinsicType LoadContextFacade =
+        new() { Namespace = "System.Runtime.Loader", Name = "AssemblyLoadContext", IsValue = false };
+
+    public required VmAssemblyContext Context { get; init; }
+    public required string? Name { get; init; }
+    public bool IsCollectible { get; init; }
+    public bool IsDefault { get; init; }
+    public VmType? DeclaredType { get; init; }
+    internal Action? UnloadAction { get; init; }
+    internal bool IsUnloaded { get; private set; }
+
+    internal void Unload() {
+        if (IsDefault)
+            throw new InvalidOperationException("AssemblyLoadContext.Default はアンロードできません。");
+        if (IsUnloaded)
+            return;
+        UnloadAction?.Invoke();
+        IsUnloaded = true;
+    }
+
+    public override VmType Type => DeclaredType ?? LoadContextFacade;
+}
+
+/// <summary>ゲストの System.Reflection.AssemblyName を表す VM 側ハンドル。</summary>
+public sealed class VmAssemblyNameObject : VmObject {
+    public static readonly VmIntrinsicType AssemblyNameFacade =
+        new() { Namespace = "System.Reflection", Name = "AssemblyName", IsValue = false };
+
+    public string FullName { get; internal set; } = "";
+    public VmType? DeclaredType { get; init; }
+
+    /// <summary>AssemblyName.Name 相当の単純名。</summary>
+    public string Name {
+        get {
+            var comma = FullName.IndexOf(',');
+            return (comma < 0 ? FullName : FullName[..comma]).Trim();
+        }
+    }
+
+    public override VmType Type => DeclaredType ?? AssemblyNameFacade;
+}
+
+/// <summary>ゲストの MemoryStream を表す小さな VM ストリーム。AssemblyLoadContext.LoadFromStream 用。</summary>
+public sealed class VmMemoryStreamObject : VmObject {
+    public static readonly VmIntrinsicType MemoryStreamFacade =
+        new() { Namespace = "System.IO", Name = "MemoryStream", IsValue = false };
+    public static readonly VmIntrinsicType StreamFacade =
+        new() { Namespace = "System.IO", Name = "Stream", IsValue = false };
+
+    public required byte[] Bytes { get; init; }
+    public int Position { get; internal set; }
+    public VmType? DeclaredType { get; init; }
+
+    public override VmType Type => DeclaredType ?? MemoryStreamFacade;
+}
+
+/// <summary>VM 内で評価する式木ノード。Compile は CLR delegate を作らず VmDelegate を返す。</summary>
+public enum VmExpressionKind : byte {
+    Constant,
+    Parameter,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Negate,
+    Not,
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    And,
+    Or,
+    ExclusiveOr,
+    AndAlso,
+    OrElse,
+    Convert,
+    TypeIs,
+    TypeAs,
+    Conditional,
+    Block,
+    Assign,
+    NewArray,
+    Default,
+    Quote,
+    Call,
+    Invoke,
+    New,
+    MemberAccess,
+    ArrayIndex,
+    ArrayLength,
+    Lambda,
+}
+
+public sealed class VmExpressionObject : VmObject {
+    public static readonly VmIntrinsicType ExpressionFacade =
+        new() { Namespace = "System.Linq.Expressions", Name = "Expression", IsValue = false };
+    public static readonly VmIntrinsicType LambdaExpressionFacade =
+        new() { Namespace = "System.Linq.Expressions", Name = "LambdaExpression", IsValue = false, Parent = ExpressionFacade };
+    public static readonly VmIntrinsicType ParameterExpressionFacade =
+        new() { Namespace = "System.Linq.Expressions", Name = "ParameterExpression", IsValue = false, Parent = ExpressionFacade };
+    public static readonly VmIntrinsicType BinaryExpressionFacade =
+        new() { Namespace = "System.Linq.Expressions", Name = "BinaryExpression", IsValue = false, Parent = ExpressionFacade };
+    public static readonly VmIntrinsicType ConstantExpressionFacade =
+        new() { Namespace = "System.Linq.Expressions", Name = "ConstantExpression", IsValue = false, Parent = ExpressionFacade };
+
+    public required VmExpressionKind Kind { get; init; }
+    public StackSlot Constant { get; init; }
+    public VmType? ResultType { get; init; }
+    public VmExpressionObject? Left { get; init; }
+    public VmExpressionObject? Right { get; init; }
+    public VmExpressionObject? Body { get; init; }
+    public VmExpressionObject? Object { get; init; }
+    public VmExpressionObject? IfTrue { get; init; }
+    public VmExpressionObject? IfFalse { get; init; }
+    public VmExpressionObject[] Arguments { get; init; } = [];
+    public VmExpressionObject[] Expressions { get; init; } = [];
+    public bool NewArrayBounds { get; init; }
+    public VmExpressionObject[] Parameters { get; init; } = [];
+    public VmType? DelegateType { get; init; }
+    public VmMethod? Method { get; init; }
+    public VmField? Field { get; init; }
+    public VmRuntimeProperty? Property { get; init; }
+    public VmType? NewType { get; init; }
+    public int ParameterIndex { get; set; }
+    public bool IsVariable { get; init; }
+
+    public override VmType Type => Kind switch {
+        VmExpressionKind.Lambda => LambdaExpressionFacade,
+        VmExpressionKind.Parameter => ParameterExpressionFacade,
+        VmExpressionKind.Constant => ConstantExpressionFacade,
+        _ => BinaryExpressionFacade,
+    };
+}
+
 /// <summary>
 /// intrinsic が VM スロット上に内部状態 (ホスト側バッファ等) を保持するための搬送体。
 /// DefaultInterpolatedStringHandler 等の「構造体ファサードのローカルスロットに実体を置く」
@@ -263,6 +445,22 @@ public sealed class VmIntrinsicCarrier : VmObject {
     public required object? Payload { get; set; }
 
     public override VmType Type => CarrierType;
+}
+
+/// <summary>Reflection.Emit の Label/LocalBuilder を VM 側で保持する搬送体。</summary>
+public sealed class VmEmitLabel : VmObject {
+    public static readonly VmIntrinsicType LabelType =
+        new() { Namespace = "System.Reflection.Emit", Name = "Label", IsValue = true };
+    public required int Id { get; init; }
+    public override VmType Type => LabelType;
+}
+
+public sealed class VmLocalBuilder : VmObject {
+    public static readonly VmIntrinsicType LocalBuilderType =
+        new() { Namespace = "System.Reflection.Emit", Name = "LocalBuilder", IsValue = false };
+    public required int Index { get; init; }
+    public required VmType LocalType { get; init; }
+    public override VmType Type => LocalBuilderType;
 }
 
 /// <summary>デリゲートの 1 呼出エントリ (レシーバ + 束縛先メソッド)。</summary>
@@ -291,6 +489,9 @@ public sealed class VmDelegate : VmObject {
 
     /// <summary>デリゲート宣言型 (Func&lt;int&gt; 等の構築型 / ゲストのカスタム delegate 型)。</summary>
     public required VmType DeclaredType { get; init; }
+
+    /// <summary>式木 delegate の場合、呼出リストの代わりに評価する LambdaExpression。</summary>
+    public VmExpressionObject? ExpressionLambda { get; init; }
 
     public IReadOnlyList<DelegateInvocation> Invocations => _invocations;
 
@@ -605,6 +806,8 @@ public sealed class ObjectModel {
         VmBoxedValue boxed => EstimateFieldStorageSize(boxed.Fields.Length),
         VmIntrinsicInstance intrinsic => EstimateFieldStorageSize(intrinsic.State.Length),
         VmTaskObject => 48,
+        VmExpressionObject => 64,
+        VmDelegate @delegate => 48 + 24L * @delegate.Invocations.Count,
         // localloc の仮想メモリブロックは実バイト数を計上する (メモリポリシーの対象)
         VmLocallocMemory memory => EstimateLocallocSize(memory.Bytes.Length),
         _ => 24,

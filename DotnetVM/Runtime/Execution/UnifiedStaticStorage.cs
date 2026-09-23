@@ -74,12 +74,6 @@ public sealed class UnifiedStaticStorage {
         }
     }
 
-    /// <summary>後方互換 (string キー経路)。新規コードでは使わないこと。
-    /// 旧呼び出し (constructed.FullName) を定義参照のみのキーに縮退させる。</summary>
-    [Obsolete("VmType identity 列の GetOrCreate(VmType, VmType[]?) を使うこと。")]
-    internal StackSlot[] GetOrCreate(VmType canonicalType, string constructedKey, Func<StackSlot[]> factory) =>
-        GetOrCreate(canonicalType, (VmType[]?)null, factory);
-
     internal IEnumerable<StackSlot[]> EnumerateRoots() {
         lock (_gate)
             return Registry.ToArray();

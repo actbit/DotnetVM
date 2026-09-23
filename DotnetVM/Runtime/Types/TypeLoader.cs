@@ -73,9 +73,39 @@ public sealed class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System", Name = "Convert", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Array", IsValue = false, Parent = @object });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Type", IsValue = false, Parent = @object });
+        var memberInfo = new VmIntrinsicType { Namespace = "System.Reflection", Name = "MemberInfo", IsValue = false, Parent = @object };
+        Add(memberInfo);
+        var methodBase = new VmIntrinsicType { Namespace = "System.Reflection", Name = "MethodBase", IsValue = false, Parent = memberInfo };
+        Add(methodBase);
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "MethodInfo", IsValue = false, Parent = methodBase });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "ConstructorInfo", IsValue = false, Parent = methodBase });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "FieldInfo", IsValue = false, Parent = memberInfo });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "PropertyInfo", IsValue = false, Parent = memberInfo });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "Assembly", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection", Name = "AssemblyName", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.Loader", Name = "AssemblyLoadContext", IsValue = false, Parent = @object });
+        var stream = new VmIntrinsicType { Namespace = "System.IO", Name = "Stream", IsValue = false, Parent = @object };
+        Add(stream);
+        Add(new VmIntrinsicType { Namespace = "System.IO", Name = "MemoryStream", IsValue = false, Parent = stream });
+        var expression = new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "Expression", IsValue = false, Parent = @object };
+        Add(expression);
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "Expression`1", IsValue = false, Parent = expression }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "LambdaExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "ParameterExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "BinaryExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "ConstantExpression", IsValue = false, Parent = expression });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "DynamicMethod", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "ILGenerator", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "Label", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "LocalBuilder", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "OpCodes", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Reflection.Emit", Name = "OpCode", IsValue = true, Parent = valueType });
         // 例外階層のファサード (ECMA-335 / CLR の SystemException 配下)。VM 内部例外もここから実体化する
         var systemException = new VmIntrinsicType { Namespace = "System", Name = "SystemException", IsValue = false, Parent = _intrinsicTypes["System.Exception"] };
         Add(systemException);
+        var ioException = new VmIntrinsicType { Namespace = "System.IO", Name = "IOException", IsValue = false, Parent = systemException };
+        Add(ioException);
+        Add(new VmIntrinsicType { Namespace = "System.IO", Name = "FileNotFoundException", IsValue = false, Parent = ioException });
         Add(new VmIntrinsicType { Namespace = "System", Name = "InvalidOperationException", IsValue = false, Parent = systemException });
         var argumentException = new VmIntrinsicType { Namespace = "System", Name = "ArgumentException", IsValue = false, Parent = systemException };
         Add(argumentException);
@@ -86,7 +116,7 @@ public sealed class TypeLoader {
             "NullReferenceException", "IndexOutOfRangeException", "DivideByZeroException",
             "OverflowException", "InvalidCastException", "ArrayTypeMismatchException",
             "FormatException", "StackOverflowException", "OutOfMemoryException",
-            "NotSupportedException", "OperationCanceledException", "TimeoutException",
+            "NotSupportedException", "OperationCanceledException", "TimeoutException", "TypeLoadException",
             "NotImplementedException", "RankException",
         })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false, Parent = systemException });
@@ -585,9 +615,10 @@ public sealed class TypeLoader {
                 return forwarded;
         }
         // ③ trusted assembly に限定した FullName 統合 (BCL の参照アセンブリ→実装の解決)。
-        // 例: ゲストが System.Runtime (ref) を参照し、実装が trusted System.Private.CoreLib に
-        // ある場合。非 trusted なゲスト画像同士では統合しない (fake 混入防止)。
-        return TryResolveTrustedUnifiedType(fullName);
+        // ただし単に「解決できなかった AssemblyRef」であることだけを根拠にすると、
+        // 任意の AssemblyRef が同名 CoreLib 型へ統合される。既知 framework contract identity
+        // からの参照、または上の正式な TypeForwarder 経路だけを許可する。
+        return IsKnownFrameworkContract(refIdentity) ? TryResolveTrustedUnifiedType(fullName) : null;
     }
 
     /// <summary>画像の ExportedType テーブルに FullName の転送宣言があれば転送先を解決する
@@ -606,8 +637,10 @@ public sealed class TypeLoader {
                 var fwdTarget = Context?.TryResolveAssembly(fwdIdentity, image);
                 if (fwdTarget?.FindTypeByFullName(fullName) is { } fwdType)
                     return fwdType;
-                // 転送先が未ロードでも trusted 統合で拾える場合はそちらへ (BCL forwarder の救済)
-                if (TryResolveTrustedUnifiedType(fullName) is { } trusted)
+                // 転送先が未ロードでも、forwarder の参照先が既知 framework contract の場合だけ
+                // trusted 統合で拾える (任意 AssemblyRef の同名統合はしない)
+                if (IsKnownFrameworkContract(fwdIdentity) &&
+                    TryResolveTrustedUnifiedType(fullName) is { } trusted)
                     return trusted;
             }
         }
@@ -650,7 +683,8 @@ public sealed class TypeLoader {
                 targetLoader = resolved;
             } else {
                 // BCL 参照アセンブリ (System.Runtime 等) のネスト型は trusted 実装で救済する
-                var unified = TryResolveTrustedUnifiedType(names[0]);
+                var unified = IsKnownFrameworkContract(refIdentity)
+                    ? TryResolveTrustedUnifiedType(names[0]) : null;
                 if (unified is VmClassType unifiedClass)
                     return WalkNested(unifiedClass, names, 1);
                 return null;
@@ -662,7 +696,9 @@ public sealed class TypeLoader {
         var owner = targetLoader.FindTypeByFullName(names[0]) ?? targetLoader.FindTypeByName(names[0]);
         if (owner is null) {
             // 自画像に無く BCL 統合で拾える場合 (参照アセンブリ経由の BCL ネスト型)
-            if (targetLoader == this && TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
+            if (targetLoader == this && terminalTable == TableKind.AssemblyRef &&
+                IsKnownFrameworkContract(_image.GetAssemblyRefIdentity(terminalRid)) &&
+                TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
                 return WalkNested(unifiedClass, names, 1);
             return null;
         }
@@ -692,6 +728,19 @@ public sealed class TypeLoader {
         }
         return owner;
     }
+
+    /// <summary>
+    /// CoreLib 統合 fallback に使える framework contract identity。
+    /// 名前だけでは fake System.Runtime.dll を区別できないため、既知の strong-name token を
+    /// 必須にする。正式な AssemblyRef→TypeForwarder 解決はこの制約とは別に上で処理する。
+    /// </summary>
+    private static bool IsKnownFrameworkContract(AssemblyIdentity identity) =>
+        identity.IsStrongNamed &&
+        identity.PublicKeyToken is "7cec85d7bea7798e" or "b03f5f7f11d50a3a" or "cc7b13ffcd2ddd51" &&
+        identity.Name is "System.Private.CoreLib" or "System.Runtime" or "System.Runtime.Extensions"
+            or "System.Console" or "System.Linq" or "System.Collections" or "System.Collections.Concurrent"
+            or "System.Threading" or "System.Threading.Tasks" or "System.Reflection"
+            or "System.Reflection.Emit" or "System.Runtime.InteropServices" or "netstandard";
 
     // ---- 検索 API ----
 

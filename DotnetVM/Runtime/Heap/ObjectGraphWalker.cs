@@ -34,6 +34,23 @@ public static class ObjectGraphWalker {
             case VmDelegate @delegate:
                 foreach (var invocation in @delegate.Invocations)
                     CollectFromSlot(invocation.Target, visit);
+                if (@delegate.ExpressionLambda is { } lambda)
+                    visit(lambda);
+                break;
+            case VmExpressionObject expression:
+                if (expression.Left is { } left) visit(left);
+                if (expression.Right is { } right) visit(right);
+                if (expression.Body is { } body) visit(body);
+                if (expression.Object is { } receiver) visit(receiver);
+                if (expression.IfTrue is { } ifTrue) visit(ifTrue);
+                if (expression.IfFalse is { } ifFalse) visit(ifFalse);
+                foreach (var argument in expression.Arguments)
+                    visit(argument);
+                foreach (var child in expression.Expressions)
+                    visit(child);
+                foreach (var parameter in expression.Parameters)
+                    visit(parameter);
+                CollectFromSlot(expression.Constant, visit);
                 break;
             case VmTypedReference typedRef:
                 CollectFromSlot(typedRef.Slot, visit);

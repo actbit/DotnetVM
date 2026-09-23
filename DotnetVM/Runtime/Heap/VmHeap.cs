@@ -54,6 +54,18 @@ public sealed class VmHeap {
             _rootSlotSources.Add(source);
     }
 
+    /// <summary>VM/Interpreter の破棄時に登録済みのルート源を解除する。</summary>
+    internal void RemoveRootSlotSource(Func<IEnumerable<StackSlot[]>> source) {
+        lock (_gate)
+            _rootSlotSources.RemoveAll(existing => existing == source);
+    }
+
+    /// <summary>VM/Interpreter の破棄時に登録済みの直接ルート源を解除する。</summary>
+    internal void RemoveRootObjectSource(Func<IEnumerable<VmObject?>> source) {
+        lock (_gate)
+            _rootObjectSources.RemoveAll(existing => existing == source);
+    }
+
     /// <summary>
     /// アロケーション予約 (トランザクション)。生成時 (Reserve) に上限検査と計上を先に済ませ、
     /// <see cref="Commit"/> でオブジェクトの登録を確定する。localloc / newarr のように

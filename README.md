@@ -48,6 +48,10 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ホストは自前の intrinsic 契約アセンブリ (ファサードの C# 側シグネチャ) を持ち込めます (`VirtualMachine.RegisterIntrinsic`)。
 
+**動的コード関連 API** (`Assembly.Load`、式木、`Reflection.Emit`) は標準で利用できます。追加オプションは不要です。これらは CLR のアセンブリロードやコード生成へ脱出せず、`Assembly.Load` は VM の `TypeLoader` に PE を登録し、式木の `Compile` と `Reflection.Emit` の生成コードは VM の実行モデルへ変換して実行します。PE サイズ・ヒープ・命令数の既存ポリシーも適用されます。VM のメタデータモデルで表現できる API 面は同じ経路で扱い、未登録のネイティブ依存面だけは従来どおり fail-closed になります。
+
+`System.Runtime.Loader.AssemblyLoadContext` と `System.Reflection.AssemblyName` もゲスト面として利用できます。`Default`、名前付きコンテキスト、`LoadFromAssemblyBytes`、`LoadFromStream`、`LoadFromAssemblyPath`、`LoadFromAssemblyName`、`Assemblies`、`Unload` を VM の `VmAssemblyContext` に接続します。パスロードは `StorageBridge` 経由に限定し、CLR の `AssemblyLoadContext` や CLR 動的コードをゲストへ公開しません。
+
 **メソッド解決の優先順位** (C4 ランタイムバインド層):
 1. **ランタイムバインド** — `BindingKey(型完全名, メソッド名, パラメータ型名, this 有無)` の署名照合
 2. **IL 本体実行** — CoreLib を含む全アセンブリの managed IL (`IlPreferred` 面の型は 3. より先にこちらへ解決。置換面 `VmCoreLibSurfaces` に載った面は解決後に `DotnetVM.CoreLib` の managed IL へ差し替え)

@@ -1,3 +1,5 @@
+using DotnetVM.Runtime.Objects;
+
 namespace DotnetVM.Runtime.Execution;
 
 /// <summary>
@@ -6,18 +8,39 @@ namespace DotnetVM.Runtime.Execution;
 /// VM ごとに分離する (ホスト環境の読み替え遮断と VM 間分離のため)。
 /// lastError は CLR の TLS と同じく実行 host thread ごとに分離する。
 /// </summary>
-public sealed class VmSharedState {
+public sealed class VmSharedState : IDisposable {
     private readonly System.Threading.ThreadLocal<int> _lastSystemError = new();
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly GuestWorkerBudget _workerBudget;
+    private int _disposed;
 
-    public VmSharedState(int maxGuestThreads = 64) {
-        GuestThreads = new GuestThreadRuntime(maxGuestThreads);
-        GuestTasks = new GuestTaskRuntime(maxGuestThreads);
+    public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
+        int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000) {
+        if (maxGuestThreads < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxGuestThreads));
+        if (maxTaskWorkers < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxTaskWorkers));
+        if (maxGuestWorkers < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxGuestWorkers));
+        if (maxPendingTaskTimers < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxPendingTaskTimers));
+        if (shutdownTimeoutMilliseconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(shutdownTimeoutMilliseconds));
+
+        _workerBudget = new GuestWorkerBudget(maxGuestWorkers);
+        GuestThreads = new GuestThreadRuntime(maxGuestThreads, _workerBudget, _shutdown.Token,
+            shutdownTimeoutMilliseconds);
+        GuestTasks = new GuestTaskRuntime(maxTaskWorkers, maxPendingTaskTimers, _workerBudget, _shutdown.Token,
+            shutdownTimeoutMilliseconds);
     }
 
     /// <summary>Guest Thread の実行と join 状態 (VM ごとに分離)。</summary>
     internal GuestThreadRuntime GuestThreads { get; }
 
     internal GuestTaskRuntime GuestTasks { get; }
+
+    /// <summary>VM 単位の型初期化状態表。</summary>
+    internal TypeInitializationTracker TypeInitialization { get; } = new();
 
     /// <summary>Monitor のオブジェクト別同期ブロック。</summary>
     internal GuestMonitorTable Monitors { get; } = new();
@@ -45,4 +68,29 @@ public sealed class VmSharedState {
     /// 誤分岐するため、同一 VmType には同一 VmRuntimeObject を返す。
     /// VM 単位 (loader をまたいで共有する。VmType はローダ横断で同一参照のため安全)。</summary>
     internal readonly System.Collections.Concurrent.ConcurrentDictionary<DotnetVM.Runtime.Types.VmType, DotnetVM.Runtime.Objects.VmRuntimeObject> TypeFacades = new();
+
+    internal CancellationToken ShutdownToken => _shutdown.Token;
+
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    internal void ThrowIfDisposed() {
+        if (IsDisposed)
+            throw new ObjectDisposedException("VirtualMachine");
+    }
+
+    /// <summary>RuntimeType ファサードを GC の直接ルートとして列挙する。</summary>
+    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values;
+
+    public void Dispose() {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        _shutdown.Cancel();
+        // Task を先に fault させて待機中の continuation / guest Thread を起こし、
+        // その後 Thread worker を interrupt する。どちらも同じ cancellation token を見る。
+        GuestTasks.Dispose();
+        GuestThreads.Dispose();
+        _workerBudget.Dispose();
+        _lastSystemError.Dispose();
+        _shutdown.Dispose();
+    }
 }

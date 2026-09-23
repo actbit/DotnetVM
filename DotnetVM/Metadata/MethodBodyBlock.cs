@@ -1,4 +1,5 @@
 using DotnetVM.PE;
+using DotnetVM.Metadata.Signatures;
 
 namespace DotnetVM.Metadata;
 
@@ -27,9 +28,18 @@ public sealed class MethodBodyBlock {
     private ReadOnlyMemory<byte> IlBytes { get; init; }
     public ReadOnlySpan<byte> IlCode => IlBytes.Span;
     public ExceptionClause[]? ExceptionClauses { get; private init; }
+    internal SigType[]? DynamicLocalTypes { get; private init; }
     public int Size => IlCode.Length;
 
     private MethodBodyBlock() { }
+
+    /// <summary>VM DynamicMethod の IL を既存インタプリタに渡すための本体。</summary>
+    internal static MethodBodyBlock FromDynamicCode(ReadOnlyMemory<byte> code, SigType[]? localTypes = null) => new() {
+        MaxStack = 8,
+        LocalVarSigToken = 0,
+        IlBytes = code,
+        DynamicLocalTypes = localTypes,
+    };
 
     /// <summary>RVA 位置のメソッド本体を解析する。RVA = 0 の場合は null。
     /// maxMethodBodyBytes を渡すと IL コードサイズを読み込み時に強制する

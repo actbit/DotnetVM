@@ -3,6 +3,7 @@ using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
+using DotnetVM.Runtime.Intrinsics.Builtins;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
@@ -17,7 +18,8 @@ internal sealed class ObjectEngine(
     InterpreterServices services,
     IExecutionGate gate,
     IGuestInvoker invoker,
-    UnifiedStaticStorage? unifiedStaticStorage = null) {
+    UnifiedStaticStorage? unifiedStaticStorage = null,
+    TypeInitializationTracker? typeInitialization = null) {
     private readonly TypeLoader _loader = services.Loader;
     private readonly IntrinsicRegistry _intrinsics = services.Intrinsics;
     private readonly VmHeap _heap = services.Heap;
@@ -27,41 +29,12 @@ internal sealed class ObjectEngine(
     /// null = 単一画像実行 (既定動作の ObjectModel ローカル辞書に統一)。</summary>
     private readonly UnifiedStaticStorage? _unifiedStaticStorage = unifiedStaticStorage;
 
-    private readonly HashSet<VmType> _initializedTypes = [];
-    // 構築ジェネリック型の .cctor 起動済み集合 (CLR と同じく実引数ごとに 1 回。
-    // FullName 文字列ではなく定義参照 + 型引数参照列で鍵化する)
-    private readonly HashSet<ConstructedIdentity> _initializedConstructedTypes = [];
-
-    private readonly struct ConstructedIdentity : IEquatable<ConstructedIdentity> {
-        public readonly VmType Definition;
-        public readonly VmType[] TypeArguments;
-        public ConstructedIdentity(VmType definition, VmType[] typeArguments) {
-            Definition = definition;
-            TypeArguments = [.. typeArguments];
-        }
-        public bool Equals(ConstructedIdentity other) {
-            if (!ReferenceEquals(Definition, other.Definition) || TypeArguments.Length != other.TypeArguments.Length)
-                return false;
-            for (var i = 0; i < TypeArguments.Length; i++)
-                if (!ReferenceEquals(TypeArguments[i], other.TypeArguments[i]))
-                    return false;
-            return true;
-        }
-        public override bool Equals(object? obj) => obj is ConstructedIdentity other && Equals(other);
-        public override int GetHashCode() {
-            var hash = new HashCode();
-            hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Definition));
-            foreach (var arg in TypeArguments)
-                hash.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(arg));
-            return hash.ToHashCode();
-        }
-    }
+    private readonly TypeInitializationTracker _typeInitialization = typeInitialization ?? new();
     /// <summary>intrinsic 型の静的フィールドのストレージ (トークンごとに 1 スロット。例: String.Empty)。GC ルート源。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, StackSlot[]> _intrinsicStaticFields = new();
     /// <summary>静的 FieldRVA データフィールドのアドレス (トークンごとに 1 つ。例: Char.Latin1CharInfo の
     /// &lt;PrivateImplementationDetails&gt; 初期化データ)。GC グラフ源 (Interpreter が到達可能性に使う)。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, VmNativePointer> _rvaFieldAddresses = new();
-    private readonly object _typeInitGate = new();
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;
@@ -94,8 +67,13 @@ internal sealed class ObjectEngine(
 
     // ---- 型トークン解決 ----
 
-    public VmType ResolveTypeToken(int token, GenericContext? context = null) =>
-        _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token), context);
+    public VmType ResolveTypeToken(int token, GenericContext? context = null,
+        IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
+            dynamicReference is VmType dynamicType)
+            return dynamicType;
+        return _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token), context);
+    }
 
     /// <summary>MemberRef の TypeSpec 親を構築型として解決する。VAR/MVAR を含む場合は context で置換する。</summary>
     public VmConstructedType ResolveConstructedParent(int typeSpecRid, GenericContext? context) =>
@@ -156,7 +134,11 @@ internal sealed class ObjectEngine(
     }
 
     /// <summary>フィールドトークン (Field / MemberRef) を解決する。TypeSpec 親 (構築型のフィールド) も解決する。</summary>
-    public VmField ResolveFieldToken(int token, GenericContext? context = null) {
+    public VmField ResolveFieldToken(int token, GenericContext? context = null,
+        IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
+            dynamicReference is VmField dynamicField)
+            return dynamicField;
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         switch (table) {
@@ -267,7 +249,15 @@ internal sealed class ObjectEngine(
     }
 
     /// <summary>静的フィールドの位置を解決する (.cctor 起動を含む)。intrinsic 型 (TypeRef 親) の静的フィールドも解決する。</summary>
-    public VmByRef StaticFieldLocation(int token, GenericContext? context = null) {
+    public VmByRef StaticFieldLocation(int token, GenericContext? context = null,
+        IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
+            dynamicReference is VmField dynamicField) {
+            if (!dynamicField.IsStatic)
+                throw new UnhandledGuestException("System.FieldAccessException",
+                    $"{dynamicField.DeclaringType.FullName}::{dynamicField.Name} は静的フィールドではありません。");
+            return StaticFieldLocationForField(token, dynamicField, context);
+        }
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table == TableKind.MemberRef) {
@@ -301,7 +291,11 @@ internal sealed class ObjectEngine(
                     ResolveFieldToken(token, context)));
             }
         }
-        var field = ResolveFieldToken(token);
+        var field = ResolveFieldToken(token, context, dynamicTokens);
+        return StaticFieldLocationForField(token, field, context);
+    }
+
+    private VmByRef StaticFieldLocationForField(int token, VmField field, GenericContext? context) {
         var owner = (VmClassType)field.DeclaringType;
         // 本家 CoreLib の IL 内からの ldsfld / stsfld (Field token 直接)。実 CLR では
         // ランタイムが値を設定する静的フィールド (String.Empty 等) は IL に初期化子が
@@ -337,26 +331,22 @@ internal sealed class ObjectEngine(
 
     /// <summary>型初期化子 (.cctor) の起動規約: 静的フィールド初回アクセス/newobj 前に 1 回だけ実行。</summary>
     public void EnsureInitialized(VmClassType type) {
-        lock (_typeInitGate) {
-            if (!_initializedTypes.Add(type))
-                return;
+        _typeInitialization.Ensure(type, () => {
             var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
                 invoker.Invoke(cctor, [], null);
-        }
+        });
     }
 
     /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回。
     /// 定義参照 + 型引数参照列で鍵化し、FullName 文字列は使わない)。</summary>
     public void EnsureConstructedInitialized(VmConstructedType type) {
-        lock (_typeInitGate) {
-            if (!_initializedConstructedTypes.Add(new ConstructedIdentity(type.Definition, type.TypeArguments)))
-                return;
+        _typeInitialization.Ensure(type, () => {
             var definition = (VmClassType)type.Definition;
             var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
                 invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
-        }
+        });
     }
 
     /// <summary>intrinsic からのインスタンス生成 (Activator.CreateInstance 用フック実体)。
@@ -599,12 +589,21 @@ internal sealed class ObjectEngine(
     }
 
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
+        if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
+            dynamicReference is VmMethod dynamicCtor) {
+            var values = new StackSlot[dynamicCtor.Signature.ParamTypes.Length];
+            for (var i = values.Length - 1; i >= 0; i--)
+                values[i] = caller.Stack.Pop();
+            return ConstructExpression(dynamicCtor, values);
+        }
         VmMethod ctor;
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table == TableKind.MethodDef) {
             ctor = _loader.GetMethodByToken((uint)token)
                 ?? throw new BadImageFormatException($"newobj トークン 0x{token:X8} を解決できません。");
+            if (ctor.DeclaringType.FullName == "System.Reflection.Emit.DynamicMethod" && ctor.Name == ".ctor")
+                return NewDynamicMethodInstance(ctor.Signature.ParamTypes.Length, caller);
         } else if (table == TableKind.MemberRef) {
             var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
             if (parent.Table == TableKind.TypeSpec)
@@ -616,7 +615,16 @@ internal sealed class ObjectEngine(
             var facadeParamCount = signature.ParamTypes.Length;
             var name = _loader.GetMemberRefName(rid);
             var typeName = _loader.GetMemberRefParentTypeName(rid);
+            if (typeName == "System.Reflection.Emit.DynamicMethod" && name == ".ctor")
+                return NewDynamicMethodInstance(facadeParamCount, caller);
             if (typeName is not null) {
+                if (typeName is ("System.Runtime.Loader.AssemblyLoadContext" or "System.Reflection.AssemblyName"
+                    or "System.IO.MemoryStream") && name == ".ctor") {
+                    var specialCtorArgs = new StackSlot[facadeParamCount + 1];
+                    for (var i = facadeParamCount; i >= 1; i--)
+                        specialCtorArgs[i] = caller.Stack.Pop();
+                    return AssemblyLoadContextRuntime.Construct(_intrinsicContext, typeName, specialCtorArgs);
+                }
                 // string の構築面 (new string(char[]) / new string(char, int) 等):
                 // FastAllocateString + char 列コピーと同じ確保点で VmString を生成する。
                 // 置換面 (DotnetVM.CoreLib の NumberFormatting IL) が使うほか、ゲストの
@@ -719,6 +727,42 @@ internal sealed class ObjectEngine(
         args[0] = StackSlot.OfObject(instance);
         if (ctor.Body is not null)
             invoker.Invoke(ctor, args, null);
+        return StackSlot.OfObject(instance);
+    }
+
+    /// <summary>式木/動的コードから MethodInfo として保持された VM .ctor を実行する生成経路。</summary>
+    public StackSlot ConstructExpression(VmMethod ctor, StackSlot[] values) {
+        if (ctor.DeclaringType is not VmClassType owner)
+            throw new UnhandledGuestException("System.NotSupportedException", $"型 {ctor.DeclaringType.FullName} の構築は未対応です。");
+        if (owner.IsValueType) {
+            var storage = new[] { StackSlot.OfValueType(_objects.DefaultStruct(owner, _loader)) };
+            var callArgs = new StackSlot[values.Length + 1];
+            callArgs[0] = StackSlot.OfByRef(new VmByRef(storage, 0));
+            Array.Copy(values, 0, callArgs, 1, values.Length);
+            invoker.Invoke(ctor, callArgs, null);
+            return storage[0].Kind == StackKind.ValueType ? storage[0] : StackSlot.OfValueType(storage[0]);
+        }
+        var instance = _heap.Allocate(new VmClassInstance(owner, _objects.CreateInstanceStorage(owner, _loader)));
+        var args = new StackSlot[values.Length + 1];
+        args[0] = StackSlot.OfObject(instance);
+        Array.Copy(values, 0, args, 1, values.Length);
+        invoker.Invoke(ctor, args, null);
+        return StackSlot.OfObject(instance);
+    }
+
+    private StackSlot NewDynamicMethodInstance(int parameterCount, InterpreterFrame caller) {
+        if (parameterCount is not (3 or 4 or 5 or 7))
+            throw new NotSupportedException($"DynamicMethod .ctor の引数 {parameterCount} 個は未対応です。");
+        var facade = _loader.FindIntrinsicType("System.Reflection.Emit.DynamicMethod")
+            ?? throw new InvalidOperationException("DynamicMethod ファサードがありません。");
+        var instance = _heap.Allocate(new VmIntrinsicInstance(facade));
+        var args = new StackSlot[parameterCount + 1];
+        for (var i = parameterCount; i >= 1; i--)
+            args[i] = caller.Stack.Pop();
+        args[0] = StackSlot.OfObject(instance);
+        gate.ConsumeInstruction();
+        gate.CheckSafepoint();
+        ReflectionEmitRuntime.ConstructDynamicMethod(_intrinsicContext, args);
         return StackSlot.OfObject(instance);
     }
 

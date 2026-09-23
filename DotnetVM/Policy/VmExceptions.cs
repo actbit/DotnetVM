@@ -34,6 +34,11 @@ public sealed class InstructionQuotaExceededException : ResourceExhaustedExcepti
     public InstructionQuotaExceededException(string message) : base(message) { }
 }
 
+/// <summary>guest Thread / Task worker / pending Timer の VM 上限を超過した。</summary>
+public sealed class GuestConcurrencyLimitExceededException : ResourceExhaustedException {
+    public GuestConcurrencyLimitExceededException(string message) : base(message) { }
+}
+
 /// <summary>未許可の操作 (P/Invoke、マルチモジュール、未登録 intrinsic、未設定ブリッジ等)。</summary>
 public sealed class OperationNotAllowedException : VmExecutionException {
     public OperationNotAllowedException(string message) : base(message) { }

@@ -20,8 +20,8 @@ internal sealed class MethodPreparer(TypeLoader loader) {
         if (_prepared.TryGetValue(method, out var cached))
             return cached;
 
-        SigType[] localTypes = [];
-        if (method.Body is { } body && body.LocalVarSigToken != 0) {
+        SigType[] localTypes = method.Body?.DynamicLocalTypes ?? [];
+        if (method.Body is { } body && body.DynamicLocalTypes is null && body.LocalVarSigToken != 0) {
             var table = (TableKind)(body.LocalVarSigToken >> 24);
             var rid = (int)(body.LocalVarSigToken & 0xFFFFFF);
             if (table != TableKind.StandAloneSig)

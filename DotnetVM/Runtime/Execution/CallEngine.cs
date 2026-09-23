@@ -84,7 +84,7 @@ internal sealed class CallEngine(
             // ByRef のまま渡す (状態の読み書きが参照先スロットに対して行われる必要がある)。
             if (target.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef &&
                 !PreservesByRefReceiver(target.DeclaringType))
-                args[0] = thisByRef.Slot;
+                args[0] = thisByRef.Read();
             // callvirt で intrinsic 宣言型 (System.Object 等) をターゲットにする場合、
             // レシーバの実行時型にゲスト側 override があればそちらを優先する (仮想ディスパッチ)
             if (isCallvirt && target.HasThis) {
@@ -151,7 +151,12 @@ internal sealed class CallEngine(
                 target.MethodArgs?.Select(t => t.FullName).ToArray() ?? [];
             _intrinsicContext.ClassTypeArgumentNames =
                 target.ClassArgs?.Select(t => t.FullName).ToArray() ?? [];
-            return intrinsic(_intrinsicContext, args);
+            _intrinsicContext.MethodTypeArguments = target.MethodArgs ?? [];
+            _intrinsicContext.ClassTypeArguments = target.ClassArgs ?? [];
+            using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+            return target.DeclaringType == "System.Threading.Interlocked"
+                ? InvokeInterlocked(intrinsic, target.ParamTypeNames ?? [], args, alreadyGated: true)
+                : intrinsic(_intrinsicContext, args);
         }
 
         // 解決未了 (未登録 intrinsic): レシーバへの仮想ディスパッチを最終試行してから拒否
@@ -232,7 +237,11 @@ internal sealed class CallEngine(
     /// <summary>ByRef レシーバを値に読み替えずにそのまま渡す intrinsic 宣言型
     /// (ローカルスロットに可変状態を保持する構造体ファサード)。</summary>
     private static bool PreservesByRefReceiver(string? declaringType) =>
-        declaringType == "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler";
+        declaringType is "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler"
+            or "System.Runtime.CompilerServices.AsyncTaskMethodBuilder"
+            or "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1"
+            or "System.Runtime.CompilerServices.TaskAwaiter"
+            or "System.Runtime.CompilerServices.TaskAwaiter`1";
 
     /// <summary>VM ランタイムオブジェクトのレシーバが属する intrinsic 面 (仮想ディスパッチの
     /// 実行時型相当)。ランタイムオブジェクトは対応する intrinsic ファサード型の実体として振る舞う。</summary>
@@ -619,7 +628,9 @@ internal sealed class CallEngine(
         BindingDomain callerDomain, out IntrinsicImpl impl) {
         impl = null!;
         if (paramTypeNames.Any(string.IsNullOrEmpty))
-            return false;
+            return TryGetBindingWithCaller(hasThis
+                ? BindingKey.InstanceAnyParams(typeName, name)
+                : BindingKey.StaticAnyParams(typeName, name), callerDomain, out impl);
         var key = hasThis ? BindingKey.Instance(typeName, name, paramTypeNames)
                           : BindingKey.Static(typeName, name, paramTypeNames);
         return TryGetBindingWithCaller(key, callerDomain, out impl);
@@ -646,6 +657,9 @@ internal sealed class CallEngine(
                 return false;
             NormalizeByRefReceiver(method, args);
             _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
+            _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
+            _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
+            _intrinsicContext.ClassTypeArguments = classArgs ?? [];
             result = InvokeDelegated(anyImpl, [], args);
             return true;
         }
@@ -659,9 +673,23 @@ internal sealed class CallEngine(
             : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);
         // callerDomain は呼出元フレーム基準 (引数で明示)。trusted caller は特権面を優先し、
         // 汎用面にも到達できる。guest caller は汎用面のみ。
-        if (!TryGetBindingWithCaller(key, callerDomain, out var impl) &&
-            (returnName.Length == 0 || !TryGetBindingWithCaller(key.WithAnyReturn(), callerDomain, out impl)) &&
-            !TryInvokeOpenGenericBinding(method, methodArgs, names, returnName, callerDomain, args, out impl)) {
+        var hasBinding = TryGetBindingWithCaller(key, callerDomain, out var impl);
+        if (!hasBinding && returnName.Length != 0)
+            hasBinding = TryGetBindingWithCaller(key.WithAnyReturn(), callerDomain, out impl);
+        if (!hasBinding)
+            hasBinding = TryInvokeOpenGenericBinding(method, methodArgs, names, returnName, callerDomain, args, out impl);
+        if (!hasBinding && TryGetBindingWithCaller(method.Signature.HasThis
+                ? BindingKey.InstanceAnyParams(declaringName, method.Name)
+                : BindingKey.StaticAnyParams(declaringName, method.Name), callerDomain, out impl)) {
+            NormalizeByRefReceiver(method, args);
+            _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
+            _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
+            _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
+            _intrinsicContext.ClassTypeArguments = classArgs ?? [];
+            result = InvokeMethodDelegated(method, impl, names, args);
+            return true;
+        }
+        if (!hasBinding) {
             // 特権面が存在するのに guest から呼ばれた場合は fail-closed を明示する
             // (InternalCall 未登録との区別 = 監査性のため OperationNotAllowed)。
             if (callerDomain == BindingDomain.Guest && HasTrustedBinding(method, methodArgs, names, returnName, classArgs))
@@ -675,7 +703,9 @@ internal sealed class CallEngine(
         // 渡す (EqualityComparer<T>.get_Default 等のクラスジェネリック面のため)
         _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
         _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
-        result = InvokeDelegated(impl, names, args);
+        _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
+        _intrinsicContext.ClassTypeArguments = classArgs ?? [];
+        result = InvokeMethodDelegated(method, impl, names, args);
         return true;
     }
 
@@ -759,8 +789,25 @@ internal sealed class CallEngine(
             !_objectEngine.TryGetIntrinsicThroughHierarchy(declaringName, method.Name, arity, method.Signature.HasThis, out impl))
             return false;
         NormalizeByRefReceiver(method, args);
-        result = InvokeDelegated(impl, ParamTypeNamesOf(method, null) ?? [], args);
+        result = InvokeMethodDelegated(method, impl, ParamTypeNamesOf(method, null) ?? [], args);
         return true;
+    }
+
+    private StackSlot? InvokeMethodDelegated(VmMethod method, IntrinsicImpl impl, string[] paramNames, StackSlot[] args) {
+        if (method.DeclaringType.FullName == "System.Threading.Interlocked")
+            return InvokeInterlocked(impl, paramNames, args);
+        return InvokeDelegated(impl, paramNames, args);
+    }
+
+    private StackSlot? InvokeInterlocked(IntrinsicImpl impl, string[] paramNames, StackSlot[] args, bool alreadyGated = false) {
+        StackSlot? Invoke() => alreadyGated ? impl(_intrinsicContext, args) : InvokeDelegated(impl, paramNames, args);
+        lock (_intrinsicContext.Shared.InterlockedGate) {
+            if (args.Length > 0 && args[0].ObjectValue is VmByRef location) {
+                lock (location.Container)
+                    return Invoke();
+            }
+            return Invoke();
+        }
     }
 
     /// <summary>委譲実装 (ランタイムバインド / legacy intrinsic) を intrinsic 呼出ゲート経由で実行する。
@@ -770,6 +817,7 @@ internal sealed class CallEngine(
         gate.ConsumeInstruction();
         gate.CheckSafepoint();
         _intrinsicContext.ParameterTypeNames = paramNames;
+        using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
         return impl(_intrinsicContext, args);
     }
 
@@ -779,7 +827,7 @@ internal sealed class CallEngine(
     private void NormalizeByRefReceiver(VmMethod method, StackSlot[] args) {
         if (method.Signature.HasThis && args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef thisByRef &&
             !PreservesByRefReceiver(method.DeclaringType.FullName))
-            args[0] = thisByRef.Slot;
+            args[0] = thisByRef.Read();
     }
 
     /// <summary>解決済みメソッドの宣言パラメータ型名 (i4 統合面の判別 / バインドキー構築用)。
@@ -1036,6 +1084,7 @@ internal sealed class CallEngine(
                     ParamCount = signature.ParamTypes.Length,
                     HasThis = signature.HasThis,
                     ParamTypeNames = facadeParamNames,
+                    ClassArgs = constructed.TypeArguments,
                 };
             }
             if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
@@ -1048,6 +1097,7 @@ internal sealed class CallEngine(
                     ParamCount = signature.ParamTypes.Length,
                     HasThis = signature.HasThis,
                     ParamTypeNames = facadeParamNames,
+                    ClassArgs = constructed.TypeArguments,
                 };
             }
             // 未登録 intrinsic: 即例外にせず解決未了の CallTarget を返す
@@ -1225,6 +1275,48 @@ internal sealed class CallEngine(
             }
             if (parent.Table == TableKind.TypeSpec) {
                 var constructed = _objectEngine.ResolveConstructedParent(parent.Rid, context);
+                if (constructed.Definition is VmIntrinsicType facade) {
+                    var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+                    if (_intrinsics.TryGetBinding(signature.HasThis
+                            ? BindingKey.InstanceAnyParams(facade.FullName, name)
+                            : BindingKey.StaticAnyParams(facade.FullName, name), out var facadeImpl, out _, CallerDomainOfLoader())) {
+                        return new CallTarget {
+                            Arity = arity,
+                            Intrinsic = facadeImpl,
+                            DeclaringType = facade.FullName,
+                            Name = name,
+                            ParamCount = signature.ParamTypes.Length,
+                            HasThis = signature.HasThis,
+                            ClassArgs = constructed.TypeArguments,
+                            MethodArgs = methodArgs,
+                            ParamTypeNames = signature.ParamTypes.Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
+                        };
+                    }
+                    if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var facadeLegacy)) {
+                        return new CallTarget {
+                            Arity = arity,
+                            Intrinsic = facadeLegacy,
+                            DeclaringType = facade.FullName,
+                            Name = name,
+                            ParamCount = signature.ParamTypes.Length,
+                            HasThis = signature.HasThis,
+                            ClassArgs = constructed.TypeArguments,
+                            MethodArgs = methodArgs,
+                            ParamTypeNames = signature.ParamTypes.Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
+                        };
+                    }
+                    if (!throwOnMissingIntrinsic)
+                        return new CallTarget {
+                            Arity = arity,
+                            DeclaringType = facade.FullName,
+                            Name = name,
+                            ParamCount = signature.ParamTypes.Length,
+                            HasThis = signature.HasThis,
+                            ClassArgs = constructed.TypeArguments,
+                            MethodArgs = methodArgs,
+                        };
+                    throw new OperationNotAllowedException($"intrinsic {facade.FullName}::{name} (引数 {arity} 個) は未登録です。");
+                }
                 var definition = (VmClassType)constructed.Definition;
                 var method = FindMethodThroughChain(definition, name, signature.ParamTypes)
                     ?? throw new BadImageFormatException(

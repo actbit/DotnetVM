@@ -292,13 +292,13 @@ public static class DefaultIntrinsics {
 
         // this (ByRef) → 状態バッファ
         static System.Text.StringBuilder State(StackSlot[] a) =>
-            a[0].ObjectValue is VmByRef byRef && byRef.Slot.ObjectValue is VmIntrinsicCarrier carrier
+            a[0].ObjectValue is VmByRef byRef && byRef.Read().ObjectValue is VmIntrinsicCarrier carrier
                 ? (System.Text.StringBuilder)carrier.Payload!
                 : throw new InvalidOperationException("DefaultInterpolatedStringHandler の this が初期化されていません。");
         // this (ByRef) → 状態バッファを書き戻す
         static void SetState(StackSlot[] a, object? payload) {
             if (a[0].ObjectValue is VmByRef byRef)
-                byRef.Slot = StackSlot.OfObject(new VmIntrinsicCarrier { Payload = payload });
+                byRef.Write(StackSlot.OfObject(new VmIntrinsicCarrier { Payload = payload }));
         }
 
         void I(string name, int ps, IntrinsicImpl impl) =>
@@ -359,11 +359,13 @@ public static class DefaultIntrinsics {
     /// 実 CLR の RuntimeType と同じく型ごとに単一実体 (VM 単位でインターンする)。
     /// CoreLib IL が bne.un 等の参照同一性で型分岐するため、都度 new では誤分岐する。</summary>
     internal static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) {
+        lock (ctx.Shared.TypeFacadeGate) {
         if (!ctx.Shared.TypeFacades.TryGetValue(type, out var facade)) {
             facade = ctx.Heap.Allocate(new VmRuntimeObject { Target = type });
             ctx.Shared.TypeFacades[type] = facade;
         }
         return StackSlot.OfObject(facade);
+        }
     }
 
     /// <summary>オブジェクトの実行時型ファサードをスロットで返す (Object.GetType() /
@@ -547,8 +549,8 @@ public static class DefaultIntrinsics {
 
     /// <summary>System.Threading.Interlocked 面。フィールド風イベントの add/remove でコンパイラが
     /// 生成する CompareExchange&lt;T&gt; (MethodSpec 経由・ジェネリック引数はキーに含まれない) を含む。
-    /// 第 1 引数は常に ref → ByRef スロット経由で読み書きする。VM は単一スレッドで走るため
-    /// 比較と交換は逐次実行で競合なし (意味論は CLR と同一)。</summary>
+    /// 第 1 引数は常に ref → ByRef スロット経由で読み書きする。VM の共有 atomic gate と
+    /// スロットロックを使い、ゲストスレッド / 並列ホスト呼出の間でも比較交換を原子的に行う。</summary>
     private static void RegisterInterlocked(IntrinsicRegistry registry) {
         const string T = "System.Threading.Interlocked";
 
@@ -585,7 +587,7 @@ public static class DefaultIntrinsics {
             if (equal)
                 loc.Slot = a[1];
             if (a[3].ObjectValue is VmByRef succeeded)
-                succeeded.Slot = StackSlot.OfInt32(equal ? 1 : 0);
+                succeeded.Write(StackSlot.OfInt32(equal ? 1 : 0));
             return original;
         });
         // Exchange<T>(ref T, T) → 旧値
@@ -643,10 +645,9 @@ public static class DefaultIntrinsics {
                 : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32);
             return original;
         });
-        // 単一スレッド実行のためフェンスは意味論上ノーオペレーション
-        registry.Register(IntrinsicKey.Static(T, "MemoryBarrier", 0), static (_, _) => null);
-        registry.Register(IntrinsicKey.Static(T, "ReadMemoryBarrier", 0), static (_, _) => null);
-        registry.Register(IntrinsicKey.Static(T, "WriteMemoryBarrier", 0), static (_, _) => null);
+        registry.Register(IntrinsicKey.Static(T, "MemoryBarrier", 0), static (_, _) => { Thread.MemoryBarrier(); return null; });
+        registry.Register(IntrinsicKey.Static(T, "ReadMemoryBarrier", 0), static (_, _) => { Thread.MemoryBarrier(); return null; });
+        registry.Register(IntrinsicKey.Static(T, "WriteMemoryBarrier", 0), static (_, _) => { Thread.MemoryBarrier(); return null; });
     }
 
     private static StackSlot CombineDelegates(IntrinsicContext ctx, StackSlot left, StackSlot right) {

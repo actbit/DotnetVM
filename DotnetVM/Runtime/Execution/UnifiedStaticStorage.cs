@@ -19,6 +19,7 @@ using DotnetVM.Runtime.Types;
 public sealed class UnifiedStaticStorage {
     /// <summary>storage キー (definition VmType identity + 型引数 identity 列)。参照で鍵化。</summary>
     private readonly Dictionary<VmTypeIdentityKey, StackSlot[]> Table = [];
+    private readonly object _gate = new();
 
     /// <summary>GC ルート源 (生成済みの全ストレージを強参照で保持する)。</summary>
     internal readonly List<StackSlot[]> Registry = [];
@@ -60,6 +61,7 @@ public sealed class UnifiedStaticStorage {
     /// <summary>静的ストレージを取得。definition は型 identity (VmType 参照)、
     /// typeArguments は非構築型では null/空、構築型では実引数の VmType identity 列。</summary>
     internal StackSlot[] GetOrCreate(VmType definition, VmType[]? typeArguments, Func<StackSlot[]> factory) {
+        lock (_gate) {
         var identityKey = new VmTypeIdentityKey(
             definition ?? throw new ArgumentNullException(nameof(definition)),
             typeArguments);
@@ -69,6 +71,7 @@ public sealed class UnifiedStaticStorage {
         Table[identityKey] = storage;
         Registry.Add(storage);
         return storage;
+        }
     }
 
     /// <summary>後方互換 (string キー経路)。新規コードでは使わないこと。
@@ -77,5 +80,8 @@ public sealed class UnifiedStaticStorage {
     internal StackSlot[] GetOrCreate(VmType canonicalType, string constructedKey, Func<StackSlot[]> factory) =>
         GetOrCreate(canonicalType, (VmType[]?)null, factory);
 
-    internal IEnumerable<StackSlot[]> EnumerateRoots() => Registry;
+    internal IEnumerable<StackSlot[]> EnumerateRoots() {
+        lock (_gate)
+            return Registry.ToArray();
+    }
 }

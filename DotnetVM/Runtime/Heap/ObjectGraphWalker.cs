@@ -26,6 +26,11 @@ public static class ObjectGraphWalker {
             case VmIntrinsicInstance intrinsicInstance:
                 CollectFromSlots(intrinsicInstance.State, visit);
                 break;
+            case VmTaskObject task:
+                var snapshot = task.Snapshot();
+                CollectFromSlot(snapshot.Result, visit);
+                CollectFromSlot(snapshot.GuestException, visit);
+                break;
             case VmDelegate @delegate:
                 foreach (var invocation in @delegate.Invocations)
                     CollectFromSlot(invocation.Target, visit);

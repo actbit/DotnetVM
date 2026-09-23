@@ -29,6 +29,7 @@ internal static class CoreLibBindings {
         RegisterObject(r);
         RegisterEnum(r);
         RegisterThreading(r);
+        RegisterTaskBindings(r);
         RegisterComparableInterfaces(r);
         RegisterPrimitiveToString(r);
         RegisterDecimalBindings(r);
@@ -114,7 +115,7 @@ internal static class CoreLibBindings {
                     ok = false;
                 }
                 if (a[1].ObjectValue is VmByRef byref)
-                    byref.Slot = StackSlot.OfValueType(MakeDecimalStruct(ctx, ok ? value : 0m));
+                    byref.Write(StackSlot.OfValueType(MakeDecimalStruct(ctx, ok ? value : 0m)));
                 return StackSlot.OfInt32(ok ? 1 : 0);
             },
             BindingOrigin.Managed);
@@ -566,7 +567,7 @@ internal static class CoreLibBindings {
 
     private static void WriteWritten(in StackSlot slot, int value) {
         if (slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef byRef)
-            byRef.Slot = StackSlot.OfInt32(value);
+            byRef.Write(StackSlot.OfInt32(value));
         else
             throw new InvalidOperationException("TryFormat の out 引数が参照ではありません。");
     }
@@ -930,7 +931,7 @@ internal static class CoreLibBindings {
         var comparison = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         foreach (var literal in EnumLiteralsOf(enumType)) {
             if (string.Equals(literal.Name, raw, comparison)) {
-                outRef.Slot = RawSlot(literal.Bits, enumType);
+            outRef.Write(RawSlot(literal.Bits, enumType));
                 return StackSlot.OfInt32(1);
             }
         }
@@ -952,10 +953,10 @@ internal static class CoreLibBindings {
             }
         }
         if (parsedOk) {
-            outRef.Slot = RawSlot(parsedBits, enumType);
+            outRef.Write(RawSlot(parsedBits, enumType));
             return StackSlot.OfInt32(1);
         }
-        outRef.Slot = size == 8 ? StackSlot.OfInt64(0) : StackSlot.OfInt32(0);
+        outRef.Write(size == 8 ? StackSlot.OfInt64(0) : StackSlot.OfInt32(0));
         return StackSlot.OfInt32(0);
     }
 
@@ -1124,7 +1125,7 @@ internal static class CoreLibBindings {
     private static StackSlot ModFImpl(StackSlot[] a) {
         var intPart = Math.Truncate(a[0].DoubleValue);
         if (a[1].ObjectValue is VmByRef byref)
-            byref.Slot = StackSlot.OfFloat(a[0].DoubleValue - intPart);
+            byref.Write(StackSlot.OfFloat(a[0].DoubleValue - intPart));
         return StackSlot.OfFloat(intPart);
     }
 
@@ -1938,7 +1939,7 @@ internal static class CoreLibBindings {
             static (ctx, a) => {
                 var ok = Guid.TryParse(S(a[0]) ?? "", out var value);
                 if (a[1].ObjectValue is VmByRef byRef)
-                    byRef.Slot = MakeGuidStruct(ctx, value);
+                    byRef.Write(MakeGuidStruct(ctx, value));
                 else
                     throw new InvalidOperationException("Guid.TryParse の out 引数が参照ではありません。");
                 return StackSlot.OfInt32(ok ? 1 : 0);
@@ -2399,28 +2400,410 @@ internal static class CoreLibBindings {
             BindingOrigin.Managed);
     }
 
-    // ---- System.Threading.Monitor (VM は単一スレッド実行のため競合なしのロック面) ----
+    // ---- System.Threading.Thread / Monitor ----
 
     private static void RegisterThreading(IntrinsicRegistry r) {
-        // CoreLib Monitor の InternalCall 面 4 件 (Enter/Exit の IL から呼ばれる)。
-        // VM にはスレッドがなく同期ブロックもないため、常に即時取得・競合なしで即解放する:
-        //   TryEnter_FastPath(obj)              → true (競合しないので FastPath で取得成功。
-        //                                                  bool 返し (Enter IL が brtrue で分岐))
-        //   TryEnter_FastPath_WithTimeout(...)  → Entered (待ちなしで取得成功。
-        //                                                  EnterHelperResult enum の int 値 1)
-        //   Exit_FastPath(obj)                  → None (保持解除は no-op。
-        //                                                  LeaveHelperAction enum の int 値 0)
-        //   IsEnteredNative(obj)                → false (ロックを保持しないモデルと整合)
-        // .NET 10 の既知署名を列挙する (戻りが enum struct の面も int スロットで同等提供)
+        // Thread は VM delegate をホスト worker thread 上で実行する。ゲスト IL への再入は
+        // Interpreter のスレッド別フレームと共有 quota / heap を通る。
+        const string thread = "System.Threading.Thread";
+        static VmObject Receiver(StackSlot[] a) => a[0].ObjectValue as VmObject
+            ?? throw new UnhandledGuestException("System.NullReferenceException", null);
+        static VmDelegate StartDelegate(StackSlot[] a, int index) => a[index].ObjectValue as VmDelegate
+            ?? throw new UnhandledGuestException("System.ArgumentNullException", "start");
+        static bool Start(IntrinsicContext ctx, StackSlot[] a, bool hasState) {
+            var run = ctx.RunGuestThreadDelegate ?? throw new InvalidOperationException("Guest Thread runner が初期化されていません。");
+            ctx.Shared.GuestThreads.Start(Receiver(a), hasState ? a[1] : default, run, hasState);
+            return true;
+        }
+        static bool Join(IntrinsicContext ctx, StackSlot[] a, int timeout) {
+            var completed = false;
+            SuspendHostWait(ctx, () => completed = ctx.Shared.GuestThreads.Join(Receiver(a), timeout));
+            return completed;
+        }
+        r.RegisterBinding(BindingKey.Instance(thread, ".ctor", "System.Threading.ThreadStart"),
+            static (ctx, a) => {
+                ctx.Shared.GuestThreads.Configure(Receiver(a), StartDelegate(a, 1), parameterized: false);
+                return null;
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance(thread, ".ctor", "System.Threading.ParameterizedThreadStart"),
+            static (ctx, a) => {
+                ctx.Shared.GuestThreads.Configure(Receiver(a), StartDelegate(a, 1), parameterized: true);
+                return null;
+            }, BindingOrigin.InternalCall);
+        r.Register(new IntrinsicKey(thread, ".ctor", 2, true), static (ctx, a) => {
+            var start = StartDelegate(a, 1);
+            ctx.Shared.GuestThreads.Configure(Receiver(a), start,
+                parameterized: start.DeclaredType.FullName == "System.Threading.ParameterizedThreadStart");
+            return null;
+        });
+        r.RegisterBinding(BindingKey.Instance(thread, "Start"),
+            static (ctx, a) => { Start(ctx, a, hasState: false); return null; }, BindingOrigin.InternalCall);
+        r.Register(IntrinsicKey.Instance(thread, "Start", 0), static (ctx, a) => { Start(ctx, a, hasState: false); return null; });
+        r.RegisterBinding(BindingKey.Instance(thread, "Start", "System.Object"),
+            static (ctx, a) => { Start(ctx, a, hasState: true); return null; }, BindingOrigin.InternalCall);
+        r.Register(IntrinsicKey.Instance(thread, "Start", 1), static (ctx, a) => { Start(ctx, a, hasState: true); return null; });
+        r.RegisterBinding(BindingKey.InstanceWithReturn(thread, "Join", "System.Boolean", []),
+            static (ctx, a) => StackSlot.OfInt32(Join(ctx, a, Timeout.Infinite) ? 1 : 0), BindingOrigin.InternalCall);
+        r.Register(IntrinsicKey.Instance(thread, "Join", 0), static (ctx, a) => StackSlot.OfInt32(Join(ctx, a, Timeout.Infinite) ? 1 : 0));
+        r.RegisterBinding(BindingKey.InstanceWithReturn(thread, "Join", "System.Boolean", ["System.Int32"]),
+            static (ctx, a) => StackSlot.OfInt32(Join(ctx, a, ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")) ? 1 : 0), BindingOrigin.InternalCall);
+        r.Register(IntrinsicKey.Instance(thread, "Join", 1), static (ctx, a) => StackSlot.OfInt32(Join(ctx, a, ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")) ? 1 : 0));
+        r.RegisterBinding(BindingKey.InstanceWithReturn(thread, "Join", "System.Boolean", ["System.TimeSpan"]),
+            static (ctx, a) => StackSlot.OfInt32(Join(ctx, a, ValidateTimeout(TimeSpanMilliseconds(a[1]), "timeout")) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance(thread, "get_IsAlive"),
+            static (ctx, a) => StackSlot.OfInt32(ctx.Shared.GuestThreads.IsAlive(Receiver(a)) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance(thread, "get_ManagedThreadId"),
+            static (ctx, a) => StackSlot.OfInt32(ctx.Shared.GuestThreads.ManagedThreadId(Receiver(a))), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("System.Threading.Thread", "Sleep", "System.Int32"),
+            static (ctx, a) => { var timeout = ValidateTimeout(a[0].AsInt32, "millisecondsTimeout"); SuspendHostWait(ctx, () => Thread.Sleep(timeout)); return null; }, BindingOrigin.InternalCall);
+        r.Register(IntrinsicKey.Static("System.Threading.Thread", "Sleep", 1), static (ctx, a) => { var timeout = ValidateTimeout(a[0].AsInt32, "millisecondsTimeout"); SuspendHostWait(ctx, () => Thread.Sleep(timeout)); return null; });
+        r.RegisterBinding(BindingKey.Static("System.Threading.Thread", "Sleep", "System.TimeSpan"),
+            static (ctx, a) => { var timeout = ValidateTimeout(TimeSpanMilliseconds(a[0]), "timeout"); SuspendHostWait(ctx, () => Thread.Sleep(timeout)); return null; }, BindingOrigin.InternalCall);
+
+        // Monitor はゲストオブジェクト identity ごとの CLR Monitor を同期ブロックとして持つ。
+        // Enter の lockTaken overload も直接受け、CoreLib fast path / slow path に依存しない。
         const string T = "System.Threading.Monitor";
         r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath", "System.Object"),
-            static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
+            static (ctx, a) => { SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))); return StackSlot.OfInt32(1); }, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "TryEnter_FastPath_WithTimeout", "System.Object", "System.Int32"),
-            static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
+            static (ctx, a) => SuspendHostWait(ctx, () => Monitor.TryEnter(
+                ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")))
+                ? StackSlot.OfInt32(1) : StackSlot.OfInt32(2), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "Exit_FastPath", "System.Object"),
-            static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
+            static (ctx, a) => { ExitMonitor(ctx, a[0]); return StackSlot.OfInt32(0); }, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "IsEnteredNative", "System.Object"),
-            static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
+            static (ctx, a) => StackSlot.OfInt32(Monitor.IsEntered(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)) ? 1 : 0), BindingOrigin.InternalCall);
+
+        r.RegisterBinding(BindingKey.Static(T, "Enter", "System.Object"),
+            static (ctx, a) => { SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(T, "Enter", "System.Object", "System.Boolean&"),
+            static (ctx, a) => {
+                SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)));
+                WriteByRef(a[1], StackSlot.OfInt32(1));
+                return null;
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(T, "Exit", "System.Object"),
+            static (ctx, a) => { ExitMonitor(ctx, a[0]); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "TryEnter", "System.Boolean", ["System.Object"]),
+            static (ctx, a) => StackSlot.OfInt32(Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "TryEnter", "System.Boolean", ["System.Object", "System.Int32"]),
+            static (ctx, a) => StackSlot.OfInt32(SuspendHostWait(ctx,
+                () => Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout"))) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "TryEnter", "System.Boolean", ["System.Object", "System.Boolean&"]),
+            static (ctx, a) => {
+                var entered = Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue));
+                WriteByRef(a[1], StackSlot.OfInt32(entered ? 1 : 0));
+                return StackSlot.OfInt32(entered ? 1 : 0);
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "TryEnter", "System.Boolean", ["System.Object", "System.Int32", "System.Boolean&"]),
+            static (ctx, a) => {
+                var entered = SuspendHostWait(ctx,
+                    () => Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")));
+                WriteByRef(a[2], StackSlot.OfInt32(entered ? 1 : 0));
+                return StackSlot.OfInt32(entered ? 1 : 0);
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Wait", "System.Boolean", ["System.Object"]),
+            static (ctx, a) => StackSlot.OfInt32(SuspendHostWait(ctx, () => Monitor.Wait(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "Wait", "System.Boolean", ["System.Object", "System.Int32"]),
+            static (ctx, a) => StackSlot.OfInt32(SuspendHostWait(ctx, () => Monitor.Wait(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout"))) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(T, "Pulse", "System.Object"),
+            static (ctx, a) => { Monitor.Pulse(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(T, "PulseAll", "System.Object"),
+            static (ctx, a) => { Monitor.PulseAll(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "IsEntered", "System.Boolean", ["System.Object"]),
+            static (ctx, a) => StackSlot.OfInt32(Monitor.IsEntered(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)) ? 1 : 0), BindingOrigin.InternalCall);
+
+        // Fallback facade 経路 (LoadHostCoreLib=false) の legacy key 群。CoreLib ロード時は
+        // 上の署名バインドが優先される。
+        r.Register(IntrinsicKey.Static(T, "Enter", 1), static (ctx, a) => { SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))); return null; });
+        r.Register(IntrinsicKey.Static(T, "Enter", 2), static (ctx, a) => { SuspendHostWait(ctx, () => Monitor.Enter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue))); WriteByRef(a[1], StackSlot.OfInt32(1)); return null; });
+        r.Register(IntrinsicKey.Static(T, "Exit", 1), static (ctx, a) => { ExitMonitor(ctx, a[0]); return null; });
+        r.Register(IntrinsicKey.Static(T, "TryEnter", 1), static (ctx, a) => StackSlot.OfInt32(Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)) ? 1 : 0));
+        r.Register(IntrinsicKey.Static(T, "TryEnter", 2), static (ctx, a) => {
+            var sync = ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue);
+            var taken = a[1].Kind == StackKind.ByRef
+                ? Monitor.TryEnter(sync)
+                : SuspendHostWait(ctx, () => Monitor.TryEnter(sync, ValidateTimeout(a[1].AsInt32, "millisecondsTimeout")));
+            if (a[1].Kind == StackKind.ByRef)
+                WriteByRef(a[1], StackSlot.OfInt32(taken ? 1 : 0));
+            return StackSlot.OfInt32(taken ? 1 : 0);
+        });
+        r.Register(IntrinsicKey.Static(T, "TryEnter", 3), static (ctx, a) => { var taken = SuspendHostWait(ctx, () => Monitor.TryEnter(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue), ValidateTimeout(a[1].AsInt32, "millisecondsTimeout"))); WriteByRef(a[2], StackSlot.OfInt32(taken ? 1 : 0)); return StackSlot.OfInt32(taken ? 1 : 0); });
+        r.Register(IntrinsicKey.Static(T, "Pulse", 1), static (ctx, a) => { Monitor.Pulse(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)); return null; });
+        r.Register(IntrinsicKey.Static(T, "PulseAll", 1), static (ctx, a) => { Monitor.PulseAll(ctx.Shared.Monitors.SyncRoot(a[0].ObjectValue)); return null; });
+    }
+
+    // ---- System.Threading.Tasks.Task / async state machines ----
+
+    private static void RegisterTaskBindings(IntrinsicRegistry r) {
+        const string task = "System.Threading.Tasks.Task";
+        const string taskOfT = "System.Threading.Tasks.Task`1";
+        const string awaiter = "System.Runtime.CompilerServices.TaskAwaiter";
+        const string awaiterOfT = "System.Runtime.CompilerServices.TaskAwaiter`1";
+        const string builder = "System.Runtime.CompilerServices.AsyncTaskMethodBuilder";
+        const string builderOfT = "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1";
+
+        static VmTaskObject AsTask(in StackSlot slot) => slot.ObjectValue as VmTaskObject
+            ?? throw new UnhandledGuestException("System.InvalidOperationException", "Task の VM 実体がありません。");
+        static VmType FindType(IntrinsicContext ctx, string name) =>
+            (ctx.Types.IsTrustedCoreLib
+                ? (VmType?)ctx.Types.FindTypeByFullName(name) ?? ctx.Types.FindIntrinsicType(name)
+                : (VmType?)ctx.Types.FindIntrinsicType(name) ?? ctx.Types.FindTypeByFullName(name))
+            ?? throw new InvalidOperationException($"{name} type が見つかりません。");
+        static VmTaskObject NewTask(IntrinsicContext ctx, bool generic, VmType? resultType = null, bool completed = false,
+            StackSlot result = default) {
+            var taskDefinition = FindType(ctx, generic ? taskOfT : task);
+            VmType taskType = generic
+                ? new VmConstructedType {
+                    Definition = taskDefinition,
+                    TypeArguments = [resultType ?? ctx.ClassTypeArguments.FirstOrDefault()
+                        ?? ctx.Types.FindIntrinsicType("System.Object")!],
+                }
+                : taskDefinition;
+            return ctx.Heap.Allocate(ctx.Shared.GuestTasks.Create(taskType, completed, result));
+        }
+        static VmType AwaiterType(IntrinsicContext ctx, bool generic, VmType? resultType) {
+            var definition = FindType(ctx, generic ? awaiterOfT : awaiter);
+            return generic
+                ? new VmConstructedType { Definition = definition, TypeArguments = [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] }
+                : definition;
+        }
+        static VmTaskObject AwaitedTask(in StackSlot slot) {
+            var awaiterValue = slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef byRef
+                ? byRef.Read() : slot;
+            if (awaiterValue.Kind != StackKind.ValueType || awaiterValue.ObjectValue is not VmStructValue value || value.Fields.Length == 0)
+                throw new UnhandledGuestException("System.InvalidOperationException", "Task awaiter が初期化されていません。");
+            return AsTask(value.Fields[0]);
+        }
+        static VmStructValue BuilderValue(in StackSlot slot) {
+            var value = slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef byRef
+                ? byRef.Read() : slot;
+            return value.Kind == StackKind.ValueType && value.ObjectValue is VmStructValue builderValue
+                ? builderValue : throw new UnhandledGuestException("System.InvalidOperationException", "Async builder が初期化されていません。");
+        }
+        static VmTaskObject EnsureBuilderTask(IntrinsicContext ctx, StackSlot[] args) {
+            var builderValue = BuilderValue(args[0]);
+            if (builderValue.Fields.Length > 0 && builderValue.Fields[0].ObjectValue is VmTaskObject taskObject)
+                return taskObject;
+            var generic = builderValue.StructType.FullName == builderOfT;
+            var resultType = builderValue.TypeArguments.FirstOrDefault() ?? ctx.ClassTypeArguments.FirstOrDefault();
+            var newTask = NewTask(ctx, generic, resultType);
+            if (builderValue.Fields.Length == 0) {
+                var replacement = new VmStructValue(builderValue.StructType, [StackSlot.OfObject(newTask)], builderValue.TypeArguments);
+                if (args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef emptyDestination)
+                    emptyDestination.Write(StackSlot.OfValueType(replacement));
+                return newTask;
+            } else {
+                builderValue.Fields[0] = StackSlot.OfObject(newTask);
+            }
+            if (args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef destination)
+                destination.Write(StackSlot.OfValueType(builderValue));
+            return newTask;
+        }
+        static StackSlot TaskResult(IntrinsicContext ctx, VmTaskObject taskObject) {
+            if (!taskObject.IsCompleted)
+                SuspendHostWait(ctx, taskObject.Wait);
+            var result = taskObject.Snapshot();
+            if (result.GuestException.Kind != StackKind.Empty) {
+                var exceptionObject = result.GuestException.ObjectValue;
+                var typeName = exceptionObject switch {
+                    VmExceptionObject guestException => guestException.ExceptionType.FullName,
+                    VmClassInstance guestException => guestException.ClassType.FullName,
+                    VmIntrinsicInstance guestException => guestException.InstanceType.FullName,
+                    _ => "System.Exception",
+                };
+                throw new UnhandledGuestException(typeName, null);
+            }
+            if (result.HostException is not null)
+                throw result.HostException;
+            return result.Result;
+        }
+        static VmType? ResultType(IntrinsicContext ctx, bool fromMethod) => fromMethod
+            ? ctx.MethodTypeArguments.FirstOrDefault()
+            : ctx.ClassTypeArguments.FirstOrDefault();
+        static void RegisterTaskType(IntrinsicRegistry registry, string typeName, bool generic) {
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "get_IsCompleted"),
+                static (_, a) => StackSlot.OfInt32(AsTask(a[0]).IsCompleted ? 1 : 0), BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "GetAwaiter"),
+                (ctx, a) => {
+                    var objectTask = AsTask(a[0]);
+                    var resultType = generic ? ResultType(ctx, fromMethod: false) : null;
+                    return StackSlot.OfValueType(new VmStructValue(AwaiterType(ctx, generic, resultType),
+                        [StackSlot.OfObject(objectTask)], generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
+                }, BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "Wait"),
+                (ctx, a) => {
+                    var target = AsTask(a[0]);
+                    if (a.Length == 1) {
+                        SuspendHostWait(ctx, target.Wait);
+                        return null;
+                    }
+                    if (a.Length != 2)
+                        throw new UnhandledGuestException("System.NotSupportedException", "この Task.Wait overload は VM では未対応です。");
+                    var milliseconds = a[1].Kind == StackKind.Int32 ? a[1].AsInt32 : TimeSpanMilliseconds(a[1]);
+                    if (milliseconds < Timeout.Infinite)
+                        throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "timeout");
+                    return StackSlot.OfInt32(SuspendHostWait(ctx, () => target.Wait(milliseconds)) ? 1 : 0);
+                }, BindingOrigin.InternalCall);
+        }
+
+        RegisterTaskType(r, task, generic: false);
+        RegisterTaskType(r, taskOfT, generic: true);
+        r.RegisterBinding(BindingKey.InstanceAnyParams(taskOfT, "get_Result"),
+            static (ctx, a) => TaskResult(ctx, AsTask(a[0])), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(task, "get_CompletedTask"),
+            static (ctx, _) => StackSlot.OfObject(NewTask(ctx, generic: false, completed: true)), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(task, "Delay"),
+            static (ctx, a) => {
+                if (a.Length != 1)
+                    throw new UnhandledGuestException("System.NotSupportedException", "キャンセル対応 Task.Delay overload は VM では未対応です。");
+                var milliseconds = a[0].Kind == StackKind.Int32 ? a[0].AsInt32 : TimeSpanMilliseconds(a[0]);
+                if (milliseconds < Timeout.Infinite)
+                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "delay");
+                var delayed = NewTask(ctx, generic: false);
+                ctx.Shared.GuestTasks.Delay(delayed, milliseconds);
+                return StackSlot.OfObject(delayed);
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(task, "FromResult"),
+            static (ctx, a) => {
+                if (a.Length != 1)
+                    throw new UnhandledGuestException("System.NotSupportedException", "この Task.FromResult overload は VM では未対応です。");
+                return StackSlot.OfObject(NewTask(ctx, generic: true,
+                    ResultType(ctx, fromMethod: true), completed: true, result: a[0]));
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.StaticAnyParams(task, "Run"),
+            static (ctx, a) => {
+                if (a[0].ObjectValue is not VmDelegate guestDelegate)
+                    throw new UnhandledGuestException("System.ArgumentNullException", "function");
+                if (a.Length != 1)
+                    throw new UnhandledGuestException("System.NotSupportedException", "キャンセル対応 Task.Run overload は VM では未対応です。");
+                var resultType = ResultType(ctx, fromMethod: true);
+                var generic = resultType is not null;
+                var running = NewTask(ctx, generic, resultType);
+                var invoke = ctx.InvokeGuestDelegate ?? throw new InvalidOperationException("guest delegate runner が初期化されていません。");
+                ctx.Shared.GuestTasks.Run(running, [StackSlot.OfObject(running), a[0]], () => {
+                    var result = invoke(guestDelegate, [StackSlot.OfObject(guestDelegate)]) ?? default;
+                    if (result.ObjectValue is VmTaskObject nestedTask) {
+                        nestedTask.Wait();
+                        var nested = nestedTask.Snapshot();
+                        if (nested.GuestException.Kind != StackKind.Empty)
+                            throw new UnhandledGuestException("System.Exception", null);
+                        if (nested.HostException is not null)
+                            throw nested.HostException;
+                        return nested.Result;
+                    }
+                    return result;
+                });
+                return StackSlot.OfObject(running);
+            }, BindingOrigin.InternalCall);
+
+        foreach (var typeName in new[] { awaiter, awaiterOfT }) {
+            r.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "get_IsCompleted"),
+                static (_, a) => StackSlot.OfInt32(AwaitedTask(a[0]).IsCompleted ? 1 : 0), BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "GetResult"),
+                static (ctx, a) => TaskResult(ctx, AwaitedTask(a[0])), BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "OnCompleted"),
+                static (_, _) => null, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "UnsafeOnCompleted"),
+                static (_, _) => null, BindingOrigin.InternalCall);
+        }
+
+        RegisterBuilderType(r, builder, generic: false);
+        RegisterBuilderType(r, builderOfT, generic: true);
+
+        static void RegisterBuilderType(IntrinsicRegistry registry, string typeName, bool generic) {
+            registry.RegisterBinding(BindingKey.StaticAnyParams(typeName, "Create"),
+                (ctx, _) => {
+                    var resultType = generic ? ResultType(ctx, fromMethod: false) : null;
+                    var definition = FindType(ctx, typeName);
+                    VmType builderType = generic
+                        ? new VmConstructedType { Definition = definition, TypeArguments = [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] }
+                        : definition;
+                    return StackSlot.OfValueType(new VmStructValue(builderType, [default], generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
+                }, BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "get_Task"),
+                (ctx, a) => StackSlot.OfObject(EnsureBuilderTask(ctx, a)), BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "SetResult"),
+                (ctx, a) => {
+                    var target = EnsureBuilderTask(ctx, a);
+                    var result = generic && a.Length > 1 ? a[1] : default;
+                    ctx.Shared.GuestTasks.Complete(target, result);
+                    return null;
+                }, BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "SetException"),
+                (ctx, a) => {
+                    var target = EnsureBuilderTask(ctx, a);
+                    ctx.Shared.GuestTasks.CompleteGuestException(target, a.Length > 1 ? a[1] : default);
+                    return null;
+                }, BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "Start"),
+                (ctx, a) => {
+                    var run = ctx.RunGuestStateMachine ?? throw new InvalidOperationException("guest state machine runner が初期化されていません。");
+                    run(a[1]);
+                    return null;
+                }, BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "AwaitOnCompleted"),
+                (ctx, a) => RegisterContinuation(ctx, a), BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "AwaitUnsafeOnCompleted"),
+                (ctx, a) => RegisterContinuation(ctx, a), BindingOrigin.InternalCall);
+            registry.RegisterBinding(BindingKey.InstanceAnyParams(typeName, "SetStateMachine"),
+                static (_, _) => null, BindingOrigin.InternalCall);
+        }
+
+        static StackSlot? RegisterContinuation(IntrinsicContext ctx, StackSlot[] a) {
+            var awaited = AwaitedTask(a[1]);
+            var resume = ctx.RunGuestStateMachine ?? throw new InvalidOperationException("guest state machine runner が初期化されていません。");
+            ctx.Shared.GuestTasks.ScheduleContinuation(awaited, a[2], resume);
+            return null;
+        }
+    }
+
+    private static int TimeSpanMilliseconds(StackSlot slot) {
+        var value = slot.ObjectValue switch {
+            VmStructValue vm => vm,
+            VmByRef byRef when byRef.Read().ObjectValue is VmStructValue vm => vm,
+            _ => throw new UnhandledGuestException("System.ArgumentException", "TimeSpan value is not available."),
+        };
+        long ticks = 0;
+        if (value.Fields.Length > 0)
+            ticks = value.Fields[0].Int64Value;
+        if (ticks == -TimeSpan.TicksPerMillisecond)
+            return Timeout.Infinite;
+        if (ticks < 0)
+            return -2;
+        return (int)Math.Min(int.MaxValue, (ticks + TimeSpan.TicksPerMillisecond - 1) / TimeSpan.TicksPerMillisecond);
+    }
+
+    private static int ValidateTimeout(int milliseconds, string parameterName) => milliseconds >= Timeout.Infinite
+        ? milliseconds
+        : throw new UnhandledGuestException("System.ArgumentOutOfRangeException", parameterName);
+
+    private static void SuspendHostWait(IntrinsicContext context, Action wait) {
+        if (context.SuspendExecution is { } suspend)
+            suspend(wait);
+        else
+            wait();
+    }
+
+    private static T SuspendHostWait<T>(IntrinsicContext context, Func<T> wait) {
+        T result = default!;
+        SuspendHostWait(context, () => result = wait());
+        return result;
+    }
+
+    private static void WriteByRef(StackSlot byRefSlot, StackSlot value) {
+        if (byRefSlot.ObjectValue is VmByRef byRef)
+            byRef.Write(value);
+        else
+            throw new UnhandledGuestException("System.ArgumentException", "A writable byref argument is required.");
+    }
+
+    private static void ExitMonitor(IntrinsicContext context, StackSlot target) {
+        try {
+            Monitor.Exit(context.Shared.Monitors.SyncRoot(target.ObjectValue));
+        } catch (SynchronizationLockException) {
+            throw new UnhandledGuestException("System.Threading.SynchronizationLockException", null);
+        }
     }
 
     // ---- System.String (culture 依存面のバインド: 署名キーで ② IL より先に解決される) ----
@@ -2849,7 +3232,7 @@ internal static class CoreLibBindings {
         if (slot.Kind == StackKind.Object && slot.ObjectValue is VmNativePointer directNative)
             return (directNative, null);
         if (slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef outer) {
-            var target = outer.Slot; // 指し先スロットの値
+            var target = outer.Read(); // 指し先スロットの値
             if (target.Kind == StackKind.ByRef && target.ObjectValue is VmByRef inner)
                 return (null, inner); // ② アドレス先スロットに格納された byref 値
             if (target.Kind == StackKind.Object && target.ObjectValue is VmNativePointer innerNative)
@@ -3376,7 +3759,7 @@ internal static class CoreLibBindings {
     /// PlatformNotSupportedException()) のため、② IL 実行に落ちるとダミー本体が表出する。
     /// 実 CLR では JIT が命令列へ置換するため IL は決して実行されない (監査表 (c) jit-intrinsic)。
     /// legacy intrinsic (③) は IL 本体なしの面しか受けないため、ここに ① バインドで登録する。
-    /// VM は単一スレッドで走るため比較と交換は逐次実行で競合なし (意味論は CLR と同一)。</summary>
+    /// VM の共有 atomic gate と参照スロットロックで比較と交換を原子的に行う (CLR と同じ意味論)。</summary>
     private static void RegisterInterlockedBindings(IntrinsicRegistry r) {
         const string T = "System.Threading.Interlocked";
         static VmByRef Location(StackSlot slot, string method) =>
@@ -3471,7 +3854,7 @@ internal static class CoreLibBindings {
             if (equal)
                 loc.Slot = a[1];
             if (a.Length >= 4 && a[3].ObjectValue is VmByRef succeeded)
-                succeeded.Slot = StackSlot.OfInt32(equal ? 1 : 0);
+                succeeded.Write(StackSlot.OfInt32(equal ? 1 : 0));
             return original;
         });
         var addImpl = (IntrinsicImpl)((_, a) => {
@@ -3491,9 +3874,9 @@ internal static class CoreLibBindings {
         RegExchangeFamily(r, T, exchangeImpl, compareExchange, addImpl);
 
         // 参照型 CompareExchange<T>/Exchange<T> ( CultureInfo 初期化等の lock-free 起動経路)。
-        // 本家はジェネリック面のため開いたキー (!!0) で 1 件ずつ登録する。VM は単一スレッド
-        // 逐次実行のため参照同一性 (SlotEquals の ReferenceEquals 側) での比較と交換が
-        // CLR と同一意味論。値型の具体面は上の正確キーが先に一致する
+        // 本家はジェネリック面のため開いたキー (!!0) で 1 件ずつ登録する。共有 atomic gate
+        // の中で参照同一性 (SlotEquals の ReferenceEquals 側) による比較交換を行う。
+        // 値型の具体面は上の正確キーが先に一致する
         r.RegisterBinding(BindingKey.Static(T, "Exchange", "!!0&", "!!0"),
             exchangeImpl, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(T, "CompareExchange", "!!0&", "!!0", "!!0"),
@@ -3531,11 +3914,11 @@ internal static class CoreLibBindings {
         RegAndOrFamily(r, T, "And", andImpl);
         RegAndOrFamily(r, T, "Or", orImpl);
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "MemoryBarrier", "System.Void", Array.Empty<string>()),
-            static (_, _) => null, BindingOrigin.InternalCall);
+            static (_, _) => { Thread.MemoryBarrier(); return null; }, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "ReadMemoryBarrier", "System.Void", []),
-            static (_, _) => null, BindingOrigin.InternalCall);
+            static (_, _) => { Thread.MemoryBarrier(); return null; }, BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "WriteMemoryBarrier", "System.Void", []),
-            static (_, _) => null, BindingOrigin.InternalCall);
+            static (_, _) => { Thread.MemoryBarrier(); return null; }, BindingOrigin.InternalCall);
     }
 
     private static StackSlot GetEnvironmentVariableImpl(IntrinsicContext ctx, StackSlot[] a) {

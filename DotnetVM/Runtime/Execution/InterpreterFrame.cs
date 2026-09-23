@@ -19,6 +19,16 @@ public sealed class VmByRef {
     }
 
     public ref StackSlot Slot => ref Container[Index];
+
+    public StackSlot Read() {
+        lock (Container)
+            return Container[Index];
+    }
+
+    public void Write(in StackSlot value) {
+        lock (Container)
+            Container[Index] = value;
+    }
 }
 
 /// <summary>

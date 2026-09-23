@@ -18,6 +18,7 @@ public sealed class TypeLoader {
     internal const uint Contravariant = 0x0002;
 
     private readonly AssemblyImage _image;
+    private static readonly object MetadataGate = new();
 
     /// <summary>ロード対象のアセンブリ。</summary>
     public AssemblyImage Image => _image;
@@ -125,6 +126,22 @@ public sealed class TypeLoader {
         Add(@delegate);
         var multicastDelegate = new VmIntrinsicType { Namespace = "System", Name = "MulticastDelegate", IsValue = false, Parent = @delegate };
         Add(multicastDelegate);
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadStart", IsValue = false, Parent = multicastDelegate });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ParameterizedThreadStart", IsValue = false, Parent = multicastDelegate });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Thread", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Monitor", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadState", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadPriority", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "SynchronizationLockException", IsValue = false, Parent = systemException });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Interlocked", IsValue = false });
+        var task = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task", IsValue = false, Parent = @object };
+        Add(task);
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task`1", IsValue = false, Parent = task }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter`1", IsValue = true, Parent = valueType }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncTaskMethodBuilder", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncTaskMethodBuilder`1", IsValue = true, Parent = valueType }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "IAsyncStateMachine", IsValue = false });
         foreach (var arity in Enumerable.Range(0, 17))
             Add(new VmIntrinsicType { Namespace = "System", Name = arity == 0 ? "Action" : $"Action`{arity}", IsValue = false, Parent = multicastDelegate },
                 Enumerable.Repeat(0u, arity).ToArray());
@@ -195,6 +212,11 @@ public sealed class TypeLoader {
 
     /// <summary>TypeDef rid をロードする (ロード済みならキャッシュを返す)。</summary>
     public VmClassType GetTypeDef(int typeDefRid) {
+        lock (MetadataGate)
+            return GetTypeDefCore(typeDefRid);
+    }
+
+    private VmClassType GetTypeDefCore(int typeDefRid) {
         if (_typeDefs.TryGetValue(typeDefRid, out var cached))
             return cached;
 
@@ -326,6 +348,11 @@ public sealed class TypeLoader {
 
     /// <summary>保留中の型の基底型/インターフェース/フィールド型を解決する。全型解決後に 1 回呼ぶ。</summary>
     public void CompletePendingTypes() {
+        lock (MetadataGate)
+            CompletePendingTypesCore();
+    }
+
+    private void CompletePendingTypesCore() {
         // スタックで処理 (CompleteType 内の GetTypeDef が再入して依存型を完了させるため、
         // 二重完了にならないよう完了済みセットで守る)
         while (_pendingCompletion.Count > 0) {
@@ -372,13 +399,18 @@ public sealed class TypeLoader {
     // ---- SigType → VmType 解決 ----
 
     /// <summary>署名中の型を VmType に解決し、ジェネリックパラメータを context の実引数で置換する。</summary>
-    public VmType ResolveToken(SigType sigType, GenericContext? context) =>
-        GenericSubstitutor.Substitute(ResolveToken(sigType), context);
+    public VmType ResolveToken(SigType sigType, GenericContext? context) {
+        lock (MetadataGate)
+            return GenericSubstitutor.Substitute(ResolveToken(sigType), context);
+    }
 
     /// <summary>署名中の型を VmType に解決する。ジェネリックパラメータは置換コンテキストがないため
     /// VmGenericParameterType をそのまま返す (インタプリタは ResolveToken(sigType, context) を使う)。
     /// GenericInst の解決時にもネスト上限を強制する (TypeSpec 連鎖の再帰対策)。</summary>
-    public VmType ResolveToken(SigType sigType) => ResolveTokenWithDepth(sigType, 0);
+    public VmType ResolveToken(SigType sigType) {
+        lock (MetadataGate)
+            return ResolveTokenWithDepth(sigType, 0);
+    }
 
     private VmType ResolveTokenWithDepth(SigType sigType, int genericDepth) => sigType.Kind switch {
         SigKind.TypeToken => ResolveTypeDefOrRefToken(sigType.Token),
@@ -449,6 +481,11 @@ public sealed class TypeLoader {
     /// <summary>TypeSpec rid を解決する (ジェネリックパラメータは context の実引数で置換)。
     /// GenericInst のネスト深度は署名デコード時と解決時の双方で強制する。</summary>
     public VmType ResolveTypeSpec(int typeSpecRid, GenericContext? context = null) {
+        lock (MetadataGate)
+            return ResolveTypeSpecCore(typeSpecRid, context);
+    }
+
+    private VmType ResolveTypeSpecCore(int typeSpecRid, GenericContext? context) {
         var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
         var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray(),
             _image.Limits?.MaxSignatureDepth ?? 64,
@@ -660,6 +697,11 @@ public sealed class TypeLoader {
 
     /// <summary>MethodDef トークン (0x06xxxxxx) を VmMethod に解決する。所有 TypeDef を MethodList 範囲走査で特定する。</summary>
     public VmMethod? GetMethodByToken(uint token) {
+        lock (MetadataGate)
+            return GetMethodByTokenCore(token);
+    }
+
+    private VmMethod? GetMethodByTokenCore(uint token) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table != TableKind.MethodDef)
@@ -681,6 +723,11 @@ public sealed class TypeLoader {
     /// <summary>TypeDef のフルネームで型を検索する (ネスト型は "Outer/Inner"、独自表記は "Outer.Inner")。
     /// 最初の呼び出しで完全名索引を 1 回だけ構築する (CoreLib 規模の画像での線形走査を避ける)。</summary>
     public VmClassType? FindTypeByFullName(string fullName) {
+        lock (MetadataGate)
+            return FindTypeByFullNameCore(fullName);
+    }
+
+    private VmClassType? FindTypeByFullNameCore(string fullName) {
         if (_typeDefByFullName is null) {
             var index = new Dictionary<string, int>(StringComparer.Ordinal);
             var count = _image.Tables.GetRowCount(TableKind.TypeDef);
@@ -704,6 +751,7 @@ public sealed class TypeLoader {
 
     /// <summary>名前 (末尾要素) で TypeDef を検索する。</summary>
     public VmClassType? FindTypeByName(string name) {
+        lock (MetadataGate) {
         var count = _image.Tables.GetRowCount(TableKind.TypeDef);
         for (var rid = 1; rid <= count; rid++) {
             var (_, typeName) = _image.GetTypeDefName(rid);
@@ -711,10 +759,16 @@ public sealed class TypeLoader {
                 return GetTypeDef(rid);
         }
         return null;
+        }
     }
 
     /// <summary>Field トークン (0x04xxxxxx) を VmField に解決する。</summary>
     public VmField? GetFieldByToken(uint token) {
+        lock (MetadataGate)
+            return GetFieldByTokenCore(token);
+    }
+
+    private VmField? GetFieldByTokenCore(uint token) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table != TableKind.Field)
@@ -779,7 +833,8 @@ public sealed class TypeLoader {
     /// 他アセンブリの型はそのローダのビルダに委譲する (索引は画像ごとに分かれる)。</summary>
     internal DispatchMaps EnsureDispatchMaps(VmClassType type) {
         var owner = type.Loader;
-        return owner is null || ReferenceEquals(owner, this) ? DispatchBuilder.EnsureMaps(type) : owner.EnsureDispatchMaps(type);
+        lock (MetadataGate)
+            return owner is null || ReferenceEquals(owner, this) ? DispatchBuilder.EnsureMaps(type) : owner.EnsureDispatchMaps(type);
     }
 
     /// <summary>スロットキー用にパラメータ型列 (SigType) を VmType 列へ解決する。
@@ -803,6 +858,11 @@ public sealed class TypeLoader {
     /// 注意: 非 trusted 画像を含む global 統合は新規コードでは使わないこと。
     /// 新規は TryResolveTrustedUnifiedType (trusted 限定) を使う。</summary>
     public VmType? TryResolveUnifiedType(string fullName) {
+        lock (MetadataGate)
+            return TryResolveUnifiedTypeCore(fullName);
+    }
+
+    private VmType? TryResolveUnifiedTypeCore(string fullName) {
         if (_unifiedTypes.TryGetValue(fullName, out var cached))
             return cached;
         if (Context is not { } context)
@@ -827,6 +887,11 @@ public sealed class TypeLoader {
     /// BCL の参照アセンブリ→実装の統合はここに限定する (非 trusted なゲスト画像同士は
     /// 統合しない)。プリミティブ等の既知型や ResolveViaAssemblyRef の最終救済に使う。</summary>
     public VmType? TryResolveTrustedUnifiedType(string fullName) {
+        lock (MetadataGate)
+            return TryResolveTrustedUnifiedTypeCore(fullName);
+    }
+
+    private VmType? TryResolveTrustedUnifiedTypeCore(string fullName) {
         if (_unifiedTypes.TryGetValue(fullName, out var cached) && cached is VmClassType cachedCls &&
             cachedCls.Loader?.IsTrustedCoreLib == true)
             return cached;

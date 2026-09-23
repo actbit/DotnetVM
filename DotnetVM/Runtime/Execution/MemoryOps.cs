@@ -49,7 +49,9 @@ internal static class MemoryOps {
         var index = frame.Stack.Pop().AsInt32;
         var array = GetArray(frame.Stack.Pop());
         CheckArrayBounds(array, index);
-        var slot = array.Elements[index];
+        StackSlot slot;
+        lock (array.Elements)
+            slot = array.Elements[index];
         return kind switch {
             ArrayElementKind.Int32 => StackSlot.OfInt32((int)slot.Int64Value),
             ArrayElementKind.Int64 => StackSlot.OfInt64(slot.Int64Value),
@@ -71,12 +73,13 @@ internal static class MemoryOps {
             throw new UnhandledGuestException("System.ArrayTypeMismatchException",
                 $"{SlotOps.Describe(value)} を {array.ArrayType.ElementType.FullName}[] に格納できません。");
 
-        array.Elements[index] = kind switch {
-            ArrayElementKind.Int32 => StackSlot.OfInt32((int)value.Int64Value),
-            ArrayElementKind.Int64 => StackSlot.OfInt64(value.Int64Value),
-            ArrayElementKind.Float => StackSlot.OfFloat(value.DoubleValue),
-            _ => value,
-        };
+        lock (array.Elements)
+            array.Elements[index] = kind switch {
+                ArrayElementKind.Int32 => StackSlot.OfInt32((int)value.Int64Value),
+                ArrayElementKind.Int64 => StackSlot.OfInt64(value.Int64Value),
+                ArrayElementKind.Float => StackSlot.OfFloat(value.DoubleValue),
+                _ => value,
+            };
     }
 
     // ---- 生メモリ系 (cpblk / initblk) ----
@@ -184,19 +187,23 @@ internal static class MemoryOps {
         // CLR は callvirt 時に unbox 済み this ポインタを渡すが、VM は box をそのまま渡すため
         // ここで unbox + 読み出しに落とす (IConvertible EII のプリミティブ / enum 基底型面)
         if (address.ObjectValue is VmBoxedValue boxed) {
-            return op switch {
-                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(boxed.Fields[0].Int64Value),
-                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(boxed.Fields[0].DoubleValue),
-                ILOp.Ldind_Ref => boxed.Fields[0],
-                _ => StackSlot.OfInt32((int)boxed.Fields[0].Int64Value), // I1〜U4 は i4 正規化スロット
-            };
+            lock (boxed.Fields) {
+                var slot = boxed.Fields[0];
+                return op switch {
+                    ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
+                    ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
+                    ILOp.Ldind_Ref => slot,
+                    _ => StackSlot.OfInt32((int)slot.Int64Value), // I1〜U4 は i4 正規化スロット
+                };
+            }
         }
         if (address.ObjectValue is VmByRef byRef) {
+            var slot = byRef.Read();
             return op switch {
-                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(byRef.Slot.Int64Value),
-                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(byRef.Slot.DoubleValue),
-                ILOp.Ldind_Ref => byRef.Slot,
-                _ => StackSlot.OfInt32((int)byRef.Slot.Int64Value), // I1〜U4 は i4 正規化スロット
+                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
+                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
+                ILOp.Ldind_Ref => slot,
+                _ => StackSlot.OfInt32((int)slot.Int64Value), // I1〜U4 は i4 正規化スロット
             };
         }
         throw new InvalidOperationException($"ldind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
@@ -220,21 +227,22 @@ internal static class MemoryOps {
             throw new UnhandledGuestException("System.NullReferenceException", null);
         // ボックス実体への書き込みの緩和 (LoadIndirect と対。box が指す先 = Fields[0] を更新する)
         if (address.ObjectValue is VmBoxedValue boxed) {
-            boxed.Fields[0] = op switch {
-                ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
-                ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
-                ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
-                _ => StackSlot.OfInt32((int)value.Int64Value),
-            };
+            lock (boxed.Fields)
+                boxed.Fields[0] = op switch {
+                    ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
+                    ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                    ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
+                    _ => StackSlot.OfInt32((int)value.Int64Value),
+                };
             return;
         }
         if (address.ObjectValue is VmByRef byRef) {
-            byRef.Slot = op switch {
+            byRef.Write(op switch {
                 ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
                 ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
                 ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
                 _ => StackSlot.OfInt32((int)value.Int64Value),
-            };
+            });
             return;
         }
         throw new InvalidOperationException($"stind のアドレスがポインタではありません: {SlotOps.Describe(address)}");

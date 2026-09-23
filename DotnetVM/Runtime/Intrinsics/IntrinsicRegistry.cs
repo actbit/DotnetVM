@@ -25,6 +25,15 @@ public readonly record struct IntrinsicKey(string TypeFullName, string MethodNam
 /// </summary>
 public sealed class IntrinsicContext {
     private static readonly ConditionalWeakTable<object, Box> IdentityHashes = [];
+    private sealed class InvocationMetadata {
+        public string[] Parameters = [];
+        public string[] MethodArguments = [];
+        public string[] ClassArguments = [];
+        public VmType[] MethodTypes = [];
+        public VmType[] ClassTypes = [];
+    }
+    private readonly ThreadLocal<InvocationMetadata> _metadata = new(() => new InvocationMetadata());
+    private readonly object _arrayTypeGate = new();
 
     /// <summary>仮想コンソールデバイス (ホスト物理 I/O ではなくここへ出る)。</summary>
     public required VmConsole Console { get; init; }
@@ -53,17 +62,20 @@ public sealed class IntrinsicContext {
     /// i4 スロットに統合される char / bool / int 等のオーバーロードを intrinsic 側で
     /// 判別するために使う (例: Console.Write(char) と Console.Write(int) は同一キー)。
     /// </summary>
-    public string[] ParameterTypeNames { get; internal set; } = [];
+    public string[] ParameterTypeNames { get => _metadata.Value!.Parameters; internal set => _metadata.Value!.Parameters = value; }
 
     /// <summary>呼出ゲート (CallEngine.TryInvokeBinding) が設定する「今回の呼出のメソッド型実引数名」。
     /// ジェネリック メソッドのバインド (IsReferenceOrContainsReferences&lt;T&gt;() 等の値パラメータ
     /// 0 個の面) で T を判別するために使う。</summary>
-    public string[] MethodTypeArgumentNames { get; internal set; } = [];
+    public string[] MethodTypeArgumentNames { get => _metadata.Value!.MethodArguments; internal set => _metadata.Value!.MethodArguments = value; }
 
     /// <summary>呼出ゲートが設定する「今回の呼出のクラス型実引数名」 (構築型の !0 等)。
     /// EqualityComparer&lt;T&gt;.get_Default 等の値パラメータ 0 個のクラスジェネリック面で
     /// T を判別するために使う (MethodSpec の !!n とは別軸)。</summary>
-    public string[] ClassTypeArgumentNames { get; internal set; } = [];
+    public string[] ClassTypeArgumentNames { get => _metadata.Value!.ClassArguments; internal set => _metadata.Value!.ClassArguments = value; }
+
+    internal VmType[] MethodTypeArguments { get => _metadata.Value!.MethodTypes; set => _metadata.Value!.MethodTypes = value; }
+    internal VmType[] ClassTypeArguments { get => _metadata.Value!.ClassTypes; set => _metadata.Value!.ClassTypes = value; }
 
     /// <summary>クラス型実引数のインデックス名 (範囲外は空文字列)。</summary>
     public string ClassTypeArgAt(int i) =>
@@ -85,6 +97,19 @@ public sealed class IntrinsicContext {
     /// <summary>MethodBase.GetCurrentMethod() 用の現在メソッド取得フック (Interpreter が設定)。</summary>
     internal Func<VmMethod?>? CurrentMethodHook { get; set; }
 
+    /// <summary>Guest Thread が delegate を VM の呼出ゲート経由で実行するためのフック。</summary>
+    internal Action<VmDelegate, StackSlot, bool>? RunGuestThreadDelegate { get; set; }
+
+    internal Func<VmDelegate, StackSlot[], StackSlot?>? InvokeGuestDelegate { get; set; }
+
+    internal Action<StackSlot>? RunGuestStateMachine { get; set; }
+
+    /// <summary>Blocking host waits release VM execution leases so other guest threads can run.</summary>
+    internal Action<Action>? SuspendExecution { get; set; }
+
+    /// <summary>Temporarily roots intrinsic arguments while the guest execution lease is yielded.</summary>
+    internal Func<StackSlot[], IDisposable>? RegisterTransientRoots { get; set; }
+
     /// <summary>インスタンス生成フック (Activator.CreateInstance 等が .ctor を実行する用)。
     /// 定義型 + 実行する .ctor + 引数 + ジェネリック文脈を受け、確保＋初期化＋.ctor 実行済みの
     /// インスタンスを返す。ゲートは呼出側 intrinsic が既に通過済みで、.ctor 本体は
@@ -102,13 +127,16 @@ public sealed class IntrinsicContext {
     private VmArrayType? _stringArrayType;
     private VmArrayType? _objectArrayType;
 
-    private VmArrayType ArrayTypeOf(string intrinsicTypeFullName, ref VmArrayType? cache) =>
-        cache ??= new VmArrayType { ElementType = Types.FindIntrinsicType(intrinsicTypeFullName)
-            ?? throw new InvalidOperationException($"ファサード型 {intrinsicTypeFullName} が未登録です。") };
+    private VmArrayType ArrayTypeOf(string intrinsicTypeFullName, ref VmArrayType? cache) {
+        lock (_arrayTypeGate)
+            return cache ??= new VmArrayType { ElementType = Types.FindIntrinsicType(intrinsicTypeFullName)
+                ?? throw new InvalidOperationException($"ファサード型 {intrinsicTypeFullName} が未登録です。") };
+    }
 
     /// <summary>byte 配列を VM オブジェクト (VmArray) に正規化して作る (ヒープ計上済み)。</summary>
     public VmArray MakeByteArray(ReadOnlySpan<byte> data) {
-        _byteArrayType ??= new VmArrayType { ElementType = Types.FindIntrinsicType("System.Byte")! };
+        lock (_arrayTypeGate)
+            _byteArrayType ??= new VmArrayType { ElementType = Types.FindIntrinsicType("System.Byte")! };
         var elements = new StackSlot[data.Length];
         for (var i = 0; i < data.Length; i++)
             elements[i] = StackSlot.OfInt32(data[i]);
@@ -149,11 +177,13 @@ public sealed class IntrinsicContext {
         if (value is null)
             return 0;
         var box = IdentityHashes.GetOrCreateValue(value);
-        if (!box.Assigned) {
-            box.Value = System.HashCode.Combine(RuntimeHelpers.GetHashCode(value));
-            box.Assigned = true;
+        lock (box) {
+            if (!box.Assigned) {
+                box.Value = System.HashCode.Combine(RuntimeHelpers.GetHashCode(value));
+                box.Assigned = true;
+            }
+            return box.Value;
         }
-        return box.Value;
     }
 
     private static readonly ConditionalWeakTable<VmClassInstance, StrongBox<VmString?>> ExceptionMessages = [];
@@ -164,15 +194,20 @@ public sealed class IntrinsicContext {
     /// </summary>
     public static void SetExceptionMessage(VmClassInstance instance, VmString? message) {
         var box = ExceptionMessages.GetOrCreateValue(instance);
-        box.Value = message;
+        lock (box)
+            box.Value = message;
     }
 
     /// <summary>
     /// Exception 派生のゲストクラスのインスタンスからメッセージを取り出す
     /// (get_Message intrinsic 用)。未記録なら null。
     /// </summary>
-    public static VmString? GetExceptionMessage(VmClassInstance instance) =>
-        ExceptionMessages.TryGetValue(instance, out var box) ? box.Value : null;
+    public static VmString? GetExceptionMessage(VmClassInstance instance) {
+        if (!ExceptionMessages.TryGetValue(instance, out var box))
+            return null;
+        lock (box)
+            return box.Value;
+    }
 
     private sealed class StrongBox<T> {
         public T? Value;

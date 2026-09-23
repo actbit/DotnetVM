@@ -24,15 +24,21 @@ public sealed class VirtualMachine : IDisposable {
     private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
     private readonly VmAssemblyContext _context;
-    private readonly VmSharedState _sharedState = new();
+    private readonly VmSharedState _sharedState;
+    private readonly object _interpreterGate = new();
     private Interpreter? _interpreter;
     private VmCoreLibSurfaces? _coreLibSurfaces;
     private VmClassType? _stringType;
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
+        if (_options.MaxGuestThreads < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestThreads は 1 以上である必要があります。");
+        _sharedState = new VmSharedState(_options.MaxGuestThreads);
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
+        _heap.AddRootObjectSource(_sharedState.GuestThreads.EnumerateRoots);
+        _heap.AddRootSlotSource(_sharedState.GuestTasks.EnumerateRoots);
         _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
         _context = new VmAssemblyContext(LoadDependencyAssembly);
@@ -108,7 +114,7 @@ public sealed class VirtualMachine : IDisposable {
     internal StorageGateway Storage => _storage;
 
     /// <summary>GC を起動し統計を返す (通常はアロケーション間隔で自動起動。明示起動はホスト用)。</summary>
-    public GcStatistics CollectGarbage() => RunGuest(_heap.Collect);
+    public GcStatistics CollectGarbage() => RunGuest(() => GetInterpreter().CollectGarbage());
 
     /// <summary>ロード済みアセンブリの型ローダ。</summary>
     public IReadOnlyList<TypeLoader> Loaders => _loaders;
@@ -201,6 +207,7 @@ public sealed class VirtualMachine : IDisposable {
         var type = FindType(typeFullName);
         var ctor = FindConstructor(type, args.Length);
         var interpreter = GetInterpreter();
+        using var operation = interpreter.EnterHostOperation();
         var ctorArgs = new StackSlot[args.Length];
         for (var i = 0; i < args.Length; i++)
             ctorArgs[i] = ToSlot(args[i], ctor.Signature.ParamTypes[i], interpreter);
@@ -211,6 +218,7 @@ public sealed class VirtualMachine : IDisposable {
     public object? CallInstance(VmClassInstance instance, string methodName, params object?[] args) {
         var method = FindInstanceMethod(instance.ClassType, methodName, args.Length);
         var interpreter = GetInterpreter();
+        using var operation = interpreter.EnterHostOperation();
         var slots = new StackSlot[args.Length + 1];
         slots[0] = StackSlot.OfObject(instance);
         for (var i = 0; i < args.Length; i++)
@@ -230,17 +238,18 @@ public sealed class VirtualMachine : IDisposable {
             throw new ArgumentException($"引数個数が一致しません ({method}: 期待 {signature.ParamTypes.Length}, 実際 {args.Length})。");
 
         var interpreter = GetInterpreter();
+        using var operation = interpreter.EnterHostOperation();
         var slots = new StackSlot[args.Length];
         for (var i = 0; i < args.Length; i++)
             slots[i] = ToSlot(args[i], signature.ParamTypes[i], interpreter);
 
-        var countBefore = interpreter.InstructionCount;
+        var countBefore = interpreter.CurrentThreadInstructionCount;
         return RunGuest(() => {
             var result = interpreter.Invoke(method, slots);
             return new ExecutionResult(
                 FromSlot(result, method.Signature.ReturnType),
                 _console.OutputLog,
-                interpreter.InstructionCount - countBefore);
+                interpreter.CurrentThreadInstructionCount - countBefore);
         });
     }
 
@@ -308,9 +317,11 @@ public sealed class VirtualMachine : IDisposable {
     public string? GetVirtualEnvironmentVariable(string name) =>
         _sharedState.VirtualEnvironment.TryGetValue(name, out var value) ? value : null;
 
-    private Interpreter GetInterpreter() =>
-        _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
-            _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState);
+    private Interpreter GetInterpreter() {
+        lock (_interpreterGate)
+            return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
+                _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState);
+    }
 
     /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
     /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>

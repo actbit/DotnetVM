@@ -188,8 +188,11 @@ dotnet test DotnetVM.Tests
 - [x] C4: ランタイムバインド層 (BindingKey + BindingOrigin / 優先順位 ①〜④ / CoreLib InternalCall・JIT intrinsic 面のバインド)
 - [x] C5: CoreLib IL 実行の全面化 + 差分テスト (String/整数 ToString・Parse/Convert/Math の IL 実行、ExecutionTracer で IL 実行証明、VM CoreLib (DotnetVM.CoreLib) 置換面、newobj string 構築面、例外既定文言のホスト CLR 委譲)
 - [x] C5.5: CoreLib 委譲面の全面監査 (分類ゼロ構造保証: RealCoreLibIl / VmCoreLibSubstitute / RuntimeInternal / Device + 正当化タグ)。Convert(object) / Enum IConvertible / 整数・浮動小数点書式・Parse / String ordinal・Split・Format 面を実 CoreLib IL または DotnetVM.CoreLib 置換 IL へ移行、culture 面 (Compare / 大文字小文字等) は不変カルチャ規約で監査確定
-- [ ] C6: ゲストスレッド対応 (スレッドモデル + Monitor の真の競合・ブロッキング。現行の Monitor バインドは単一スレッド前提の暫定ファサード)
+- [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
+- [x] C6.1: Task / async-await (Task / Task<T>、Delay / Run / FromResult、Task awaiter、AsyncTaskMethodBuilder と継続 state machine)
 - [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
 - [ ] M9: デバッガ / 実行トレース
+
+C6.1 は `Task` / `Task<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` に対応する。キャンセル token、`ValueTask`、`ConfigureAwait`、独自 awaiter は未対応。
 
 プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。同梱の DotnetVM.CoreLib も依存ゼロのクラスライブラリで、VM の置換面として DotnetVM.dll と同じディレクトリに配置される。

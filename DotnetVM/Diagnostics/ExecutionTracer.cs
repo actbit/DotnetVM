@@ -14,30 +14,37 @@ public readonly record struct ExecutionFrame(string AssemblyName, string TypeFul
 /// </summary>
 public sealed class ExecutionTracer {
     private readonly List<ExecutionFrame> _frames = [];
+    private readonly object _gate = new();
 
     /// <summary>記録済みフレーム (記録順)。読み取り専用ビュー。</summary>
-    public IReadOnlyList<ExecutionFrame> Frames => _frames;
+    public IReadOnlyList<ExecutionFrame> Frames { get { lock (_gate) return _frames.ToArray(); } }
 
     /// <summary>記録の有効化状態。Start() で true になり Stop() で false になる。</summary>
     public bool Enabled { get; private set; }
 
     /// <summary>記録を開始する (既存の記録はクリア)。</summary>
     public void Start() {
-        _frames.Clear();
-        Enabled = true;
+        lock (_gate) {
+            _frames.Clear();
+            Enabled = true;
+        }
     }
 
     /// <summary>記録を停止する (既存の記録は保持)。</summary>
-    public void Stop() => Enabled = false;
+    public void Stop() { lock (_gate) Enabled = false; }
 
     /// <summary>指定アセンブリの指定メソッドが実行されたか (IL 実行の証明に使う)。</summary>
-    public bool ContainsFrame(string assemblyName, string typeFullName, string methodName) =>
-        _frames.Any(f => f.AssemblyName == assemblyName &&
-                         f.TypeFullName == typeFullName && f.MethodName == methodName);
+    public bool ContainsFrame(string assemblyName, string typeFullName, string methodName) {
+        lock (_gate)
+            return _frames.Any(f => f.AssemblyName == assemblyName &&
+                                    f.TypeFullName == typeFullName && f.MethodName == methodName);
+    }
 
     /// <summary>Interpreter がフレーム開始時に呼ぶ (internal: VM 本体からの記録のみ)。</summary>
     internal void Record(string assemblyName, string typeFullName, string methodName) {
-        if (Enabled)
-            _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
+        lock (_gate) {
+            if (Enabled)
+                _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
+        }
     }
 }

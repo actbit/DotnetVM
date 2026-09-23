@@ -19,6 +19,7 @@ public readonly record struct GcStatistics(long TotalAllocatedBytes, long LiveBy
 public sealed class VmHeap {
     private readonly MemoryPolicy _memory;
     private readonly IGcStrategy _strategy;
+    private readonly object _gate = new();
     private readonly List<VmObject> _objects = [];
     private readonly List<Func<IEnumerable<VmObject?>>> _rootObjectSources = [];
     private readonly List<Func<IEnumerable<StackSlot[]>>> _rootSlotSources = [];
@@ -42,12 +43,16 @@ public sealed class VmHeap {
     public string GcStrategyName => _strategy.Name;
 
     /// <summary>オブジェクトを直接ルートとして登録する (GcHandleTable 等)。</summary>
-    public void AddRootObjectSource(Func<IEnumerable<VmObject?>> source) =>
-        _rootObjectSources.Add(source);
+    public void AddRootObjectSource(Func<IEnumerable<VmObject?>> source) {
+        lock (_gate)
+            _rootObjectSources.Add(source);
+    }
 
     /// <summary>スロット配列をルートとして登録する (フレームの args/locals/スタック、静的ストレージ等)。</summary>
-    public void AddRootSlotSource(Func<IEnumerable<StackSlot[]>> source) =>
-        _rootSlotSources.Add(source);
+    public void AddRootSlotSource(Func<IEnumerable<StackSlot[]>> source) {
+        lock (_gate)
+            _rootSlotSources.Add(source);
+    }
 
     /// <summary>
     /// アロケーション予約 (トランザクション)。生成時 (Reserve) に上限検査と計上を先に済ませ、
@@ -69,29 +74,44 @@ public sealed class VmHeap {
 
         /// <summary>予約を確定してオブジェクトをヒープに登録する (計上は予約時のまま = 二重計上しない)。</summary>
         public T Commit<T>(T obj) where T : VmObject {
-            if (_committed || _heap is null)
-                throw new InvalidOperationException("アロケーション予約は確定済みか解放済みです (Commit は 1 回だけ呼べます)。");
-            _committed = true;
-            var heap = _heap;
-            _heap = null;
-            heap.Register(obj);
-            return obj;
+            lock (_heap?._gate ?? throw new InvalidOperationException("アロケーション予約は確定済みか解放済みです (Commit は 1 回だけ呼べます)。")) {
+                if (_committed || _heap is null)
+                    throw new InvalidOperationException("アロケーション予約は確定済みか解放済みです (Commit は 1 回だけ呼べます)。");
+                _committed = true;
+                var heap = _heap;
+                _heap = null;
+                heap.Register(obj);
+                Monitor.Exit(heap._gate); // Reserve が保持した排他を解放する
+                return obj;
+            }
         }
 
         /// <summary>未確定なら予約分の計上を巻き戻す (実確保の途中失敗 → using 抜けで自動実行)。</summary>
         public void Dispose() {
-            if (!_committed && _heap is not null) {
-                _heap.Rollback(_size);
-                _heap = null;
+            var heap = _heap;
+            if (heap is null)
+                return;
+            lock (heap._gate) {
+                if (!_committed) {
+                    heap.Rollback(_size);
+                    _heap = null;
+                    Monitor.Exit(heap._gate); // Reserve が保持した排他を解放する
+                }
             }
         }
     }
 
     /// <summary>確保予約を開始する (サイズは概算式を直接指定)。Commit で確定、未確定のまま Dispose すると巻き戻し。</summary>
     public VmReservation Reserve(long size) {
-        CheckQuota(size);
-        Charge(size);
-        return new VmReservation(this, size);
+        Monitor.Enter(_gate);
+        try {
+            CheckQuota(size);
+            Charge(size);
+            return new VmReservation(this, size);
+        } catch {
+            Monitor.Exit(_gate);
+            throw;
+        }
     }
 
     /// <summary>localloc ブロックの確保予約 (概算式は ObjectModel.EstimateLocallocSize と共有)。</summary>
@@ -142,6 +162,7 @@ public sealed class VmHeap {
     /// HostTempAllocationByteLimit (タスク 2: ホスト側一時メモリも quota 対象) を計上する。
     /// </summary>
     public void ChargeHostBuffer(int charCount) {
+        lock (_gate) {
         var size = 24 + 2L * charCount;
         // HostTemp quota (ゲスト操作の結果で VM ヒープ外に生じるホスト確保分)
         if (_hostTempAllocated + size > _memory.HostTempAllocationByteLimit)
@@ -151,49 +172,59 @@ public sealed class VmHeap {
         _hostTempAllocated += size;
         CheckQuota(size);
         _totalAllocated += size;
+        }
     }
 
     /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget タスク 2)。bc/intrinsic 毎に
     /// 重い host 処理 (InvariantCulture 比較 / formatting / encoding 等) の発生に対して
     /// 見積ったコストを積み上げる。budget中超過はメモリ系例外で VM に伝播 (ゲスト catch 外)。</summary>
     public void ChargeHostWork(long costUnits) {
+        lock (_gate) {
         if (_hostWorkSpent + costUnits > _memory.HostWorkBudget)
             throw new MemoryQuotaExceededException(
                 $"host 側作業予算 (HostWorkBudget) {_memory.HostWorkBudget:N0} を超えました。" +
                 $"+{costUnits:N0} ユニットで累計 {_hostWorkSpent + costUnits:N0}。");
         _hostWorkSpent += costUnits;
+        }
     }
 
     /// <summary>オブジェクトをヒープに登録し、サイズを計上する。上限超過は拒否。</summary>
     public T Allocate<T>(T obj) where T : VmObject {
-        var size = ObjectModel.EstimateSize(obj);
-        CheckQuota(size);
-        Charge(size);
-        _objects.Add(obj);
-        return obj;
+        lock (_gate) {
+            var size = ObjectModel.EstimateSize(obj);
+            CheckQuota(size);
+            Charge(size);
+            _objects.Add(obj);
+            return obj;
+        }
     }
 
     /// <summary>文字列のアロケーション計上 (VmString はプール共有のため概算のみ計上)。</summary>
     public void ChargeString(int charCount) {
+        lock (_gate) {
         var size = 24 + 2L * charCount;
         if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
             throw new MemoryQuotaExceededException(
                 $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (文字列 {charCount} 文字)。");
         _totalAllocated += size;
+        }
     }
 
     /// <summary>セーフポイントから呼ぶ。回収要求が溜まっていれば Collect を起動する。</summary>
     public void CollectIfDue() {
-        if (_collectionDue && !_collecting)
-            Collect();
+        lock (_gate) {
+            if (_collectionDue && !_collecting)
+                Collect();
+        }
     }
 
     /// <summary>GC を起動する (IGcStrategy にルートとヒープを渡し、到達不能オブジェクトを sweep)。</summary>
     public GcStatistics Collect() {
-        if (_collecting)
-            return Snapshot(); // 再入 (セーフポイントとホスト呼出の同時起動) は 1 回に潰す
-        _collecting = true;
-        try {
+        lock (_gate) {
+            if (_collecting)
+                return Snapshot(); // 再入 (セーフポイントとホスト呼出の同時起動) は 1 回に潰す
+            _collecting = true;
+            try {
             var roots = new List<VmObject>();
             foreach (var source in _rootObjectSources)
                 foreach (var obj in source())
@@ -225,19 +256,27 @@ public sealed class VmHeap {
             if (_liveBytes > _memory.LiveObjectByteLimit)
                 throw new MemoryQuotaExceededException(
                     $"生存オブジェクト上限 {_memory.LiveObjectByteLimit:N0} バイトを超過しました (GC 後の生存 {_liveBytes:N0} バイト)。");
-            return new GcStatistics(_totalAllocated, _liveBytes, _collectionCount);
-        } finally {
-            _collecting = false;
+                return new GcStatistics(_totalAllocated, _liveBytes, _collectionCount);
+            } finally {
+                _collecting = false;
+            }
         }
     }
 
-    public GcStatistics Snapshot() => new(_totalAllocated, _liveBytes, _collectionCount);
+    public GcStatistics Snapshot() {
+        lock (_gate)
+            return new GcStatistics(_totalAllocated, _liveBytes, _collectionCount);
+    }
 
     /// <summary>ヒープ登録解除 (テスト補助。通常は Collect が担当)。</summary>
     internal void RemoveDead(IEnumerable<VmObject> dead) {
-        var deadSet = new HashSet<VmObject>(dead);
-        _objects.RemoveAll(o => deadSet.Contains(o));
+        lock (_gate) {
+            var deadSet = new HashSet<VmObject>(dead);
+            _objects.RemoveAll(o => deadSet.Contains(o));
+        }
     }
 
-    internal IReadOnlyList<VmObject> TrackedObjects => _objects;
+    internal IReadOnlyList<VmObject> TrackedObjects {
+        get { lock (_gate) return _objects.ToArray(); }
+    }
 }

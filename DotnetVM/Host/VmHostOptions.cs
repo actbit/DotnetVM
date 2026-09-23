@@ -86,4 +86,7 @@ public sealed class VmHostOptions {
     /// 実行が可能になる (段階的に有効化)。false では従来どおり intrinsic ファサード面で動く。
     /// </summary>
     public bool LoadHostCoreLib { get; init; }
+
+    /// <summary>同時に開始できる guest Thread 数 (別途ホスト側の OS 制限も適用)。既定 = 64。</summary>
+    public int MaxGuestThreads { get; init; } = 64;
 }

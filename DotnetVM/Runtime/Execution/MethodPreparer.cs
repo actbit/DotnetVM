@@ -9,8 +9,14 @@ namespace DotnetVM.Runtime.Execution;
 /// EH 句を命令インデックス基準に解決した結果をメソッドごとに 1 回だけ計算して保持する。</summary>
 internal sealed class MethodPreparer(TypeLoader loader) {
     private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
+    private readonly object _gate = new();
 
     public PreparedMethod Prepare(VmMethod method) {
+        lock (_gate)
+            return PrepareCore(method);
+    }
+
+    private PreparedMethod PrepareCore(VmMethod method) {
         if (_prepared.TryGetValue(method, out var cached))
             return cached;
 

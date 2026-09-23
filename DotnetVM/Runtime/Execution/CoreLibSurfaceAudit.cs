@@ -338,11 +338,60 @@ internal static class CoreLibSurfaceAudit {
         Add("System.SR", "UsingResourceKeys", CoreLibSurfaceKind.RuntimeInternal,
             CultureOutOfScope + "。AppContext スイッチ面 (culture 機構) のため false 固定で提供", hasThis: false, paramCount: 0);
 
-        var monitorJ = InternalCall + "。VM は単一スレッド実行のため競合なしの暫定ファサード (C6 ゲストスレッドで真の競合を実装予定)";
+        var threadJ = InternalCall + "。guest Thread をホスト worker に割り当て、delegate 呼出は VM の共有 quota / heap / stop-the-world GC を通る";
+        Add("System.Threading.Thread", ".ctor", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 1);
+        Add("System.Threading.Thread", "Start", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
+        Add("System.Threading.Thread", "Start", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 1);
+        Add("System.Threading.Thread", "Join", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
+        Add("System.Threading.Thread", "Join", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 1);
+        Add("System.Threading.Thread", "get_IsAlive", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
+        Add("System.Threading.Thread", "get_ManagedThreadId", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
+        Add("System.Threading.Thread", "Sleep", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: false, paramCount: 1);
+
+        var taskJ = InternalCall + "。VM Task と awaiter の状態を保持し、async state machine 継続を guest worker で再開";
+        Add("System.Threading.Tasks.Task", "Delay", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "Run", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "FromResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "get_CompletedTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        foreach (var type in new[] { "System.Threading.Tasks.Task", "System.Threading.Tasks.Task`1" }) {
+            Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "Wait", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
+        Add("System.Threading.Tasks.Task`1", "get_Result", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        foreach (var type in new[] { "System.Runtime.CompilerServices.TaskAwaiter", "System.Runtime.CompilerServices.TaskAwaiter`1" }) {
+            Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "GetResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "OnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "UnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
+        foreach (var type in new[] { "System.Runtime.CompilerServices.AsyncTaskMethodBuilder", "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1" }) {
+            Add(type, "Create", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+            Add(type, "get_Task", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetException", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "Start", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "AwaitOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "AwaitUnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetStateMachine", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
+
+        var monitorJ = InternalCall + "。guest object identity ごとの再入可能 monitor と host thread blocking で競合を処理";
         Add("System.Threading.Monitor", "TryEnter_FastPath", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
         Add("System.Threading.Monitor", "TryEnter_FastPath_WithTimeout", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
         Add("System.Threading.Monitor", "Exit_FastPath", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
         Add("System.Threading.Monitor", "IsEnteredNative", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);
+        Add("System.Threading.Monitor", "Enter", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "Enter", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 2);
+        Add("System.Threading.Monitor", "Exit", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "TryEnter", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "TryEnter", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 2);
+        Add("System.Threading.Monitor", "TryEnter", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 3);
+        Add("System.Threading.Monitor", "Wait", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "Wait", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 2);
+        Add("System.Threading.Monitor", "Pulse", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "PulseAll", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
+        Add("System.Threading.Monitor", "IsEntered", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false, paramCount: 1);
 
         // ---- CoreLibBindings: String culture 面 (C5.5 Wave 5 確定) ----
         // culture 相当必須の面 (Compare / IndexOf(string) / LastIndexOf(string) /
@@ -537,7 +586,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Delegate", "Equals", CoreLibSurfaceKind.RuntimeInternal, delegateJ, hasThis: true, paramCount: 1);
 
         // ---- DefaultIntrinsics: Interlocked (計算 + バリア) ----
-        var interlockedJ = JitIntrinsic + " (単一スレッド逐次実行で計算面は CLR 同一、バリアは no-op)";
+        var interlockedJ = JitIntrinsic + " (VM の共有 atomic gate / slot lock で原子操作し、MemoryBarrier は host memory fence を実行)";
         // ① バインド (CoreLibBindings.RegisterInterlockedBindings) は .NET 10 既知署名の列挙面。
         // 本家 IL 本体が JIT intrinsic ダミー (typeof(T); throw) のため ② IL 実行に落ちないよう
         // ① で受ける必要がある (探査テストで発掘: CultureInfo::get_InvariantCulture 経路)

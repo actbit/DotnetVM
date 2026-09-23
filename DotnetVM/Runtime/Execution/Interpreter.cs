@@ -46,16 +46,38 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     private readonly ExceptionDispatcher _exceptionDispatcher;
     /// <summary>loader ごとのエンジンセット (多アセンブリ実行: メソッドの所属画像で token 解決する)。</summary>
     private readonly Dictionary<TypeLoader, LoaderEngines> _engines = [];
+    private readonly object _enginesGate = new();
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは 1 つ)。</summary>
     private readonly UnifiedStaticStorage _unifiedStaticStorage = new();
     private bool? _enginesRegisteredRootKey;
-    // 実行中フレームの一覧 (GC ルート源。Invoke の呼出チェーン = フレームチェーン)
-    private readonly List<InterpreterFrame> _liveFrames = [];
+    // 実行状態はホストスレッドごとに分離する。フレーム一覧は stop-the-world GC が
+    // 全ゲスト命令を停止した状態で走査し、独立した呼出しのルートをまとめて返す。
+    private sealed class ExecutionState {
+        public readonly object Gate = new();
+        public readonly List<InterpreterFrame> Frames = [];
+        public readonly List<StackSlot[]> TemporaryRoots = [];
+        public int Depth;
+        public long InstructionCount;
+    }
+    private readonly ThreadLocal<ExecutionState> _currentExecution = new(() => new ExecutionState());
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
+    private readonly VmExecutionCoordinator _coordinator = new();
     private long _instructionCount;
-    private int _depth;
-    private bool _running;
+    private int _running;
 
-    public long InstructionCount => _instructionCount;
+    public long InstructionCount => Interlocked.Read(ref _instructionCount);
+
+    internal long CurrentThreadInstructionCount => CurrentState.InstructionCount;
+
+    internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
+
+    private ExecutionState CurrentState {
+        get {
+            var state = _currentExecution.Value!;
+            _executionStates.TryAdd(state, 0);
+            return state;
+        }
+    }
 
     /// <summary>1 アセンブリ (TypeLoader) 分の実行エンジン。token 解決はすべてこの loader の画像に対して行う。</summary>
     private sealed class LoaderEngines {
@@ -94,11 +116,13 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     /// <summary>指定 loader のエンジンセットを取得 (無ければ遅延生成して GC ルート源も登録する)。</summary>
     private LoaderEngines EnginesFor(VmMethod method) {
         var loader = method.Loader;
-        if (loader is null || ReferenceEquals(loader, _services.Loader))
-            return _engines[_services.Loader];
-        return _engines.TryGetValue(loader, out var engines)
-            ? engines
-            : _engines[loader] = CreateEngines(loader, _services.Strings);
+        lock (_enginesGate) {
+            if (loader is null || ReferenceEquals(loader, _services.Loader))
+                return _engines[_services.Loader];
+            return _engines.TryGetValue(loader, out var engines)
+                ? engines
+                : _engines[loader] = CreateEngines(loader, _services.Strings);
+        }
     }
 
     /// <summary>loader のエンジンセットを構築する (文字列プール・静的ストレージは VM 単位で共有)。</summary>
@@ -121,16 +145,57 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);
+        intrinsicContext.RunGuestThreadDelegate = (guestDelegate, state, hasState) => {
+            var arguments = hasState
+                ? new[] { StackSlot.OfObject(guestDelegate), state }
+                : new[] { StackSlot.OfObject(guestDelegate) };
+            calls.InvokeDelegate(guestDelegate, arguments);
+        };
+        intrinsicContext.InvokeGuestDelegate = (guestDelegate, arguments) => calls.InvokeDelegate(guestDelegate, arguments);
+        intrinsicContext.RunGuestStateMachine = stateMachine => {
+            var byRef = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef reference
+                ? reference
+                : null;
+            var value = byRef?.Read() ?? stateMachine;
+            if (value.Kind != StackKind.ValueType || value.ObjectValue is not VmStructValue machine)
+                throw new InvalidOperationException("async state machine は VM 値型である必要があります。");
+            var definition = machine.StructType is VmConstructedType constructed
+                ? constructed.Definition : machine.StructType;
+            if (definition is not VmClassType stateType)
+                throw new InvalidOperationException($"async state machine 型 {machine.StructType.FullName} に IL 本体がありません。");
+            var moveNext = stateType.Methods.FirstOrDefault(method => method.Name == "MoveNext" && !method.IsStatic)
+                ?? throw new InvalidOperationException($"async state machine {stateType.FullName} に MoveNext がありません。");
+            var container = byRef?.Container ?? [value];
+            var index = byRef?.Index ?? 0;
+            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index))],
+                GenericContext.Of(machine.TypeArguments, null));
+        };
         // Activator.CreateInstance 等が .ctor を実行するためのフック
         intrinsicContext.NewInstanceHook = objects.CreateInstanceByCtor;
         // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
         intrinsicContext.ToStringHook = calls.InvokeToStringSlot;
         // MethodBase.GetCurrentMethod() 用の現在メソッドフック
-        intrinsicContext.CurrentMethodHook = () =>
-            _liveFrames.Count > 0 ? _liveFrames[^1].Method : null;
+        intrinsicContext.CurrentMethodHook = () => {
+            var state = CurrentState;
+            lock (state.Gate)
+                return state.Frames.Count > 0 ? state.Frames[^1].Method : null;
+        };
+        intrinsicContext.SuspendExecution = action => {
+            using (_coordinator.SuspendExecution())
+                action();
+        };
+        intrinsicContext.RegisterTransientRoots = slots => {
+            var state = CurrentState;
+            lock (state.Gate)
+                state.TemporaryRoots.Add(slots);
+            return new ActionLease(() => {
+                lock (state.Gate)
+                    state.TemporaryRoots.Remove(slots);
+            });
+        };
         // GC ルート源の登録: 静的ストレージ / intrinsic 静的フィールド (フレームは Interpreter 単位で登録済み)
         // 共有静的ストレージ (UnifiedStaticStorage) は全画像で共通の 1 件として VM 単位で 1 回登録する
-        if (ReferenceEquals(_enginesRegisteredRootKey, null)) {
+        if (_enginesRegisteredRootKey is null) {
             _heap.AddRootSlotSource(() => _unifiedStaticStorage?.EnumerateRoots().ToArray() ?? []);
             _enginesRegisteredRootKey = true;
         }
@@ -146,6 +211,11 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     /// <summary>VM ヒープ (アロケーション計上の唯一の入口。ホスト API のインスタンス生成からも使う)。</summary>
     public VmHeap Heap => _services.Heap;
+
+    internal GcStatistics CollectGarbage() {
+        using (_coordinator.StopTheWorld())
+            return _heap.Collect();
+    }
 
     /// <summary>値を指定の型としてボックス化する (box 命令と同じセマンティクス)。</summary>
     public StackSlot Box(VmType type, in StackSlot value) {
@@ -175,8 +245,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
     public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
-        if (!_running) {
-            _running = true;
+        if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
         // 置換面 (C5): 実在 CoreLib 由来のメソッドのうち DotnetVM.CoreLib の managed IL が
@@ -198,29 +267,37 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         }
         if (method.Body is null)
             ThrowNoBody(method);
-        if (_depth >= _memory.MaxRecursionDepth)
+        var state = CurrentState;
+        if (state.Depth >= _memory.MaxRecursionDepth)
             throw new UnhandledGuestException("System.StackOverflowException",
                 $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
-        _depth++;
+        state.Depth++;
         try {
             var engines = EnginesFor(method);
             CloneStructArgs(method, arguments);
             var frame = InterpreterFrame.Create(method, arguments,
                 engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
-            _liveFrames.Add(frame);
+            using (_coordinator.EnterRead()) {
+                lock (state.Gate)
+                    state.Frames.Add(frame);
+            }
             // 実行トレース: IL 本体を実行したフレームのみ記録する
             // (intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されない)
             if (_tracer is { } tracer)
                 tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
             try {
-                FixupStructLocals(frame);
+                using (_coordinator.EnterRead())
+                    FixupStructLocals(frame);
                 return engines.Exceptions.RunFrame(frame);
             } finally {
-                _liveFrames.RemoveAt(_liveFrames.Count - 1);
+                using (_coordinator.EnterRead()) {
+                    lock (state.Gate)
+                        state.Frames.Remove(frame);
+                }
             }
         } finally {
-            _depth--;
+            state.Depth--;
         }
 
     }
@@ -237,13 +314,23 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     /// <summary>実行中フレームが保持する全スロット (引数/ローカル/評価スタック/送出中例外) をルートとして列挙する。</summary>
     private IEnumerable<StackSlot[]> EnumerateFrameRoots() {
-        foreach (var frame in _liveFrames) {
-            yield return frame.Arguments;
-            yield return frame.Locals;
-            if (frame.Stack.Count > 0)
-                yield return frame.Stack.CopySlots();
-            if (frame.CurrentThrow is { } throwing)
-                yield return [StackSlot.OfObject(throwing.ExceptionObject)];
+        foreach (var state in _executionStates.Keys) {
+            InterpreterFrame[] frames;
+            lock (state.Gate)
+                frames = [.. state.Frames];
+            StackSlot[][] temporaryRoots;
+            lock (state.Gate)
+                temporaryRoots = [.. state.TemporaryRoots];
+            foreach (var roots in temporaryRoots)
+                yield return roots;
+            foreach (var frame in frames) {
+                yield return frame.Arguments;
+                yield return frame.Locals;
+                if (frame.Stack.Count > 0)
+                    yield return frame.Stack.CopySlots();
+                if (frame.CurrentThrow is { } throwing)
+                    yield return [StackSlot.OfObject(throwing.ExceptionObject)];
+            }
         }
     }
 
@@ -292,17 +379,26 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     // ---- クォータ/セーフポイント ----
 
     private void ConsumeInstruction() {
-        _instructionCount++;
-        if (_instructionCount > _memory.InstructionQuota)
+        var count = Interlocked.Increment(ref _instructionCount);
+        var state = CurrentState;
+        state.InstructionCount++;
+        if (count > _memory.InstructionQuota)
             throw new InstructionQuotaExceededException(
-                $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {_instructionCount:N0})。");
-        if (_instructionCount % SafepointInterval == 0)
+                $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {count:N0})。");
+        if (count % SafepointInterval == 0)
             CheckSafepoint();
     }
 
     /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
     /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
-    private void CheckSafepoint() => _services.Heap.CollectIfDue();
+    private void CheckSafepoint() {
+        // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
+        // その場で GC せず、RunFrameCore の次の命令境界で stop-the-world 回収する。
+        if (_coordinator.IsInsideGuestInstruction)
+            return;
+        using (_coordinator.StopTheWorldAtBoundary())
+            _services.Heap.CollectIfDue();
+    }
 
     // ---- 命令ディスパッチ ループ ----
 
@@ -316,6 +412,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         var calls = engines.Calls;
         var objects = engines.Objects;
         while (true) {
+            CheckSafepoint();
+            using var instructionLease = _coordinator.EnterInstruction();
             ConsumeInstruction();
             var instruction = frame.Code[frame.Ip];
             switch (instruction.Op) {
@@ -570,7 +668,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                         break;
                     }
                     var location = objects.FieldLocation(objSlot, field);
-                    frame.Stack.Push(SlotOps.PushCopyOfValue(location.Slot));
+                    frame.Stack.Push(SlotOps.PushCopyOfValue(location.Read()));
                     break;
                 }
                 case ILOp.Stfld: {
@@ -580,12 +678,12 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     // VnString レシーバはバイト実体 (真実源) に直接書く
                     if (objects.TryStoreStringField(objSlot, field, value))
                         break;
-                    objects.FieldLocation(objSlot, field).Slot = SlotOps.StoreCopyOfValue(value);
+                    objects.FieldLocation(objSlot, field).Write(SlotOps.StoreCopyOfValue(value));
                     break;
                 }
                 case ILOp.Ldsfld: {
                     var slot = objects.StaticFieldLocation(instruction.IntOperand, frame.Context);
-                    frame.Stack.Push(SlotOps.PushCopyOfValue(slot.Slot));
+                    frame.Stack.Push(SlotOps.PushCopyOfValue(slot.Read()));
                     break;
                 }
                 case ILOp.Ldsflda: {
@@ -600,7 +698,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 }
                 case ILOp.Stsfld: {
                     var value = frame.Stack.Pop();
-                    objects.StaticFieldLocation(instruction.IntOperand, frame.Context).Slot = value;
+                    objects.StaticFieldLocation(instruction.IntOperand, frame.Context).Write(value);
                     break;
                 }
 
@@ -650,7 +748,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                         break;
                     }
                     var byref = (VmByRef)stAddress.ObjectValue!;
-                    byref.Slot = SlotOps.StoreCopyOfValue(value);
+                    byref.Write(SlotOps.StoreCopyOfValue(value));
                     break;
                 }
                 case ILOp.Cpobj: {
@@ -670,11 +768,11 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                             throw new InvalidOperationException("cpobj がブロック外を参照します。");
                         var value = MemoryOps.ValueFromBytes(
                             srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
-                        ((VmByRef)dst.ObjectValue!).Slot = SlotOps.StoreCopyOfValue(value);
+                        ((VmByRef)dst.ObjectValue!).Write(SlotOps.StoreCopyOfValue(value));
                         break;
                     }
                     if (dst.ObjectValue is VmNativePointer dstOnly) {
-                        var srcValue = ((VmByRef)src.ObjectValue!).Slot;
+                        var srcValue = ((VmByRef)src.ObjectValue!).Read();
                         var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
                         if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
                             throw new InvalidOperationException("cpobj がブロック外を参照します。");
@@ -683,7 +781,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                     }
                     var srcRef = (VmByRef)src.ObjectValue!;
                     var dstRef = (VmByRef)dst.ObjectValue!;
-                    dstRef.Slot = SlotOps.StoreCopyOfValue(srcRef.Slot);
+                    dstRef.Write(SlotOps.StoreCopyOfValue(srcRef.Read()));
                     break;
                 }
                 case ILOp.Initobj: {
@@ -697,8 +795,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                         break;
                     }
                     var byref = (VmByRef)initAddress.ObjectValue!;
-                    byref.Slot = engines.Services.Objects.DefaultForType(
-                        objects.ResolveTypeToken(instruction.IntOperand, frame.Context), loader);
+                    byref.Write(engines.Services.Objects.DefaultForType(
+                        objects.ResolveTypeToken(instruction.IntOperand, frame.Context), loader));
                     break;
                 }
 
@@ -999,5 +1097,10 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
         if ((uint)index >= (uint)frame.Locals.Length)
             throw new BadImageFormatException(
                 $"ローカル変数インデックス {index} が範囲外です ({frame.Method} はローカル {frame.Locals.Length} 個)。");
+    }
+
+    private sealed class ActionLease(Action action) : IDisposable {
+        private Action? _action = action;
+        public void Dispose() => Interlocked.Exchange(ref _action, null)?.Invoke();
     }
 }

@@ -55,16 +55,73 @@ public sealed class VmBoxedValue : VmObject {
 /// instance メソッドの intrinsic は this (= args[0]) 経由で読み書きする。
 /// </summary>
 public sealed class VmIntrinsicInstance : VmObject {
-    public VmIntrinsicInstance(VmIntrinsicType instanceType, int stateSlots = 4) {
+    public VmIntrinsicInstance(VmIntrinsicType instanceType, int stateSlots = 4, VmType[]? typeArguments = null) {
         ArgumentNullException.ThrowIfNull(instanceType);
         InstanceType = instanceType;
         State = new StackSlot[stateSlots];
+        TypeArguments = typeArguments ?? [];
     }
 
     public VmIntrinsicType InstanceType { get; }
     public readonly StackSlot[] State;
+    public VmType[] TypeArguments { get; }
+    public VmType RuntimeType => TypeArguments.Length == 0
+        ? InstanceType
+        : new VmConstructedType { Definition = InstanceType, TypeArguments = TypeArguments };
 
     public override VmType Type => InstanceType;
+}
+
+/// <summary>ゲスト Task / Task&lt;T&gt;。完了値と例外は VM スロットで保持し、待機はイベントで行う。</summary>
+public sealed class VmTaskObject : VmObject {
+    private readonly VmType _type;
+    private readonly object _gate = new();
+    private readonly ManualResetEventSlim _completed = new(false);
+    private StackSlot _result;
+    private StackSlot _guestException;
+    private Exception? _hostException;
+    private bool _isCompleted;
+
+    public VmTaskObject(VmType type) => _type = type;
+
+    public override VmType Type => _type;
+    public bool IsCompleted { get { lock (_gate) return _isCompleted; } }
+
+    public void SetResult(StackSlot result = default) {
+        lock (_gate) {
+            if (_isCompleted) return;
+            _result = result;
+            _isCompleted = true;
+            _completed.Set();
+        }
+    }
+
+    public void SetGuestException(StackSlot exception) {
+        lock (_gate) {
+            if (_isCompleted) return;
+            _guestException = exception;
+            _isCompleted = true;
+            _completed.Set();
+        }
+    }
+
+    public void SetHostException(Exception exception) {
+        lock (_gate) {
+            if (_isCompleted) return;
+            _hostException = exception;
+            _isCompleted = true;
+            _completed.Set();
+        }
+    }
+
+    public void Wait() => _completed.Wait();
+
+    public bool Wait(int millisecondsTimeout) => _completed.Wait(millisecondsTimeout);
+
+    public (StackSlot Result, StackSlot GuestException, Exception? HostException) Snapshot() {
+        lock (_gate)
+            return (_result, _guestException, _hostException);
+    }
 }
 
 /// <summary>
@@ -384,6 +441,7 @@ public sealed class VmNativePointer : VmObject {
 /// </remarks>
 public sealed class ObjectModel {
     private readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
+    private readonly object _gate = new();
     // 静的ストレージは「正準型キー (構築型なら FullName)」で保持する。CLR と同じく
     // 構築ジェネリック型 (C<int> と C<string> 等) は静的フィールドを共有しない。
     private readonly Dictionary<string, StackSlot[]> StaticStorage = [];
@@ -392,6 +450,7 @@ public sealed class ObjectModel {
     /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。
     /// 基底が構築ジェネリック型 (例: Sub`1 : Base`1&lt;!0&gt;) の場合は定義型に解いて収集する。</summary>
     public Dictionary<VmField, int> GetLayout(VmClassType type) {
+        lock (_gate) {
         if (Layouts.TryGetValue(type, out var cached))
             return cached;
         var layout = new Dictionary<VmField, int>();
@@ -411,6 +470,7 @@ public sealed class ObjectModel {
         }
         Layouts.Add(type, layout);
         return layout;
+        }
     }
 
     /// <summary>インスタンスフィールド既定値のストレージを生成する。</summary>
@@ -436,12 +496,14 @@ public sealed class ObjectModel {
         GenericContext? context = null, UnifiedStaticStorage? world = null, VmType[]? typeArguments = null) {
         if (world is not null)
             return world.GetOrCreate(type, typeArguments, () => BuildStaticStorage(type, loader, context));
+        lock (_gate) {
         if (StaticStorage.TryGetValue(storageKey, out var existing))
             return existing;
         var storage = BuildStaticStorage(type, loader, context);
         StaticStorage[storageKey] = storage;
         StaticStorageList.Add(storage);
         return storage;
+        }
     }
 
     private StackSlot[] BuildStaticStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
@@ -454,7 +516,10 @@ public sealed class ObjectModel {
     }
 
     /// <summary>生成済みの全静的ストレージを列挙する (GC ルート源)。</summary>
-    internal IEnumerable<StackSlot[]> EnumerateStaticStorage() => StaticStorageList;
+    internal IEnumerable<StackSlot[]> EnumerateStaticStorage() {
+        lock (_gate)
+            return StaticStorageList.ToArray();
+    }
 
     public static int StaticFieldIndex(VmClassType type, VmField field) {
         var index = 0;
@@ -533,6 +598,8 @@ public sealed class ObjectModel {
         VmArray array => EstimateArraySize(array.Elements.Length),
         VmClassInstance instance => EstimateFieldStorageSize(instance.Fields.Length),
         VmBoxedValue boxed => EstimateFieldStorageSize(boxed.Fields.Length),
+        VmIntrinsicInstance intrinsic => EstimateFieldStorageSize(intrinsic.State.Length),
+        VmTaskObject => 48,
         // localloc の仮想メモリブロックは実バイト数を計上する (メモリポリシーの対象)
         VmLocallocMemory memory => EstimateLocallocSize(memory.Bytes.Length),
         _ => 24,

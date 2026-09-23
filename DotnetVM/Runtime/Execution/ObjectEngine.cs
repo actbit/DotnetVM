@@ -57,10 +57,11 @@ internal sealed class ObjectEngine(
         }
     }
     /// <summary>intrinsic 型の静的フィールドのストレージ (トークンごとに 1 スロット。例: String.Empty)。GC ルート源。</summary>
-    private readonly Dictionary<int, StackSlot[]> _intrinsicStaticFields = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, StackSlot[]> _intrinsicStaticFields = new();
     /// <summary>静的 FieldRVA データフィールドのアドレス (トークンごとに 1 つ。例: Char.Latin1CharInfo の
     /// &lt;PrivateImplementationDetails&gt; 初期化データ)。GC グラフ源 (Interpreter が到達可能性に使う)。</summary>
-    private readonly Dictionary<int, VmNativePointer> _rvaFieldAddresses = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, VmNativePointer> _rvaFieldAddresses = new();
+    private readonly object _typeInitGate = new();
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;
@@ -230,7 +231,7 @@ internal sealed class ObjectEngine(
             }
             case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
                 // 構造体ローカル/引数へのフィールド書込 (ldloca → ldfld/stfld)
-                var target = outer.Slot;
+                var target = outer.Read();
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
                     DefinitionOf(sv.StructType) is VmClassType st)
                     return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field));
@@ -336,22 +337,26 @@ internal sealed class ObjectEngine(
 
     /// <summary>型初期化子 (.cctor) の起動規約: 静的フィールド初回アクセス/newobj 前に 1 回だけ実行。</summary>
     public void EnsureInitialized(VmClassType type) {
-        if (!_initializedTypes.Add(type))
-            return;
-        var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
-        if (cctor?.Body is not null)
-            invoker.Invoke(cctor, [], null);
+        lock (_typeInitGate) {
+            if (!_initializedTypes.Add(type))
+                return;
+            var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
+            if (cctor?.Body is not null)
+                invoker.Invoke(cctor, [], null);
+        }
     }
 
     /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回。
     /// 定義参照 + 型引数参照列で鍵化し、FullName 文字列は使わない)。</summary>
     public void EnsureConstructedInitialized(VmConstructedType type) {
-        if (!_initializedConstructedTypes.Add(new ConstructedIdentity(type.Definition, type.TypeArguments)))
-            return;
-        var definition = (VmClassType)type.Definition;
-        var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
-        if (cctor?.Body is not null)
-            invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
+        lock (_typeInitGate) {
+            if (!_initializedConstructedTypes.Add(new ConstructedIdentity(type.Definition, type.TypeArguments)))
+                return;
+            var definition = (VmClassType)type.Definition;
+            var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
+            if (cctor?.Body is not null)
+                invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
+        }
     }
 
     /// <summary>intrinsic からのインスタンス生成 (Activator.CreateInstance 用フック実体)。

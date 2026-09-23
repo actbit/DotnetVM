@@ -107,6 +107,7 @@ public sealed class VmString {
 public sealed class VmStringPool {
     private readonly Dictionary<string, VmString> _pool = [];
     private readonly VmHeap? _heap;
+    private readonly object _gate = new();
 
     public VmStringPool(VmHeap? heap = null) {
         _heap = heap;
@@ -114,14 +115,16 @@ public sealed class VmStringPool {
 
     /// <summary>文字列を取得 (未登録なら新規作成して登録。新規作成時はアロケーションを計上する)。</summary>
     public VmString Get(string value) {
-        if (_pool.TryGetValue(value, out var existing))
-            return existing;
-        // インタニング済み文字列はヒープ管理外だが、新規作成は計上する
-        // (intrinsic/ホスト境界経由の文字列生成も IL の ldstr と等価に制約される)
-        _heap?.ChargeString(value.Length);
-        var created = new VmString(value);
-        _pool[value] = created;
-        return created;
+        lock (_gate) {
+            if (_pool.TryGetValue(value, out var existing))
+                return existing;
+            // インタニング済み文字列はヒープ管理外だが、新規作成は計上する
+            // (intrinsic/ホスト境界経由の文字列生成も IL の ldstr と等価に制約される)
+            _heap?.ChargeString(value.Length);
+            var created = new VmString(value);
+            _pool[value] = created;
+            return created;
+        }
     }
 
     /// <summary>既に同一内容がプール済みならそれを返す (演算結果用)。
@@ -146,5 +149,5 @@ public sealed class VmStringPool {
         return new VmString(new byte[VmString.HeaderByteCount + charCount * 2]);
     }
 
-    public int Count => _pool.Count;
+    public int Count { get { lock (_gate) return _pool.Count; } }
 }

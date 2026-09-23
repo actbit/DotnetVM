@@ -2,6 +2,7 @@ namespace DotnetVM.Host;
 
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
+using DotnetVM.Runtime.Intrinsics;
 
 /// <summary>
 /// メモリ/実行リソースのポリシー。すべてクォータ+拒否方式の上限。
@@ -103,6 +104,20 @@ public sealed class VmHostOptions {
     /// 実行が可能になる (段階的に有効化)。false では従来どおり intrinsic ファサード面で動く。
     /// </summary>
     public bool LoadHostCoreLib { get; init; }
+
+    /// <summary>
+    /// 組み込みの CoreLib ランタイムバインドを登録するか (既定 = true)。false にすると
+    /// <see cref="CoreLibBindingProviders"/> で指定したプロバイダーだけが登録される。
+    /// DefaultIntrinsics の登録には影響しない。
+    /// </summary>
+    public bool UseDefaultCoreLibBindings { get; init; } = true;
+
+    /// <summary>
+    /// 追加または置換用の CoreLib バインドプロバイダー。既定バインドと併用する場合は
+    /// 新しいキーは RegisterBinding、既定の特定キーは ReplaceBinding で登録できる。
+    /// 既定バインド全体を置き換える場合は <see cref="UseDefaultCoreLibBindings"/> を false にする。
+    /// </summary>
+    public IReadOnlyList<ICoreLibBindingProvider> CoreLibBindingProviders { get; init; } = [];
 
     /// <summary>同時に開始できる guest Thread 数 (別途 host 側の OS 制限も適用)。既定 = 64。</summary>
     public int MaxGuestThreads { get; init; } = 64;

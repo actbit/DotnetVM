@@ -72,7 +72,13 @@ public sealed class VirtualMachine : IDisposable {
             IsDefault = true,
         };
         DefaultIntrinsics.RegisterAll(_intrinsics);
-        CoreLibBindings.RegisterAll(_intrinsics); // ランタイムバインド (InternalCall / デバイス / 代替面)
+        if (_options.UseDefaultCoreLibBindings)
+            new BuiltInCoreLibBindingProvider().RegisterBindings(_intrinsics); // 外部プロバイダーと同じ登録契約を使う
+        foreach (var provider in _options.CoreLibBindingProviders) {
+            if (provider is null)
+                throw new ArgumentException("CoreLibBindingProviders に null は指定できません。", nameof(options));
+            provider.RegisterBindings(_intrinsics);
+        }
         if (_options.LoadHostCoreLib)
             LoadHostCoreLib();
     }

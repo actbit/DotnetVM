@@ -252,6 +252,16 @@ public sealed class IntrinsicContext {
 public delegate StackSlot? IntrinsicImpl(IntrinsicContext context, StackSlot[] args);
 
 /// <summary>
+/// CoreLib のランタイムバインドを VM 起動時に登録するプロバイダー。
+/// 実行時の VM 状態へは登録時ではなく、登録した <see cref="IntrinsicImpl"/> に渡される
+/// <see cref="IntrinsicContext"/> 経由でアクセスする。
+/// </summary>
+public interface ICoreLibBindingProvider {
+    /// <summary>VM 起動時にバインドを登録する。重複キーの登録は失敗する。</summary>
+    void RegisterBindings(IntrinsicRegistry registry);
+}
+
+/// <summary>
 /// intrinsic レジストリ。(型, メソッド, arity) → 実装の対応表。
 /// 登録は VM 起動時のみ許可し、Seal 呼出後は OperationNotAllowedException。
 /// 実行中の intrinsic 呼出は必ず Interpreter の InvokeIntrinsic ゲートを経由する
@@ -285,6 +295,21 @@ public sealed class IntrinsicRegistry {
             throw new OperationNotAllowedException("VM 実行開始後のランタイムバインド登録は許可されていません。");
         if (!_bindings.TryAdd(key, (impl, origin)))
             throw new InvalidOperationException($"ランタイムバインド {key} は既に登録されています。");
+        }
+    }
+
+    /// <summary>
+    /// 起動時に登録済みのランタイムバインドを、指定キーに限って置き換える。
+    /// カスタムプロバイダーが組み込み CoreLib バインドを差し替える場合に使う。
+    /// キーが未登録の場合は例外。
+    /// </summary>
+    public void ReplaceBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
+        lock (_gate) {
+            if (_sealed)
+                throw new OperationNotAllowedException("VM 実行開始後のランタイムバインド登録は許可されていません。");
+            if (!_bindings.ContainsKey(key))
+                throw new InvalidOperationException($"置換対象のランタイムバインド {key} は登録されていません。");
+            _bindings[key] = (impl, origin);
         }
     }
 

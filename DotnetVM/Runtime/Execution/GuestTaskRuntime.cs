@@ -70,9 +70,13 @@ internal sealed class GuestTaskRuntime(int maxWorkers) {
         var state = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef byRef
             ? byRef.Read()
             : stateMachine;
-        if (state.Kind != StackKind.ValueType || state.ObjectValue is not VmStructValue machine)
-            throw new InvalidOperationException("async state machine は値型の参照である必要があります。");
-        var detached = StackSlot.OfValueType(machine.Clone());
+        StackSlot detached;
+        if (state.ObjectValue is VmStructValue machine)
+            detached = StackSlot.OfValueType(machine.Clone());
+        else if (state.ObjectValue is VmClassInstance)
+            detached = state;
+        else
+            throw new InvalidOperationException("async state machine は VM オブジェクトである必要があります。");
         var stateContainer = new[] { detached };
         var detachedRef = StackSlot.OfByRef(new VmByRef(stateContainer, 0));
         var id = Interlocked.Increment(ref _nextContinuationId);

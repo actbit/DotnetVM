@@ -157,18 +157,30 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
                 ? reference
                 : null;
             var value = byRef?.Read() ?? stateMachine;
-            if (value.Kind != StackKind.ValueType || value.ObjectValue is not VmStructValue machine)
-                throw new InvalidOperationException("async state machine は VM 値型である必要があります。");
-            var definition = machine.StructType is VmConstructedType constructed
-                ? constructed.Definition : machine.StructType;
-            if (definition is not VmClassType stateType)
-                throw new InvalidOperationException($"async state machine 型 {machine.StructType.FullName} に IL 本体がありません。");
-            var moveNext = stateType.Methods.FirstOrDefault(method => method.Name == "MoveNext" && !method.IsStatic)
+            VmType stateType;
+            VmStructValue? structMachine = null;
+            if (value.ObjectValue is VmStructValue valueMachine) {
+                structMachine = valueMachine;
+                stateType = valueMachine.StructType is VmConstructedType constructed
+                    ? constructed.Definition : valueMachine.StructType;
+            } else if (value.ObjectValue is VmClassInstance classMachine) {
+                stateType = classMachine.RuntimeType is VmConstructedType constructed
+                    ? constructed.Definition : classMachine.RuntimeType;
+            } else {
+                throw new InvalidOperationException("async state machine は VM の構造体またはクラス値である必要があります。");
+            }
+            if (stateType is not VmClassType stateClass)
+                throw new InvalidOperationException($"async state machine 型 {stateType.FullName} に IL 本体がありません。");
+            var moveNext = stateClass.Methods.FirstOrDefault(method => method.Name == "MoveNext" && !method.IsStatic)
                 ?? throw new InvalidOperationException($"async state machine {stateType.FullName} に MoveNext がありません。");
+            if (structMachine is null) {
+                Invoke(moveNext, [value], GenericContext.Of([], null));
+                return;
+            }
             var container = byRef?.Container ?? [value];
             var index = byRef?.Index ?? 0;
             Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index))],
-                GenericContext.Of(machine.TypeArguments, null));
+                GenericContext.Of(structMachine.TypeArguments, null));
         };
         // Activator.CreateInstance 等が .ctor を実行するためのフック
         intrinsicContext.NewInstanceHook = objects.CreateInstanceByCtor;

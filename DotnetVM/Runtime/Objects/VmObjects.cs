@@ -543,16 +543,21 @@ public sealed class ObjectModel {
             return StackSlot.Null;
         var substituted = GenericSubstitutor.Substitute(type, context);
         if (substituted is VmIntrinsicType intrinsic) {
+            if (!intrinsic.IsValue)
+                return StackSlot.Null;
             return intrinsic.FullName switch {
                 "System.Boolean" or "System.Char" or "System.SByte" or "System.Byte"
                     or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" => StackSlot.OfInt32(0),
                 "System.Int64" or "System.UInt64" => StackSlot.OfInt64(0),
                 "System.Single" or "System.Double" => StackSlot.OfFloat(0),
                 "System.IntPtr" or "System.UIntPtr" => StackSlot.OfNativeInt(0),
-                _ => StackSlot.Null, // String/Object 等の参照型
+                _ => StackSlot.OfValueType(new VmStructValue(intrinsic, [default])),
             };
         }
         if (substituted.IsValueType && !VmPrimitiveTypes.IsSlotPrimitive(substituted.FullName)) {
+            if (substituted is VmConstructedType { Definition: VmIntrinsicType } constructedIntrinsic)
+                return StackSlot.OfValueType(new VmStructValue(
+                    constructedIntrinsic, [default], constructedIntrinsic.TypeArguments));
             var structType = substituted switch {
                 VmClassType cls => cls,
                 VmConstructedType constructed => (VmClassType)constructed.Definition,

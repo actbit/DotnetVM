@@ -14,26 +14,37 @@ public readonly record struct GcHandle(long Id) {
 /// </summary>
 public sealed class GcHandleTable {
     private readonly Dictionary<long, VmObject> _handles = [];
+    private readonly object _gate = new();
     private long _nextId;
 
     /// <summary>オブジェクトへの強参照ハンドルを割り当てる。</summary>
     public GcHandle Register(VmObject obj) {
         ArgumentNullException.ThrowIfNull(obj);
-        var handle = new GcHandle(++_nextId);
-        _handles[handle.Id] = obj;
-        return handle;
+        lock (_gate) {
+            var handle = new GcHandle(++_nextId);
+            _handles[handle.Id] = obj;
+            return handle;
+        }
     }
 
     /// <summary>ハンドルの参照先を取得する (解除済みなら null)。</summary>
-    public VmObject? GetTarget(GcHandle handle) =>
-        _handles.TryGetValue(handle.Id, out var obj) ? obj : null;
+    public VmObject? GetTarget(GcHandle handle) {
+        lock (_gate)
+            return _handles.TryGetValue(handle.Id, out var obj) ? obj : null;
+    }
 
     /// <summary>ハンドルを解除する (参照先が他に参照されていなければ次の GC で回収される)。
     /// 二重解除は許容する (no-op)。</summary>
-    public void Free(GcHandle handle) => _handles.Remove(handle.Id);
+    public void Free(GcHandle handle) {
+        lock (_gate)
+            _handles.Remove(handle.Id);
+    }
 
-    public int Count => _handles.Count;
+    public int Count { get { lock (_gate) return _handles.Count; } }
 
     /// <summary>生存ハンドルの参照先を列挙する (GC ルート用)。</summary>
-    public IEnumerable<VmObject> EnumerateRoots() => _handles.Values;
+    public IEnumerable<VmObject> EnumerateRoots() {
+        lock (_gate)
+            return _handles.Values.ToArray();
+    }
 }

@@ -382,6 +382,52 @@ internal static class CoreLibSurfaceAudit {
             Add(type, "AwaitUnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "SetStateMachine", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
         }
+        foreach (var type in new[] { "System.Threading.Tasks.ValueTask", "System.Threading.Tasks.ValueTask`1" }) {
+            Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "AsTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "ConfigureAwait", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 1);
+        }
+        foreach (var type in new[] { "System.Threading.Tasks.Task", "System.Threading.Tasks.Task`1" }) {
+            Add(type, "ConfigureAwait", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 1);
+        }
+        Add("System.Threading.Tasks.ValueTask", "get_CompletedTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.ValueTask", "FromResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.ValueTask`1", "get_Result", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        foreach (var type in new[] { "System.Runtime.CompilerServices.ValueTaskAwaiter", "System.Runtime.CompilerServices.ValueTaskAwaiter`1" }) {
+            Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "GetResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "OnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "UnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
+        foreach (var type in new[] {
+            "System.Runtime.CompilerServices.ConfiguredTaskAwaitable+ConfiguredTaskAwaiter",
+            "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter",
+            "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter",
+            "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter",
+        }) {
+            Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "GetResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "OnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "UnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
+        foreach (var type in new[] {
+            "System.Runtime.CompilerServices.ConfiguredTaskAwaitable",
+            "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1",
+            "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable",
+            "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1",
+        })
+            Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        foreach (var type in new[] { "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder", "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1" }) {
+            Add(type, "Create", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+            Add(type, "get_Task", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetException", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "Start", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "AwaitOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "AwaitUnsafeOnCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+            Add(type, "SetStateMachine", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
+        }
 
         var monitorJ = InternalCall + "。guest object identity ごとの再入可能 monitor と host thread blocking で競合を処理";
         Add("System.Threading.Monitor", "TryEnter_FastPath", CoreLibSurfaceKind.RuntimeInternal, monitorJ, hasThis: false);

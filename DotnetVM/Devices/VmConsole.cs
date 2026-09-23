@@ -43,27 +43,45 @@ public sealed class VmConsole {
     /// <summary>ゲストの Console.ReadLine への入力供給源を差し替える。</summary>
     public void BindInput(Func<string?> readLine) {
         ArgumentNullException.ThrowIfNull(readLine);
-        var current = _binding;
-        _binding = new InternalBinding(this, readLine, current);
+        lock (_gate) {
+            var current = _binding;
+            _binding = new InternalBinding(this, readLine, current);
+        }
     }
 
     /// <summary>完全カスタム実装へ差し替える (既定の内蔵実装の代わり)。</summary>
     public void BindImplementation(IVirtualConsoleBinding impl) {
         ArgumentNullException.ThrowIfNull(impl);
-        _binding = impl;
+        lock (_gate)
+            _binding = impl;
     }
 
     /// <summary>蓄積ログを持たない生の現在のバインディングを取得 (デバイス内部用)。</summary>
-    internal IVirtualConsoleBinding CurrentBinding => _binding;
-
-    internal void Write(bool isError, string text) {
-        lock (_gate)
-            _log.Add(new ConsoleOutputEvent(isError, text));
-        OutputWritten?.Invoke(new ConsoleOutputEvent(isError, text));
-        _binding.Write(isError, text);
+    internal IVirtualConsoleBinding CurrentBinding {
+        get { lock (_gate) return _binding; }
     }
 
-    internal string? ReadLine() => _binding.ReadLine();
+    internal void Write(bool isError, string text) {
+        var output = new ConsoleOutputEvent(isError, text);
+        IVirtualConsoleBinding binding;
+        Action<ConsoleOutputEvent>? handler;
+        lock (_gate) {
+            _log.Add(output);
+            // Binding の差し替えと同時実行されても、1 件の出力は開始時点の
+            // binding へ一貫して配送する。フィールドを lock 外で読むデータ競合を避ける。
+            binding = _binding;
+            handler = OutputWritten;
+        }
+        handler?.Invoke(output);
+        binding.Write(isError, text);
+    }
+
+    internal string? ReadLine() {
+        IVirtualConsoleBinding binding;
+        lock (_gate)
+            binding = _binding;
+        return binding.ReadLine();
+    }
 
     /// <summary>内蔵実装: メモリログは Write 側で蓄積済み。入力は BindInput で差し込まれた関数。</summary>
     private sealed class InternalBinding : IVirtualConsoleBinding {

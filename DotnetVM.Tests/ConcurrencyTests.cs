@@ -17,6 +17,7 @@ public sealed class ConcurrencyTests {
         namespace Vm {
             public static class ConcurrentCode {
                 private static int counter;
+                private static int awaiterCallbackValue;
 
                 public static int Increment() => Interlocked.Increment(ref counter);
                 public static int GetCounter() => Interlocked.CompareExchange(ref counter, 0, 0);
@@ -50,8 +51,44 @@ public sealed class ConcurrencyTests {
                     return value + 1;
                 }
 
+                public static async ValueTask<int> AddAfterDelayValueTask(int value) {
+                    await Task.Delay(1);
+                    return value + 2;
+                }
+                public static async Task<int> AddAfterConfigureAwait(int value) {
+                    await Task.Delay(1).ConfigureAwait(false);
+                    return value + 1;
+                }
+                public static async ValueTask<int> AddAfterValueTaskConfigureAwait(int value) {
+                    await ValueTask.FromResult(value).ConfigureAwait(false);
+                    return value + 1;
+                }
+                public static async Task<int> FaultAsync() {
+                    await Task.Delay(1);
+                    throw new InvalidOperationException("task fault");
+                }
+                public static async ValueTask<int> FaultValueTaskAsync() {
+                    await Task.Delay(1);
+                    throw new InvalidOperationException("value task fault");
+                }
+                public static int RunFaultAsync() => FaultAsync().GetAwaiter().GetResult();
+                public static int RunFaultValueTaskAsync() => FaultValueTaskAsync().GetAwaiter().GetResult();
+
                 public static int RunAsync() => AddAfterDelay(41).GetAwaiter().GetResult();
                 public static int RunCompletedAwait() => Task.FromResult(41).GetAwaiter().GetResult();
+                public static int RunValueTaskAsync() => AddAfterDelayValueTask(40).GetAwaiter().GetResult();
+                public static int RunValueTaskCompleted() => ValueTask.FromResult(41).GetAwaiter().GetResult();
+                public static int RunValueTaskValueCtor() => new ValueTask<int>(41).GetAwaiter().GetResult();
+                public static int RunValueTaskTaskCtor() => new ValueTask<int>(Task.FromResult(41)).GetAwaiter().GetResult();
+                public static int RunConfigureAwait() => AddAfterConfigureAwait(41).GetAwaiter().GetResult();
+                public static int RunValueTaskConfigureAwait() => AddAfterValueTaskConfigureAwait(41).GetAwaiter().GetResult();
+                private static void MarkAwaiterCallback() => awaiterCallbackValue = 42;
+                public static int DirectAwaiterCallback() {
+                    awaiterCallbackValue = 0;
+                    Task.Delay(1).GetAwaiter().OnCompleted(MarkAwaiterCallback);
+                    Thread.Sleep(250);
+                    return awaiterCallbackValue;
+                }
 
                 public static class InitializationProbe {
                     public static int Runs;
@@ -156,6 +193,13 @@ public sealed class ConcurrencyTests {
         Assert.Equal(2, Call(type, "RunThreads"));
         Assert.Equal(42, Call(type, "RunAsync"));
         Assert.Equal(41, Call(type, "RunCompletedAwait"));
+        Assert.Equal(42, Call(type, "RunValueTaskAsync"));
+        Assert.Equal(41, Call(type, "RunValueTaskCompleted"));
+        Assert.Equal(41, Call(type, "RunValueTaskValueCtor"));
+        Assert.Equal(41, Call(type, "RunValueTaskTaskCtor"));
+        Assert.Equal(42, Call(type, "RunConfigureAwait"));
+        Assert.Equal(42, Call(type, "RunValueTaskConfigureAwait"));
+        Assert.Equal(42, Call(type, "DirectAwaiterCallback"));
     }
 
     [Fact]
@@ -190,6 +234,53 @@ public sealed class ConcurrencyTests {
         using var vm = CreateVm();
 
         Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunCompletedAwait"));
+    }
+
+    [Fact]
+    public void AsyncValueTask_AwaitsTaskDelay() {
+        using var vm = CreateVm();
+
+        Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskAsync"));
+    }
+
+    [Fact]
+    public void CompletedValueTask_AwaitReturnsResult() {
+        using var vm = CreateVm();
+
+        Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskCompleted"));
+    }
+
+    [Fact]
+    public void ValueTaskConstructors_AwaitResults() {
+        using var vm = CreateVm();
+
+        Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskValueCtor"));
+        Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskTaskCtor"));
+    }
+
+    [Fact]
+    public void ConfigureAwait_WorksForTaskAndValueTask() {
+        using var vm = CreateVm();
+
+        Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "RunConfigureAwait"));
+        Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskConfigureAwait"));
+    }
+
+    [Fact]
+    public void AsyncExceptions_AreObservedThroughTaskAndValueTaskAwaiters() {
+        using var vm = CreateVm();
+
+        var taskFailure = Assert.Throws<UnhandledGuestException>(() => vm.Invoke("Vm.ConcurrentCode", "RunFaultAsync"));
+        var valueTaskFailure = Assert.Throws<UnhandledGuestException>(() => vm.Invoke("Vm.ConcurrentCode", "RunFaultValueTaskAsync"));
+        Assert.Equal("System.InvalidOperationException", taskFailure.ExceptionTypeName);
+        Assert.Equal("System.InvalidOperationException", valueTaskFailure.ExceptionTypeName);
+    }
+
+    [Fact]
+    public void AwaiterOnCompleted_InvokesGuestContinuation() {
+        using var vm = CreateVm();
+
+        Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "DirectAwaiterCallback"));
     }
 
     [Fact]

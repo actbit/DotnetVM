@@ -18,7 +18,6 @@ internal sealed class GuestTaskRuntime(
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
-    private readonly ConcurrentDictionary<VmTaskObject, byte> _knownTasks = new();
     private readonly ConcurrentDictionary<int, Thread> _workers = new();
     private readonly object _lifetimeGate = new();
     private readonly int _maxWorkers = maxWorkers;
@@ -35,15 +34,15 @@ internal sealed class GuestTaskRuntime(
     public int PendingTimerCount => _timers.Count;
 
     public VmTaskObject Create(VmType type, bool completed = false, StackSlot result = default) {
-        lock (_lifetimeGate)
+        lock (_lifetimeGate) {
             ThrowIfDisposed();
-        var task = new VmTaskObject(type);
-        _knownTasks[task] = 0;
-        if (completed)
-            task.SetResult(result);
-        else
-            _activeRoots[task] = [StackSlot.OfObject(task)];
-        return task;
+            var task = new VmTaskObject(type);
+            if (completed)
+                task.SetResult(result);
+            else
+                _activeRoots[task] = [StackSlot.OfObject(task)];
+            return task;
+        }
     }
 
     public IEnumerable<StackSlot[]> EnumerateRoots() {
@@ -125,12 +124,43 @@ internal sealed class GuestTaskRuntime(
         var stateContainer = new[] { detached };
         var detachedRef = StackSlot.OfByRef(new VmByRef(stateContainer, 0));
         var id = Interlocked.Increment(ref _nextContinuationId);
-        _continuationRoots[id] = [StackSlot.OfObject(awaited), detachedRef];
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            _continuationRoots[id] = [StackSlot.OfObject(awaited), detachedRef];
+        }
         try {
             StartWorker(null, [StackSlot.OfObject(awaited), detachedRef], () => {
                 awaited.Wait(_shutdownToken);
                 _shutdownToken.ThrowIfCancellationRequested();
                 resume(detachedRef);
+                return default;
+            }, onSuccess: null, onError: _ => { },
+                onFinished: () => _continuationRoots.TryRemove(id, out _));
+        } catch {
+            _continuationRoots.TryRemove(id, out _);
+            throw;
+        }
+    }
+
+    /// <summary>TaskAwaiter/ValueTaskAwaiter.OnCompleted から渡される guest delegate を
+    /// worker 上で一度だけ実行する。awaiter の直接利用でも no-op にせず、state machine
+    /// 継続と同じ worker quota・shutdown 規約を通す。</summary>
+    public void ScheduleCallback(VmTaskObject awaited, StackSlot callback, Action<StackSlot> invoke) {
+        var value = callback.Kind == StackKind.ByRef && callback.ObjectValue is VmByRef byRef
+            ? byRef.Read()
+            : callback;
+        if (value.ObjectValue is not VmDelegate)
+            throw new InvalidOperationException("awaiter continuation は guest delegate である必要があります。");
+        var id = Interlocked.Increment(ref _nextContinuationId);
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            _continuationRoots[id] = [StackSlot.OfObject(awaited), value];
+        }
+        try {
+            StartWorker(null, [StackSlot.OfObject(awaited), value], () => {
+                awaited.Wait(_shutdownToken);
+                _shutdownToken.ThrowIfCancellationRequested();
+                invoke(value);
                 return default;
             }, onSuccess: null, onError: _ => { },
                 onFinished: () => _continuationRoots.TryRemove(id, out _));

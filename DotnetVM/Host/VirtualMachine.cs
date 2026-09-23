@@ -40,6 +40,7 @@ public sealed class VirtualMachine : IDisposable {
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
+        _options.Memory.Validate();
         if (_options.MaxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestThreads は 1 以上である必要があります。");
         if (_options.MaxTaskWorkers < 1)
@@ -163,32 +164,36 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>ゲスト ALC に byte[] を VM アセンブリとして解析・登録する。入力コピーの quota は intrinsic 側で事前計上済み。</summary>
     private TypeLoader LoadAssemblyBytesInContext(VmAssemblyLoadContext loadContext, ReadOnlyMemory<byte> bytes) {
         ThrowIfDisposed();
-        if (loadContext.IsUnloaded)
-            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
-        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
-            throw new OperationNotAllowedException(
-                $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
-        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
-        return RegisterAssemblyImage(image, loadContext.Context);
+        lock (loadContext.LifetimeGate) {
+            if (loadContext.IsUnloaded)
+                throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
+            if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+                throw new OperationNotAllowedException(
+                    $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+            var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+            return RegisterAssemblyImage(image, loadContext.Context);
+        }
     }
 
     /// <summary>ゲスト ALC のパスロード。ホストファイル API ではなくストレージブリッジを使う。</summary>
     private TypeLoader LoadAssemblyPathInContext(VmAssemblyLoadContext loadContext, string path) {
         ThrowIfDisposed();
-        if (loadContext.IsUnloaded)
-            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
-        if (!_storage.IsEnabled)
-            throw new OperationNotAllowedException(
-                "AssemblyLoadContext.LoadFromAssemblyPath はストレージブリッジが設定されている場合のみ利用できます。");
-        var fullPath = Path.GetFullPath(path);
-        var bytes = _storage.Read(fullPath, _options.Memory.MaxAssemblyBytes);
-        if (bytes.Length > _options.Memory.MaxAssemblyBytes)
-            throw new OperationNotAllowedException(
-                $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
-        _heap.ChargeHostBuffer(bytes.Length);
-        var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
-        image.SourcePath = fullPath;
-        return RegisterAssemblyImage(image, loadContext.Context);
+        lock (loadContext.LifetimeGate) {
+            if (loadContext.IsUnloaded)
+                throw new ObjectDisposedException(nameof(VmAssemblyLoadContext));
+            if (!_storage.IsEnabled)
+                throw new OperationNotAllowedException(
+                    "AssemblyLoadContext.LoadFromAssemblyPath はストレージブリッジが設定されている場合のみ利用できます。");
+            var fullPath = Path.GetFullPath(path);
+            var bytes = _storage.Read(fullPath, _options.Memory.MaxAssemblyBytes);
+            if (bytes.Length > _options.Memory.MaxAssemblyBytes)
+                throw new OperationNotAllowedException(
+                    $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
+            _heap.ChargeHostBuffer(bytes.Length);
+            var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
+            image.SourcePath = fullPath;
+            return RegisterAssemblyImage(image, loadContext.Context);
+        }
     }
 
     private void UnloadAssemblyLoadContext(VmAssemblyContext context) {
@@ -278,12 +283,17 @@ public sealed class VirtualMachine : IDisposable {
         // 上限を超えた時点で打ち切って拒否する。巨大 stream を丸ごと buffer してから判定しない)
         var maxBytes = _options.Memory.MaxAssemblyBytes;
         using var buffered = new MemoryStream();
-        var copyBuffer = new byte[81920];
+        // maxBytes が小さい場合は上限を検査するために必要な 1 バイトだけを
+        // 余分に読む。固定 80 KiB の host 一時配列を先に確保しない。
+        var copyBufferSize = maxBytes >= 81920
+            ? 81920
+            : checked((int)Math.Max(1, maxBytes + 1));
+        var copyBuffer = new byte[copyBufferSize];
         while (true) {
             var n = peStream.Read(copyBuffer, 0, copyBuffer.Length);
             if (n == 0)
                 break; // EOF
-            if (buffered.Position + n > maxBytes)
+            if (n > maxBytes - buffered.Position)
                 throw new OperationNotAllowedException(
                     $"LoadAssembly の入力が上限を超えています (上限 {maxBytes:N0} バイト。読込途中で打ち切りました)。");
             buffered.Write(copyBuffer, 0, n);

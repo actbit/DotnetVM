@@ -54,6 +54,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     private readonly object _enginesGate = new();
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは 1 つ)。</summary>
     private readonly UnifiedStaticStorage _unifiedStaticStorage = new();
+    private readonly object _cacheRemovalGate = new();
+    private readonly Dictionary<VmAssemblyContext, TypeLoader[]> _pendingCacheRemovals = [];
     private bool? _enginesRegisteredRootKey;
     // 実行状態はホストスレッドごとに分離する。フレーム一覧は stop-the-world GC が
     // 全ゲスト命令を停止した状態で走査し、独立した呼出しのルートをまとめて返す。
@@ -254,14 +256,40 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     /// <summary>アンロード対象 ALC のローダー別エンジンと VM-wide 静的キャッシュを解放する。</summary>
     internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
-        _unifiedStaticStorage.RemoveForContext(context);
-        lock (_enginesGate) {
-            foreach (var loader in context.Loaders) {
-                // Interpreter の primary engine は VM の公開呼出し面が直接保持している。
-                if (ReferenceEquals(loader, _services.Loader) || !_engines.Remove(loader, out var engines))
-                    continue;
-                _heap.RemoveRootSlotSource(engines.StaticStorageRoots);
-                _heap.RemoveRootSlotSource(engines.IntrinsicStaticRoots);
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+        // Unload は guest 命令中の intrinsic から再入できる。実行中に engine の
+        // root source を外すと、同じ frame の後続 call が辞書から消えた engine を
+        // 参照するため、loader のスナップショットを取って安全な命令境界まで遅延する。
+        var loaders = context.Loaders.ToArray();
+        lock (_cacheRemovalGate)
+            _pendingCacheRemovals[context] = loaders;
+        FlushPendingAssemblyContextCaches();
+    }
+
+    private void FlushPendingAssemblyContextCaches() {
+        if (_coordinator.IsInsideGuestInstruction)
+            return;
+        KeyValuePair<VmAssemblyContext, TypeLoader[]>[] pending;
+        lock (_cacheRemovalGate) {
+            if (_pendingCacheRemovals.Count == 0)
+                return;
+            pending = _pendingCacheRemovals.ToArray();
+            _pendingCacheRemovals.Clear();
+        }
+
+        using (_coordinator.StopTheWorldAtBoundary()) {
+            foreach (var (context, loaders) in pending) {
+                _unifiedStaticStorage.RemoveForContext(context);
+                lock (_enginesGate) {
+                    foreach (var loader in loaders) {
+                        // Interpreter の primary engine は VM の公開呼出し面が直接保持している。
+                        if (ReferenceEquals(loader, _services.Loader) || !_engines.Remove(loader, out var engines))
+                            continue;
+                        _heap.RemoveRootSlotSource(engines.StaticStorageRoots);
+                        _heap.RemoveRootSlotSource(engines.IntrinsicStaticRoots);
+                    }
+                }
             }
         }
     }
@@ -363,6 +391,8 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             }
         } finally {
             state.Depth--;
+            if (state.Depth == 0)
+                FlushPendingAssemblyContextCaches();
         }
 
     }
@@ -1221,7 +1251,16 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     internal void Dispose() {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        _heap.RemoveRootSlotSource(_frameRootSource);
+        // 通常の VM.Dispose は別 host thread から来るため、実行中の read lease が
+        // 全て抜けるまで write lease で待ってから coordinator を破棄する。
+        // guest callback から再入的に Dispose された場合は自分の read lease を
+        // 解放できないので、lock を破棄せず root だけ外し、残りの lease に任せる。
+        if (_coordinator.IsExecutingOnCurrentThread) {
+            _heap.RemoveRootSlotSource(_frameRootSource);
+            return;
+        }
+        using (_coordinator.StopTheWorld())
+            _heap.RemoveRootSlotSource(_frameRootSource);
         _coordinator.Dispose();
     }
 }

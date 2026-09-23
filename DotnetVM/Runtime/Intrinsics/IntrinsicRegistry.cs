@@ -258,6 +258,7 @@ public delegate StackSlot? IntrinsicImpl(IntrinsicContext context, StackSlot[] a
 /// (命令クォータ消費・セーフポイント・VM オブジェクトモデル正規化はゲート側で強制)。
 /// </summary>
 public sealed class IntrinsicRegistry {
+    private readonly object _gate = new();
     private readonly Dictionary<IntrinsicKey, IntrinsicImpl> _impls = [];
     private readonly Dictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)> _bindings = [];
     private readonly Dictionary<(string TypeFullName, string FieldName), Func<IntrinsicContext, StackSlot>> _staticFields = [];
@@ -265,10 +266,12 @@ public sealed class IntrinsicRegistry {
 
     /// <summary>intrinsic を登録する (起動時のみ。Seal 後は拒否)。重複登録は例外。</summary>
     public void Register(IntrinsicKey key, IntrinsicImpl impl) {
+        lock (_gate) {
         if (_sealed)
             throw new OperationNotAllowedException("VM 実行開始後の intrinsic 登録は許可されていません。");
         if (!_impls.TryAdd(key, impl))
             throw new InvalidOperationException($"intrinsic {key.TypeFullName}::{key.MethodName} (arity {key.Arity}) は既に登録されています。");
+        }
     }
 
     /// <summary>
@@ -277,27 +280,33 @@ public sealed class IntrinsicRegistry {
     /// (命令クォータ消費・セーフポイント・VM オブジェクトモデル正規化) を経由する。
     /// </summary>
     public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
+        lock (_gate) {
         if (_sealed)
             throw new OperationNotAllowedException("VM 実行開始後のランタイムバインド登録は許可されていません。");
         if (!_bindings.TryAdd(key, (impl, origin)))
             throw new InvalidOperationException($"ランタイムバインド {key} は既に登録されています。");
+        }
     }
 
     /// <summary>intrinsic 型の静的フィールド値を登録する (例: String.Empty)。遅延評価 (実行時に文字列プールから実体化等)。起動時のみ。</summary>
     public void RegisterStaticField(string typeFullName, string fieldName, Func<IntrinsicContext, StackSlot> value) {
+        lock (_gate) {
         if (_sealed)
             throw new OperationNotAllowedException("VM 実行開始後の intrinsic 静的フィールド登録は許可されていません。");
         if (!_staticFields.TryAdd((typeFullName, fieldName), value))
             throw new InvalidOperationException($"静的フィールド {typeFullName}::{fieldName} は既に登録されています。");
+        }
     }
 
     /// <summary>実行開始前に呼ぶ。以降の登録を拒否する。</summary>
-    public void Seal() => _sealed = true;
+    public void Seal() { lock (_gate) _sealed = true; }
 
-    public bool IsSealed => _sealed;
+    public bool IsSealed { get { lock (_gate) return _sealed; } }
 
-    public bool TryGet(IntrinsicKey key, out IntrinsicImpl impl) =>
-        _impls.TryGetValue(key, out impl!);
+    public bool TryGet(IntrinsicKey key, out IntrinsicImpl impl) {
+        lock (_gate)
+            return _impls.TryGetValue(key, out impl!);
+    }
 
     /// <summary>
     /// 署名キーでランタイムバインドを解決する (完全一致 → 全引数一致面の順)。由来も返す。
@@ -307,6 +316,7 @@ public sealed class IntrinsicRegistry {
     /// </summary>
     public bool TryGetBinding(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin,
         BindingDomain callerDomain = BindingDomain.Guest) {
+        lock (_gate) {
         // 完全一致 (domain も含めて照合)
         if (_bindings.TryGetValue(key, out var entry) &&
             (key.Domain != BindingDomain.TrustedCoreLib || callerDomain == BindingDomain.TrustedCoreLib ||
@@ -333,18 +343,30 @@ public sealed class IntrinsicRegistry {
         impl = null!;
         origin = default;
         return false;
+        }
     }
 
     /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。
     /// domain は BindingKey 側に保持されるためここでは origin のみを返す。</summary>
-    public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings =>
-        [.. _bindings.Select(kv => (kv.Key, kv.Value.Origin))];
+    public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings {
+        get {
+            lock (_gate)
+                return [.. _bindings.Select(kv => (kv.Key, kv.Value.Origin))];
+        }
+    }
 
     /// <summary>intrinsic 型の静的フィールド値を取得する (ldsfld の TypeRef 親用)。</summary>
-    public bool TryGetStaticField(string typeFullName, string fieldName, out Func<IntrinsicContext, StackSlot> value) =>
-        _staticFields.TryGetValue((typeFullName, fieldName), out value!);
+    public bool TryGetStaticField(string typeFullName, string fieldName, out Func<IntrinsicContext, StackSlot> value) {
+        lock (_gate)
+            return _staticFields.TryGetValue((typeFullName, fieldName), out value!);
+    }
 
-    public int Count => _impls.Count;
+    public int Count { get { lock (_gate) return _impls.Count; } }
 
-    public IEnumerable<IntrinsicKey> Keys => _impls.Keys;
+    public IEnumerable<IntrinsicKey> Keys {
+        get {
+            lock (_gate)
+                return _impls.Keys.ToArray();
+        }
+    }
 }

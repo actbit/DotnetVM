@@ -305,17 +305,25 @@ public sealed class VmAssemblyLoadContext : VmObject {
     public bool IsDefault { get; init; }
     public VmType? DeclaredType { get; init; }
     internal Action? UnloadAction { get; init; }
-    internal bool IsUnloaded { get; private set; }
+    private readonly object _unloadGate = new();
+    private int _unloaded;
+    internal bool IsUnloaded => Volatile.Read(ref _unloaded) != 0;
+    /// <summary>ロード操作と Unload を直列化する lifetime gate。</summary>
+    internal object LifetimeGate => _unloadGate;
 
     internal void Unload() {
         if (IsDefault)
             throw new InvalidOperationException("AssemblyLoadContext.Default はアンロードできません。");
         if (!IsCollectible)
             throw new InvalidOperationException("collectible ではない AssemblyLoadContext はアンロードできません。");
-        if (IsUnloaded)
-            return;
-        UnloadAction?.Invoke();
-        IsUnloaded = true;
+        lock (_unloadGate) {
+            if (Volatile.Read(ref _unloaded) != 0)
+                return;
+            // これ以降のロードを直ちに拒否し、UnloadAction のキャッシュ掃除と
+            // 並行するロードが新しい強参照を作らないようにする。
+            Volatile.Write(ref _unloaded, 1);
+            UnloadAction?.Invoke();
+        }
     }
 
     public override VmType Type => DeclaredType ?? LoadContextFacade;
@@ -822,11 +830,23 @@ public sealed class ObjectModel {
     //      呼び出し側にサイズ式を散らさず、ここに集約する) ----
 
     /// <summary>配列の概算サイズ (オブジェクト ヘッダ概算 + 要素 16 バイト)。</summary>
-    public static long EstimateArraySize(long elementCount) => 24 + 16L * elementCount;
+    public static long EstimateArraySize(long elementCount) {
+        if (elementCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(elementCount));
+        return checked(24 + 16L * elementCount);
+    }
 
     /// <summary>クラス実体 / ボックス化実体の概算サイズ (オブジェクト ヘッダ概算 + フィールド 16 バイト)。</summary>
-    public static long EstimateFieldStorageSize(long fieldCount) => 24 + 16L * fieldCount;
+    public static long EstimateFieldStorageSize(long fieldCount) {
+        if (fieldCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(fieldCount));
+        return checked(24 + 16L * fieldCount);
+    }
 
     /// <summary>localloc ブロックの概算サイズ (実バイト数 + オブジェクト ヘッダ概算)。</summary>
-    public static long EstimateLocallocSize(long byteCount) => 24 + byteCount;
+    public static long EstimateLocallocSize(long byteCount) {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        return checked(24 + byteCount);
+    }
 }

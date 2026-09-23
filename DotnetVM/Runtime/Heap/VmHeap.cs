@@ -36,6 +36,7 @@ public sealed class VmHeap {
 
     public VmHeap(MemoryPolicy memory, IGcStrategy? strategy = null) {
         _memory = memory;
+        _memory.Validate();
         _strategy = strategy ?? new MarkSweepStrategy();
     }
 
@@ -115,6 +116,8 @@ public sealed class VmHeap {
 
     /// <summary>確保予約を開始する (サイズは概算式を直接指定)。Commit で確定、未確定のまま Dispose すると巻き戻し。</summary>
     public VmReservation Reserve(long size) {
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "アロケーションサイズは 0 以上である必要があります。");
         Monitor.Enter(_gate);
         try {
             CheckQuota(size);
@@ -127,12 +130,18 @@ public sealed class VmHeap {
     }
 
     /// <summary>localloc ブロックの確保予約 (概算式は ObjectModel.EstimateLocallocSize と共有)。</summary>
-    public VmReservation ReserveLocalloc(int byteCount) =>
-        Reserve(ObjectModel.EstimateLocallocSize(byteCount));
+    public VmReservation ReserveLocalloc(int byteCount) {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        return Reserve(ObjectModel.EstimateLocallocSize(byteCount));
+    }
 
     /// <summary>配列の確保予約 (概算式は ObjectModel.EstimateArraySize と共有)。</summary>
-    public VmReservation ReserveArray(int elementCount) =>
-        Reserve(ObjectModel.EstimateArraySize(elementCount));
+    public VmReservation ReserveArray(int elementCount) {
+        if (elementCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(elementCount));
+        return Reserve(ObjectModel.EstimateArraySize(elementCount));
+    }
 
     /// <summary>予約分の計上を巻き戻す (VmReservation.Dispose 専用)。</summary>
     private void Rollback(long size) {
@@ -150,10 +159,12 @@ public sealed class VmHeap {
 
     /// <summary>上限検査のみ (超過は拒否)。</summary>
     private void CheckQuota(long size) {
-        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size));
+        if (size > _memory.TotalAllocationByteLimit - _totalAllocated)
             throw new MemoryQuotaExceededException(
                 $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (要求 {size:N0} バイト)。");
-        if (_liveBytes + size > _memory.LiveObjectByteLimit)
+        if (size > _memory.LiveObjectByteLimit - _liveBytes)
             throw new MemoryQuotaExceededException(
                 $"生存オブジェクト上限 {_memory.LiveObjectByteLimit:N0} バイトを超過しました (生存 {_liveBytes:N0} + 要求 {size:N0} バイト)。GC で回収可能なオブジェクトがない場合はゲストのメモリ使用量を見直してください。");
     }
@@ -174,15 +185,18 @@ public sealed class VmHeap {
     /// HostTempAllocationByteLimit (タスク 2: ホスト側一時メモリも quota 対象) を計上する。
     /// </summary>
     public void ChargeHostBuffer(int charCount) {
+        if (charCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(charCount));
         lock (_gate) {
         var size = 24 + 2L * charCount;
         // HostTemp quota (ゲスト操作の結果で VM ヒープ外に生じるホスト確保分)
-        if (_hostTempAllocated + size > _memory.HostTempAllocationByteLimit)
+        if (size > _memory.HostTempAllocationByteLimit - _hostTempAllocated)
             throw new MemoryQuotaExceededException(
                 $"ホスト側一時アロケーション上限 {_memory.HostTempAllocationByteLimit:N0} バイトを超過しました (buffers " +
                 $"(+{size:N0}) 内 {charCount:N0} 文字)。\n残 {_hostTempAllocated:N0} / 上限 {_memory.HostTempAllocationByteLimit:N0}。");
-        _hostTempAllocated += size;
+        // CheckQuota は失敗する可能性があるため、すべての検査が通るまで会計を変更しない。
         CheckQuota(size);
+        _hostTempAllocated += size;
         _totalAllocated += size;
         }
     }
@@ -191,8 +205,10 @@ public sealed class VmHeap {
     /// 重い host 処理 (InvariantCulture 比較 / formatting / encoding 等) の発生に対して
     /// 見積ったコストを積み上げる。budget中超過はメモリ系例外で VM に伝播 (ゲスト catch 外)。</summary>
     public void ChargeHostWork(long costUnits) {
+        if (costUnits < 0)
+            throw new ArgumentOutOfRangeException(nameof(costUnits));
         lock (_gate) {
-        if (_hostWorkSpent + costUnits > _memory.HostWorkBudget)
+        if (costUnits > _memory.HostWorkBudget - _hostWorkSpent)
             throw new MemoryQuotaExceededException(
                 $"host 側作業予算 (HostWorkBudget) {_memory.HostWorkBudget:N0} を超えました。" +
                 $"+{costUnits:N0} ユニットで累計 {_hostWorkSpent + costUnits:N0}。");
@@ -213,9 +229,11 @@ public sealed class VmHeap {
 
     /// <summary>文字列のアロケーション計上 (VmString はプール共有のため概算のみ計上)。</summary>
     public void ChargeString(int charCount) {
+        if (charCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(charCount));
         lock (_gate) {
         var size = 24 + 2L * charCount;
-        if (_totalAllocated + size > _memory.TotalAllocationByteLimit)
+        if (size > _memory.TotalAllocationByteLimit - _totalAllocated)
             throw new MemoryQuotaExceededException(
                 $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (文字列 {charCount} 文字)。");
         _totalAllocated += size;

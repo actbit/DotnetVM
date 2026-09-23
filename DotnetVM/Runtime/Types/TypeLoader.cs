@@ -170,10 +170,34 @@ public sealed class TypeLoader {
         var task = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task", IsValue = false, Parent = @object };
         Add(task);
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task`1", IsValue = false, Parent = task }, [0u]);
+        // ValueTask は Task と同じ VM task object を値型ラッパー越しに公開する。
+        // async ValueTask<T> のコンパイラ生成 state machine が参照する面もここで
+        // 明示的に合成し、同名の guest 型へ binding が誤適用されないようにする。
+        var valueTask = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask", IsValue = true, Parent = valueType };
+        Add(valueTask);
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask`1", IsValue = true, Parent = valueTask }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter", IsValue = true, Parent = valueType });
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter`1", IsValue = true, Parent = valueType }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "ValueTaskAwaiter", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "ValueTaskAwaiter`1", IsValue = true, Parent = valueType }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncTaskMethodBuilder", IsValue = true, Parent = valueType });
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncTaskMethodBuilder`1", IsValue = true, Parent = valueType }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncValueTaskMethodBuilder", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "AsyncValueTaskMethodBuilder`1", IsValue = true, Parent = valueType }, [0u]);
+        foreach (var name in new[] {
+            "ConfiguredTaskAwaitable", "ConfiguredTaskAwaitable`1",
+            "ConfiguredValueTaskAwaitable", "ConfiguredValueTaskAwaitable`1",
+        })
+            Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = name, IsValue = true, Parent = valueType },
+                name.EndsWith("`1", StringComparison.Ordinal) ? [0u] : null);
+        foreach (var name in new[] {
+            "ConfiguredTaskAwaitable+ConfiguredTaskAwaiter",
+            "ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter",
+            "ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter",
+            "ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter",
+        })
+            Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = name, IsValue = true, Parent = valueType },
+                name.Contains("`1+", StringComparison.Ordinal) ? [0u] : null);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "IAsyncStateMachine", IsValue = false });
         foreach (var arity in Enumerable.Range(0, 17))
             Add(new VmIntrinsicType { Namespace = "System", Name = arity == 0 ? "Action" : $"Action`{arity}", IsValue = false, Parent = multicastDelegate },
@@ -572,6 +596,8 @@ public sealed class TypeLoader {
         // ② intrinsic ファサード (CoreLib 未ロード時の既定面)
         if (_intrinsicTypes.TryGetValue(fullName, out var intrinsic))
             return intrinsic;
+        if (scopeTable == TableKind.TypeRef && ResolveIntrinsicNestedTypeRef(typeRefRid) is { } intrinsicNested)
+            return intrinsicNested;
 
         // ③ Context 未所属時の従来解決 (ネスト型 TypeRef は包含チェーンごと TypeDef と照合)
         if (context is null && scopeTable == TableKind.TypeRef &&
@@ -706,6 +732,28 @@ public sealed class TypeLoader {
             return null;
         }
         return WalkNested(owner, names, 1);
+    }
+
+    /// <summary>CoreLib の実画像がロードされていないときでも、intrinsic facade として
+    /// 合成したネスト型 (ConfiguredTaskAwaitable+ConfiguredTaskAwaiter 等) を解決する。</summary>
+    private VmIntrinsicType? ResolveIntrinsicNestedTypeRef(int typeRefRid) {
+        var names = new List<string>();
+        var current = typeRefRid;
+        string? outerNamespace = null;
+        while (true) {
+            var (ns, name, scope) = _image.GetTypeRefName(current);
+            names.Insert(0, name);
+            outerNamespace = ns;
+            if (scope.Item1 != TableKind.TypeRef)
+                break;
+            current = scope.Item2;
+        }
+        if (names.Count < 2)
+            return null;
+        var fullName = string.IsNullOrEmpty(outerNamespace) ? names[0] : outerNamespace + "." + names[0];
+        for (var i = 1; i < names.Count; i++)
+            fullName += "+" + names[i];
+        return _intrinsicTypes.GetValueOrDefault(fullName);
     }
 
     /// <summary>包含型からネスト名列を辿る (対象画像の NestedClass で解決する)。</summary>

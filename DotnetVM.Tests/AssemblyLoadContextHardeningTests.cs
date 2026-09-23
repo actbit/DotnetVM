@@ -39,6 +39,56 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void LoadFromStream_RejectsOversizeBeforeCallingLoaderAndKeepsPosition() {
+        var memory = new MemoryPolicy { MaxAssemblyBytes = 8 };
+        var heap = new VmHeap(memory);
+        var loader = CreateLoader("StreamQuotaInput");
+        using var shared = new VmSharedState();
+        var callbackCount = 0;
+        var context = CreateIntrinsicContext(heap, loader, shared, memory, (_, _) => {
+            callbackCount++;
+            return loader;
+        });
+        var registry = CreateAssemblyIntrinsicRegistry();
+        Assert.True(registry.TryGet(IntrinsicKey.Instance(
+            "System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", 1), out var invoke));
+        var stream = new VmMemoryStreamObject { Bytes = new byte[18], Position = 9 };
+
+        Assert.Throws<OperationNotAllowedException>(() => invoke(context,
+            [StackSlot.OfObject(NewLoadContext("oversize")), StackSlot.OfObject(stream)]));
+
+        Assert.Equal(0, callbackCount);
+        Assert.Equal(9, stream.Position);
+    }
+
+    [Fact]
+    public void LoadFromStream_ExactLimitPassesOnlyUnreadSliceAndAdvancesOnSuccess() {
+        var memory = new MemoryPolicy { MaxAssemblyBytes = 8 };
+        var heap = new VmHeap(memory);
+        var loader = CreateLoader("StreamSliceInput");
+        using var shared = new VmSharedState();
+        byte[]? observed = null;
+        var context = CreateIntrinsicContext(heap, loader, shared, memory, (_, bytes) => {
+            observed = bytes.ToArray();
+            return loader;
+        });
+        var registry = CreateAssemblyIntrinsicRegistry();
+        Assert.True(registry.TryGet(IntrinsicKey.Instance(
+            "System.Runtime.Loader.AssemblyLoadContext", "LoadFromStream", 1), out var invoke));
+        var stream = new VmMemoryStreamObject {
+            Bytes = [99, 98, 97, 1, 2, 3, 4, 5, 6, 7, 8],
+            Position = 3,
+        };
+
+        var result = invoke(context,
+            [StackSlot.OfObject(NewLoadContext("slice")), StackSlot.OfObject(stream)]);
+
+        Assert.IsType<VmAssemblyObject>(result?.ObjectValue);
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }, observed);
+        Assert.Equal(stream.Bytes.Length, stream.Position);
+    }
+
+    [Fact]
     public void LoadFromAssemblyName_UsesFullIdentityForSameSimpleName() {
         var first = CompileVersionedLibrary("1.0.0.0");
         var second = CompileVersionedLibrary("2.0.0.0");
@@ -85,24 +135,85 @@ public sealed class AssemblyLoadContextHardeningTests {
         shared.TypeInitialization.Ensure(type, static () => { });
         var staticStorage = new UnifiedStaticStorage();
         staticStorage.GetOrCreate(type, null, () => [StackSlot.OfObject(facade)]);
+        var arrayType = new VmArrayType { ElementType = type };
+        shared.TypeFacades[arrayType] = new VmRuntimeObject { Target = arrayType };
+        staticStorage.GetOrCreate(type, [arrayType], () => [StackSlot.OfObject(facade)]);
 
+        var retainedImage = AssemblyImage.Parse(TestAssemblyCompiler.CompileToBytes(
+            "namespace Vm.AlcCacheOther { public class RetainedType { } }", "AlcCacheRetainedImage"));
+        var retainedContext = new VmAssemblyContext(_ => throw new InvalidOperationException());
+        var retainedLoader = new TypeLoader(retainedImage);
+        retainedContext.Register(retainedLoader);
+        retainedLoader.CompletePendingTypes();
+        var retainedType = Assert.IsType<VmClassType>(retainedLoader.FindTypeByFullName("Vm.AlcCacheOther.RetainedType"));
+        var retainedFacade = new VmRuntimeObject { Target = retainedType };
+        shared.TypeFacades[retainedType] = retainedFacade;
+        shared.TypeInitialization.Ensure(retainedType, static () => { });
+        staticStorage.GetOrCreate(retainedType, null, () => [StackSlot.OfObject(retainedFacade)]);
+
+        var unloadActionCount = 0;
         var loadContext = new VmAssemblyLoadContext {
             Context = context,
             Name = "cache",
             IsCollectible = true,
             IsDefault = false,
             UnloadAction = () => {
+                unloadActionCount++;
                 shared.RemoveAssemblyContextCaches(context);
                 staticStorage.RemoveForContext(context);
                 context.Unregister(loader);
             },
         };
         loadContext.Unload();
+        loadContext.Unload();
 
         Assert.True(loadContext.IsUnloaded);
-        Assert.Empty(shared.TypeFacades);
+        Assert.Equal(1, unloadActionCount);
+        Assert.DoesNotContain(type, shared.TypeFacades.Keys);
+        Assert.DoesNotContain(arrayType, shared.TypeFacades.Keys);
+        Assert.Same(retainedFacade, shared.TypeFacades[retainedType]);
         Assert.Equal(TypeInitializationStatus.NotStarted, shared.TypeInitialization.GetStatus(type));
-        Assert.Empty(staticStorage.EnumerateRoots());
+        Assert.Equal(TypeInitializationStatus.Completed, shared.TypeInitialization.GetStatus(retainedType));
+        Assert.Single(staticStorage.EnumerateRoots());
+    }
+
+    [Fact]
+    public void CollectibleUnload_ThroughGuestApiRemovesLoaderAndTypeCachesAcrossCycles() {
+        var childBytes = TestAssemblyCompiler.CompileToBytes("""
+            namespace Vm.AlcUnloadChild {
+                public class Marker { public static object Root = new object(); }
+            }
+            """, "AlcUnloadChild");
+        using var vm = new VirtualMachine();
+        using var driver = new MemoryStream(TestAssemblyCompiler.CompileToBytes("""
+            using System.IO;
+            using System.Runtime.Loader;
+            namespace Vm.AlcUnloadDriver {
+                public static class Ops {
+                    private static AssemblyLoadContext? current;
+                    public static void Load(byte[] bytes) {
+                        current = new AssemblyLoadContext("cycle", true);
+                        current.LoadFromStream(new MemoryStream(bytes));
+                    }
+                    public static void Unload() => current!.Unload();
+                }
+            }
+            """, "AlcUnloadDriver"));
+        vm.LoadAssembly(driver);
+
+        for (var cycle = 0; cycle < 3; cycle++) {
+            vm.Invoke("Vm.AlcUnloadDriver.Ops", "Load", childBytes);
+            var childLoader = Assert.Single(vm.Loaders, loader => loader.Image.Name == "AlcUnloadChild");
+            var childType = Assert.IsType<VmClassType>(childLoader.FindTypeByFullName("Vm.AlcUnloadChild.Marker"));
+            vm.SharedState.TypeFacades[childType] = new VmRuntimeObject { Target = childType };
+            vm.SharedState.TypeInitialization.Ensure(childType, static () => { });
+
+            vm.Invoke("Vm.AlcUnloadDriver.Ops", "Unload");
+
+            Assert.DoesNotContain(vm.Loaders, loader => loader.Image.Name == "AlcUnloadChild");
+            Assert.DoesNotContain(childType, vm.SharedState.TypeFacades.Keys);
+            Assert.Equal(TypeInitializationStatus.NotStarted, vm.SharedState.TypeInitialization.GetStatus(childType));
+        }
     }
 
     [Fact]
@@ -146,6 +257,70 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void LoadFromAssemblyBytes_ExactLimitReservesHostBufferBeforeLoaderCallback() {
+        const int length = 8;
+        var memory = new MemoryPolicy { MaxAssemblyBytes = length };
+        var heap = new VmHeap(memory);
+        var loader = CreateLoader("AssemblyBytesExactInput");
+        using var shared = new VmSharedState();
+        long? bytesChargedAtCallback = null;
+        var context = CreateIntrinsicContext(heap, loader, shared, memory, (_, bytes) => {
+            bytesChargedAtCallback = heap.Snapshot().TotalAllocatedBytes;
+            Assert.Equal(length, bytes.Length);
+            return loader;
+        });
+        var registry = CreateAssemblyIntrinsicRegistry();
+        Assert.True(registry.TryGet(IntrinsicKey.Instance(
+            "System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyBytes", 1), out var invoke));
+        var before = heap.Snapshot().TotalAllocatedBytes;
+
+        var result = invoke(context,
+            [StackSlot.OfObject(NewLoadContext("exact")), StackSlot.OfObject(ByteArray(length))]);
+
+        Assert.IsType<VmAssemblyObject>(result?.ObjectValue);
+        Assert.True(bytesChargedAtCallback > before);
+    }
+
+    [Fact]
+    public void LoadFromAssemblyName_DoesNotFallbackToSameSimpleNameWithDifferentVersion() {
+        var memory = new MemoryPolicy();
+        var heap = new VmHeap(memory);
+        var loaded = new TypeLoader(AssemblyImage.Parse(CompileVersionedLibrary("1.0.0.0")));
+        var vmContext = new VmAssemblyContext(_ => throw new InvalidOperationException());
+        vmContext.Register(loaded);
+        using var shared = new VmSharedState();
+        var context = CreateIntrinsicContext(heap, loaded, shared, memory);
+        var registry = CreateAssemblyIntrinsicRegistry();
+        Assert.True(registry.TryGet(IntrinsicKey.Instance(
+            "System.Runtime.Loader.AssemblyLoadContext", "LoadFromAssemblyName", 1), out var invoke));
+
+        var error = Assert.Throws<UnhandledGuestException>(() => invoke(context, [
+            StackSlot.OfObject(NewLoadContext("identity", vmContext)),
+            StackSlot.OfObject(new VmAssemblyNameObject {
+                FullName = "Vm.IdentityLib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=null",
+            }),
+        ]));
+
+        Assert.Equal("System.IO.FileNotFoundException", error.ExceptionTypeName);
+        Assert.Single(vmContext.Loaders);
+    }
+
+    [Fact]
+    public void AssemblyIdentityExactMatch_RequiresVersionCultureAndPublicKeyToken() {
+        var expected = AssemblyIdentity.ParseFullName(
+            "Example, Version=1.2.3.4, Culture=neutral, PublicKeyToken=0011223344556677");
+
+        Assert.False(expected.MatchesExactly(AssemblyIdentity.ParseFullName(
+            "Example, Version=1.2.3.5, Culture=neutral, PublicKeyToken=0011223344556677")));
+        Assert.False(expected.MatchesExactly(AssemblyIdentity.ParseFullName(
+            "Example, Version=1.2.3.4, Culture=fr-FR, PublicKeyToken=0011223344556677")));
+        Assert.False(expected.MatchesExactly(AssemblyIdentity.ParseFullName(
+            "Example, Version=1.2.3.4, Culture=neutral, PublicKeyToken=8899aabbccddeeff")));
+        Assert.True(expected.MatchesExactly(AssemblyIdentity.ParseFullName(
+            "example, Version=1.2.3.4, Culture=neutral, PublicKeyToken=0011223344556677")));
+    }
+
+    [Fact]
     public void MemoryStreamByteArrayConstructor_ReservesHostBufferBeforeCopy() {
         var memory = new MemoryPolicy { HostTempAllocationByteLimit = 64 };
         var heap = new VmHeap(memory);
@@ -179,6 +354,59 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void StorageRead_RejectsBridgeOverResponseWithoutChargingQuota() {
+        var bridge = new RecordingStorageBridge { ReadHandler = (_, _) => new byte[5] };
+        var gateway = new StorageGateway(new StoragePolicy {
+            MaxBytesPerOperation = 10,
+            TotalByteLimit = 100,
+        }, bridge);
+
+        Assert.Throws<StorageQuotaExceededException>(() => gateway.Read("oversized", callerMaxBytes: 4));
+
+        Assert.Equal(new long[] { 4 }, bridge.ReadLimits);
+        Assert.Equal(0, gateway.TotalBytes);
+    }
+
+    [Fact]
+    public void StorageRead_RejectsNegativeCallerLimitBeforeCallingBridge() {
+        var bridge = new RecordingStorageBridge();
+        var gateway = new StorageGateway(new StoragePolicy(), bridge);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => gateway.Read("negative", callerMaxBytes: -1));
+
+        Assert.Empty(bridge.ReadLimits);
+        Assert.Equal(0, gateway.TotalBytes);
+    }
+
+    [Fact]
+    public void AssemblyLoadContextPathRead_PassesAssemblyLimitToStorageBridge() {
+        var driver = TestAssemblyCompiler.CompileToBytes("""
+            using System.Runtime.Loader;
+            namespace Vm.AlcPathBudget {
+                public static class Ops {
+                    public static void Read() {
+                        var alc = new AssemblyLoadContext("path-budget", true);
+                        alc.LoadFromAssemblyPath("/untrusted/oversized.dll");
+                    }
+                }
+            }
+            """, "AlcPathBudgetDriver");
+        var assemblyLimit = driver.LongLength + 64;
+        var bridge = new RecordingStorageBridge { ReadHandler = (_, _) => [] };
+        using var vm = new VirtualMachine(new VmHostOptions {
+            Memory = new() { MaxAssemblyBytes = assemblyLimit },
+            Storage = new() { MaxBytesPerOperation = assemblyLimit * 4, TotalByteLimit = assemblyLimit * 4 },
+            StorageBridge = bridge,
+        });
+        using var stream = new MemoryStream(driver);
+        vm.LoadAssembly(stream);
+
+        Assert.ThrowsAny<Exception>(() => vm.Invoke("Vm.AlcPathBudget.Ops", "Read"));
+
+        Assert.Equal(new long[] { assemblyLimit }, bridge.ReadLimits);
+    }
+
+    [Fact]
     public void DynamicMethod_RejectsInvalidLocalAndTokenBeforeDelegateCreation() {
         var loader = new TypeLoader(AssemblyImage.Parse(TestAssemblyCompiler.CompileToBytes(
             "public static class Input { public static int Run() => 0; }", "DynamicMethodInput")));
@@ -196,20 +424,139 @@ public sealed class AssemblyLoadContextHardeningTests {
         Assert.Throws<BadImageFormatException>(() => token.CreateMethod());
     }
 
+    [Fact]
+    public void DynamicMethod_RejectsShortAndWideArgumentIndexesOutsideSignature() {
+        var loader = CreateLoader("DynamicMethodArgumentInput");
+        var heap = new VmHeap(new MemoryPolicy());
+        var shortArgument = NewDynamicMethod(loader, heap, "badShortArgument");
+        shortArgument.EmitByte((ushort)ILOp.Ldarg_S, 0);
+        shortArgument.EmitOpcode((ushort)ILOp.Pop);
+        shortArgument.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => shortArgument.CreateMethod());
+
+        var wideArgument = NewDynamicMethod(loader, heap, "badWideArgument");
+        wideArgument.EmitInt32((ushort)ILOp.Ldarg, 0);
+        wideArgument.EmitOpcode((ushort)ILOp.Pop);
+        wideArgument.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => wideArgument.CreateMethod());
+    }
+
+    [Fact]
+    public void DynamicMethod_RejectsReferenceTokenWithWrongOperandKind() {
+        var loader = CreateLoader("DynamicMethodReferenceKindInput");
+        var heap = new VmHeap(new MemoryPolicy());
+        var method = NewDynamicMethod(loader, heap, "badReferenceKind");
+        method.EmitReference((ushort)ILOp.Call, "not a VM method");
+        method.EmitOpcode((ushort)ILOp.Ret);
+
+        Assert.Throws<BadImageFormatException>(() => method.CreateMethod());
+    }
+
+    [Fact]
+    public void DynamicMethod_RejectsUnregisteredStringTokenAndUnmarkedBranchLabel() {
+        var loader = CreateLoader("DynamicMethodStructureInput");
+        var heap = new VmHeap(new MemoryPolicy());
+        var stringToken = NewDynamicMethod(loader, heap, "badStringToken");
+        stringToken.EmitToken((ushort)ILOp.Ldstr, 0x7000_0001);
+        stringToken.EmitOpcode((ushort)ILOp.Pop);
+        stringToken.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => stringToken.CreateMethod());
+
+        var branch = NewDynamicMethod(loader, heap, "unmarkedBranch");
+        branch.EmitLabel((ushort)ILOp.Br, branch.DefineLabel());
+        branch.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<UnhandledGuestException>(() => branch.CreateMethod());
+    }
+
+    [Fact]
+    public void DynamicMethod_RejectsShortBranchOutsideSignedByteRange() {
+        var loader = CreateLoader("DynamicMethodBranchRangeInput");
+        var heap = new VmHeap(new MemoryPolicy());
+        var method = NewDynamicMethod(loader, heap, "longShortBranch", maxMethodBodyBytes: 256);
+        var target = method.DefineLabel();
+        method.EmitLabel((ushort)ILOp.Br_S, target);
+        for (var i = 0; i < 128; i++)
+            method.EmitOpcode((ushort)ILOp.Nop);
+        method.MarkLabel(target);
+        method.EmitOpcode((ushort)ILOp.Ret);
+
+        Assert.Throws<UnhandledGuestException>(() => method.CreateMethod());
+    }
+
+    [Fact]
+    public void DynamicMethod_BodyLimitRejectsNextInstructionWithoutDamagingPriorCode() {
+        var loader = CreateLoader("DynamicMethodBodyLimitInput");
+        var heap = new VmHeap(new MemoryPolicy());
+        var method = NewDynamicMethod(loader, heap, "bodyLimit", maxMethodBodyBytes: 1);
+        method.EmitOpcode((ushort)ILOp.Ret);
+
+        Assert.Throws<OperationNotAllowedException>(() => method.EmitOpcode((ushort)ILOp.Nop));
+        Assert.NotNull(method.CreateMethod().Body);
+    }
+
+    [Fact]
+    public void NamedNonCollectibleUnloadIntrinsic_ThrowsGuestExceptionWithoutCleanup() {
+        var loader = CreateLoader("NonCollectibleUnloadInput");
+        var memory = new MemoryPolicy();
+        var heap = new VmHeap(memory);
+        using var shared = new VmSharedState();
+        var context = CreateIntrinsicContext(heap, loader, shared, memory);
+        var registry = CreateAssemblyIntrinsicRegistry();
+        Assert.True(registry.TryGet(IntrinsicKey.Instance(
+            "System.Runtime.Loader.AssemblyLoadContext", "Unload", 0), out var invoke));
+        var cleanupCount = 0;
+        var alc = NewLoadContext("named-default-semantics", isCollectible: false);
+        alc = new VmAssemblyLoadContext {
+            Context = alc.Context,
+            Name = alc.Name,
+            IsCollectible = false,
+            IsDefault = false,
+            UnloadAction = () => cleanupCount++,
+        };
+
+        var error = Assert.Throws<UnhandledGuestException>(() => invoke(context, [StackSlot.OfObject(alc)]));
+
+        Assert.Equal("System.InvalidOperationException", error.ExceptionTypeName);
+        Assert.Equal(0, cleanupCount);
+        Assert.False(alc.IsUnloaded);
+    }
+
     private static byte[] CompileVersionedLibrary(string version) => TestAssemblyCompiler.CompileToBytes($$"""
         [assembly: System.Reflection.AssemblyVersion("{{version}}")]
         namespace Vm.Identity { public class Marker { } }
         """, "Vm.IdentityLib");
 
     private static IntrinsicContext CreateIntrinsicContext(VmHeap heap, TypeLoader loader,
-        VmSharedState shared, MemoryPolicy memory) => new() {
+        VmSharedState shared, MemoryPolicy memory,
+        Func<VmAssemblyLoadContext, ReadOnlyMemory<byte>, TypeLoader>? loadAssembly = null) => new() {
         Console = new(),
         Strings = new VmStringPool(heap),
         Heap = heap,
         Types = loader,
         Shared = shared,
         MemoryPolicy = memory,
+        LoadAssemblyInContext = loadAssembly,
     };
+
+    private static TypeLoader CreateLoader(string assemblyName) => new(AssemblyImage.Parse(
+        TestAssemblyCompiler.CompileToBytes("public static class Input { public static int Run() => 0; }", assemblyName)));
+
+    private static IntrinsicRegistry CreateAssemblyIntrinsicRegistry() {
+        var registry = new IntrinsicRegistry();
+        AssemblyLoadContextRuntime.RegisterAll(registry);
+        return registry;
+    }
+
+    private static VmAssemblyLoadContext NewLoadContext(string name, VmAssemblyContext? context = null,
+        bool isCollectible = true) => new() {
+        Context = context ?? new VmAssemblyContext(_ => throw new InvalidOperationException()),
+        Name = name,
+        IsCollectible = isCollectible,
+        IsDefault = false,
+    };
+
+    private static VmDynamicMethodBuilder NewDynamicMethod(TypeLoader loader, VmHeap heap, string name,
+        int maxMethodBodyBytes = 128) => new(loader, heap, name, new SigType(SigKind.Void), [], maxMethodBodyBytes);
 
     private static VmArray ByteArray(int length) => new(
         new VmArrayType {
@@ -219,10 +566,11 @@ public sealed class AssemblyLoadContextHardeningTests {
 
     private sealed class RecordingStorageBridge : IStorageBridge {
         public List<long> ReadLimits { get; } = [];
+        public Func<string, long, byte[]>? ReadHandler { get; init; }
         public bool Exists(string path) => true;
         public byte[] Read(string path, long maxBytes) {
             ReadLimits.Add(maxBytes);
-            return new byte[checked((int)maxBytes)];
+            return ReadHandler?.Invoke(path, maxBytes) ?? new byte[checked((int)maxBytes)];
         }
         public void Write(string path, ReadOnlyMemory<byte> contents) { }
         public void Delete(string path) { }

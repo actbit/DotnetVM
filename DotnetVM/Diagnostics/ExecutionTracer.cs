@@ -20,18 +20,19 @@ public sealed class ExecutionTracer {
     public IReadOnlyList<ExecutionFrame> Frames { get { lock (_gate) return _frames.ToArray(); } }
 
     /// <summary>記録の有効化状態。Start() で true になり Stop() で false になる。</summary>
-    public bool Enabled { get; private set; }
+    public bool Enabled { get { lock (_gate) return _enabled; } }
+    private bool _enabled;
 
     /// <summary>記録を開始する (既存の記録はクリア)。</summary>
     public void Start() {
         lock (_gate) {
             _frames.Clear();
-            Enabled = true;
+            _enabled = true;
         }
     }
 
     /// <summary>記録を停止する (既存の記録は保持)。</summary>
-    public void Stop() { lock (_gate) Enabled = false; }
+    public void Stop() { lock (_gate) _enabled = false; }
 
     /// <summary>指定アセンブリの指定メソッドが実行されたか (IL 実行の証明に使う)。</summary>
     public bool ContainsFrame(string assemblyName, string typeFullName, string methodName) {
@@ -43,7 +44,7 @@ public sealed class ExecutionTracer {
     /// <summary>Interpreter がフレーム開始時に呼ぶ (internal: VM 本体からの記録のみ)。</summary>
     internal void Record(string assemblyName, string typeFullName, string methodName) {
         lock (_gate) {
-            if (Enabled)
+            if (_enabled)
                 _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
         }
     }

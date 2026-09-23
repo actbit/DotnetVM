@@ -60,6 +60,7 @@ public sealed class AssemblyImage {
     /// サイズを MemoryPolicy の上限と比較して超過はロード拒否 (OperationNotAllowed) にする。
     /// hostile 画像は実行の前にここで落ちる (タスク 2 hardening)。</summary>
     public static AssemblyImage Parse(ReadOnlyMemory<byte> image, MemoryPolicy? limits) {
+        limits?.Validate();
         var pe = PEImage.Parse(image);
         var cli = CliHeader.ParseFrom(pe);
         var root = MetadataRoot.Parse(pe, cli, limits);

@@ -188,6 +188,7 @@ internal sealed class VmCoreLibSurfaces {
     private readonly TypeLoader _coreLibLoader;
     private readonly Dictionary<string, VmMethod> _substituteByFace = new(StringComparer.Ordinal);
     private readonly Dictionary<VmMethod, string?> _faceKeyByMethod = [];
+    private readonly object _faceKeyGate = new();
 
     private VmCoreLibSurfaces(TypeLoader coreLibLoader) => _coreLibLoader = coreLibLoader;
 
@@ -235,13 +236,16 @@ internal sealed class VmCoreLibSurfaces {
             return null; // 置換先 (DotnetVM.CoreLib) 自身の IL はこれ以上置換しない
         if (!IsTrustedCoreLibLoader(method.Loader))
             return null; // 実在 System.Private.CoreLib 由来のみを置換対象にする (identity 照合)
-        if (!_faceKeyByMethod.TryGetValue(method, out var key)) {
-            var paramNames = method.Loader?.TryResolveSlotParams(method.Signature.ParamTypes);
-            key = paramNames is null
-                ? null // 署名が解決できない面は置換せず従来経路にフォールバック
-                : FaceKey(method.DeclaringType.FullName, method.Name,
-                    paramNames.Select(p => p.FullName).ToArray());
-            _faceKeyByMethod[method] = key;
+        string? key;
+        lock (_faceKeyGate) {
+            if (!_faceKeyByMethod.TryGetValue(method, out key)) {
+                var paramNames = method.Loader?.TryResolveSlotParams(method.Signature.ParamTypes);
+                key = paramNames is null
+                    ? null // 署名が解決できない面は置換せず従来経路にフォールバック
+                    : FaceKey(method.DeclaringType.FullName, method.Name,
+                        paramNames.Select(p => p.FullName).ToArray());
+                _faceKeyByMethod[method] = key;
+            }
         }
         return key is not null && _substituteByFace.TryGetValue(key, out var substitute) ? substitute : null;
     }

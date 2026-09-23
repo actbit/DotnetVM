@@ -40,10 +40,15 @@ public interface IStorageBridge {
 public sealed class StorageGateway {
     private readonly StoragePolicy _policy;
     private readonly IStorageBridge? _bridge;
+    private readonly object _gate = new();
     private long _totalBytes;
 
     public StorageGateway(StoragePolicy policy, IStorageBridge? bridge) {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        if (_policy.TotalByteLimit < 0)
+            throw new ArgumentOutOfRangeException(nameof(policy), "TotalByteLimit は 0 以上である必要があります。");
+        if (_policy.MaxBytesPerOperation < 0)
+            throw new ArgumentOutOfRangeException(nameof(policy), "MaxBytesPerOperation は 0 以上である必要があります。");
         _bridge = bridge;
     }
 
@@ -51,7 +56,7 @@ public sealed class StorageGateway {
     public bool IsEnabled => _bridge is not null;
 
     /// <summary>累計転送バイト数 (診断用)。</summary>
-    public long TotalBytes => _totalBytes;
+    public long TotalBytes { get { lock (_gate) return _totalBytes; } }
 
     public bool Exists(string path) {
         RequireBridge();
@@ -64,28 +69,33 @@ public sealed class StorageGateway {
 
     /// <summary>呼び出し元固有の上限も適用してファイルを読む。</summary>
     public byte[] Read(string path, long callerMaxBytes) {
-        RequireBridge();
-        if (callerMaxBytes < 0)
-            throw new ArgumentOutOfRangeException(nameof(callerMaxBytes));
-        // maxBytes を事前に伝える: 呼び出し元上限、1 操作上限、累計残量の min。
-        // 呼び出し元上限と storage 側の両上限を bridge に渡し、host 側の巨大バッファ増幅を避ける
-        var remainingTotal = _totalBytes < 0
-            ? _policy.TotalByteLimit
-            : Math.Max(0, _policy.TotalByteLimit - _totalBytes);
-        var maxBytes = Math.Min(callerMaxBytes,
-            Math.Min(_policy.MaxBytesPerOperation, remainingTotal));
-        var contents = _bridge!.Read(RequirePath(path), maxBytes);
-        if (contents.LongLength > maxBytes)
-            throw new StorageQuotaExceededException(
-                $"読み取りバイト数 {contents.LongLength:N0} が要求上限 {maxBytes:N0} を超過しました。");
-        Charge(contents.LongLength, "読み取り");
-        return contents;
+        lock (_gate) {
+            RequireBridge();
+            if (callerMaxBytes < 0)
+                throw new ArgumentOutOfRangeException(nameof(callerMaxBytes));
+            // maxBytes を事前に伝える: 呼び出し元上限、1 操作上限、累計残量の min。
+            // bridge 呼出も同じロック内で行い、並行 read が同じ累計残量を二重消費しないようにする。
+            var remainingTotal = _totalBytes < 0
+                ? _policy.TotalByteLimit
+                : Math.Max(0, _policy.TotalByteLimit - _totalBytes);
+            var maxBytes = Math.Min(callerMaxBytes,
+                Math.Min(_policy.MaxBytesPerOperation, remainingTotal));
+            var contents = _bridge!.Read(RequirePath(path), maxBytes)
+                ?? throw new StorageQuotaExceededException("ストレージブリッジが null 応答を返しました。");
+            if (contents.LongLength > maxBytes)
+                throw new StorageQuotaExceededException(
+                    $"読み取りバイト数 {contents.LongLength:N0} が要求上限 {maxBytes:N0} を超過しました。");
+            Charge(contents.LongLength, "読み取り");
+            return contents;
+        }
     }
 
     public void Write(string path, ReadOnlyMemory<byte> contents) {
-        RequireBridge();
-        Charge(contents.Length, "書き込み");
-        _bridge!.Write(RequirePath(path), contents);
+        lock (_gate) {
+            RequireBridge();
+            Charge(contents.Length, "書き込み");
+            _bridge!.Write(RequirePath(path), contents);
+        }
     }
 
     public void Delete(string path) {
@@ -109,7 +119,7 @@ public sealed class StorageGateway {
         if (bytes > _policy.MaxBytesPerOperation)
             throw new StorageQuotaExceededException(
                 $"{operation}バイト数 {bytes:N0} が 1 操作上限 {_policy.MaxBytesPerOperation:N0} を超過しました。");
-        if (_totalBytes + bytes > _policy.TotalByteLimit)
+        if (bytes > _policy.TotalByteLimit - _totalBytes)
             throw new StorageQuotaExceededException(
                 $"累計ストレージバイト上限 {_policy.TotalByteLimit:N0} を超過しました (これまで {_totalBytes:N0} + 今回 {bytes:N0})。");
         _totalBytes += bytes;

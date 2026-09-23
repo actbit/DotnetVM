@@ -16,7 +16,6 @@ internal sealed class GuestThreadRuntime(
     private readonly object _gate = new();
     private readonly ConditionalWeakTable<VmObject, GuestThread> _threads = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, GuestThread> _active = new();
-    private readonly Dictionary<int, GuestThread> _known = [];
     private readonly GuestWorkerBudget _workerBudget = workerBudget;
     private readonly CancellationToken _shutdownToken = shutdownToken;
     private readonly int _shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
@@ -36,7 +35,6 @@ internal sealed class GuestThreadRuntime(
             }
             var thread = new GuestThread(threadObject, Interlocked.Increment(ref _nextId), startDelegate, parameterized);
             _threads.Add(threadObject, thread);
-            _known[thread.Id] = thread;
         }
     }
 
@@ -130,7 +128,10 @@ internal sealed class GuestThreadRuntime(
             if (_disposed)
                 return;
             _disposed = true;
-            threads = [.. _known.Values];
+            // 完了済みスレッドは _active から除去されているため、ここで保持する必要はない。
+            // 完了履歴を強参照で蓄積すると、ゲストが Thread を大量生成しただけで
+            // delegate と guest object のグラフが VM の寿命まで残ってしまう。
+            threads = [.. _active.Values];
         }
 
         foreach (var thread in threads) {

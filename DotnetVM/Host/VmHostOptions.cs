@@ -54,6 +54,23 @@ public sealed class MemoryPolicy {
 
     /// <summary>ドキュメント読み込みの最大メタデータストリームサイズ (単一 #~ / #Strings 等)。</summary>
     public long MaxMetadataStreamBytes { get; init; } = 64 * 1024 * 1024;
+
+    /// <summary>ポリシー値の符号と、実行に必要な最小値を検証する。</summary>
+    internal void Validate() {
+        if (InstructionQuota < 0) throw new ArgumentOutOfRangeException(nameof(InstructionQuota));
+        if (MaxRecursionDepth < 1) throw new ArgumentOutOfRangeException(nameof(MaxRecursionDepth));
+        if (TotalAllocationByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(TotalAllocationByteLimit));
+        if (LiveObjectByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(LiveObjectByteLimit));
+        if (GcTriggerAllocationInterval < 1) throw new ArgumentOutOfRangeException(nameof(GcTriggerAllocationInterval));
+        if (HostTempAllocationByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(HostTempAllocationByteLimit));
+        if (HostWorkBudget < 0) throw new ArgumentOutOfRangeException(nameof(HostWorkBudget));
+        if (MaxAssemblyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxAssemblyBytes));
+        if (MaxMetadataRows < 0) throw new ArgumentOutOfRangeException(nameof(MaxMetadataRows));
+        if (MaxMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxMethodBodyBytes));
+        if (MaxSignatureDepth < 0) throw new ArgumentOutOfRangeException(nameof(MaxSignatureDepth));
+        if (MaxGenericNestingDepth < 0) throw new ArgumentOutOfRangeException(nameof(MaxGenericNestingDepth));
+        if (MaxMetadataStreamBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxMetadataStreamBytes));
+    }
 }
 
 /// <summary>VM 起動オプション。</summary>

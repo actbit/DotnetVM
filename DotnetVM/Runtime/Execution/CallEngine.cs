@@ -255,7 +255,15 @@ internal sealed class CallEngine(
             or "System.Runtime.CompilerServices.AsyncTaskMethodBuilder"
             or "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1"
             or "System.Runtime.CompilerServices.TaskAwaiter"
-            or "System.Runtime.CompilerServices.TaskAwaiter`1";
+            or "System.Runtime.CompilerServices.TaskAwaiter`1"
+            or "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder"
+            or "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1"
+            or "System.Runtime.CompilerServices.ValueTaskAwaiter"
+            or "System.Runtime.CompilerServices.ValueTaskAwaiter`1"
+            or "System.Runtime.CompilerServices.ConfiguredTaskAwaitable+ConfiguredTaskAwaiter"
+            or "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter"
+            or "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter"
+            or "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter";
 
     /// <summary>VM ランタイムオブジェクトのレシーバが属する intrinsic 面 (仮想ディスパッチの
     /// 実行時型相当)。ランタイムオブジェクトは対応する intrinsic ファサード型の実体として振る舞う。</summary>
@@ -882,9 +890,19 @@ internal sealed class CallEngine(
 
     private static bool IsTaskSurface(string typeName) => typeName is
         "System.Threading.Tasks.Task" or "System.Threading.Tasks.Task`1" or
+        "System.Threading.Tasks.ValueTask" or "System.Threading.Tasks.ValueTask`1" or
         "System.Runtime.CompilerServices.TaskAwaiter" or "System.Runtime.CompilerServices.TaskAwaiter`1" or
+        "System.Runtime.CompilerServices.ValueTaskAwaiter" or "System.Runtime.CompilerServices.ValueTaskAwaiter`1" or
+        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable" or "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1" or
+        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable+ConfiguredTaskAwaiter" or
+        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter" or
+        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable" or "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1" or
+        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter" or
+        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter" or
         "System.Runtime.CompilerServices.AsyncTaskMethodBuilder" or
-        "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1";
+        "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1" or
+        "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder" or
+        "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1";
 
     /// <summary>
     /// Task 系の署名 binding は FullName だけで fake TypeDef に適用してはいけない。

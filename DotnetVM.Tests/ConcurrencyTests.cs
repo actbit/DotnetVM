@@ -1,5 +1,6 @@
 using DotnetVM.Host;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -51,6 +52,76 @@ public sealed class ConcurrencyTests {
 
                 public static int RunAsync() => AddAfterDelay(41).GetAwaiter().GetResult();
                 public static int RunCompletedAwait() => Task.FromResult(41).GetAwaiter().GetResult();
+
+                public static class InitializationProbe {
+                    public static int Runs;
+                    static InitializationProbe() {
+                        Runs++;
+                        Thread.Sleep(25);
+                    }
+                    public static int GetRuns() => Runs;
+                }
+
+                public static class FailingInitializationProbe {
+                    static FailingInitializationProbe() => throw new InvalidOperationException("cctor failed");
+                    public static int GetValue() => 7;
+                }
+
+                private static void HoldThreadWorker() => Thread.Sleep(250);
+                private static void HoldTaskWorker() => Thread.Sleep(250);
+                private static void HoldLongTaskWorker() => Thread.Sleep(5000);
+
+                public static int ExceedThreadLimit() {
+                    var first = new Thread(HoldThreadWorker);
+                    var second = new Thread(HoldThreadWorker);
+                    first.Start();
+                    try {
+                        second.Start();
+                        return -1;
+                    }
+                    finally {
+                        first.Join();
+                    }
+                }
+
+                public static int ExceedTaskWorkerLimit() {
+                    var first = Task.Run((Action)HoldTaskWorker);
+                    try {
+                        _ = Task.Run((Action)HoldTaskWorker);
+                        return -1;
+                    }
+                    finally {
+                        first.GetAwaiter().GetResult();
+                    }
+                }
+
+                public static int RunSequentialTasks() {
+                    var first = Task.Run((Action)HoldTaskWorker);
+                    first.GetAwaiter().GetResult();
+                    var second = Task.Run((Action)HoldTaskWorker);
+                    second.GetAwaiter().GetResult();
+                    return 2;
+                }
+
+                public static int ExceedSharedWorkerLimit() {
+                    var first = new Thread(HoldThreadWorker);
+                    first.Start();
+                    try {
+                        _ = Task.Run((Action)HoldTaskWorker);
+                        return -1;
+                    }
+                    finally {
+                        first.Join();
+                    }
+                }
+
+                public static int ExceedTimerLimit() {
+                    _ = Task.Delay(10000);
+                    _ = Task.Delay(10000);
+                    return -1;
+                }
+
+                public static Task StartLongTask() => Task.Run((Action)HoldLongTaskWorker);
             }
         }
         """;
@@ -58,14 +129,21 @@ public sealed class ConcurrencyTests {
     private static readonly byte[] AssemblyBytes =
         TestAssemblyCompiler.CompileToBytes(Source, "ConcurrencyAsm");
 
-    private static VirtualMachine CreateVm() {
-        var vm = new VirtualMachine(new VmHostOptions {
+    private static VirtualMachine CreateVm(VmHostOptions? options = null) {
+        var vm = new VirtualMachine(options ?? new VmHostOptions {
             MaxGuestThreads = 16,
             Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
         });
         using var stream = new MemoryStream(AssemblyBytes);
         vm.LoadAssembly(stream);
         return vm;
+    }
+
+    private static void AssertGuestWorkersDrained(VirtualMachine vm) {
+        Assert.True(SpinWait.SpinUntil(
+            () => vm.SharedState.GuestThreads.ActiveCount == 0 &&
+                  vm.SharedState.GuestTasks.ActiveWorkerCount == 0,
+            TimeSpan.FromSeconds(1)));
     }
 
     [Fact]
@@ -112,5 +190,135 @@ public sealed class ConcurrencyTests {
         using var vm = CreateVm();
 
         Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunCompletedAwait"));
+    }
+
+    [Fact]
+    public void StaticConstructors_RunOnceAndAreVmLocal() {
+        using (var first = CreateVm()) {
+            Assert.Equal(1, first.Invoke("Vm.ConcurrentCode+InitializationProbe", "GetRuns"));
+            Assert.Equal(1, first.Invoke("Vm.ConcurrentCode+InitializationProbe", "GetRuns"));
+        }
+
+        using var second = CreateVm();
+        Assert.Equal(1, second.Invoke("Vm.ConcurrentCode+InitializationProbe", "GetRuns"));
+    }
+
+    [Fact]
+    public async Task StaticConstructors_AreSerializedWithoutHoldingTheTypeLock() {
+        using var vm = CreateVm();
+        var calls = Enumerable.Range(0, 16)
+            .Select(_ => Task.Run(() => vm.Invoke("Vm.ConcurrentCode+InitializationProbe", "GetRuns")))
+            .ToArray();
+
+        var results = await Task.WhenAll(calls);
+
+        Assert.All(results, result => Assert.Equal(1, result));
+    }
+
+    [Fact]
+    public void FailedStaticConstructor_IsCachedPerVm() {
+        using var vm = CreateVm();
+
+        var first = Assert.Throws<UnhandledGuestException>(() =>
+            vm.Invoke("Vm.ConcurrentCode+FailingInitializationProbe", "GetValue"));
+        var second = Assert.Throws<UnhandledGuestException>(() =>
+            vm.Invoke("Vm.ConcurrentCode+FailingInitializationProbe", "GetValue"));
+
+        Assert.Equal(first.ExceptionTypeName, second.ExceptionTypeName);
+    }
+
+    [Fact]
+    public void GuestThreads_RejectTheConfiguredLimit() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxGuestThreads = 1,
+            MaxGuestWorkers = 4,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "ExceedThreadLimit"));
+        AssertGuestWorkersDrained(vm);
+    }
+
+    [Fact]
+    public void GuestTasks_RejectTheConfiguredWorkerLimit() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxTaskWorkers = 1,
+            MaxGuestWorkers = 4,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "ExceedTaskWorkerLimit"));
+        AssertGuestWorkersDrained(vm);
+    }
+
+    [Fact]
+    public void GuestTaskWorkerBudgetIsReleasedBeforeTaskCompletion() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxTaskWorkers = 1,
+            MaxGuestWorkers = 1,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Equal(2, vm.Invoke("Vm.ConcurrentCode", "RunSequentialTasks"));
+        AssertGuestWorkersDrained(vm);
+    }
+
+    [Fact]
+    public void ThreadAndTaskWorkersShareOneVmWideBudget() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxGuestThreads = 4,
+            MaxTaskWorkers = 4,
+            MaxGuestWorkers = 1,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "ExceedSharedWorkerLimit"));
+        AssertGuestWorkersDrained(vm);
+    }
+
+    [Fact]
+    public void TaskDelay_RejectsTheConfiguredTimerLimitAndDisposesTimers() {
+        var vm = CreateVm(new VmHostOptions {
+            MaxPendingTaskTimers = 1,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "ExceedTimerLimit"));
+        Assert.Equal(1, vm.SharedState.GuestTasks.PendingTimerCount);
+
+        vm.Dispose();
+        Assert.Equal(0, vm.SharedState.GuestTasks.PendingTimerCount);
+    }
+
+    [Fact]
+    public void Dispose_StopsGuestTaskWorkersAndIsIdempotent() {
+        var vm = CreateVm(new VmHostOptions {
+            ShutdownTimeoutMilliseconds = 1_000,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+        var task = Assert.IsType<VmTaskObject>(vm.Invoke("Vm.ConcurrentCode", "StartLongTask"));
+        Assert.True(vm.SharedState.GuestTasks.ActiveWorkerCount >= 1);
+
+        vm.Dispose();
+        vm.Dispose();
+
+        Assert.Equal(0, vm.SharedState.GuestTasks.ActiveWorkerCount);
+        Assert.True(task.IsCompleted);
+        Assert.IsType<ObjectDisposedException>(task.Snapshot().HostException);
+    }
+
+    [Fact]
+    public void PublicOperations_RejectUseAfterDispose() {
+        var vm = CreateVm();
+        vm.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "GetCounter"));
+        using var stream = new MemoryStream(AssemblyBytes);
+        Assert.Throws<ObjectDisposedException>(() => vm.LoadAssembly(stream));
     }
 }

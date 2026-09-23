@@ -89,4 +89,19 @@ public sealed class VmHostOptions {
 
     /// <summary>同時に開始できる guest Thread 数 (別途ホスト側の OS 制限も適用)。既定 = 64。</summary>
     public int MaxGuestThreads { get; init; } = 64;
+
+    /// <summary>同時に実行できる guest Task worker 数。Thread の上限とは別に明示する。既定 = 64。</summary>
+    public int MaxTaskWorkers { get; init; } = 64;
+
+    /// <summary>
+    /// Thread と Task worker を合わせた VM-wide host worker 上限。
+    /// 個別上限を両方満たしても host thread が二重に増えないよう、共通予算を既定で 64 にする。
+    /// </summary>
+    public int MaxGuestWorkers { get; init; } = 64;
+
+    /// <summary>未完了の Task.Delay が保持できる host Timer 数。-1 の無限 Delay も 1 件として数える。</summary>
+    public int MaxPendingTaskTimers { get; init; } = 1024;
+
+    /// <summary>VM.Dispose が worker の停止を待つ最大時間 (ミリ秒)。</summary>
+    public int ShutdownTimeoutMilliseconds { get; init; } = 5_000;
 }

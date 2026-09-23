@@ -585,9 +585,10 @@ public sealed class TypeLoader {
                 return forwarded;
         }
         // ③ trusted assembly に限定した FullName 統合 (BCL の参照アセンブリ→実装の解決)。
-        // 例: ゲストが System.Runtime (ref) を参照し、実装が trusted System.Private.CoreLib に
-        // ある場合。非 trusted なゲスト画像同士では統合しない (fake 混入防止)。
-        return TryResolveTrustedUnifiedType(fullName);
+        // ただし単に「解決できなかった AssemblyRef」であることだけを根拠にすると、
+        // 任意の AssemblyRef が同名 CoreLib 型へ統合される。既知の framework contract identity
+        // からの参照、または正式な TypeForwarder 経路だけを許可する。
+        return IsKnownFrameworkContract(refIdentity) ? TryResolveTrustedUnifiedType(fullName) : null;
     }
 
     /// <summary>画像の ExportedType テーブルに FullName の転送宣言があれば転送先を解決する
@@ -606,8 +607,10 @@ public sealed class TypeLoader {
                 var fwdTarget = Context?.TryResolveAssembly(fwdIdentity, image);
                 if (fwdTarget?.FindTypeByFullName(fullName) is { } fwdType)
                     return fwdType;
-                // 転送先が未ロードでも trusted 統合で拾える場合はそちらへ (BCL forwarder の救済)
-                if (TryResolveTrustedUnifiedType(fullName) is { } trusted)
+                // 転送先が未ロードでも、forwarder の参照先が既知 framework contract の場合だけ
+                // trusted 統合で拾える (任意 AssemblyRef の同名統合はしない)。
+                if (IsKnownFrameworkContract(fwdIdentity) &&
+                    TryResolveTrustedUnifiedType(fullName) is { } trusted)
                     return trusted;
             }
         }
@@ -650,7 +653,8 @@ public sealed class TypeLoader {
                 targetLoader = resolved;
             } else {
                 // BCL 参照アセンブリ (System.Runtime 等) のネスト型は trusted 実装で救済する
-                var unified = TryResolveTrustedUnifiedType(names[0]);
+                var unified = IsKnownFrameworkContract(refIdentity)
+                    ? TryResolveTrustedUnifiedType(names[0]) : null;
                 if (unified is VmClassType unifiedClass)
                     return WalkNested(unifiedClass, names, 1);
                 return null;
@@ -662,7 +666,9 @@ public sealed class TypeLoader {
         var owner = targetLoader.FindTypeByFullName(names[0]) ?? targetLoader.FindTypeByName(names[0]);
         if (owner is null) {
             // 自画像に無く BCL 統合で拾える場合 (参照アセンブリ経由の BCL ネスト型)
-            if (targetLoader == this && TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
+            if (targetLoader == this && terminalTable == TableKind.AssemblyRef &&
+                IsKnownFrameworkContract(_image.GetAssemblyRefIdentity(terminalRid)) &&
+                TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
                 return WalkNested(unifiedClass, names, 1);
             return null;
         }
@@ -692,6 +698,19 @@ public sealed class TypeLoader {
         }
         return owner;
     }
+
+    /// <summary>
+    /// CoreLib 統合 fallback に使える framework contract identity。
+    /// 名前だけでは fake System.Runtime.dll を区別できないため、既知の strong-name token を
+    /// 必須にする。正式な AssemblyRef→TypeForwarder 解決はこの制約とは別に上で処理する。
+    /// </summary>
+    private static bool IsKnownFrameworkContract(AssemblyIdentity identity) =>
+        identity.IsStrongNamed &&
+        identity.PublicKeyToken is "7cec85d7bea7798e" or "b03f5f7f11d50a3a" or "cc7b13ffcd2ddd51" &&
+        identity.Name is "System.Private.CoreLib" or "System.Runtime" or "System.Runtime.Extensions"
+            or "System.Console" or "System.Linq" or "System.Collections" or "System.Collections.Concurrent"
+            or "System.Threading" or "System.Threading.Tasks" or "System.Reflection"
+            or "System.Reflection.Emit" or "System.Runtime.InteropServices" or "netstandard";
 
     // ---- 検索 API ----
 

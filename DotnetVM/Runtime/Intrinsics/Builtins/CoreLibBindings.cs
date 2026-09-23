@@ -2585,7 +2585,8 @@ internal static class CoreLibBindings {
             var builderValue = BuilderValue(args[0]);
             if (builderValue.Fields.Length > 0 && builderValue.Fields[0].ObjectValue is VmTaskObject taskObject)
                 return taskObject;
-            var generic = builderValue.StructType.FullName == builderOfT;
+            var generic = builderValue.StructType is VmConstructedType { Definition.FullName: builderOfT } ||
+                builderValue.StructType.FullName == builderOfT;
             var resultType = builderValue.TypeArguments.FirstOrDefault() ?? ctx.ClassTypeArguments.FirstOrDefault();
             var newTask = NewTask(ctx, generic, resultType);
             if (builderValue.Fields.Length == 0) {
@@ -2621,80 +2622,101 @@ internal static class CoreLibBindings {
         static VmType? ResultType(IntrinsicContext ctx, bool fromMethod) => fromMethod
             ? ctx.MethodTypeArguments.FirstOrDefault()
             : ctx.ClassTypeArguments.FirstOrDefault();
+        static void RegisterBinding(IntrinsicRegistry registry, BindingKey key, IntrinsicImpl impl) =>
+            registry.RegisterBinding(key, impl, BindingOrigin.Managed);
+
         static void RegisterTaskType(IntrinsicRegistry registry, string typeName, bool generic) {
-            registry.Register(IntrinsicKey.Instance(typeName, "get_IsCompleted", 0),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "get_IsCompleted"),
                 static (_, a) => StackSlot.OfInt32(AsTask(a[0]).IsCompleted ? 1 : 0));
-            registry.Register(IntrinsicKey.Instance(typeName, "GetAwaiter", 0),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "GetAwaiter"),
                 (ctx, a) => {
                     var objectTask = AsTask(a[0]);
                     var resultType = generic ? ResultType(ctx, fromMethod: false) : null;
                     return StackSlot.OfValueType(new VmStructValue(AwaiterType(ctx, generic, resultType),
                         [StackSlot.OfObject(objectTask)], generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
                 });
-            registry.Register(IntrinsicKey.Instance(typeName, "Wait", 0),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "Wait"),
                 static (ctx, a) => { SuspendHostWait(ctx, AsTask(a[0]).Wait); return null; });
-            registry.Register(IntrinsicKey.Instance(typeName, "Wait", 1),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "Wait", "System.Int32"),
                 (ctx, a) => {
                     var target = AsTask(a[0]);
-                    var milliseconds = a[1].Kind == StackKind.Int32 ? a[1].AsInt32 : TimeSpanMilliseconds(a[1]);
+                    var milliseconds = a[1].AsInt32;
                     if (milliseconds < Timeout.Infinite)
                         throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "timeout");
                     return StackSlot.OfInt32(SuspendHostWait(ctx, () => target.Wait(milliseconds)) ? 1 : 0);
                 });
+            RegisterBinding(registry, BindingKey.Instance(typeName, "Wait", "System.TimeSpan"),
+                (ctx, a) => StackSlot.OfInt32(SuspendHostWait(ctx, () => AsTask(a[0]).Wait(
+                    ValidateTimeout(TimeSpanMilliseconds(a[1]), "timeout"))) ? 1 : 0));
+        }
+
+        static StackSlot StartTaskWorker(IntrinsicContext ctx, StackSlot[] a, VmType? resultType, bool generic) {
+            if (a[0].ObjectValue is not VmDelegate guestDelegate)
+                throw new UnhandledGuestException("System.ArgumentNullException", "function");
+            var running = NewTask(ctx, generic, resultType);
+            var invoke = ctx.InvokeGuestDelegate ?? throw new InvalidOperationException("guest delegate runner が初期化されていません。");
+            ctx.Shared.GuestTasks.Run(running, [StackSlot.OfObject(running), a[0]], () => {
+                var result = invoke(guestDelegate, [StackSlot.OfObject(guestDelegate)]) ?? default;
+                if (result.ObjectValue is VmTaskObject nestedTask) {
+                    nestedTask.Wait();
+                    var nested = nestedTask.Snapshot();
+                    if (nested.GuestException.Kind != StackKind.Empty)
+                        throw new UnhandledGuestException("System.Exception", null);
+                    if (nested.HostException is not null)
+                        throw nested.HostException;
+                    return nested.Result;
+                }
+                return result;
+            });
+            return StackSlot.OfObject(running);
         }
 
         RegisterTaskType(r, task, generic: false);
         RegisterTaskType(r, taskOfT, generic: true);
-        r.Register(IntrinsicKey.Instance(taskOfT, "get_Result", 0),
+        RegisterBinding(r, BindingKey.Instance(taskOfT, "get_Result"),
             static (ctx, a) => TaskResult(ctx, AsTask(a[0])));
-        r.Register(IntrinsicKey.Static(task, "get_CompletedTask", 0),
+        RegisterBinding(r, BindingKey.Static(task, "get_CompletedTask"),
             static (ctx, _) => StackSlot.OfObject(NewTask(ctx, generic: false, completed: true)));
-        r.Register(IntrinsicKey.Static(task, "Delay", 1),
+        RegisterBinding(r, BindingKey.Static(task, "Delay", "System.Int32"),
             static (ctx, a) => {
-                var milliseconds = a[0].Kind == StackKind.Int32 ? a[0].AsInt32 : TimeSpanMilliseconds(a[0]);
+                var milliseconds = a[0].AsInt32;
                 if (milliseconds < Timeout.Infinite)
                     throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "delay");
                 var delayed = NewTask(ctx, generic: false);
                 ctx.Shared.GuestTasks.Delay(delayed, milliseconds);
                 return StackSlot.OfObject(delayed);
             });
-        r.Register(IntrinsicKey.Static(task, "FromResult", 1),
+        RegisterBinding(r, BindingKey.Static(task, "Delay", "System.TimeSpan"),
             static (ctx, a) => {
-                return StackSlot.OfObject(NewTask(ctx, generic: true,
-                    ResultType(ctx, fromMethod: true), completed: true, result: a[0]));
+                var milliseconds = TimeSpanMilliseconds(a[0]);
+                if (milliseconds < Timeout.Infinite)
+                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "delay");
+                var delayed = NewTask(ctx, generic: false);
+                ctx.Shared.GuestTasks.Delay(delayed, milliseconds);
+                return StackSlot.OfObject(delayed);
             });
-        r.Register(IntrinsicKey.Static(task, "Run", 1),
+        RegisterBinding(r, BindingKey.Static(task, "FromResult", "!!0"),
+            static (ctx, a) => StackSlot.OfObject(NewTask(ctx, generic: true,
+                ResultType(ctx, fromMethod: true), completed: true, result: a[0])));
+        RegisterBinding(r, BindingKey.Static(task, "Run", "System.Action"),
+            static (ctx, a) => StartTaskWorker(ctx, a, resultType: null, generic: false));
+        RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<System.Threading.Tasks.Task>"),
+            static (ctx, a) => StartTaskWorker(ctx, a, resultType: null, generic: false));
+        RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<!!0>"),
             static (ctx, a) => {
-                if (a[0].ObjectValue is not VmDelegate guestDelegate)
-                    throw new UnhandledGuestException("System.ArgumentNullException", "function");
                 var resultType = ResultType(ctx, fromMethod: true);
                 var generic = resultType is not null;
-                var running = NewTask(ctx, generic, resultType);
-                var invoke = ctx.InvokeGuestDelegate ?? throw new InvalidOperationException("guest delegate runner が初期化されていません。");
-                ctx.Shared.GuestTasks.Run(running, [StackSlot.OfObject(running), a[0]], () => {
-                    var result = invoke(guestDelegate, [StackSlot.OfObject(guestDelegate)]) ?? default;
-                    if (result.ObjectValue is VmTaskObject nestedTask) {
-                        nestedTask.Wait();
-                        var nested = nestedTask.Snapshot();
-                        if (nested.GuestException.Kind != StackKind.Empty)
-                            throw new UnhandledGuestException("System.Exception", null);
-                        if (nested.HostException is not null)
-                            throw nested.HostException;
-                        return nested.Result;
-                    }
-                    return result;
-                });
-                return StackSlot.OfObject(running);
+                return StartTaskWorker(ctx, a, resultType, generic);
             });
 
         foreach (var typeName in new[] { awaiter, awaiterOfT }) {
-            r.Register(IntrinsicKey.Instance(typeName, "get_IsCompleted", 0),
+            RegisterBinding(r, BindingKey.Instance(typeName, "get_IsCompleted"),
                 static (_, a) => StackSlot.OfInt32(AwaitedTask(a[0]).IsCompleted ? 1 : 0));
-            r.Register(IntrinsicKey.Instance(typeName, "GetResult", 0),
+            RegisterBinding(r, BindingKey.Instance(typeName, "GetResult"),
                 static (ctx, a) => TaskResult(ctx, AwaitedTask(a[0])));
-            r.Register(IntrinsicKey.Instance(typeName, "OnCompleted", 1),
+            RegisterBinding(r, BindingKey.Instance(typeName, "OnCompleted", "System.Action"),
                 static (_, _) => null);
-            r.Register(IntrinsicKey.Instance(typeName, "UnsafeOnCompleted", 1),
+            RegisterBinding(r, BindingKey.Instance(typeName, "UnsafeOnCompleted", "System.Action"),
                 static (_, _) => null);
         }
 
@@ -2702,7 +2724,7 @@ internal static class CoreLibBindings {
         RegisterBuilderType(r, builderOfT, generic: true);
 
         static void RegisterBuilderType(IntrinsicRegistry registry, string typeName, bool generic) {
-            registry.Register(IntrinsicKey.Static(typeName, "Create", 0),
+            RegisterBinding(registry, BindingKey.Static(typeName, "Create"),
                 (ctx, _) => {
                     var resultType = generic ? ResultType(ctx, fromMethod: false) : null;
                     var definition = FindType(ctx, typeName);
@@ -2711,32 +2733,35 @@ internal static class CoreLibBindings {
                         : definition;
                     return StackSlot.OfValueType(new VmStructValue(builderType, [default], generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
                 });
-            registry.Register(IntrinsicKey.Instance(typeName, "get_Task", 0),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "get_Task"),
                 (ctx, a) => StackSlot.OfObject(EnsureBuilderTask(ctx, a)));
-            registry.Register(IntrinsicKey.Instance(typeName, "SetResult", generic ? 1 : 0),
+            RegisterBinding(registry, generic
+                    ? BindingKey.Instance(typeName, "SetResult", "!0")
+                    : BindingKey.Instance(typeName, "SetResult"),
                 (ctx, a) => {
                     var target = EnsureBuilderTask(ctx, a);
                     var result = generic && a.Length > 1 ? a[1] : default;
                     ctx.Shared.GuestTasks.Complete(target, result);
                     return null;
                 });
-            registry.Register(IntrinsicKey.Instance(typeName, "SetException", 1),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "SetException", "System.Exception"),
                 (ctx, a) => {
                     var target = EnsureBuilderTask(ctx, a);
                     ctx.Shared.GuestTasks.CompleteGuestException(target, a.Length > 1 ? a[1] : default);
                     return null;
                 });
-            registry.Register(IntrinsicKey.Instance(typeName, "Start", 1),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "Start", "!!0&"),
                 (ctx, a) => {
                     var run = ctx.RunGuestStateMachine ?? throw new InvalidOperationException("guest state machine runner が初期化されていません。");
                     run(a[1]);
                     return null;
                 });
-            registry.Register(IntrinsicKey.Instance(typeName, "AwaitOnCompleted", 2),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "AwaitOnCompleted", "!!0&", "!!1&"),
                 (ctx, a) => RegisterContinuation(ctx, a));
-            registry.Register(IntrinsicKey.Instance(typeName, "AwaitUnsafeOnCompleted", 2),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "AwaitUnsafeOnCompleted", "!!0&", "!!1&"),
                 (ctx, a) => RegisterContinuation(ctx, a));
-            registry.Register(IntrinsicKey.Instance(typeName, "SetStateMachine", 1),
+            RegisterBinding(registry, BindingKey.Instance(typeName, "SetStateMachine",
+                    "System.Runtime.CompilerServices.IAsyncStateMachine"),
                 static (_, _) => null);
         }
 

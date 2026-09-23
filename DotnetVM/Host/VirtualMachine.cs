@@ -29,14 +29,25 @@ public sealed class VirtualMachine : IDisposable {
     private Interpreter? _interpreter;
     private VmCoreLibSurfaces? _coreLibSurfaces;
     private VmClassType? _stringType;
+    private int _disposed;
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
         if (_options.MaxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestThreads は 1 以上である必要があります。");
-        _sharedState = new VmSharedState(_options.MaxGuestThreads);
+        if (_options.MaxTaskWorkers < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxTaskWorkers は 1 以上である必要があります。");
+        if (_options.MaxGuestWorkers < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestWorkers は 1 以上である必要があります。");
+        if (_options.MaxPendingTaskTimers < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxPendingTaskTimers は 1 以上である必要があります。");
+        if (_options.ShutdownTimeoutMilliseconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(options), "ShutdownTimeoutMilliseconds は 0 以上である必要があります。");
+        _sharedState = new VmSharedState(_options.MaxGuestThreads, _options.MaxTaskWorkers,
+            _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds);
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _heap.AddRootObjectSource(_handles.EnumerateRoots); // ホスト保持参照 (GCHandle 相当) をルートに
+        _heap.AddRootObjectSource(_sharedState.EnumerateRoots);
         _heap.AddRootObjectSource(_sharedState.GuestThreads.EnumerateRoots);
         _heap.AddRootSlotSource(_sharedState.GuestTasks.EnumerateRoots);
         _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
@@ -126,12 +137,16 @@ public sealed class VirtualMachine : IDisposable {
     public long InstructionCount => _interpreter?.InstructionCount ?? 0;
 
     /// <summary>intrinsic を起動前に追加登録する (実行開始後は不可)。</summary>
-    public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) =>
+    public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) {
+        _sharedState.ThrowIfDisposed();
         _intrinsics.Register(key, impl);
+    }
 
     /// <summary>ランタイムバインドを起動前に追加登録する (実行開始後は不可。P/Invoke 代替等)。</summary>
-    public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) =>
+    public void RegisterBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
+        _sharedState.ThrowIfDisposed();
         _intrinsics.RegisterBinding(key, impl, origin);
+    }
 
     /// <summary>登録済みランタイムバインドの監査面 (キーと由来。監査テスト / 診断用)。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings => _intrinsics.Bindings;
@@ -142,6 +157,7 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>DLL アセンブリをファイルからロードする (EXE は不要/非対応)。
     /// AssemblyRef による依存アセンブリは、参照元と同一ディレクトリの同名 DLL から自動解決される。</summary>
     public AssemblyImage LoadAssembly(string path) {
+        _sharedState.ThrowIfDisposed();
         using var stream = File.OpenRead(path);
         return LoadAssembly(stream, Path.GetFullPath(path));
     }
@@ -152,6 +168,7 @@ public sealed class VirtualMachine : IDisposable {
     /// LoadAssembly(path) / LoadDependencyAssembly で解決するか、resolver を登録する。
     /// host current directory への暗黙フォールバック (SourcePath ?? ".") を廃止した (タスク 2)。</summary>
     public AssemblyImage LoadAssembly(Stream peStream, string? sourcePath = null) {
+        _sharedState.ThrowIfDisposed();
         // 入力サイズ上限 (loader hardening): 読み込み途中で強制する (非 seekable な入力も含め、
         // 上限を超えた時点で打ち切って拒否する。巨大 stream を丸ごと buffer してから判定しない)
         var maxBytes = _options.Memory.MaxAssemblyBytes;
@@ -186,6 +203,7 @@ public sealed class VirtualMachine : IDisposable {
     /// 対応しているのは静的メソッド (インスタンスメソッドは CreateInstance + CallInstance を使用)。
     /// </summary>
     public object? Invoke(string typeFullName, string methodName, params object?[] args) {
+        _sharedState.ThrowIfDisposed();
         var method = FindMethod(typeFullName, methodName, args);
         return RunGuest(() => Execute(method, args).ReturnValue);
     }
@@ -204,6 +222,7 @@ public sealed class VirtualMachine : IDisposable {
     /// 戻り値は VM オブジェクト (CallInstance のレシーバや Invoke の引数に使える)。
     /// </summary>
     public VmClassInstance CreateInstance(string typeFullName, params object?[] args) {
+        _sharedState.ThrowIfDisposed();
         var type = FindType(typeFullName);
         var ctor = FindConstructor(type, args.Length);
         var interpreter = GetInterpreter();
@@ -216,6 +235,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>インスタンスメソッドを明示指定して呼び出す (仮想メソッドは最派生実装を実行)。</summary>
     public object? CallInstance(VmClassInstance instance, string methodName, params object?[] args) {
+        _sharedState.ThrowIfDisposed();
         var method = FindInstanceMethod(instance.ClassType, methodName, args.Length);
         var interpreter = GetInterpreter();
         using var operation = interpreter.EnterHostOperation();
@@ -231,6 +251,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>メソッドを実行し、戻り値・コンソール出力スナップショット・命令数を返す。</summary>
     public ExecutionResult Execute(VmMethod method, params object?[] args) {
+        _sharedState.ThrowIfDisposed();
         if (!method.IsStatic)
             throw new NotSupportedException($"インスタンスメソッド {method} はオブジェクトモデル (M3) 以降に対応します。静的メソッドを指定してください。");
         var signature = method.Signature;
@@ -307,6 +328,7 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>仮想環境変数を設定する (Kernel32.GetEnvironmentVariable 面が読む VM ごとのストア)。
     /// value が null なら削除する。host の実環境変数には触れない。</summary>
     public void SetVirtualEnvironmentVariable(string name, string? value) {
+        _sharedState.ThrowIfDisposed();
         if (value is null)
             _sharedState.VirtualEnvironment.TryRemove(name, out _);
         else
@@ -314,13 +336,18 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     /// <summary>仮想環境変数を取得する (未定義なら null)。</summary>
-    public string? GetVirtualEnvironmentVariable(string name) =>
-        _sharedState.VirtualEnvironment.TryGetValue(name, out var value) ? value : null;
+    public string? GetVirtualEnvironmentVariable(string name) {
+        _sharedState.ThrowIfDisposed();
+        return _sharedState.VirtualEnvironment.TryGetValue(name, out var value) ? value : null;
+    }
 
     private Interpreter GetInterpreter() {
-        lock (_interpreterGate)
+        _sharedState.ThrowIfDisposed();
+        lock (_interpreterGate) {
+            _sharedState.ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
                 _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState);
+        }
     }
 
     /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
@@ -514,7 +541,11 @@ public sealed class VirtualMachine : IDisposable {
     }
 
     public void Dispose() {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        _sharedState.Dispose();
+        lock (_interpreterGate)
+            _interpreter = null;
         _loaders.Clear();
-        _interpreter = null;
     }
 }

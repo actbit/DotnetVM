@@ -142,7 +142,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             StringType = _stringType,
         };
         var preparer = new MethodPreparer(loader);
-        var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage);
+        var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage, _shared.TypeInitialization);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);
         intrinsicContext.RunGuestThreadDelegate = (guestDelegate, state, hasState) => {
@@ -257,9 +257,11 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
     public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
+        _shared.ThrowIfDisposed();
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
+        EnsureStaticMethodTypeInitialized(method, context);
         // 置換面 (C5): 実在 CoreLib 由来のメソッドのうち DotnetVM.CoreLib の managed IL が
         // 面を置換するものは、ここ (唯一の IL 実行入口) で本体を差し替える。MemberRef 解決
         // でも仮想ディスパッチでも最終的にここを通るため、CoreLib IL 内の boxed int の
@@ -312,6 +314,27 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
             state.Depth--;
         }
 
+    }
+
+    /// <summary>
+    /// 静的メソッド呼出しの入口でも CLR の型初期化規約を適用する。
+    /// 静的フィールドを直接参照しない .cctor でも、明示的 static constructor は最初の
+    /// static method 呼出し前に実行される必要がある。.cctor 自身は再入を避けて除外する。
+    /// </summary>
+    private void EnsureStaticMethodTypeInitialized(VmMethod method, GenericContext? context) {
+        if (!method.IsStatic || method.Name == ".cctor" || method.DeclaringType is not VmClassType definition)
+            return;
+
+        var objects = EnginesFor(method).Objects;
+        if (definition.GenericParamCount > 0 && context?.ClassArgs is { Length: > 0 } classArgs &&
+            classArgs.Length == definition.GenericParamCount) {
+            objects.EnsureConstructedInitialized(new VmConstructedType {
+                Definition = definition,
+                TypeArguments = classArgs,
+            });
+        } else {
+            objects.EnsureInitialized(definition);
+        }
     }
 
     // サービス群からの再帰呼出入口 (循環依存をインターフェースで切る)
@@ -404,6 +427,7 @@ public sealed class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
     /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
     /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
     private void CheckSafepoint() {
+        _shared.ShutdownToken.ThrowIfCancellationRequested();
         // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
         // その場で GC せず、RunFrameCore の次の命令境界で stop-the-world 回収する。
         if (_coordinator.IsInsideGuestInstruction)

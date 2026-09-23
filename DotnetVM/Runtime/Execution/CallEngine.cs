@@ -282,7 +282,8 @@ internal sealed class CallEngine(
             }
         }
         throw new OperationNotAllowedException(
-            $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録されたランタイムバインド / intrinsic のみ提供されます。");
+            $"intrinsic {target.DeclaringType}::{target.Name} (引数 {target.Arity} 個) は未登録です。BCL 面は VM 起動時に登録されたランタイムバインド / intrinsic のみ提供されます。" +
+            (target.ParamTypeNames is { } names ? $" 署名: {string.Join(",", names)}" : ""));
     }
 
     /// <summary>
@@ -1036,6 +1037,7 @@ internal sealed class CallEngine(
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
                             HasThis = signature.HasThis,
+                            ParamTypeNames = paramNames,
                         };
                     throw new OperationNotAllowedException(
                         $"intrinsic {typeName}::{name} (引数 {arity} 個) は未登録です。BCL 面は VM 起動時に登録された intrinsic のみ提供されます。");
@@ -1109,6 +1111,7 @@ internal sealed class CallEngine(
                     Name = name,
                     ParamCount = signature.ParamTypes.Length,
                     HasThis = signature.HasThis,
+                    ParamTypeNames = facadeParamNames,
                     ClassArgs = constructed.TypeArguments,
                 };
             throw new OperationNotAllowedException(
@@ -1253,6 +1256,8 @@ internal sealed class CallEngine(
                         Name = name,
                         ParamCount = signature.ParamTypes.Length,
                         HasThis = signature.HasThis,
+                        ParamTypeNames = signature.ParamTypes
+                            .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
                         MethodArgs = methodArgs,
                     };
                 throw new OperationNotAllowedException(
@@ -1277,9 +1282,14 @@ internal sealed class CallEngine(
                 var constructed = _objectEngine.ResolveConstructedParent(parent.Rid, context);
                 if (constructed.Definition is VmIntrinsicType facade) {
                     var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
-                    if (_intrinsics.TryGetBinding(signature.HasThis
-                            ? BindingKey.InstanceAnyParams(facade.FullName, name)
-                            : BindingKey.StaticAnyParams(facade.FullName, name), out var facadeImpl, out _, CallerDomainOfLoader())) {
+                    var concreteParams = signature.ParamTypes
+                        .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray();
+                    var openParams = signature.ParamTypes
+                        .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
+                    if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, concreteParams,
+                            CallerDomainOfLoader(), out var facadeImpl) ||
+                        TryGetResolvedBinding(facade.FullName, name, signature.HasThis, openParams,
+                            CallerDomainOfLoader(), out facadeImpl)) {
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = facadeImpl,
@@ -1289,7 +1299,7 @@ internal sealed class CallEngine(
                             HasThis = signature.HasThis,
                             ClassArgs = constructed.TypeArguments,
                             MethodArgs = methodArgs,
-                            ParamTypeNames = signature.ParamTypes.Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
+                            ParamTypeNames = concreteParams,
                         };
                     }
                     if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var facadeLegacy)) {
@@ -1302,7 +1312,7 @@ internal sealed class CallEngine(
                             HasThis = signature.HasThis,
                             ClassArgs = constructed.TypeArguments,
                             MethodArgs = methodArgs,
-                            ParamTypeNames = signature.ParamTypes.Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray(),
+                            ParamTypeNames = concreteParams,
                         };
                     }
                     if (!throwOnMissingIntrinsic)
@@ -1312,6 +1322,7 @@ internal sealed class CallEngine(
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
                             HasThis = signature.HasThis,
+                            ParamTypeNames = concreteParams,
                             ClassArgs = constructed.TypeArguments,
                             MethodArgs = methodArgs,
                         };
@@ -1411,7 +1422,13 @@ internal sealed class CallEngine(
         SigKind.String => "System.String",
         SigKind.Object => "System.Object",
         SigKind.SzArray => ParamTypeName(type.Inner!, context) + "[]",
+        SigKind.ByRef => ParamTypeName(type.Inner!, context) + "&",
+        SigKind.Pointer => ParamTypeName(type.Inner!, context) + "*",
         SigKind.TypeToken => TryResolveTypeName(type.Token, context),
+        SigKind.GenericMethodVar => type.VarNumber < (context?.MethodArgs.Length ?? 0)
+            ? context!.MethodArgs[type.VarNumber].FullName : $"!!{type.VarNumber}",
+        SigKind.GenericVar => type.VarNumber < (context?.ClassArgs.Length ?? 0)
+            ? context!.ClassArgs[type.VarNumber].FullName : $"!{type.VarNumber}",
         _ => "",
     };
 
@@ -1420,6 +1437,8 @@ internal sealed class CallEngine(
     private string SubstitutedParamTypeName(SigType type, VmType[] methodArgs) => type.Kind switch {
         SigKind.GenericMethodVar when type.VarNumber < methodArgs.Length => methodArgs[type.VarNumber].FullName,
         SigKind.SzArray => SubstitutedParamTypeName(type.Inner!, methodArgs) + "[]",
+        SigKind.ByRef => SubstitutedParamTypeName(type.Inner!, methodArgs) + "&",
+        SigKind.Pointer => SubstitutedParamTypeName(type.Inner!, methodArgs) + "*",
         _ => ParamTypeName(type, null),
     };
 

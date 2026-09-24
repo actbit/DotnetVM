@@ -106,10 +106,10 @@ public sealed class VmHostOptions {
 
     /// <summary>ストレージブリッジ (ホスト実装のファイル I/O 面。null = 全拒否)。</summary>
     public IStorageBridge? StorageBridge { get; init; }
-    /// <summary>JIT (= M8 のインタプリタホットパス IL 実行) を有効化するか。
-    /// 既定 = false (未実装面の IL 実行保証はインタプリタが担うため、明示的に true を
-    /// 設定したホストのみ JIT 昇格が効く。セキュリティ的にも既定で JIT 動作は避ける)。</summary>
+    /// <summary>簡易 JIT (M8 のスカラー IL ホットパス) を有効化するか。
+    /// 既定 = false。未対応の IL は常にインタプリタへフォールバックする。</summary>
     public bool EnableJit { get; init; }
+    /// <summary>JIT 昇格までのメソッド呼出回数。1 なら初回呼出でコンパイルする。</summary>
     public int JitPromotionThreshold { get; init; } = 1000;
 
     /// <summary>GC 戦略 (既定 = 非世代別マーク &amp; スイープ。世代別戦略に差し替え可能)。</summary>

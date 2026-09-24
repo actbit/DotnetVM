@@ -30,6 +30,8 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private const int SafepointInterval = 1024;
 
     private readonly MemoryPolicy _memory;
+    private readonly bool _enableJit;
+    private readonly int _jitPromotionThreshold;
     private readonly IntrinsicRegistry _intrinsics;
     private readonly VmConsole _console;
     private readonly VmHeap _heap;
@@ -75,8 +77,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly Func<IEnumerable<StackSlot[]>> _frameRootSource;
 
     public long InstructionCount => Interlocked.Read(ref _instructionCount);
+    internal bool HasInstructionBudget => Interlocked.Read(ref _instructionCount) < _memory.InstructionQuota;
 
     internal long CurrentThreadInstructionCount => CurrentState.InstructionCount;
+
+    internal bool IsJitCompiled(VmMethod method) => EnginesFor(method).Jit.IsCompiled(method);
+    internal int JitInvocationCount(VmMethod method) => EnginesFor(method).Jit.InvocationCount(method);
 
     internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
 
@@ -120,6 +126,13 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         using (_coordinator.StopTheWorldAtBoundary())
             _services.Heap.CollectIfDue();
     }
+
+    // JIT frames use the same quota and coordinator gates as interpreter
+    // instructions.  These narrow wrappers keep the coordinator private while
+    // allowing the generated delegate to bracket each instruction safely.
+    internal void ConsumeJitInstruction() => ConsumeInstruction();
+    internal void CheckJitSafepoint() => CheckSafepoint();
+    internal IDisposable EnterJitInstruction() => _coordinator.EnterInstruction();
 
     // ---- 命令ディスパッチ ループ ----
 

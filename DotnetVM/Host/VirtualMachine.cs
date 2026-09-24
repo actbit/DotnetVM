@@ -41,6 +41,8 @@ public sealed class VirtualMachine : IDisposable {
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
         _options.Memory.Validate();
+        if (_options.EnableJit && _options.JitPromotionThreshold < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "JitPromotionThreshold は 1 以上である必要があります。");
         if (_options.MaxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestThreads は 1 以上である必要があります。");
         if (_options.MaxTaskWorkers < 1)
@@ -253,6 +255,9 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>累積実行命令数。</summary>
     public long InstructionCount => _interpreter?.InstructionCount ?? 0;
+
+    /// <summary>JIT 診断用の内部フック (テスト/診断アセンブリのみ)。</summary>
+    internal bool IsJitCompiled(VmMethod method) => GetInterpreter().IsJitCompiled(method);
 
     /// <summary>intrinsic を起動前に追加登録する (実行開始後は不可)。</summary>
     public void RegisterIntrinsic(IntrinsicKey key, IntrinsicImpl impl) {
@@ -505,6 +510,7 @@ public sealed class VirtualMachine : IDisposable {
         lock (_interpreterGate) {
             ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
+                _options.EnableJit, _options.JitPromotionThreshold,
                 _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
                 _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
                 LoadAssemblyPathInContext);

@@ -19,11 +19,13 @@ public sealed partial class Interpreter {
         public required ObjectEngine Objects { get; init; }
         public required CallEngine Calls { get; init; }
         public required ExceptionDispatcher Exceptions { get; init; }
+        public required JitCodeCache Jit { get; init; }
         public required Func<IEnumerable<StackSlot[]>> StaticStorageRoots { get; init; }
         public required Func<IEnumerable<StackSlot[]>> IntrinsicStaticRoots { get; init; }
     }
 
     internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
+        bool enableJit = false, int jitPromotionThreshold = 1000,
         NetworkGateway? network = null, StorageGateway? storage = null, Diagnostics.ExecutionTracer? tracer = null,
         VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null, VmSharedState? shared = null,
         Func<ReadOnlyMemory<byte>, TypeLoader>? loadAssemblyFromBytes = null,
@@ -32,6 +34,8 @@ public sealed partial class Interpreter {
         Func<VmAssemblyLoadContext, ReadOnlyMemory<byte>, TypeLoader>? loadAssemblyInContext = null,
         Func<VmAssemblyLoadContext, string, TypeLoader>? loadAssemblyFromPath = null) {
         _memory = memory;
+        _enableJit = enableJit;
+        _jitPromotionThreshold = jitPromotionThreshold;
         _intrinsics = intrinsics;
         _console = console;
         _heap = heap;
@@ -62,6 +66,9 @@ public sealed partial class Interpreter {
     /// <summary>指定 loader のエンジンセットを取得 (無ければ遅延生成して GC ルート源も登録する)。</summary>
     private LoaderEngines EnginesFor(VmMethod method) {
         var loader = method.Loader;
+        if (loader is not null && loader.Context is null && !ReferenceEquals(loader, _services.Loader))
+            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext),
+                $"メソッド {method} のアセンブリロードコンテキストは既にアンロードされています。");
         lock (_enginesGate) {
             if (loader is null || ReferenceEquals(loader, _services.Loader))
                 return _engines[_services.Loader];
@@ -175,6 +182,7 @@ public sealed partial class Interpreter {
             Objects = objects,
             Calls = calls,
             Exceptions = exceptions,
+            Jit = new JitCodeCache(_enableJit, _jitPromotionThreshold),
             StaticStorageRoots = staticStorageRoots,
             IntrinsicStaticRoots = intrinsicStaticRoots,
         };

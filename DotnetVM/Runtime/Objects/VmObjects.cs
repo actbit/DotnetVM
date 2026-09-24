@@ -82,6 +82,7 @@ public sealed class VmTaskObject : VmObject {
     private StackSlot _result;
     private StackSlot _guestException;
     private Exception? _hostException;
+    private bool _isCanceled;
     private bool _isCompleted;
 
     public VmTaskObject(VmType type) => _type = type;
@@ -116,9 +117,22 @@ public sealed class VmTaskObject : VmObject {
         }
     }
 
+    public void SetCanceled() {
+        lock (_gate) {
+            if (_isCompleted) return;
+            _isCanceled = true;
+            _isCompleted = true;
+            _completed.Set();
+        }
+    }
+
     public void Wait() => _completed.Wait();
 
     public bool Wait(int millisecondsTimeout) => _completed.Wait(millisecondsTimeout);
+
+    internal WaitHandle CompletionWaitHandle => _completed.WaitHandle;
+
+    public bool IsCanceled { get { lock (_gate) return _isCanceled; } }
 
     internal void Wait(CancellationToken cancellationToken) => _completed.Wait(cancellationToken);
 
@@ -126,6 +140,28 @@ public sealed class VmTaskObject : VmObject {
         lock (_gate)
             return (_result, _guestException, _hostException);
     }
+}
+
+/// <summary>
+/// VM 内の CancellationTokenSource。CLR の token を guest に露出せず、VM ヒープ上の
+/// source identity と host cancellation primitive の組だけを保持する。
+/// </summary>
+public sealed class VmCancellationState : VmObject {
+    private readonly VmType _type;
+    private readonly CancellationTokenSource _source = new();
+
+    public VmCancellationState(VmType type) => _type = type;
+    public override VmType Type => _type;
+    public CancellationToken Token => _source.Token;
+    public bool IsCancellationRequested => _source.IsCancellationRequested;
+    public void Cancel() => _source.Cancel();
+}
+
+/// <summary>VM SynchronizationContext の identity。キュー自体は VM runtime が管理する。</summary>
+public sealed class VmSynchronizationContextState : VmObject {
+    private readonly VmType _type;
+    public VmSynchronizationContextState(VmType type) => _type = type;
+    public override VmType Type => _type;
 }
 
 /// <summary>
@@ -505,6 +541,12 @@ public sealed class VmDelegate : VmObject {
 
     /// <summary>式木 delegate の場合、呼出リストの代わりに評価する LambdaExpression。</summary>
     public VmExpressionObject? ExpressionLambda { get; init; }
+
+    /// <summary>
+    /// VM の callback を必要とする runtime surface (IValueTaskSource / SynchronizationContext 等)
+    /// 用の host callback。通常の guest delegate には設定されない。
+    /// </summary>
+    internal Func<StackSlot[], StackSlot?>? HostCallback { get; init; }
 
     public IReadOnlyList<DelegateInvocation> Invocations => _invocations;
 

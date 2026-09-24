@@ -13,6 +13,8 @@ public sealed class ConcurrencyTests {
         using System;
         using System.Threading;
         using System.Threading.Tasks;
+        using System.Threading.Tasks.Sources;
+        using System.Runtime.CompilerServices;
 
         namespace Vm {
             public static class ConcurrentCode {
@@ -105,6 +107,77 @@ public sealed class ConcurrencyTests {
                 public static int RunValueTaskTaskCtor() => new ValueTask<int>(Task.FromResult(41)).GetAwaiter().GetResult();
                 public static int RunConfigureAwait() => AddAfterConfigureAwait(41).GetAwaiter().GetResult();
                 public static int RunValueTaskConfigureAwait() => AddAfterValueTaskConfigureAwait(41).GetAwaiter().GetResult();
+
+                private sealed class CustomAwaiter : INotifyCompletion {
+                    private readonly Task<int> task;
+                    public CustomAwaiter(Task<int> task) => this.task = task;
+                    public bool IsCompleted => task.IsCompleted;
+                    public int GetResult() => task.GetAwaiter().GetResult();
+                    public void OnCompleted(Action continuation) => task.GetAwaiter().OnCompleted(continuation);
+                }
+                private sealed class CustomAwaitable {
+                    private readonly Task<int> task;
+                    public CustomAwaitable(Task<int> task) => this.task = task;
+                    public CustomAwaiter GetAwaiter() => new CustomAwaiter(task);
+                }
+                private static async Task<int> AwaitCustomAwaiterAsync() =>
+                    await new CustomAwaitable(Task.Run(() => { Thread.Sleep(1); return 43; }));
+                public static int AwaitCustomAwaiter() => AwaitCustomAwaiterAsync().GetAwaiter().GetResult();
+
+                private sealed class Source : IValueTaskSource<int> {
+                    private readonly Task completion = Task.Delay(1);
+                    public ValueTaskSourceStatus GetStatus(short token) =>
+                        completion.IsCompleted ? ValueTaskSourceStatus.Succeeded : ValueTaskSourceStatus.Pending;
+                    public int GetResult(short token) => 44;
+                    public void OnCompleted(Action<object?> continuation, object? state, short token,
+                        ValueTaskSourceOnCompletedFlags flags) => completion.GetAwaiter().OnCompleted(() => continuation(state));
+                }
+                public static int AwaitValueTaskSource() =>
+                    new ValueTask<int>(new Source(), 0).GetAwaiter().GetResult();
+
+                public static int CancelledDelay() {
+                    using var cts = new CancellationTokenSource();
+                    var task = Task.Delay(1000, cts.Token);
+                    cts.Cancel();
+                    try { task.GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                private static async Task<int> AwaitCancelledDelayAsync() {
+                    using var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    try { await Task.Delay(1, cts.Token); return -1; }
+                    catch (OperationCanceledException) { return 2; }
+                }
+                public static int AwaitCancelledDelay() => AwaitCancelledDelayAsync().GetAwaiter().GetResult();
+
+                public static int RunWhenAll() {
+                    Task.WhenAll(Task.Delay(1), Task.FromResult(2)).GetAwaiter().GetResult();
+                    return 2;
+                }
+                public static int RunWaitAll() {
+                    Task.WaitAll(new Task[] { Task.Delay(1), Task.FromResult(1) });
+                    return 2;
+                }
+                public static int RunGenericWhenAll() {
+                    var values = Task.WhenAll(Task.FromResult(2), Task.FromResult(3)).GetAwaiter().GetResult();
+                    return values[0] + values[1];
+                }
+                public static int RunWhenAny() {
+                    var winner = Task.WhenAny(Task.FromResult(7), Task.FromResult(8)).GetAwaiter().GetResult();
+                    return winner.GetAwaiter().GetResult();
+                }
+
+                private static async Task<int> CaptureSynchronizationContextAsync(bool configureAwait) {
+                    var context = new SynchronizationContext();
+                    SynchronizationContext.SetSynchronizationContext(context);
+                    if (configureAwait)
+                        await Task.Delay(250).ConfigureAwait(false);
+                    else
+                        await Task.Delay(250);
+                    return ReferenceEquals(SynchronizationContext.Current, context) ? 1 : 0;
+                }
+                public static int CaptureSynchronizationContext(bool configureAwait) =>
+                    CaptureSynchronizationContextAsync(configureAwait).GetAwaiter().GetResult();
                 private static void MarkAwaiterCallback() => awaiterCallbackValue = 42;
                 public static int DirectAwaiterCallback() {
                     awaiterCallbackValue = 0;
@@ -226,6 +299,14 @@ public sealed class ConcurrencyTests {
         Assert.Equal(42, Call(type, "RunConfigureAwait"));
         Assert.Equal(42, Call(type, "RunValueTaskConfigureAwait"));
         Assert.Equal(42, Call(type, "DirectAwaiterCallback"));
+        Assert.Equal(43, Call(type, "AwaitCustomAwaiter"));
+        Assert.Equal(44, Call(type, "AwaitValueTaskSource"));
+        Assert.Equal(1, Call(type, "CancelledDelay"));
+        Assert.Equal(2, Call(type, "AwaitCancelledDelay"));
+        Assert.Equal(2, Call(type, "RunWhenAll"));
+        Assert.Equal(5, Call(type, "RunGenericWhenAll"));
+        Assert.Equal(7, Call(type, "RunWhenAny"));
+        Assert.Equal(0, Call(type, "CaptureSynchronizationContext", true));
     }
 
     [Fact]
@@ -364,6 +445,28 @@ public sealed class ConcurrencyTests {
         using var vm = CreateVm();
 
         Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "DirectAwaiterCallback"));
+    }
+
+    [Fact]
+    public void SynchronizationContext_IsCapturedUnlessConfigureAwaitFalse() {
+        using var vm = CreateVm();
+
+        Assert.Equal(1, vm.Invoke("Vm.ConcurrentCode", "CaptureSynchronizationContext", false));
+        Assert.Equal(0, vm.Invoke("Vm.ConcurrentCode", "CaptureSynchronizationContext", true));
+    }
+
+    [Fact]
+    public void ValueTaskSource_CustomAwaiter_CancellationAndCombinatorsAreSupported() {
+        using var vm = CreateVm();
+
+        Assert.Equal(43, vm.Invoke("Vm.ConcurrentCode", "AwaitCustomAwaiter"));
+        Assert.Equal(44, vm.Invoke("Vm.ConcurrentCode", "AwaitValueTaskSource"));
+        Assert.Equal(1, vm.Invoke("Vm.ConcurrentCode", "CancelledDelay"));
+        Assert.Equal(2, vm.Invoke("Vm.ConcurrentCode", "AwaitCancelledDelay"));
+        Assert.Equal(2, vm.Invoke("Vm.ConcurrentCode", "RunWhenAll"));
+        Assert.Equal(2, vm.Invoke("Vm.ConcurrentCode", "RunWaitAll"));
+        Assert.Equal(5, vm.Invoke("Vm.ConcurrentCode", "RunGenericWhenAll"));
+        Assert.Equal(7, vm.Invoke("Vm.ConcurrentCode", "RunWhenAny"));
     }
 
     [Fact]

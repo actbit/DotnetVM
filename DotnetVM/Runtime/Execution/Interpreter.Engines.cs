@@ -104,6 +104,8 @@ public sealed partial class Interpreter {
             calls.InvokeDelegate(guestDelegate, arguments);
         };
         intrinsicContext.InvokeGuestDelegate = (guestDelegate, arguments) => calls.InvokeDelegate(guestDelegate, arguments);
+        intrinsicContext.InvokeGuestInstanceMethod = (receiver, name, arguments) =>
+            calls.InvokeGuestInstanceMethod(receiver, name, arguments);
         intrinsicContext.RunGuestStateMachine = stateMachine => {
             var byRef = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef reference
                 ? reference

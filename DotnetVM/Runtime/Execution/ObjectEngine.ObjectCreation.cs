@@ -315,13 +315,18 @@ internal sealed partial class ObjectEngine {
                         intrinsicCtor(_intrinsicContext, ctorArgs);
                         return StackSlot.OfObject(facadeInstance);
                     }
-                    if (typeName == "System.Threading.Tasks.ValueTask" && name == ".ctor" && facadeParamCount == 1) {
-                        // ValueTask(Task) は VM Task を値型ラッパーに包む。IValueTaskSource
-                        // 経路は host object を取り込まないため、明示的に拒否する。
+                    if (typeName == "System.Threading.Tasks.ValueTask" && name == ".ctor") {
                         var source = ctorArgs[1];
-                        if (source.ObjectValue is not VmTaskObject task)
-                            throw new OperationNotAllowedException("ValueTask の IValueTaskSource/host 実体は VM 境界へ取り込めません。");
-                        return StackSlot.OfValueType(new VmStructValue(facadeType, [StackSlot.OfObject(task)]));
+                        if (facadeParamCount == 1) {
+                            if (source.ObjectValue is not VmTaskObject task)
+                                throw new OperationNotAllowedException("ValueTask(Task) の source は VM Task でなければなりません。");
+                            return StackSlot.OfValueType(new VmStructValue(facadeType, [StackSlot.OfObject(task)]));
+                        }
+                        if (facadeParamCount == 2) {
+                            var valueTaskToken = unchecked((short)ctorArgs[2].AsInt32);
+                            return ValueTaskRuntime.FromSource(_intrinsicContext, generic: false,
+                                resultType: null, sourceSlot: source, token: valueTaskToken);
+                        }
                     }
                     // それ以外の intrinsic 型の実体化は BCL 不実装の面として拒否し続ける
                     throw new NotSupportedException(
@@ -439,18 +444,24 @@ internal sealed partial class ObjectEngine {
         // ValueTask<T> は intrinsic 値型であり、guest TypeDef の .ctor を実行しない。
         // 値から作る ctor と Task<T> を包む ctor を同じ VM Task 表現へ正規化する。
         if (constructed.Definition is VmIntrinsicType { FullName: "System.Threading.Tasks.ValueTask`1" } &&
-            ctorName == ".ctor" && paramCount == 1) {
-            var source = caller.Stack.Pop();
+            ctorName == ".ctor" && paramCount is 1 or 2) {
             var resultType = constructed.TypeArguments.FirstOrDefault()
                 ?? _loader.FindIntrinsicType("System.Object")!;
+            if (paramCount == 2) {
+                var valueTaskToken = unchecked((short)caller.Stack.Pop().AsInt32);
+                var sourceValue = caller.Stack.Pop();
+                return ValueTaskRuntime.FromSource(_intrinsicContext, generic: true, resultType: resultType,
+                    sourceSlot: sourceValue, token: valueTaskToken);
+            }
+            var sourceValueForTask = caller.Stack.Pop();
             VmTaskObject task;
-            if (source.ObjectValue is VmTaskObject existing) {
+            if (sourceValueForTask.ObjectValue is VmTaskObject existing) {
                 task = existing;
             } else {
                 var taskDefinition = _loader.FindIntrinsicType("System.Threading.Tasks.Task`1")!
                     ?? throw new InvalidOperationException("Task<T> intrinsic type が見つかりません。");
                 var taskType = new VmConstructedType { Definition = taskDefinition, TypeArguments = [resultType] };
-                task = _heap.Allocate(_intrinsicContext.Shared.GuestTasks.Create(taskType, completed: true, result: source));
+                task = _heap.Allocate(_intrinsicContext.Shared.GuestTasks.Create(taskType, completed: true, result: sourceValueForTask));
             }
             return StackSlot.OfValueType(new VmStructValue(constructed, [StackSlot.OfObject(task)], [resultType]));
         }

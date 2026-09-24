@@ -94,6 +94,36 @@ internal static partial class CoreLibBindings {
             BindingOrigin.InternalCall);
     }
 
+    private static void RegisterMemoryMarshal(IntrinsicRegistry r) {
+        // static ReadOnlySpan<T> MemoryMarshal.CreateReadOnlySpan(ref T reference, int length)
+        // .NET 10 uses this intrinsic when params ReadOnlySpan<T> overloads are selected (notably
+        // Task.WaitAll/WhenAll/WhenAny).  The VM span representation is a value containing the
+        // source byref and logical length; no host span or raw pointer escapes the VM.
+        r.RegisterBinding(BindingKey.Static(
+                "System.Runtime.InteropServices.MemoryMarshal", "CreateReadOnlySpan", "!!0&", "System.Int32"),
+            static (ctx, a) => CreateReadOnlySpanFromReference(ctx, a),
+            BindingOrigin.InternalCall);
+    }
+
+    private static StackSlot CreateReadOnlySpanFromReference(IntrinsicContext ctx, StackSlot[] args) {
+        if (args[0].ObjectValue is not VmByRef reference)
+            throw new InvalidOperationException("MemoryMarshal.CreateReadOnlySpan の参照引数が ByRef ではありません。");
+        var length = args[1].AsInt32;
+        if (length < 0 || reference.Index + length > reference.Container.Length)
+            throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "length");
+
+        var elementName = ctx.MethodTypeArgAt(0);
+        if (string.IsNullOrEmpty(elementName) || elementName is "!!0")
+            throw new InvalidOperationException("MemoryMarshal.CreateReadOnlySpan の型引数 T を判別できませんでした。");
+        var elementType = FindAnyType(ctx, elementName)
+            ?? throw new InvalidOperationException($"span の要素型 {elementName} を解決できません。");
+        var definition = FindAnyType(ctx, "System.ReadOnlySpan`1")
+            ?? throw new InvalidOperationException("System.ReadOnlySpan`1 がロードされていません。");
+        var spanType = new VmConstructedType { Definition = definition, TypeArguments = [elementType] };
+        return StackSlot.OfValueType(new VmStructValue(spanType,
+            [StackSlot.OfByRef(reference), StackSlot.OfInt32(length)], [elementType]));
+    }
+
     private static StackSlot CreateSpanImpl(IntrinsicContext ctx, StackSlot[] a) {
         if (a[0].ObjectValue is not VmFieldRvaData rva)
             throw new InvalidOperationException(

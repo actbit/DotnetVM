@@ -17,6 +17,9 @@ internal sealed partial class CallEngine {
     /// マルチキャストは全エントリを順に実行し、最後の戻り値を返す (CLR 規約)。
     /// 各呼出は通常の Invoke ゲート経由 (クォータ/セーフポイント/EH 機構を共有)。</summary>
     public StackSlot? InvokeDelegate(VmDelegate @delegate, StackSlot[] args) {
+        if (@delegate.HostCallback is { } hostCallback)
+            return hostCallback(args);
+
         if (@delegate.ExpressionLambda is { } expressionLambda) {
             if (args.Length != expressionLambda.Parameters.Length + 1)
                 throw new UnhandledGuestException("System.ArgumentException", "式木 delegate の引数個数が一致しません。");

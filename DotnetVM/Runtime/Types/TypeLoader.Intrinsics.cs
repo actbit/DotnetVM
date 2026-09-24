@@ -71,6 +71,7 @@ public sealed partial class TypeLoader {
             "NotImplementedException", "RankException", "InvalidProgramException",
         })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false, Parent = systemException });
+        Add(new VmIntrinsicType { Namespace = "System", Name = "AggregateException", IsValue = false, Parent = systemException });
         // Activator.CreateInstance の失敗分類 (CLR の継承鎖どおり MemberAccess ← MissingMember ← MissingMethod)
         var memberAccess = new VmIntrinsicType { Namespace = "System", Name = "MemberAccessException", IsValue = false, Parent = systemException };
         Add(memberAccess);
@@ -90,6 +91,10 @@ public sealed partial class TypeLoader {
         // ゲストが実装/参照する頻出外部インターフェースのファサード
         foreach (var name in new[] { "IDisposable", "IComparable", "ICloneable", "IFormatProvider" })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "SynchronizationContext", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "SendOrPostCallback", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "CancellationToken", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "CancellationTokenSource", IsValue = false, Parent = @object });
         // 文字列補間 ($"...") がコンパイルされる DefaultInterpolatedStringHandler (ref struct) の
         // ファサード。本体は intrinsic 面 (AppendLiteral / AppendFormatted / ToStringAndClear) が担う。
         Add(new VmIntrinsicType {
@@ -125,6 +130,12 @@ public sealed partial class TypeLoader {
         var valueTask = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask", IsValue = true, Parent = valueType };
         Add(valueTask);
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask`1", IsValue = true, Parent = valueTask }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "IValueTaskSource", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "IValueTaskSource`1", IsValue = false }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceStatus", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceOnCompletedFlags", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System", Name = "Span`1", IsValue = true, Parent = valueType }, [0u]);
+        Add(new VmIntrinsicType { Namespace = "System", Name = "ReadOnlySpan`1", IsValue = true, Parent = valueType }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter", IsValue = true, Parent = valueType });
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter`1", IsValue = true, Parent = valueType }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "ValueTaskAwaiter", IsValue = true, Parent = valueType });
@@ -148,6 +159,8 @@ public sealed partial class TypeLoader {
             Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = name, IsValue = true, Parent = valueType },
                 name.Contains("`1+", StringComparison.Ordinal) ? [0u] : null);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "IAsyncStateMachine", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "INotifyCompletion", IsValue = false });
+        Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "ICriticalNotifyCompletion", IsValue = false });
         foreach (var arity in Enumerable.Range(0, 17))
             Add(new VmIntrinsicType { Namespace = "System", Name = arity == 0 ? "Action" : $"Action`{arity}", IsValue = false, Parent = multicastDelegate },
                 Enumerable.Repeat(0u, arity).ToArray());

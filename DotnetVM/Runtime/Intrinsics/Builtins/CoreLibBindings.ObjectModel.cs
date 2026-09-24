@@ -270,10 +270,38 @@ internal static partial class CoreLibBindings {
             }
         }
         try {
-            return ctx.Types.ResolveWellKnownType(fullName);
+            if (ctx.Types.ResolveWellKnownType(fullName) is { } wellKnown)
+                return wellKnown;
         } catch {
-            return null;
         }
+        // Constructed types are sometimes exposed to an intrinsic as their canonical
+        // FullName (for example Task`1<System.Int32>) rather than as a loader token.
+        // Rebuild that VM type from its definition and recursively resolved arguments.
+        var open = fullName.IndexOf('<');
+        if (open <= 0 || !fullName.EndsWith('>'))
+            return null;
+        var definition = FindAnyType(ctx, fullName[..open]);
+        if (definition is null)
+            return null;
+        var argumentsText = fullName[(open + 1)..^1];
+        var arguments = new List<string>();
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < argumentsText.Length; i++) {
+            switch (argumentsText[i]) {
+                case '<': depth++; break;
+                case '>': depth--; break;
+                case ',' when depth == 0:
+                    arguments.Add(argumentsText[start..i].Trim());
+                    start = i + 1;
+                    break;
+            }
+        }
+        arguments.Add(argumentsText[start..].Trim());
+        var typeArguments = arguments.Select(argument => FindAnyType(ctx, argument)).ToArray();
+        return typeArguments.Any(argument => argument is null)
+            ? null
+            : new VmConstructedType { Definition = definition, TypeArguments = typeArguments! };
     }
 
     private static bool IsEquatableImpl(IntrinsicContext ctx, VmType t) {

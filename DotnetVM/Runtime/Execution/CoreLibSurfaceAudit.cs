@@ -360,11 +360,36 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Threading.Thread", "get_ManagedThreadId", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
         Add("System.Threading.Thread", "Sleep", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: false, paramCount: 1);
 
+        var cancellationJ = InternalCall + "。VM 内の cancellation source identity を token 値へ正規化し、Task の待機を guest 例外へ変換";
+        Add("System.Threading.CancellationTokenSource", ".ctor", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "get_Token", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "Cancel", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "Dispose", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationToken", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationToken", "get_CanBeCanceled", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationToken", "ThrowIfCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationToken", "get_None", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: false);
+        var synchronizationJ = InternalCall + "。VM logical execution flow の context identity を捕捉し、Post/Send を guest worker で実行";
+        Add("System.Threading.SynchronizationContext", ".ctor", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+        Add("System.Threading.SynchronizationContext", "get_Current", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: false);
+        Add("System.Threading.SynchronizationContext", "SetSynchronizationContext", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: false);
+        Add("System.Threading.SynchronizationContext", "CreateCopy", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+        Add("System.Threading.SynchronizationContext", "OperationStarted", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+        Add("System.Threading.SynchronizationContext", "OperationCompleted", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+        Add("System.Threading.SynchronizationContext", "Post", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+        Add("System.Threading.SynchronizationContext", "Send", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
+
         var taskJ = InternalCall + "。VM Task と awaiter の状態を保持し、async state machine 継続を guest worker で再開";
         Add("System.Threading.Tasks.Task", "Delay", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
         Add("System.Threading.Tasks.Task", "Run", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
         Add("System.Threading.Tasks.Task", "FromResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
         Add("System.Threading.Tasks.Task", "get_CompletedTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "WhenAll", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "WhenAny", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Threading.Tasks.Task", "WaitAll", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
+        Add("System.Runtime.InteropServices.MemoryMarshal", "CreateReadOnlySpan", CoreLibSurfaceKind.RuntimeInternal,
+            InternalCall + "。ref 要素と長さから VM 管理の ReadOnlySpan 値を構築", hasThis: false);
         foreach (var type in new[] { "System.Threading.Tasks.Task", "System.Threading.Tasks.Task`1" }) {
             Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);

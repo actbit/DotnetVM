@@ -1,6 +1,7 @@
 using System.Reflection;
 using DotnetVM.Host;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 using Xunit;
 
@@ -58,10 +59,30 @@ public sealed class JitTests {
                 return value;
             }
             public static int CallsInterpreter(int value) => System.Math.Abs(value);
+            public static int SumArray(int count) {
+                var values = new int[count];
+                for (var i = 0; i < count; i++) values[i] = i * 2;
+                var result = 0;
+                for (var i = 0; i < values.Length; i++) result += values[i];
+                return result;
+            }
+            public static int NewObjectAndField(int value) => new Holder(value).Value + 1;
+            public static object BoxValue(int value) => value;
+            public static int UnboxValue(int value) => (int)(object)value;
+            public static int IsString(object value) => value is string ? 1 : 0;
+            public static int CallVirt(string value) => value.Length;
+            public static int StaticField() => StaticValue;
+            public static void ThrowFromJit() => throw new System.InvalidOperationException("jit");
+            public static int SizeOfInt() => sizeof(int);
             public static int Infinite() {
                 var i = 0;
                 while (true) i++;
             }
+            private static int StaticValue;
+        }
+        public sealed class Holder {
+            public int Value;
+            public Holder(int value) => Value = value;
         }
         """;
 
@@ -174,11 +195,32 @@ public sealed class JitTests {
     }
 
     [Fact]
-    public void UnsupportedCallsFallBackToInterpreter() {
+    public void CallsAndObjectOperationsPromote() {
         using var vm = CreateVm();
 
         Assert.Equal(12, vm.Invoke("Vm.Calc", "CallsInterpreter", -12));
-        Assert.False(vm.IsJitCompiled(Method(vm, nameof(CalcNames.CallsInterpreter))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.CallsInterpreter))));
+        Assert.Equal(20, vm.Invoke("Vm.Calc", "SumArray", 5));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.SumArray))));
+        Assert.Equal(8, vm.Invoke("Vm.Calc", "NewObjectAndField", 7));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.NewObjectAndField))));
+        var boxed = Assert.IsType<VmBoxedValue>(vm.Invoke("Vm.Calc", "BoxValue", 42));
+        Assert.Equal(42, boxed.Fields[0].AsInt32);
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.BoxValue))));
+        Assert.Equal(42, vm.Invoke("Vm.Calc", "UnboxValue", 42));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.UnboxValue))));
+        Assert.Equal(1, vm.Invoke("Vm.Calc", "IsString", "value"));
+        Assert.Equal(0, vm.Invoke("Vm.Calc", "IsString", 42));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.IsString))));
+        Assert.Equal(5, vm.Invoke("Vm.Calc", "CallVirt", "value"));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.CallVirt))));
+        Assert.Equal(0, vm.Invoke("Vm.Calc", "StaticField"));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.StaticField))));
+        var error = Assert.Throws<UnhandledGuestException>(() => vm.Invoke("Vm.Calc", "ThrowFromJit"));
+        Assert.Equal("System.InvalidOperationException", error.ExceptionTypeName);
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.ThrowFromJit))));
+        Assert.Equal(4, vm.Invoke("Vm.Calc", "SizeOfInt"));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.SizeOfInt))));
     }
 
     [Fact]
@@ -262,6 +304,15 @@ public sealed class JitTests {
         public const string NullState = "NullState";
         public const string Reassign = "Reassign";
         public const string CallsInterpreter = "CallsInterpreter";
+        public const string SumArray = "SumArray";
+        public const string NewObjectAndField = "NewObjectAndField";
+        public const string BoxValue = "BoxValue";
+        public const string UnboxValue = "UnboxValue";
+        public const string IsString = "IsString";
+        public const string CallVirt = "CallVirt";
+        public const string StaticField = "StaticField";
+        public const string ThrowFromJit = "ThrowFromJit";
+        public const string SizeOfInt = "SizeOfInt";
         public const string Infinite = "Infinite";
     }
 }

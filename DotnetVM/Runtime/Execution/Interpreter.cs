@@ -134,6 +134,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     internal void ConsumeJitInstruction() => ConsumeInstruction();
     internal void CheckJitSafepoint() => CheckSafepoint();
     internal IDisposable EnterJitInstruction() => _coordinator.EnterInstruction();
+    internal CallEngine JitCallsFor(VmMethod method) => EnginesFor(method).Calls;
+    internal ObjectEngine JitObjectsFor(VmMethod method) => EnginesFor(method).Objects;
+    internal ExceptionDispatcher JitExceptionsFor(VmMethod method) => EnginesFor(method).Exceptions;
 
     // ---- 命令ディスパッチ ループ ----
 

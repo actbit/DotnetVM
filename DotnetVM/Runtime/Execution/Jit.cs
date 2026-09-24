@@ -3,7 +3,9 @@ using System.Reflection;
 using DotnetVM.Host;
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -141,7 +143,10 @@ internal sealed class JitCodeCache(
             if (!_entries.TryGetValue(method, out var current) || !ReferenceEquals(current, entry)) {
                 if (reservedCompiled)
                     _resourceBudget.ReleaseCompiledMethod();
-                return compiled;
+                // The loader may already be collectible. Returning a delegate
+                // compiled from its metadata would let an in-flight invocation
+                // execute after unload and keep the detached loader alive.
+                return null;
             }
             entry.Compiling = false;
             if (compiled is null) {
@@ -320,6 +325,168 @@ internal sealed class JitFrame {
         _frame.Ip = next;
     }
 
+    public void Call(int token, bool isCallvirt, int next) {
+        var result = _interpreter.JitCallsFor(_frame.Method).Call(token, _frame, isCallvirt,
+            constrainedToken: 0, tailCallAllowed: false, out _);
+        if (result is { } value)
+            _frame.Stack.Push(value);
+        _frame.Ip = next;
+    }
+
+    public void NewObject(int token, int next) {
+        if (_interpreter.JitObjectsFor(_frame.Method).NewObject(token, _frame) is { } value)
+            _frame.Stack.Push(value);
+        _frame.Ip = next;
+    }
+
+    public void NewArray(int token, int next) {
+        var count = _frame.Stack.Pop().AsInt32;
+        if (count < 0)
+            throw new UnhandledGuestException("System.OverflowException", null);
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var elementType = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        using var reservation = _services.Heap.ReserveArray(count);
+        var elements = new StackSlot[count];
+        for (var i = 0; i < count; i++)
+            elements[i] = _services.Objects.DefaultForType(elementType, _services.Loader);
+        _frame.Stack.Push(StackSlot.OfObject(reservation.Commit(
+            new VmArray(new VmArrayType { ElementType = elementType }, elements))));
+        _frame.Ip = next;
+    }
+
+    public void LoadArray(MemoryOps.ArrayElementKind kind, int next) {
+        _frame.Stack.Push(MemoryOps.ArrayLoad(_frame, kind));
+        _frame.Ip = next;
+    }
+
+    public void LoadArrayByType(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        _frame.Stack.Push(MemoryOps.ArrayLoad(_frame,
+            MemoryOps.ElementKindFromType(objects.ResolveTypeToken(token, _frame.Context,
+                _frame.Method.DynamicTokens))));
+        _frame.Ip = next;
+    }
+
+    public void StoreArray(MemoryOps.ArrayElementKind kind, int next) {
+        MemoryOps.ArrayStore(_frame, kind, _services.StringType);
+        _frame.Ip = next;
+    }
+
+    public void StoreArrayByType(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        MemoryOps.ArrayStore(_frame,
+            MemoryOps.ElementKindFromType(objects.ResolveTypeToken(token, _frame.Context,
+                _frame.Method.DynamicTokens)), _services.StringType);
+        _frame.Ip = next;
+    }
+
+    public void LoadArrayLength(int next) {
+        _frame.Stack.Push(StackSlot.OfNativeInt(MemoryOps.GetArray(_frame.Stack.Pop()).Length));
+        _frame.Ip = next;
+    }
+
+    public void LoadField(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var location = objects.FieldLocation(_frame.Stack.Pop(), field);
+        _frame.Stack.Push(SlotOps.PushCopyOfValue(location.Read()));
+        _frame.Ip = next;
+    }
+
+    public void StoreField(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var value = _frame.Stack.Pop();
+        var receiver = _frame.Stack.Pop();
+        if (!objects.TryStoreStringField(receiver, field, value))
+            objects.FieldLocation(receiver, field).Write(SlotOps.StoreCopyOfValue(value));
+        _frame.Ip = next;
+    }
+
+    public void LoadStaticField(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        _frame.Stack.Push(SlotOps.PushCopyOfValue(objects.StaticFieldLocation(token, _frame.Context,
+            _frame.Method.DynamicTokens).Read()));
+        _frame.Ip = next;
+    }
+
+    public void StoreStaticField(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        objects.StaticFieldLocation(token, _frame.Context, _frame.Method.DynamicTokens)
+            .Write(_frame.Stack.Pop());
+        _frame.Ip = next;
+    }
+
+    public void Box(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var value = _frame.Stack.Pop();
+        var fields = value.Kind == StackKind.ValueType && value.ObjectValue is VmStructValue sv
+            ? sv.Clone().Fields
+            : [value];
+        _frame.Stack.Push(StackSlot.OfObject(_services.Heap.Allocate(new VmBoxedValue(type, fields))));
+        _frame.Ip = next;
+    }
+
+    public void UnboxAny(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var value = _frame.Stack.Pop();
+        if (target.IsValueType) {
+            if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+                throw new UnhandledGuestException("System.InvalidCastException",
+                    $"{SlotOps.Describe(value)} を {target.FullName} に unbox.any できません。");
+            if (VmPrimitiveTypes.IsSlotPrimitive(target.FullName))
+                _frame.Stack.Push(boxed.Fields[0]);
+            else if (target is VmClassType or VmConstructedType) {
+                var args = boxed.Type is VmConstructedType constructed ? constructed.TypeArguments : null;
+                _frame.Stack.Push(StackSlot.OfValueType(new VmStructValue(target,
+                    (StackSlot[])boxed.Fields.Clone(), args)));
+            } else
+                _frame.Stack.Push(boxed.Fields[0]);
+        } else {
+            var ok = value.ObjectValue is null ||
+                TypeChecks.IsAssignableToType(value.ObjectValue, target, _services.StringType);
+            if (!ok)
+                throw new UnhandledGuestException("System.InvalidCastException",
+                    $"{SlotOps.Describe(value)} を {target.FullName} に変換できません。");
+            _frame.Stack.Push(value);
+        }
+        _frame.Ip = next;
+    }
+
+    public void Cast(int token, bool isInst, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var value = _frame.Stack.Pop();
+        var ok = value.ObjectValue is null ||
+            TypeChecks.IsAssignableToType(value.ObjectValue, target, _services.StringType);
+        if (!ok && !isInst)
+            throw new UnhandledGuestException("System.InvalidCastException",
+                $"{SlotOps.Describe(value)} を {target.FullName} にキャストできません。");
+        _frame.Stack.Push(ok ? value : StackSlot.Null);
+        _frame.Ip = next;
+    }
+
+    public void Throw() => throw _interpreter.JitExceptionsFor(_frame.Method)
+        .MakeGuestThrow(_frame.Stack.Pop());
+
+    public void CheckFinite(int next) {
+        var value = _frame.Stack.Pop();
+        if (value.Kind == StackKind.Float &&
+            (double.IsNaN(value.DoubleValue) || double.IsInfinity(value.DoubleValue)))
+            throw new UnhandledGuestException("System.ArithmeticException", null);
+        _frame.Stack.Push(value);
+        _frame.Ip = next;
+    }
+
+    public void SizeOf(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        _frame.Stack.Push(StackSlot.OfInt32(MemoryOps.SizeOfType(
+            objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens))));
+        _frame.Ip = next;
+    }
+
     public void Return(bool hasValue) {
         ReturnValue = hasValue ? _frame.Stack.Pop() : default;
         Returned = true;
@@ -328,9 +495,9 @@ internal sealed class JitFrame {
 
 /// <summary>
 /// Expression-tree compiler for the first JIT tier.  Calls, EH, byrefs,
-/// pointers and runtime-dependent object instructions deliberately fall back to
-/// the interpreter.  The supported tier covers scalar arithmetic, locals,
-/// comparisons, branches, switch, conversions and strings.
+/// pointers and runtime-dependent instructions deliberately fall back to the
+/// interpreter. The supported tier also reuses VM call/object/array helpers so
+/// ordinary non-EH methods can be promoted without exposing CLR objects.
 /// </summary>
 internal static class JitMethodCompiler {
     private const int MaxInstructions = 4096;
@@ -474,7 +641,14 @@ internal static class JitMethodCompiler {
             or ILOp.Conv_Ovf_U8_Un or ILOp.Conv_Ovf_I_Un or ILOp.Conv_Ovf_U_Un or ILOp.Conv_Ovf_I1
             or ILOp.Conv_Ovf_U1 or ILOp.Conv_Ovf_I2 or ILOp.Conv_Ovf_U2 or ILOp.Conv_Ovf_I4
             or ILOp.Conv_Ovf_U4 or ILOp.Conv_Ovf_I8 or ILOp.Conv_Ovf_U8 or ILOp.Conv_Ovf_I or ILOp.Conv_Ovf_U
-            or ILOp.Ldstr or ILOp.Ret => true,
+            or ILOp.Ldstr or ILOp.Call or ILOp.Callvirt or ILOp.Newobj or ILOp.Newarr or ILOp.Ldlen
+            or ILOp.Ldelem_I1 or ILOp.Ldelem_U1 or ILOp.Ldelem_I2 or ILOp.Ldelem_U2 or ILOp.Ldelem_I4
+            or ILOp.Ldelem_U4 or ILOp.Ldelem_I8 or ILOp.Ldelem_I or ILOp.Ldelem_R4 or ILOp.Ldelem_R8
+            or ILOp.Ldelem_Ref or ILOp.Ldelem or ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2
+            or ILOp.Stelem_I4 or ILOp.Stelem_I8 or ILOp.Stelem_R4 or ILOp.Stelem_R8 or ILOp.Stelem_Ref
+            or ILOp.Stelem or ILOp.Ldfld or ILOp.Stfld or ILOp.Ldsfld or ILOp.Stsfld or ILOp.Box
+            or ILOp.Unbox_Any or ILOp.Castclass or ILOp.Isinst or ILOp.Throw or ILOp.Ckfinite
+            or ILOp.Sizeof or ILOp.Ret => true,
         _ => false,
     };
 
@@ -524,6 +698,9 @@ internal static class JitMethodCompiler {
                 Expression.Constant(instruction.SwitchTargets!.Select(target => offsets[target]).ToArray()), Constant(next));
         if (op is ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un)
             return Call(frame, nameof(JitFrame.Compare), Constant(op), Constant(next));
+        if (op is ILOp.Call or ILOp.Callvirt)
+            return Call(frame, nameof(JitFrame.Call), Constant(instruction.IntOperand),
+                Constant(op == ILOp.Callvirt), Constant(next));
         if (IsBinary(op))
             return Call(frame, nameof(JitFrame.Binary), Constant(op), Constant(next));
         if (op is ILOp.Neg or ILOp.Not)
@@ -532,6 +709,41 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.Convert), Constant(op), Constant(next));
         if (op == ILOp.Ldstr)
             return Call(frame, nameof(JitFrame.LoadString), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Newobj)
+            return Call(frame, nameof(JitFrame.NewObject), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Newarr)
+            return Call(frame, nameof(JitFrame.NewArray), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldlen)
+            return Call(frame, nameof(JitFrame.LoadArrayLength), Constant(next));
+        if (IsArrayLoad(op))
+            return op == ILOp.Ldelem
+                ? Call(frame, nameof(JitFrame.LoadArrayByType), Constant(instruction.IntOperand), Constant(next))
+                : Call(frame, nameof(JitFrame.LoadArray), Constant(ArrayKind(op)), Constant(next));
+        if (IsArrayStore(op))
+            return op == ILOp.Stelem
+                ? Call(frame, nameof(JitFrame.StoreArrayByType), Constant(instruction.IntOperand), Constant(next))
+                : Call(frame, nameof(JitFrame.StoreArray), Constant(ArrayKind(op)), Constant(next));
+        if (op == ILOp.Ldfld)
+            return Call(frame, nameof(JitFrame.LoadField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Stfld)
+            return Call(frame, nameof(JitFrame.StoreField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldsfld)
+            return Call(frame, nameof(JitFrame.LoadStaticField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Stsfld)
+            return Call(frame, nameof(JitFrame.StoreStaticField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Box)
+            return Call(frame, nameof(JitFrame.Box), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Unbox_Any)
+            return Call(frame, nameof(JitFrame.UnboxAny), Constant(instruction.IntOperand), Constant(next));
+        if (op is ILOp.Castclass or ILOp.Isinst)
+            return Call(frame, nameof(JitFrame.Cast), Constant(instruction.IntOperand),
+                Constant(op == ILOp.Isinst), Constant(next));
+        if (op == ILOp.Throw)
+            return Call(frame, nameof(JitFrame.Throw));
+        if (op == ILOp.Ckfinite)
+            return Call(frame, nameof(JitFrame.CheckFinite), Constant(next));
+        if (op == ILOp.Sizeof)
+            return Call(frame, nameof(JitFrame.SizeOf), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Ret)
             return Call(frame, nameof(JitFrame.Return), Expression.Constant(hasReturnValue));
         throw new InvalidOperationException($"未対応の JIT 命令です: {op}");
@@ -550,6 +762,7 @@ internal static class JitMethodCompiler {
     private static ConstantExpression Constant(double value) => Expression.Constant(value);
     private static ConstantExpression Constant(bool value) => Expression.Constant(value);
     private static ConstantExpression Constant(ILOp value) => Expression.Constant(value);
+    private static ConstantExpression Constant(MemoryOps.ArrayElementKind value) => Expression.Constant(value);
     private static bool IsBinary(ILOp op) => op is ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Div or ILOp.Div_Un
         or ILOp.Rem or ILOp.Rem_Un or ILOp.And or ILOp.Or or ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un
         or ILOp.Add_Ovf or ILOp.Add_Ovf_Un or ILOp.Sub_Ovf or ILOp.Sub_Ovf_Un or ILOp.Mul_Ovf or ILOp.Mul_Ovf_Un;
@@ -559,5 +772,20 @@ internal static class JitMethodCompiler {
         or ILOp.Conv_Ovf_I4_Un or ILOp.Conv_Ovf_I8_Un or ILOp.Conv_Ovf_U1_Un or ILOp.Conv_Ovf_U2_Un
         or ILOp.Conv_Ovf_U4_Un or ILOp.Conv_Ovf_U8_Un or ILOp.Conv_Ovf_I_Un or ILOp.Conv_Ovf_U_Un
         or ILOp.Conv_Ovf_I1 or ILOp.Conv_Ovf_U1 or ILOp.Conv_Ovf_I2 or ILOp.Conv_Ovf_U2 or ILOp.Conv_Ovf_I4
-        or ILOp.Conv_Ovf_U4 or ILOp.Conv_Ovf_I8 or ILOp.Conv_Ovf_U8 or ILOp.Conv_Ovf_I or ILOp.Conv_Ovf_U;
+         or ILOp.Conv_Ovf_U4 or ILOp.Conv_Ovf_I8 or ILOp.Conv_Ovf_U8 or ILOp.Conv_Ovf_I or ILOp.Conv_Ovf_U;
+
+    private static bool IsArrayLoad(ILOp op) => op is ILOp.Ldelem_I1 or ILOp.Ldelem_U1 or ILOp.Ldelem_I2
+        or ILOp.Ldelem_U2 or ILOp.Ldelem_I4 or ILOp.Ldelem_U4 or ILOp.Ldelem_I8 or ILOp.Ldelem_I
+        or ILOp.Ldelem_R4 or ILOp.Ldelem_R8 or ILOp.Ldelem_Ref or ILOp.Ldelem;
+
+    private static bool IsArrayStore(ILOp op) => op is ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2
+        or ILOp.Stelem_I4 or ILOp.Stelem_I8 or ILOp.Stelem_R4 or ILOp.Stelem_R8 or ILOp.Stelem_Ref
+        or ILOp.Stelem;
+
+    private static MemoryOps.ArrayElementKind ArrayKind(ILOp op) => op switch {
+        ILOp.Ldelem_I8 or ILOp.Ldelem_I or ILOp.Stelem_I8 => MemoryOps.ArrayElementKind.Int64,
+        ILOp.Ldelem_R4 or ILOp.Ldelem_R8 or ILOp.Stelem_R4 or ILOp.Stelem_R8 => MemoryOps.ArrayElementKind.Float,
+        ILOp.Ldelem_Ref or ILOp.Stelem_Ref => MemoryOps.ArrayElementKind.Object,
+        _ => MemoryOps.ArrayElementKind.Int32,
+    };
 }

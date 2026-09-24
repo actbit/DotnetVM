@@ -8,6 +8,7 @@ using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
+using System.Globalization;
 
 namespace DotnetVM.Runtime.Execution;
 
@@ -56,13 +57,14 @@ public sealed partial class Interpreter {
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
     public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
         _shared.ThrowIfDisposed();
+        var state = CurrentState;
+        using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared.Culture) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
         method = PrepareInvocation(method, arguments, context);
         if (method.Body is null)
             ThrowNoBody(method);
-        var state = CurrentState;
         if (state.Depth >= _memory.MaxRecursionDepth)
             throw new UnhandledGuestException("System.StackOverflowException",
                 $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
@@ -97,6 +99,22 @@ public sealed partial class Interpreter {
                 FlushPendingAssemblyContextCaches();
         }
 
+    }
+
+    /// <summary>外側の guest 呼出の間だけ、ホスト thread の ambient culture を VM 設定に合わせる。</summary>
+    private sealed class GuestCultureScope : IDisposable {
+        private readonly CultureInfo _previousCulture = CultureInfo.CurrentCulture;
+        private readonly CultureInfo _previousUiCulture = CultureInfo.CurrentUICulture;
+
+        public GuestCultureScope(CultureInfo culture) {
+            CultureInfo.CurrentCulture = culture;
+            CultureInfo.CurrentUICulture = culture;
+        }
+
+        public void Dispose() {
+            CultureInfo.CurrentCulture = _previousCulture;
+            CultureInfo.CurrentUICulture = _previousUiCulture;
+        }
     }
 
     private VmMethod PrepareInvocation(VmMethod method, StackSlot[] arguments, GenericContext? context) {

@@ -1,5 +1,6 @@
 namespace DotnetVM.Host;
 
+using System.Globalization;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
@@ -30,9 +31,9 @@ public sealed class MemoryPolicy {
     /// トランザクションで ChargeHostBuffer / ChargeHostWork と整合)。</summary>
     public long HostTempAllocationByteLimit { get; init; } = long.MaxValue;
 
-    /// <summary>ホスト側 CPU 作業の予算 (InvariantCulture 比較・formatting・encoding 等の
+    /// <summary>ホスト側 CPU 作業の予算 (culture-aware 比較・formatting・encoding 等の
     /// 重い host 側処理の発生に応じて消费)。「host ⟷ ゲストの CPU 増幅を縛る」独立 quota。
-    /// 実装の assignment: 操作種 (culture-insensitive 比較 = X ワーク、formatting = Y ワーク)
+    /// 実装の assignment: 操作種 (文字列比較 = X ワーク、formatting = Y ワーク)
     /// を intrinsic 毎に定数で保持する (全量計上ではなく実コスト近似)。</summary>
     public long HostWorkBudget { get; init; } = 10_000_000;
 
@@ -77,6 +78,9 @@ public sealed class MemoryPolicy {
 /// <summary>VM 起動オプション。</summary>
 public sealed class VmHostOptions {
     public MemoryPolicy Memory { get; init; } = new();
+
+    /// <summary>ゲスト実行中に使う CurrentCulture / CurrentUICulture。既定は従来互換の不変カルチャ。</summary>
+    public CultureInfo Culture { get; init; } = CultureInfo.InvariantCulture;
 
     /// <summary>ネットワークポリシー (既定 = DenyAll)。</summary>
     public NetworkPolicy Network { get; init; } = new();

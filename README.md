@@ -68,8 +68,8 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 ### VM CoreLib (DotnetVM.CoreLib) による置換面
 実在 CoreLib の一部の面は、その managed IL が VM の表現モデルに落ちません (`Number.Formatting` の byte* 生ポインタ演算 / NumberBuffer / culture 機構の静的キャッシュ等)。これらは自前の互換ライブラリ **DotnetVM.CoreLib** の managed IL に差し替えて実行します (`VmCoreLibSurfaces` の監査可能な対応表)。
 
-- DotnetVM.CoreLib は外部依存ゼロの普通の .NET クラスライブラリでもあり、**CLR 上でそのまま動作**します (`int.ToString()` / `int.Parse` / `Convert` 系と同一結果)。CLR 差分テストで正当性を担保してから VM に配線します
-- 差し替えは `Interpreter.Invoke` (唯一の IL 実行入口) で行われるため、MemberRef 解決でも CoreLib IL 内の仮想呼出 (box 済み int の `callvirt ToString` 等) でも同一の面に置換されます。実 CLR 同様 culture は不変カルチャ規約 (符号 "-" / 桁区切りなし) に固定
+- DotnetVM.CoreLib は外部依存ゼロの普通の .NET クラスライブラリでもあり、**CLR 上でそのまま動作**します (不変カルチャで `int.ToString()` / `int.Parse` / `Convert` 系と同一結果)。CLR 差分テストで正当性を担保してから VM に配線します
+- 差し替えは `Interpreter.Invoke` (唯一の IL 実行入口) で行われるため、MemberRef 解決でも CoreLib IL 内の仮想呼出 (box 済み int の `callvirt ToString` 等) でも同一の面に置換されます。数値の書式・解析や `String.Format` の互換置換面は、現在も不変カルチャ規約 (符号 "-" / 桁区切りなし) です
 - IL 実行されるため ExecutionTracer には `DotnetVM.CoreLib` フレームとして記録され、legacy intrinsic 委譲と区別できます
 - 対応表に載っていない面 (ボックス化 `object` 経由の `Convert.ToInt32(object)` 等は従来どおり legacy intrinsic 委譲) を含む全委譲面の分類は、次節の監査表 (`CoreLibSurfaceAudit`) が唯一の真実源です
 
@@ -80,12 +80,12 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 |---|---|
 | **RealCoreLibIl** | 実在 CoreLib の managed IL を VM で実行。監査表上の委譲キーは CoreLib 未ロード時の代替経路としての影 |
 | **VmCoreLibSubstitute** | DotnetVM.CoreLib の置換 IL で実行 (実配線は `VmCoreLibSurfaces.Faces`) |
-| **RuntimeInternal** | 実 CLR も IL を実行しない面。正当化タグ: `jit-intrinsic` (HasFlag / Unsafe / Interlocked 等の JIT 置換面) / `internal-call` (FastAllocateString / Monitor FastPath 等) / `runtime-representation` (Object.GetType / Type・MethodBase / 例外等のランタイム内部表現依存) / `culture-out-of-scope` (culture 機構依存面の不変カルチャ委譲) |
+| **RuntimeInternal** | 実 CLR も IL を実行しない面。正当化タグ: `jit-intrinsic` (HasFlag / Unsafe / Interlocked 等の JIT 置換面) / `internal-call` (FastAllocateString / Monitor FastPath 等) / `runtime-representation` (Object.GetType / Type・MethodBase / 例外等のランタイム内部表現依存) / `culture-out-of-scope` (CultureInfo / CompareInfo の guest 実装が未対応のためホスト BCL に委譲) |
 | **Device** | VM デバイス / ゲートウェイ面 (Console / File / WebClient / IDisposable no-op 既定)。I/O は仮想デバイス経由限定という設計原則 |
 
 `CoreLibSurfaceAuditTests` が双方向 (順方向: 全登録キーが監査表に載っている / 逆方向: 監査表エントリに実体登録がある) とシャドウ禁止 (置換面にバインドを登録する退行の検出) を常時検査します。
 
-culture 機構はスコープ外 (不変カルチャ規約固定) です。culture 必須の面 (string.Compare / IndexOf(string) / StartsWith / EndsWith / ToUpper / ToLower 等) はホスト BCL の不変カルチャ実装へ委譲し、ordinal で意味論確定の面 (CompareOrdinal / IndexOf(char) / Contains / Replace / Split 全 overload) と複合書式 (string.Format) は DotnetVM.CoreLib 置換面 (`StringOrdinalOps` / `StringFormatting`) が本家と無差別の結果を提供します (CLR 全面グリッド突合済み)。
+ロケールは `VmHostOptions.Culture` に `CultureInfo` を指定できます (既定は `InvariantCulture`)。例: `new VmHostOptions { Culture = CultureInfo.GetCultureInfo("ja-JP") }`。VM は各外側 guest 呼出の間だけ `CurrentCulture` と `CurrentUICulture` に反映し、終了時にホスト thread の値を復元します。文字列比較・大文字小文字変換、DateTime / TimeSpan の Parse・ToString、および decimal.Parse はこの設定を使います。`CultureInfo` オブジェクト自体の guest 面は未実装です。また DotnetVM.CoreLib の数値書式・整数 Parse や `String.Format` 置換面は不変カルチャ規約を維持します。ordinal で意味論確定の面 (CompareOrdinal / IndexOf(char) / Contains / Replace / Split 全 overload) は DotnetVM.CoreLib 置換面 (`StringOrdinalOps`) が CLR と同じ結果を提供します。
 
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
@@ -193,7 +193,7 @@ dotnet test DotnetVM.Tests
 - [x] C3: 署名精度の仮想/インターフェースディスパッチ (VTable / InterfaceMap / EII)
 - [x] C4: ランタイムバインド層 (BindingKey + BindingOrigin / 優先順位 ①〜④ / CoreLib InternalCall・JIT intrinsic 面のバインド)
 - [x] C5: CoreLib IL 実行の全面化 + 差分テスト (String/整数 ToString・Parse/Convert/Math の IL 実行、ExecutionTracer で IL 実行証明、VM CoreLib (DotnetVM.CoreLib) 置換面、newobj string 構築面、例外既定文言のホスト CLR 委譲)
-- [x] C5.5: CoreLib 委譲面の全面監査 (分類ゼロ構造保証: RealCoreLibIl / VmCoreLibSubstitute / RuntimeInternal / Device + 正当化タグ)。Convert(object) / Enum IConvertible / 整数・浮動小数点書式・Parse / String ordinal・Split・Format 面を実 CoreLib IL または DotnetVM.CoreLib 置換 IL へ移行、culture 面 (Compare / 大文字小文字等) は不変カルチャ規約で監査確定
+- [x] C5.5: CoreLib 委譲面の全面監査 (分類ゼロ構造保証: RealCoreLibIl / VmCoreLibSubstitute / RuntimeInternal / Device + 正当化タグ)。Convert(object) / Enum IConvertible / 整数・浮動小数点書式・Parse / String ordinal・Split・Format 面を実 CoreLib IL または DotnetVM.CoreLib 置換 IL へ移行、culture 面 (Compare / 大文字小文字等) は設定カルチャのホスト委譲で監査確定
 - [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
 - [x] C6.1: Task / ValueTask / async-await (Task / Task<T>、ValueTask / ValueTask<T>、Delay / Run / FromResult、各 awaiter、ConfigureAwait、async state machine)
 - [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)

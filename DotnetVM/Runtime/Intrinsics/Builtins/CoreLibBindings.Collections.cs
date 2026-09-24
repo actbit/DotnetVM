@@ -15,18 +15,18 @@ internal static partial class CoreLibBindings {
     /// 本家は全 overload をここへ集約する (List.Sort / Array.Sort(T[]) 等の実 IL が辿る先)。
     /// 実 IL は introsort / 比較子生成 (CreateArraySortHelper) / MethodTable 内部表現
     /// (CopyImpl) で構成され VM 表現境界のため、同一意味論を直接提供する:
-    /// 既定順序はプリミティブ数値 + 文字列 (不変カルチャ規約) のホスト比較。カスタム
+    /// 既定順序はプリミティブ数値 + guest 呼出スコープの CurrentCulture による文字列比較。カスタム
     /// IComparer がある面はゲスト委譲機構が無いため fail-closed (ホスト例外)。
     /// 多次元配列は RankException (SZArray のみ対応)。</summary>
     private static void RegisterArrayBindings(IntrinsicRegistry r) {
         const string T = "System.Array";
         r.RegisterBinding(BindingKey.Static(T, "Sort",
                 "System.Array", "System.Array", "System.Int32", "System.Int32", "System.Collections.IComparer"),
-            static (_, a) => { SortImpl(a[0], a[1], a[2].AsInt32, a[3].AsInt32, a[4]); return null; }, BindingOrigin.Managed);
+            static (ctx, a) => { SortImpl(ctx, a[0], a[1], a[2].AsInt32, a[3].AsInt32, a[4]); return null; }, BindingOrigin.Managed);
         // ジェネリック Sort (List.Sort / Array.Sort(T[]) 等が辿る実面。比較子生成の
         // ランタイム内部 (CreateArraySortHelper) を迂回し既定順序を直接提供する)
         r.RegisterBinding(BindingKey.Static(T, "Sort", "!!0[]"),
-            static (_, a) => { SortImpl(a[0], StackSlot.Null, 0, RequireSzArray(a[0], "Array.Sort").Length, StackSlot.Null); return null; }, BindingOrigin.Managed);
+            static (ctx, a) => { SortImpl(ctx, a[0], StackSlot.Null, 0, RequireSzArray(a[0], "Array.Sort").Length, StackSlot.Null); return null; }, BindingOrigin.Managed);
         // Sort(T[], int, int, IComparer<T>): 呼出元の文脈で型変数の綴り (!!0 / !0) が
         // 変わるため両形を登録する (実引数は実行時に判別する)
         foreach (var comparerParam in new[] {
@@ -34,7 +34,7 @@ internal static partial class CoreLibBindings {
             "System.Collections.Generic.IComparer`1<!0>",
         })
             r.RegisterBinding(BindingKey.Static(T, "Sort", "!!0[]", "System.Int32", "System.Int32", comparerParam),
-                static (_, a) => { SortImpl(a[0], StackSlot.Null, a[1].AsInt32, a[2].AsInt32, a[3]); return null; }, BindingOrigin.Managed);
+                static (ctx, a) => { SortImpl(ctx, a[0], StackSlot.Null, a[1].AsInt32, a[2].AsInt32, a[3]); return null; }, BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Static(T, "Reverse",
                 "System.Array", "System.Int32", "System.Int32"),
             static (_, a) => { ReverseImpl(a); return null; }, BindingOrigin.Managed);
@@ -68,7 +68,8 @@ internal static partial class CoreLibBindings {
                 $"{face} の範囲 (index={index}, length={length}) が配列長 {arrayLength} を超えています。");
     }
 
-    private static void SortImpl(in StackSlot keysSlot, in StackSlot itemsSlot, int index, int length, in StackSlot comparerSlot) {
+    private static void SortImpl(IntrinsicContext ctx, in StackSlot keysSlot, in StackSlot itemsSlot,
+        int index, int length, in StackSlot comparerSlot) {
         var keys = RequireSzArray(keysSlot, "Array.Sort");
         VmArray? items = itemsSlot.ObjectValue is null ? null : RequireSzArray(itemsSlot, "Array.Sort");
         CheckRange(index, length, keys.Length, "Array.Sort");
@@ -84,7 +85,7 @@ internal static partial class CoreLibBindings {
         for (var i = 0; i < length; i++)
             order[i] = i;
         var elements = keys.Elements;
-        Array.Sort(order, (x, y) => CompareElement(elements[index + x], elements[index + y], elementType));
+        Array.Sort(order, (x, y) => CompareElement(ctx, elements[index + x], elements[index + y], elementType));
         var sortedKeys = new StackSlot[length];
         for (var i = 0; i < length; i++)
             sortedKeys[i] = elements[index + order[i]];
@@ -158,8 +159,8 @@ internal static partial class CoreLibBindings {
 
     /// <summary>既定順序の要素比較 (CLR の既定比較子と同一順序)。
     /// 数値は符号どおり、浮動小数点は host CompareTo (NaN 順序を含む)、文字列は
-    /// 不変カルチャ規約。box 化プリミティブは開いて比較する。構造体等は fail-closed。</summary>
-    private static int CompareElement(in StackSlot x, in StackSlot y, string elementType) {
+    /// guest 呼出スコープの CurrentCulture。box 化プリミティブは開いて比較する。構造体等は fail-closed。</summary>
+    private static int CompareElement(IntrinsicContext ctx, in StackSlot x, in StackSlot y, string elementType) {
         var (xv, xn) = UnwrapForCompare(x, elementType);
         var (yv, yn) = UnwrapForCompare(y, elementType);
         if (IsNullSlot(xv) || IsNullSlot(yv)) {
@@ -167,8 +168,10 @@ internal static partial class CoreLibBindings {
                 return 0;
             return IsNullSlot(xv) ? -1 : 1; // null は先頭 (CLR 規約)
         }
-        if (xv.ObjectValue is VmString xs && yv.ObjectValue is VmString ys)
-            return string.Compare(xs.Value, ys.Value, StringComparison.InvariantCulture);
+        if (xv.ObjectValue is VmString xs && yv.ObjectValue is VmString ys) {
+            ctx.Heap.ChargeHostWork((long)xs.Value.Length + ys.Value.Length);
+            return string.Compare(xs.Value, ys.Value, StringComparison.CurrentCulture);
+        }
         if (xv.Kind is StackKind.Object or StackKind.ValueType or StackKind.ByRef ||
             yv.Kind is StackKind.Object or StackKind.ValueType or StackKind.ByRef)
             throw new InvalidOperationException(

@@ -147,6 +147,11 @@ internal static partial class CoreLibBindings {
             return new Guid(bytes);
         }
         static string? S(in StackSlot slot) => (slot.ObjectValue as VmString)?.Value;
+        // Guid.NewGuid は CoreLib の OS P/Invoke に到達するため、任意の native import を
+        // 許可せずホスト BCL の暗号学的 GUID 生成だけを委譲する。
+        r.RegisterBinding(BindingKey.StaticWithReturn(T, "NewGuid", T, []),
+            static (ctx, _) => MakeGuidStruct(ctx, Guid.NewGuid()),
+            BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", T, ["System.String"]),
             static (ctx, a) => {
                 try {

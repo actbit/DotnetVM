@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Reflection;
+using System.Security.Cryptography;
 using DotnetVM.Metadata;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
@@ -67,11 +68,9 @@ internal static partial class CoreLibBindings {
                 "System.String", "System.Char&", "System.UInt32"),
             static (ctx, a) => GetEnvironmentVariableImpl(ctx, a),
             BindingOrigin.PInvokeReplacement);
-        // Interop+BCrypt.BCryptGenRandom (Marvin ハッシュ種等の乱数源 P/Invoke)。
-        // ネイティブ実行はしない。VM 決定論規約 (仮想コンソールの決定的入力と同型) により
-        // 決定論的ゼロ埋めで代替し STATUS_SUCCESS (0) を返す。CLR (プロセス毎ランダム) と
-        // 種値は異なるが、ハッシュ利用面 (Dictionary 等) の観測意味論は同一。
-        // ゲストからの直接呼出は TrustedCoreLib domain 遮断で拒否される
+        // Interop+BCrypt.BCryptGenRandom (Random / Marvin ハッシュ種等の乱数源 P/Invoke)。
+        // 任意の native import は実行せず、ホスト暗号乱数 API に限定して委譲する。
+        // P/Invoke 呼出元は TrustedCoreLib domain に限定し、ゲストからの直接呼出は拒否する。
         r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
                 "System.IntPtr", "System.Byte*", "System.Int32", "System.Int32"),
             static (_, a) => {
@@ -81,28 +80,36 @@ internal static partial class CoreLibBindings {
                 if (count == 0)
                     return StackSlot.OfInt32(0);
                 if (a[1].ObjectValue is VmNativePointer native) {
-                    if ((long)native.ByteOffset + count > native.Bytes.Length)
+                    if (native.ByteOffset < 0 || (long)native.ByteOffset + count > native.Bytes.Length)
                         throw new InvalidOperationException(
                             $"BCryptGenRandom がブロック外を参照します (offset={native.ByteOffset}, {count} バイト)。");
-                    Array.Clear(native.Bytes, native.ByteOffset, count);
+                    RandomNumberGenerator.Fill(native.Bytes.AsSpan(native.ByteOffset, count));
                     return StackSlot.OfInt32(0);
                 }
-                // マネージポインタ (stackalloc ulong 等のスロット列): 要素をゼロ化する
-                // (Marvin.GenerateSeed の ulong 変数等。8 バイト = Int64 1 スロット)
+                // マネージポインタ (Marvin seed の stackalloc ulong)。既知の Int64 スロット
+                // のみ扱い、他の managed バッファ表現は誤書込みを避けて fail-closed にする。
                 if (a[1].Kind == StackKind.ByRef && a[1].ObjectValue is VmByRef byRef) {
                     if (byRef.Container.Length == 0)
                         throw new UnhandledGuestException("System.NullReferenceException", null);
-                    if (count == 8 && byRef.Index < byRef.Container.Length &&
-                        byRef.Container[byRef.Index].Kind == StackKind.Int64) {
-                        byRef.Container[byRef.Index] = StackSlot.OfInt64(0);
-                        return StackSlot.OfInt32(0);
-                    }
-                    var slots = (count + 7) / 8;
-                    if (byRef.Index < 0 || byRef.Index + slots > byRef.Container.Length)
+                    var slots = (int)(((long)count + 7) / 8);
+                    if (byRef.Index < 0 || slots > byRef.Container.Length - byRef.Index)
                         throw new InvalidOperationException(
                             $"BCryptGenRandom がスロット列の範囲外を参照します (index={byRef.Index}, {count} バイト)。");
-                    for (var i = 0; i < slots; i++)
-                        byRef.Container[byRef.Index + i] = StackSlot.OfInt64(0);
+                    var remaining = count;
+                    var index = byRef.Index;
+                    Span<byte> bytes = stackalloc byte[8];
+                    while (remaining > 0) {
+                        var slot = byRef.Container[index];
+                        if (slot.Kind != StackKind.Int64)
+                            throw new InvalidOperationException(
+                                $"BCryptGenRandom のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
+                        BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
+                        var writeCount = Math.Min(8, remaining);
+                        RandomNumberGenerator.Fill(bytes[..writeCount]);
+                        byRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
+                        remaining -= writeCount;
+                        index++;
+                    }
                     return StackSlot.OfInt32(0);
                 }
                 throw new InvalidOperationException(

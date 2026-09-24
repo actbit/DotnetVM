@@ -64,9 +64,8 @@ public static partial class DefaultIntrinsics {
         });
         Instance("CompareTo", 1, static (_, a) => {
             var s = new Args(a);
-            // C5.5 Wave 5: CLR の String.CompareTo は culture 比較 (Ordinal ではない)。
-            // VM 規約は不変カルチャ固定のため InvariantCulture で委譲する
-            return StackSlot.OfInt32(string.Compare(s.String(0).Value, s.String(1).Value, StringComparison.InvariantCulture));
+            // CLR の String.CompareTo は guest 呼出スコープに設定された culture で比較する。
+            return StackSlot.OfInt32(string.Compare(s.String(0).Value, s.String(1).Value, StringComparison.CurrentCulture));
         });
         Instance("Contains", 1, static (_, a) => {
             var s = new Args(a);
@@ -74,34 +73,33 @@ public static partial class DefaultIntrinsics {
         });
         Instance("StartsWith", 1, static (_, a) => {
             var s = new Args(a);
-            // C5.5 Wave 5: CLR の 1 引数 StartsWith/EndsWith は culture 比較。
-            // VM 規約は不変カルチャ固定で委譲する
-            return StackSlot.OfInt32(s.String(0).Value.StartsWith(s.String(1).Value, StringComparison.InvariantCulture) ? 1 : 0);
+            // CLR の 1 引数 StartsWith/EndsWith は culture 比較。
+            return StackSlot.OfInt32(s.String(0).Value.StartsWith(s.String(1).Value, StringComparison.CurrentCulture) ? 1 : 0);
         });
         Instance("EndsWith", 1, static (_, a) => {
             var s = new Args(a);
-            return StackSlot.OfInt32(s.String(0).Value.EndsWith(s.String(1).Value, StringComparison.InvariantCulture) ? 1 : 0);
+            return StackSlot.OfInt32(s.String(0).Value.EndsWith(s.String(1).Value, StringComparison.CurrentCulture) ? 1 : 0);
         });
         Instance("IndexOf", 1, static (_, a) => {
             var s = new Args(a);
             var value = s.String(0).Value;
             return s[1].ObjectValue is VmString needle
-                ? StackSlot.OfInt32(value.IndexOf(needle.Value, StringComparison.InvariantCulture)) // C5.5 Wave 5: 不変カルチャ固定
+                ? StackSlot.OfInt32(value.IndexOf(needle.Value, StringComparison.CurrentCulture))
                 : StackSlot.OfInt32(value.IndexOf(s.Char(1)));
         });
         Instance("LastIndexOf", 1, static (_, a) => {
             var s = new Args(a);
             var value = s.String(0).Value;
             return s[1].ObjectValue is VmString needle
-                ? StackSlot.OfInt32(value.LastIndexOf(needle.Value, StringComparison.InvariantCulture))
+                ? StackSlot.OfInt32(value.LastIndexOf(needle.Value, StringComparison.CurrentCulture))
                 : StackSlot.OfInt32(value.LastIndexOf(s.Char(1)));
         });
         Instance("Replace", 2, static (ctx, a) => {
             var s = new Args(a);
             return StackSlot.OfObject(ctx.MakeString(s.String(0).Value.Replace(s.String(1).Value, s.String(2).Value)));
         });
-        Instance("ToUpper", 0, static (ctx, a) => StackSlot.OfObject(ctx.MakeString(new Args(a).String(0).Value.ToUpperInvariant())));
-        Instance("ToLower", 0, static (ctx, a) => StackSlot.OfObject(ctx.MakeString(new Args(a).String(0).Value.ToLowerInvariant())));
+        Instance("ToUpper", 0, static (ctx, a) => StackSlot.OfObject(ctx.MakeString(new Args(a).String(0).Value.ToUpper())));
+        Instance("ToLower", 0, static (ctx, a) => StackSlot.OfObject(ctx.MakeString(new Args(a).String(0).Value.ToLower())));
         Instance("Trim", 0, static (ctx, a) => StackSlot.OfObject(ctx.MakeString(new Args(a).String(0).Value.Trim())));
         Instance("ToString", 0, static (_, a) => StackSlot.OfObject(new Args(a).String(0)));
 

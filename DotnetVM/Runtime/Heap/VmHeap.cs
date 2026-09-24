@@ -202,7 +202,7 @@ public sealed class VmHeap {
     }
 
     /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget タスク 2)。bc/intrinsic 毎に
-    /// 重い host 処理 (InvariantCulture 比較 / formatting / encoding 等) の発生に対して
+    /// 重い host 処理 (culture-aware 比較 / formatting / encoding 等) の発生に対して
     /// 見積ったコストを積み上げる。budget中超過はメモリ系例外で VM に伝播 (ゲスト catch 外)。</summary>
     public void ChargeHostWork(long costUnits) {
         if (costUnits < 0)

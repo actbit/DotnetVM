@@ -616,11 +616,10 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
         Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
-        Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: Linux の乱数源 P/Invoke を VM 所有のホスト暗号乱数 API へ委譲 (ネイティブ実行はしない)",
-            hasThis: false, paramCount: 2);
         Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
+        Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
+            "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
             InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 

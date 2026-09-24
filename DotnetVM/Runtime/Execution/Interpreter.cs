@@ -137,9 +137,36 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
             using var instructionLease = _coordinator.EnterInstruction();
             ConsumeInstruction();
             var instruction = frame.Code[frame.Ip];
+            var isPrefix = IsPrefix(instruction.Op);
+            var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
+            var readonlyArrayAddress = frame.PendingReadonly && !isPrefix && instruction.Op == ILOp.Ldelema;
+            var tailCallAllowed = frame.PendingTail && !isPrefix &&
+                (instruction.Op is ILOp.Call or ILOp.Callvirt or ILOp.Calli) &&
+                frame.Ip + 1 < frame.Code.Length && frame.Code[frame.Ip + 1].Op == ILOp.Ret &&
+                !frame.PendingTailInProtectedRegion && !IsInProtectedRegion(frame.Ip, prepared.Clauses);
+            if (!isPrefix) {
+                frame.PendingVolatile = false;
+                frame.PendingTail = false;
+                frame.PendingTailInProtectedRegion = false;
+                frame.PendingReadonly = false;
+                if (instruction.Op is not (ILOp.Call or ILOp.Callvirt))
+                    frame.PendingConstrained = 0;
+            }
+            if (volatileAccess)
+                Thread.MemoryBarrier();
             switch (instruction.Op) {
                 case ILOp.Nop or ILOp.Break:
-                case ILOp.Volatile or ILOp.Unaligned or ILOp.Readonly or ILOp.Tail: // プレフィックス (効果なし)
+                case ILOp.Unaligned: // VM の仮想メモリではアラインメント制約なし
+                    break;
+                case ILOp.Readonly:
+                    frame.PendingReadonly = true;
+                    break;
+                case ILOp.Volatile:
+                    frame.PendingVolatile = true;
+                    break;
+                case ILOp.Tail:
+                    frame.PendingTail = true;
+                    frame.PendingTailInProtectedRegion |= IsInProtectedRegion(frame.Ip, prepared.Clauses);
                     break;
                 case ILOp.Constrained:
                     // constrained. <type> は次の call/callvirt で解決する。値型レシーバは
@@ -305,8 +332,11 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 // ---- 呼出 ----
                 case ILOp.Call or ILOp.Callvirt: {
                     var result = calls.Call(instruction.IntOperand, frame,
-                        instruction.Op == ILOp.Callvirt, frame.PendingConstrained);
+                        instruction.Op == ILOp.Callvirt, frame.PendingConstrained,
+                        tailCallAllowed, out var tailCallRequest);
                     frame.PendingConstrained = 0; // constrained. は直後の 1 呼出でのみ有効
+                    if (tailCallRequest is not null)
+                        throw new TailCallTransfer(tailCallRequest);
                     if (result is { } value)
                         frame.Stack.Push(value);
                     break;
@@ -377,7 +407,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var index = frame.Stack.Pop().AsInt32;
                     var array = MemoryOps.GetArray(frame.Stack.Pop());
                     MemoryOps.CheckArrayBounds(array, index);
-                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index)));
+                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, readonlyArrayAddress)));
                     break;
                 }
 
@@ -670,12 +700,19 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         args[i] = frame.Stack.Pop();
                     ConsumeInstruction(); // 呼出ゲート: クォータ + セーフポイント
                     CheckSafepoint();
-                    StackSlot? result = fnptr.ObjectValue switch {
-                        VmMethodPointer pointer => Invoke(pointer.Target, args),
-                        VmDelegate @delegate => calls.InvokeDelegate(@delegate, args),
-                        _ => throw new UnhandledGuestException("System.ArgumentException",
-                            "calli の関数ポインタが無効です (ldftn/ldvirtftn の結果を指定してください)。"),
-                    };
+                    StackSlot? result;
+                    if (fnptr.ObjectValue is VmMethodPointer pointer) {
+                        if (tailCallAllowed && SignaturesMatch(signature, pointer.Target.Signature) &&
+                            this is IGuestInvoker guestInvoker &&
+                            guestInvoker.TryCreateTailCall(frame, pointer.Target, args, null, out var tailRequest))
+                            throw new TailCallTransfer(tailRequest!);
+                        result = Invoke(pointer.Target, args);
+                    } else if (fnptr.ObjectValue is VmDelegate @delegate) {
+                        result = calls.InvokeDelegate(@delegate, args);
+                    } else {
+                        throw new UnhandledGuestException("System.ArgumentException",
+                            "calli の関数ポインタが無効です (ldftn/ldvirtftn の結果を指定してください)。");
+                    }
                     if (SlotOps.SignatureReturnsValue(signature))
                         frame.Stack.Push(result ?? default);
                     break;
@@ -695,11 +732,18 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (target.Method is null)
                         throw new OperationNotAllowedException(
                             $"jmp: intrinsic 面 {target.DeclaringType}::{target.Name} への尾呼び移行は対応していません。");
-                    var args = new StackSlot[target.Arity];
-                    for (var i = target.Arity - 1; i >= 0; i--)
-                        args[i] = frame.Stack.Pop();
+                    if (frame.Stack.Count != 0)
+                        throw new BadImageFormatException("jmp の実行スタックは空でなければなりません。");
+                    if (frame.Arguments.Length != target.Arity)
+                        throw new BadImageFormatException("jmp の呼出先シグネチャが現在の引数数と一致しません。");
+                    var args = frame.Arguments.ToArray();
                     var method = target.Method!;
                     var context = calls.BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
+                    if (!IsInProtectedRegion(frame.Ip, prepared.Clauses) &&
+                        SignaturesMatch(frame.Method.Signature, method.Signature) &&
+                        this is IGuestInvoker guestInvoker &&
+                        guestInvoker.TryCreateTailCall(frame, method, args, context, out var tailRequest))
+                        throw new TailCallTransfer(tailRequest!);
                     return Invoke(method, args, context);
                 }
 
@@ -829,9 +873,44 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     throw new NotSupportedException(
                         $"IL 命令 {IlOpcodeTable.Get(instruction.Op)?.Name ?? instruction.Op.ToString()} は未対応です (ジェネリック/JIT は今後のフェーズで実装)。");
             }
+            if (volatileAccess)
+                Thread.MemoryBarrier();
             frame.Ip++;
         }
     }
+
+    private static bool IsPrefix(ILOp op) =>
+        op is ILOp.Unaligned or ILOp.Volatile or ILOp.Tail or ILOp.Constrained or ILOp.Readonly;
+
+    private static bool IsInProtectedRegion(int instructionIndex, PreparedClause[]? clauses) =>
+        clauses?.Any(clause =>
+            instructionIndex >= clause.TryStart && instructionIndex < clause.TryEnd ||
+            instructionIndex >= clause.HandlerStart && instructionIndex < clause.HandlerEnd ||
+            clause.FilterStart >= 0 && instructionIndex >= clause.FilterStart &&
+                instructionIndex < clause.HandlerStart) == true;
+
+    private static bool SignaturesMatch(MethodSignature left, MethodSignature right) =>
+        left.HasThis == right.HasThis && left.IsVarArg == right.IsVarArg &&
+        left.GenericParamCount == right.GenericParamCount &&
+        SignatureTypesMatch(left.ReturnType, right.ReturnType) &&
+        left.ParamTypes.Length == right.ParamTypes.Length &&
+        left.ParamTypes.Zip(right.ParamTypes).All(pair => SignatureTypesMatch(pair.First, pair.Second));
+
+    private static bool SignatureTypesMatch(SigType left, SigType right) =>
+        left.Kind == right.Kind && left.Token == right.Token && left.VarNumber == right.VarNumber &&
+        left.Rank == right.Rank &&
+        (left.Inner is null ? right.Inner is null : right.Inner is not null && SignatureTypesMatch(left.Inner, right.Inner)) &&
+        (left.Args is null ? right.Args is null : right.Args is not null && left.Args.Length == right.Args.Length &&
+            left.Args.Zip(right.Args).All(pair => SignatureTypesMatch(pair.First, pair.Second)));
+
+    private static bool IsVolatileMemoryAccess(ILOp op) => op is
+        ILOp.Ldfld or ILOp.Ldsfld or ILOp.Stfld or ILOp.Stsfld or
+        ILOp.Ldobj or ILOp.Stobj or ILOp.Cpblk or ILOp.Initblk or
+        ILOp.Ldind_I1 or ILOp.Ldind_U1 or ILOp.Ldind_I2 or ILOp.Ldind_U2 or
+        ILOp.Ldind_I4 or ILOp.Ldind_U4 or ILOp.Ldind_I8 or ILOp.Ldind_I or
+        ILOp.Ldind_R4 or ILOp.Ldind_R8 or ILOp.Ldind_Ref or
+        ILOp.Stind_Ref or ILOp.Stind_I1 or ILOp.Stind_I2 or ILOp.Stind_I4 or
+        ILOp.Stind_I8 or ILOp.Stind_I or ILOp.Stind_R4 or ILOp.Stind_R8;
 
     private static void CheckArgIndex(InterpreterFrame frame, int index) {
         if ((uint)index >= (uint)frame.Arguments.Length)

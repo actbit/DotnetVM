@@ -158,9 +158,9 @@ internal sealed partial class ObjectEngine {
                 var target = outer.Read();
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
                     DefinitionOf(sv.StructType) is VmClassType st)
-                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field));
+                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field), outer.IsReadOnly);
                 if (target.ObjectValue is VmClassInstance nested)
-                    return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field));
+                    return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field), outer.IsReadOnly);
                 break;
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&

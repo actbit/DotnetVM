@@ -115,6 +115,7 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 | **Full** | CLR 突合テストで意味論を検証済み |
 | **Partial** | 受け入れるが VM の安全側モデルに簡略化 (差分を明記) |
 | **Prefix no-op** | プレフィックス命令として受け入れるが効果なし |
+| **Prefix modeled** | VM のメモリモデルに合う範囲で効果を反映 |
 | **Rejected** | ロード / 実行時に拒否 |
 
 ### Full
@@ -141,13 +142,14 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 |---|---|
 | `localloc` | 初期化は 0 (実 CLR は不定値)。ブロックは GC 管理 (フレーム終了で解放しない = 脱出 stackalloc も安全側に動く)。ブロック外アクセスは境界検査で拒否 (実 CLR は未定義動作 = アドレス空間破壊)。確保は `VmHeap` 会計の対象で、上限検査はホスト実確保より先に実施 |
 | `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度、ByRef 間は 8 バイト切り上げのスロット粒度 |
-| `sizeof` | ゲスト値型は順次レイアウト近似 (プリミティブ整列。明示的パッキングは未対応) |
+| `sizeof` | ゲスト値型は ClassLayout の Pack/Size と FieldLayout の明示オフセットを反映。順次配置のネスト値型の整列は近似。値型フィールド自体は VM のスロットとして保持するため、明示レイアウトの重なりアクセスは未対応 |
 | `arglist` | ハンドル生成のみ。varargs 実呼出は fail-closed (C# 産 IL では生成されない) |
 | `jmp` | 尾呼び移行として実装 (残フレームを実行せず呼出先の戻り値を引き継ぐ)。intrinsic 面への移行は拒否 |
+| unmanaged 生メモリ | `ldind.r4` / `stind.r4` は 4 バイト幅、`ldobj` は符号付き小整数と列挙型の基底型を反映 |
 
-### Prefix no-op
+### Prefix behavior
 
-`volatile.` `unaligned.` `readonly.` `tail.` — 受け入れて無視します。`tail.` + `call` は通常の呼出に置き換わるため、深い末尾再帰は `MaxRecursionDepth` で拒否されうる点に注意 (実 CLR ではスタック消費なしで回る)。
+`volatile.` は対応するメモリアクセス前後にメモリバリアを置きます。`unaligned.` は VM の仮想メモリがアラインメント制約を持たないため no-op です。`readonly. ldelema` は読み取り専用 ByRef を作り、書き込み命令で拒否します。`tail.` + `call`/`callvirt`/`calli` は、戻り値型が一致し、protected region 外で、呼出元の引数/ローカルへの参照を渡さない場合にフレームを置き換えます。それ以外は通常の呼出にフォールバックします。`jmp` は評価スタックを空にし、呼出元と呼出先のシグネチャが一致するゲストメソッド間でフレームを置き換えます。
 
 ### Rejected
 

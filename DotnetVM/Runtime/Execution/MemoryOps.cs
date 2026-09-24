@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using DotnetVM.IL;
 using DotnetVM.Metadata;
 using DotnetVM.Policy;
@@ -12,6 +13,28 @@ namespace DotnetVM.Runtime.Execution;
 /// マネージポインタ (ByRef: スロット配列+インデックス) と unmanaged ポインタ
 /// (VmNativePointer: 実バイト列+オフセット) の 2 種類のメモリを命令幅どおりに扱う。</summary>
 internal static class MemoryOps {
+
+    private sealed class LayoutMetadata {
+        public required Dictionary<int, (int PackingSize, uint ClassSize)> Types { get; init; }
+        public required Dictionary<int, uint> Fields { get; init; }
+
+        public static LayoutMetadata Read(AssemblyImage image) {
+            var types = new Dictionary<int, (int, uint)>();
+            var fields = new Dictionary<int, uint>();
+            var tables = image.Tables;
+            for (var rid = 1; rid <= tables.GetRowCount(TableKind.ClassLayout); rid++) {
+                var typeRid = tables.GetRowIndex(TableKind.ClassLayout, rid, 2);
+                types[typeRid] = ((int)tables.GetCell(TableKind.ClassLayout, rid, 0),
+                    tables.GetCell(TableKind.ClassLayout, rid, 1));
+            }
+            for (var rid = 1; rid <= tables.GetRowCount(TableKind.FieldLayout); rid++)
+                fields[tables.GetRowIndex(TableKind.FieldLayout, rid, 1)] =
+                    tables.GetCell(TableKind.FieldLayout, rid, 0);
+            return new LayoutMetadata { Types = types, Fields = fields };
+        }
+    }
+
+    private static readonly ConditionalWeakTable<AssemblyImage, LayoutMetadata> s_layoutMetadata = new();
 
     // ---- 配列要素 ----
 
@@ -55,7 +78,8 @@ internal static class MemoryOps {
         return kind switch {
             ArrayElementKind.Int32 => StackSlot.OfInt32((int)slot.Int64Value),
             ArrayElementKind.Int64 => StackSlot.OfInt64(slot.Int64Value),
-            ArrayElementKind.Float => StackSlot.OfFloat(slot.DoubleValue),
+            ArrayElementKind.Float => StackSlot.OfFloat(array.ArrayType.ElementType.FullName == "System.Single"
+                ? (float)slot.DoubleValue : slot.DoubleValue),
             // 構造体要素は読み出し時にコピーする (値型コピー意味論)
             _ => slot.ObjectValue is VmStructValue sv ? StackSlot.OfValueType(sv.Clone()) : slot,
         };
@@ -77,7 +101,8 @@ internal static class MemoryOps {
             array.Elements[index] = kind switch {
                 ArrayElementKind.Int32 => StackSlot.OfInt32((int)value.Int64Value),
                 ArrayElementKind.Int64 => StackSlot.OfInt64(value.Int64Value),
-                ArrayElementKind.Float => StackSlot.OfFloat(value.DoubleValue),
+                ArrayElementKind.Float => StackSlot.OfFloat(array.ArrayType.ElementType.FullName == "System.Single"
+                    ? (float)value.DoubleValue : value.DoubleValue),
                 _ => value,
             };
     }
@@ -105,6 +130,7 @@ internal static class MemoryOps {
         }
         var dstByRef = MemoryLocation(dstSlot);
         var srcByRef = MemoryLocation(srcSlot);
+        dstByRef.EnsureWritable();
         var count = (int)Math.Min((size + 7L) / 8, int.MaxValue);
         if ((long)dstByRef.Index + count > dstByRef.Container.Length || (long)srcByRef.Index + count > srcByRef.Container.Length)
             throw new UnhandledGuestException("System.IndexOutOfRangeException",
@@ -128,6 +154,7 @@ internal static class MemoryOps {
         if (value.Int64Value != 0)
             throw new NotSupportedException("マネージポインタ (ByRef) 先への initblk は 0 以外の充填値に対応していません (スロット粒度のため)。");
         var dstByRef = MemoryLocation(dstSlot);
+        dstByRef.EnsureWritable();
         var count = (int)Math.Min((size + 7L) / 8, int.MaxValue);
         if ((long)dstByRef.Index + count > dstByRef.Container.Length)
             throw new UnhandledGuestException("System.IndexOutOfRangeException",
@@ -175,7 +202,8 @@ internal static class MemoryOps {
                 ILOp.Ldind_U2 => StackSlot.OfInt32(ptr.ReadUInt16()),
                 ILOp.Ldind_I4 or ILOp.Ldind_U4 => StackSlot.OfInt32(ptr.ReadInt32()),
                 ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(ptr.ReadInt64()),
-                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(ptr.ReadDouble()),
+                ILOp.Ldind_R4 => StackSlot.OfFloat(ptr.ReadSingle()),
+                ILOp.Ldind_R8 => StackSlot.OfFloat(ptr.ReadDouble()),
                 _ => throw new NotSupportedException(
                     "unmanaged ポインタからの参照読み出し (ldind.ref) は対応していません。"),
             };
@@ -191,7 +219,8 @@ internal static class MemoryOps {
                 var slot = boxed.Fields[0];
                 return op switch {
                     ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
-                    ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
+                    ILOp.Ldind_R4 => StackSlot.OfFloat((float)slot.DoubleValue),
+                    ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
                     ILOp.Ldind_Ref => slot,
                     _ => StackSlot.OfInt32((int)slot.Int64Value), // I1〜U4 は i4 正規化スロット
                 };
@@ -201,7 +230,8 @@ internal static class MemoryOps {
             var slot = byRef.Read();
             return op switch {
                 ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
-                ILOp.Ldind_R4 or ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
+                ILOp.Ldind_R4 => StackSlot.OfFloat((float)slot.DoubleValue),
+                ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
                 ILOp.Ldind_Ref => slot,
                 _ => StackSlot.OfInt32((int)slot.Int64Value), // I1〜U4 は i4 正規化スロット
             };
@@ -217,7 +247,8 @@ internal static class MemoryOps {
                 case ILOp.Stind_I2: ptr.WriteInt16((int)value.Int64Value); return;
                 case ILOp.Stind_I4: ptr.WriteInt32((int)value.Int64Value); return;
                 case ILOp.Stind_I8: ptr.WriteInt64(value.Int64Value); return;
-                case ILOp.Stind_R4 or ILOp.Stind_R8: ptr.WriteDouble(value.DoubleValue); return;
+                case ILOp.Stind_R4: ptr.WriteSingle((float)value.DoubleValue); return;
+                case ILOp.Stind_R8: ptr.WriteDouble(value.DoubleValue); return;
                 default: // Stind_Ref / Stind_I
                     throw new NotSupportedException(
                         "unmanaged ポインタへの参照書き込み (stind.ref) は対応していません。");
@@ -230,7 +261,8 @@ internal static class MemoryOps {
             lock (boxed.Fields)
                 boxed.Fields[0] = op switch {
                     ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
-                    ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                    ILOp.Stind_R4 => StackSlot.OfFloat((float)value.DoubleValue),
+                    ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
                     ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
                     _ => StackSlot.OfInt32((int)value.Int64Value),
                 };
@@ -239,7 +271,8 @@ internal static class MemoryOps {
         if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(op switch {
                 ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
-                ILOp.Stind_R4 or ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                ILOp.Stind_R4 => StackSlot.OfFloat((float)value.DoubleValue),
+                ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
                 ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
                 _ => StackSlot.OfInt32((int)value.Int64Value),
             });
@@ -250,8 +283,8 @@ internal static class MemoryOps {
 
     // ---- sizeof ----
 
-    /// <summary>sizeof の VM 値。プリミティブは CLR と同じ実際のサイズ、ゲスト値型は
-    /// 順次レイアウト近似 (フィールドサイズの和 + アライメント詰め)、参照型は適用不可。</summary>
+    /// <summary>sizeof の VM 値。プリミティブは CLR と同じ実際のサイズ。ゲスト値型は
+    /// ClassLayout / FieldLayout を適用し、順次配置のフィールド整列は VM の型レイアウト規則で近似する。</summary>
     public static int SizeOfType(VmType type) => SizeOfTypeCore(type, []);
 
     private static int SizeOfTypeCore(VmType type, HashSet<VmType> visiting) {
@@ -286,18 +319,30 @@ internal static class MemoryOps {
             if (!visiting.Add(cls))
                 throw new BadImageFormatException($"sizeof: 相互参照する値型レイアウト {cls.FullName} は不正です。");
             try {
+                var layout = s_layoutMetadata.GetValue(cls.Image, static image => LayoutMetadata.Read(image));
+                var packingSize = EffectivePackingSize(cls, layout);
                 var size = 0;
                 var maxAlign = 1;
                 foreach (var field in cls.Fields) {
                     if ((field.Flags & 0x0010) != 0)
                         continue; // FieldAttributes.Static
                     var fieldSize = field.FieldType is null ? 8 : SizeOfTypeCore(field.FieldType, visiting);
-                    var align = Math.Min(fieldSize, 8);
-                    size = (size + align - 1) / align * align;
-                    size += fieldSize;
-                    maxAlign = Math.Max(maxAlign, align);
+                    var fieldLayout = GetFieldOffset(field, layout);
+                    if (fieldLayout is { } explicitOffset) {
+                        size = LayoutSize(Math.Max((long)size, (long)explicitOffset + fieldSize), cls);
+                        maxAlign = Math.Max(maxAlign, Math.Min(fieldSize, packingSize));
+                    } else {
+                        if ((cls.Flags & 0x18) == 0x10)
+                            throw new BadImageFormatException(
+                                $"sizeof: 明示レイアウト型 {cls.FullName} のフィールド {field.Name} に FieldLayout がありません。");
+                        var align = Math.Min(fieldSize, packingSize);
+                        size = LayoutSize(((long)size + align - 1) / align * align + fieldSize, cls);
+                        maxAlign = Math.Max(maxAlign, align);
+                    }
                 }
-                size = (size + maxAlign - 1) / maxAlign * maxAlign;
+                var declaredSize = DeclaredClassSize(cls, layout);
+                size = Math.Max(size, declaredSize);
+                size = LayoutSize(((long)size + maxAlign - 1) / maxAlign * maxAlign, cls);
                 return Math.Max(size, 1);
             } finally {
                 visiting.Remove(cls);
@@ -306,12 +351,42 @@ internal static class MemoryOps {
         throw new InvalidOperationException($"sizeof は値型にのみ適用できます: {type.FullName}");
     }
 
+    private static int EffectivePackingSize(VmClassType type, LayoutMetadata layout) {
+        if (!layout.Types.TryGetValue(type.TypeDefRid, out var typeLayout) || typeLayout.PackingSize == 0)
+            return 8;
+        if (typeLayout.PackingSize is 1 or 2 or 4 or 8 or 16 or 32 or 64 or 128)
+            return typeLayout.PackingSize;
+        throw new BadImageFormatException(
+            $"sizeof: {type.FullName} の PackingSize {typeLayout.PackingSize} は不正です。");
+    }
+
+    private static int DeclaredClassSize(VmClassType type, LayoutMetadata layout) {
+        if (!layout.Types.TryGetValue(type.TypeDefRid, out var typeLayout))
+            return 0;
+        if (typeLayout.ClassSize > int.MaxValue)
+            throw new BadImageFormatException($"sizeof: {type.FullName} の ClassSize が大きすぎます。");
+        return (int)typeLayout.ClassSize;
+    }
+
+    private static int? GetFieldOffset(VmField field, LayoutMetadata layout) {
+        if (field.DeclaringType is not VmClassType || !layout.Fields.TryGetValue(field.FieldRid, out var rawOffset))
+            return null;
+        if (rawOffset > int.MaxValue)
+            throw new BadImageFormatException(
+                $"sizeof: {field.DeclaringType.FullName}::{field.Name} の FieldLayout offset が大きすぎます。");
+        return (int)rawOffset;
+    }
+
+    private static int LayoutSize(long size, VmClassType type) => size is >= 0 and <= int.MaxValue
+        ? (int)size
+        : throw new BadImageFormatException($"sizeof: {type.FullName} のレイアウトサイズが大きすぎます。");
+
     /// <summary>IL 値列 (LE バイト) → VM スロットへ展開する補助面。
     /// typeof から構成を取り出し, VM 表現を使って "ldobj 型", "cpobj 型" も走る</summary>
     public static StackSlot ValueFromBytes(byte[] bytes, VmType type, int size)
     {
         // プリミティブ値は VM の統合スロットで表す (int/char/bool 等は i4 スロット)
-        var typeName = type.FullName;
+        var typeName = PrimitiveStorageTypeName(type);
         if (bytes.Length == 1)
         {
             return typeName switch
@@ -322,10 +397,9 @@ internal static class MemoryOps {
                 _ => StackSlot.OfInt32(bytes[0]),
             };
         }
-        if (bytes.Length == 2)
-        {
-            var v = BinaryPrimitives.ReadUInt16LittleEndian(bytes);
-            return StackSlot.OfInt32(v);
+        if (bytes.Length == 2) {
+            var value = BinaryPrimitives.ReadUInt16LittleEndian(bytes);
+            return StackSlot.OfInt32(typeName == "System.Int16" ? (short)value : value);
         }
 
         if (bytes.Length == 4)
@@ -341,6 +415,13 @@ internal static class MemoryOps {
             return StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
         }
         throw new InvalidOperationException($"unmanaged ポインタから {typeName} (要素幅 {size} バイト) の読み取りに対応していません。");
+    }
+
+    private static string PrimitiveStorageTypeName(VmType type) {
+        if (type.IsEnum && type is VmClassType enumType &&
+            enumType.Fields.FirstOrDefault(static field => field.Name == "value__")?.FieldType is { } underlyingType)
+            return underlyingType.FullName;
+        return type.FullName;
     }
 
     /// <summary>VM スロット値を LE バイト列へ展開する (stobj/unmanaged ポインタ書き込み用)。</summary>

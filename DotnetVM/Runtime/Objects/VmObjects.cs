@@ -618,6 +618,11 @@ public sealed class VmNativePointer : VmObject {
         return System.Buffers.Binary.BinaryPrimitives.ReadDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8));
     }
 
+    public float ReadSingle() {
+        CheckBounds(4);
+        return System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(Bytes.AsSpan(ByteOffset, 4));
+    }
+
     public void WriteInt8(int value) {
         CheckBounds(1);
         Bytes[ByteOffset] = (byte)value;
@@ -641,6 +646,11 @@ public sealed class VmNativePointer : VmObject {
     public void WriteDouble(double value) {
         CheckBounds(8);
         System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
+    }
+
+    public void WriteSingle(float value) {
+        CheckBounds(4);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
 }
 

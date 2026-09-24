@@ -1,5 +1,6 @@
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -13,11 +14,13 @@ public sealed class VmByRef {
     public readonly StackSlot[] Container;
     public readonly int Index;
 
-    public VmByRef(StackSlot[] container, int index) {
+    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false) {
         Container = container;
         Index = index;
+        IsReadOnly = isReadOnly;
     }
 
+    public bool IsReadOnly { get; }
     public ref StackSlot Slot => ref Container[Index];
 
     public StackSlot Read() {
@@ -26,8 +29,15 @@ public sealed class VmByRef {
     }
 
     public void Write(in StackSlot value) {
+        EnsureWritable();
         lock (Container)
             Container[Index] = value;
+    }
+
+    public void EnsureWritable() {
+        if (IsReadOnly)
+            throw new UnhandledGuestException("System.InvalidProgramException",
+                "readonly. で作られたマネージ参照には書き込めません。");
     }
 }
 
@@ -79,6 +89,18 @@ public sealed class InterpreterFrame {
 
     /// <summary>直前の constrained. プレフィックスの型トークン (0 = なし)。次の call/callvirt で消費する。</summary>
     public int PendingConstrained;
+
+    /// <summary>volatile. プレフィックスが続くメモリ命令に適用されるか。</summary>
+    public bool PendingVolatile;
+
+    /// <summary>tail. プレフィックスが次の call/callvirt/calli に適用されるか。</summary>
+    public bool PendingTail;
+
+    /// <summary>tail. プレフィックスが protected region 内にあったか。</summary>
+    public bool PendingTailInProtectedRegion;
+
+    /// <summary>readonly. プレフィックスが次の ldelema に適用されるか。</summary>
+    public bool PendingReadonly;
 
     public static InterpreterFrame Create(VmMethod method, StackSlot[] arguments, SigType[] localTypes, int maxStack) {
         var code = method.DecodeIl();

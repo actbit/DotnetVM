@@ -59,24 +59,7 @@ public sealed partial class Interpreter {
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
-        EnsureStaticMethodTypeInitialized(method, context);
-        // 置換面 (C5): 実在 CoreLib 由来のメソッドのうち DotnetVM.CoreLib の managed IL が
-        // 面を置換するものは、ここ (唯一の IL 実行入口) で本体を差し替える。MemberRef 解決
-        // でも仮想ディスパッチでも最終的にここを通るため、CoreLib IL 内の boxed int の
-        // callvirt ToString も同じ面で置換される
-        if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
-            // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する:
-            // constrained callvirt (直接の int.ToString() 等) では VmByRef、CoreLib IL 内の
-            // box 済み値の callvirt (String.Concat など) では VmBoxedValue 参照で渡るため、
-            // どちらも保持している値スロットへ読み替えてから渡す
-            if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)
-                arguments[0] = arguments[0].ObjectValue switch {
-                    VmByRef byRef => byRef.Slot,
-                    VmBoxedValue boxed => boxed.Fields[0],
-                    _ => arguments[0],
-                };
-            method = substituted;
-        }
+        method = PrepareInvocation(method, arguments, context);
         if (method.Body is null)
             ThrowNoBody(method);
         var state = CurrentState;
@@ -101,7 +84,7 @@ public sealed partial class Interpreter {
             try {
                 using (_coordinator.EnterRead())
                     FixupStructLocals(frame);
-                return engines.Exceptions.RunFrame(frame);
+                return RunFrameWithTailCalls(ref frame, state);
             } finally {
                 using (_coordinator.EnterRead()) {
                     lock (state.Gate)
@@ -114,6 +97,64 @@ public sealed partial class Interpreter {
                 FlushPendingAssemblyContextCaches();
         }
 
+    }
+
+    private VmMethod PrepareInvocation(VmMethod method, StackSlot[] arguments, GenericContext? context) {
+        EnsureStaticMethodTypeInitialized(method, context);
+        if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
+            // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する
+            if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)
+                arguments[0] = arguments[0].ObjectValue switch {
+                    VmByRef byRef => byRef.Slot,
+                    VmBoxedValue boxed => boxed.Fields[0],
+                    _ => arguments[0],
+                };
+            method = substituted;
+        }
+        return method;
+    }
+
+    private StackSlot RunFrameWithTailCalls(ref InterpreterFrame frame, ExecutionState state) {
+        while (true) {
+            try {
+                return EnginesFor(frame.Method).Exceptions.RunFrame(frame);
+            } catch (TailCallTransfer transfer) {
+                var request = transfer.Request;
+                using (_coordinator.EnterRead()) {
+                    lock (state.Gate)
+                        state.TemporaryRoots.Add(request.Arguments);
+                }
+                try {
+                    var method = PrepareInvocation(request.Method, request.Arguments, request.Context);
+                    if (method.Body is null)
+                        ThrowNoBody(method);
+                    var engines = EnginesFor(method);
+                    CloneStructArgs(method, request.Arguments);
+                    var nextFrame = InterpreterFrame.Create(method, request.Arguments,
+                        engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
+                    nextFrame.Context = request.Context;
+
+                    using (_coordinator.EnterRead()) {
+                        lock (state.Gate) {
+                            var index = state.Frames.IndexOf(frame);
+                            if (index < 0)
+                                throw new InvalidOperationException("末尾呼出で置き換える実行フレームが見つかりません。");
+                            state.Frames[index] = nextFrame;
+                        }
+                    }
+                    frame = nextFrame;
+                    using (_coordinator.EnterRead())
+                        FixupStructLocals(frame);
+                    if (_tracer is { } tracer)
+                        tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                } finally {
+                    using (_coordinator.EnterRead()) {
+                        lock (state.Gate)
+                            state.TemporaryRoots.Remove(request.Arguments);
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -140,4 +181,32 @@ public sealed partial class Interpreter {
     // サービス群からの再帰呼出入口 (循環依存をインターフェースで切る)
     StackSlot IGuestInvoker.Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) =>
         Invoke(method, arguments, context);
+
+    bool IGuestInvoker.TryCreateTailCall(InterpreterFrame caller, VmMethod method,
+        StackSlot[] arguments, GenericContext? context, out TailCallRequest? request) {
+        request = null;
+        if (method.Body is null || caller.Stack.Count != 0 ||
+            !Equals(method.Signature.ReturnType, caller.Method.Signature.ReturnType))
+            return false;
+        if (arguments.Any(argument => ContainsCurrentFrameByRef(argument, caller, new HashSet<object>(ReferenceEqualityComparer.Instance))))
+            return false;
+        request = new TailCallRequest(method, arguments, context);
+        return true;
+    }
+
+    private static bool ContainsCurrentFrameByRef(in StackSlot slot, InterpreterFrame caller, HashSet<object> visited) {
+        if (slot.Kind == StackKind.TypedByRef)
+            return true;
+        if (slot.ObjectValue is VmByRef byRef)
+            return ReferenceEquals(byRef.Container, caller.Arguments) || ReferenceEquals(byRef.Container, caller.Locals);
+        if (slot.ObjectValue is VmStructValue value && visited.Add(value))
+            return value.Fields.Any(field => ContainsCurrentFrameByRef(field, caller, visited));
+        if (slot.ObjectValue is VmBoxedValue boxed && visited.Add(boxed))
+            return boxed.Fields.Any(field => ContainsCurrentFrameByRef(field, caller, visited));
+        return false;
+    }
+}
+
+internal sealed class TailCallTransfer(TailCallRequest request) : Exception {
+    public TailCallRequest Request { get; } = request;
 }

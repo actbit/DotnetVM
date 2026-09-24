@@ -8,7 +8,11 @@ namespace DotnetVM.Runtime.Execution;
 /// インタープリタ本体とサービス群の循環依存をこのインターフェースで切る。</summary>
 internal interface IGuestInvoker {
     StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context);
+    bool TryCreateTailCall(InterpreterFrame caller, VmMethod method, StackSlot[] arguments,
+        GenericContext? context, out TailCallRequest? request);
 }
+
+internal sealed record TailCallRequest(VmMethod Method, StackSlot[] Arguments, GenericContext? Context);
 
 /// <summary>実行ゲート: intrinsic 呼出の直前に ① 命令クォータの消費 ② セーフポイント検査
 /// (GC 起動) を強制する。IL 実行と intrinsic 実行で制約適用を等価にするための構造的入口。

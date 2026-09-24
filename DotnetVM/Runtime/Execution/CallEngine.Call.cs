@@ -13,7 +13,9 @@ namespace DotnetVM.Runtime.Execution;
 internal sealed partial class CallEngine {
     // ---- 呼出 (call / callvirt) ----
 
-    public StackSlot? Call(int token, InterpreterFrame caller, bool isCallvirt, int constrainedToken) {
+    public StackSlot? Call(int token, InterpreterFrame caller, bool isCallvirt, int constrainedToken,
+        bool tailCallAllowed, out TailCallRequest? tailCallRequest) {
+        tailCallRequest = null;
         // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
         // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
         var target = caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
@@ -93,6 +95,9 @@ internal sealed partial class CallEngine {
                     if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var overrideBound, callerDomain))
                         return overrideBound;
                     var context = BuildCallContext(target, guestOverride, args[0]);
+                    if (tailCallAllowed && invoker.TryCreateTailCall(caller, guestOverride, args,
+                            context, out tailCallRequest))
+                        return null;
                     var guestRet = invoker.Invoke(guestOverride, args, context);
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
                 }
@@ -106,6 +111,9 @@ internal sealed partial class CallEngine {
                             callerDomain, target.ClassArgs))
                         return explicitBound;
                     var context = BuildCallContext(target, explicitImpl, args[0]);
+                    if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args,
+                            context, out tailCallRequest))
+                        return null;
                     var guestRet = invoker.Invoke(explicitImpl, args, context);
                     return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? guestRet : null;
                 }
@@ -158,7 +166,8 @@ internal sealed partial class CallEngine {
 
         // 解決未了 (未登録 intrinsic): レシーバへの仮想ディスパッチを最終試行してから拒否
         if (target.Method is null)
-            return FailOrDispatchLate(target, isCallvirt, args, callerDomain);
+            return FailOrDispatchLate(target, caller, isCallvirt, args, callerDomain,
+                tailCallAllowed, out tailCallRequest);
 
         // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)。
         // constrained. 値型レシーバは ByRef/ValueType スロットで来るためディスパッチがそのまま適用される
@@ -209,6 +218,9 @@ internal sealed partial class CallEngine {
                         callerDomain, target.ClassArgs))
                     return explicitBound;
                 var implContext = BuildCallContext(target, explicitImpl, args[0]);
+                if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args,
+                        implContext, out tailCallRequest))
+                    return null;
                 var implRet = invoker.Invoke(explicitImpl, args, implContext);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? implRet : null;
             }
@@ -227,6 +239,8 @@ internal sealed partial class CallEngine {
         }
 
         var context2 = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
+        if (tailCallAllowed && invoker.TryCreateTailCall(caller, method, args, context2, out tailCallRequest))
+            return null;
         var ret = invoker.Invoke(method, args, context2);
         return SlotOps.SignatureReturnsValue(method.Signature) ? ret : null;
     }
@@ -270,7 +284,10 @@ internal sealed partial class CallEngine {
     /// <summary>解決未了の呼出 (未登録 intrinsic) の最終処理。callvirt ならレシーバの実行時型に
     /// ゲスト実装があればそれを呼び (constrained callvirt による構造体の interface 実装呼出等)、
     /// 無ければ未登録 intrinsic として拒否する。callerDomain は呼出元フレーム基準。</summary>
-    private StackSlot? FailOrDispatchLate(CallTarget target, bool isCallvirt, StackSlot[] args, BindingDomain callerDomain) {
+    private StackSlot? FailOrDispatchLate(CallTarget target, InterpreterFrame caller, bool isCallvirt,
+        StackSlot[] args, BindingDomain callerDomain, bool tailCallAllowed,
+        out TailCallRequest? tailCallRequest) {
+        tailCallRequest = null;
         // 配列レシーバのインターフェース面 (IEnumerable<T>.GetEnumerator 等) は
         // SZArrayHelper 経由で合成する (CLR と同一のコンパイラー支援面)
         if (isCallvirt && target.HasThis && TryInvokeArrayInterface(
@@ -283,6 +300,8 @@ internal sealed partial class CallEngine {
                 if (TryInvokeBinding(guestOverride, target.MethodArgs, args, out var lateBound, callerDomain))
                     return lateBound;
                 var context = BuildCallContext(target, guestOverride, args[0]);
+                if (tailCallAllowed && invoker.TryCreateTailCall(caller, guestOverride, args, context, out tailCallRequest))
+                    return null;
                 var ret = invoker.Invoke(guestOverride, args, context);
                 return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
             }
@@ -293,6 +312,8 @@ internal sealed partial class CallEngine {
                         callerDomain, target.ClassArgs))
                     return explicitBound;
                 var context = BuildCallContext(target, explicitImpl, args[0]);
+                if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args, context, out tailCallRequest))
+                    return null;
                 var ret = invoker.Invoke(explicitImpl, args, context);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? ret : null;
             }

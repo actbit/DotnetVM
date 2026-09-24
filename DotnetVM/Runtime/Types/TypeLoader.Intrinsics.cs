@@ -68,7 +68,7 @@ public sealed partial class TypeLoader {
             "OverflowException", "InvalidCastException", "ArrayTypeMismatchException",
             "FormatException", "StackOverflowException", "OutOfMemoryException",
             "NotSupportedException", "OperationCanceledException", "TimeoutException", "TypeLoadException",
-            "NotImplementedException", "RankException",
+            "NotImplementedException", "RankException", "InvalidProgramException",
         })
             Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = false, Parent = systemException });
         // Activator.CreateInstance の失敗分類 (CLR の継承鎖どおり MemberAccess ← MissingMember ← MissingMethod)

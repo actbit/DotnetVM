@@ -1,7 +1,9 @@
 using System.Linq.Expressions;
 using System.Reflection;
+using DotnetVM.Host;
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -23,15 +25,67 @@ internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry) {
 /// collectible assembly can be unloaded without leaving a delegate rooted by a
 /// different loader or VM instance.
 /// </summary>
-internal sealed class JitCodeCache(bool enabled, int promotionThreshold) {
+internal sealed class JitResourceBudget(int maxEntries, int maxCompiledMethods) {
+    private readonly int _maxEntries = maxEntries;
+    private readonly int _maxCompiledMethods = maxCompiledMethods;
+    private readonly object _gate = new();
+    private int _entries;
+    private int _compiledMethods;
+
+    public bool TryReserveEntry() {
+        lock (_gate) {
+            if (_entries >= _maxEntries)
+                return false;
+            _entries++;
+            return true;
+        }
+    }
+
+    public bool TryReserveCompiledMethod() {
+        lock (_gate) {
+            if (_compiledMethods >= _maxCompiledMethods)
+                return false;
+            _compiledMethods++;
+            return true;
+        }
+    }
+
+    public void ReleaseCompiledMethod() {
+        lock (_gate) {
+            if (_compiledMethods > 0)
+                _compiledMethods--;
+        }
+    }
+
+    public void ReleaseEntry(bool compiled) {
+        lock (_gate) {
+            if (_entries > 0)
+                _entries--;
+            if (compiled && _compiledMethods > 0)
+                _compiledMethods--;
+        }
+    }
+}
+
+internal sealed class JitCodeCache(
+    bool enabled,
+    int promotionThreshold,
+    VmHeap heap,
+    MemoryPolicy memory,
+    JitResourceBudget resourceBudget) {
     private sealed class Entry {
         public int InvocationCount;
         public JitCompiledMethod? Compiled;
         public bool Rejected;
+        public bool Compiling;
+        public bool CompiledReserved;
     }
 
     private readonly bool _enabled = enabled;
     private readonly int _promotionThreshold = promotionThreshold;
+    private readonly VmHeap _heap = heap;
+    private readonly MemoryPolicy _memory = memory;
+    private readonly JitResourceBudget _resourceBudget = resourceBudget;
     private readonly Dictionary<VmMethod, Entry> _entries = [];
     private readonly object _gate = new();
 
@@ -40,26 +94,65 @@ internal sealed class JitCodeCache(bool enabled, int promotionThreshold) {
         if (!_enabled)
             return null;
 
+        Entry entry;
         lock (_gate) {
-            if (!_entries.TryGetValue(method, out var entry))
+            if (!_entries.TryGetValue(method, out entry!)) {
+                if (!_resourceBudget.TryReserveEntry())
+                    return null;
                 _entries.Add(method, entry = new Entry());
+            }
 
-            if (entry.Compiled is not null)
+            if (entry.Compiled is not null || entry.Rejected || entry.Compiling)
                 return entry.Compiled;
-            if (entry.Rejected)
-                return null;
 
             if (entry.InvocationCount < int.MaxValue)
                 entry.InvocationCount++;
             if (entry.InvocationCount < _promotionThreshold)
                 return null;
+            entry.Compiling = true;
+        }
 
-            // Compilation is deterministic and does not execute guest code, so
-            // keeping the cache lock here also prevents duplicate promotion.
-            entry.Compiled = JitMethodCompiler.TryCompile(method, prepared, code);
-            if (entry.Compiled is null)
+        // Do not hold the loader-wide cache lock while Expression.Compile runs.
+        // A per-entry Compiling state above prevents duplicate promotions.
+        JitMethodCompiler.CompilationCost? estimate;
+        try {
+            estimate = JitMethodCompiler.TryEstimate(method, prepared, code, _memory);
+        } catch (Exception) {
+            estimate = null;
+        }
+        JitCompiledMethod? compiled = null;
+        var reservedCompiled = false;
+        if (estimate is { } cost && _resourceBudget.TryReserveCompiledMethod()) {
+            if (_heap.TryChargeJitCompilation(cost.WorkUnits, cost.HostMemoryBytes)) {
+                reservedCompiled = true;
+                try {
+                    compiled = JitMethodCompiler.TryCompile(method, prepared, code);
+                } catch (Exception) {
+                    compiled = null;
+                }
+            } else {
+                _resourceBudget.ReleaseCompiledMethod();
+            }
+        }
+
+        lock (_gate) {
+            // Clear() may have detached the entry while compilation was in
+            // progress during an unload. Never publish a detached delegate.
+            if (!_entries.TryGetValue(method, out var current) || !ReferenceEquals(current, entry)) {
+                if (reservedCompiled)
+                    _resourceBudget.ReleaseCompiledMethod();
+                return compiled;
+            }
+            entry.Compiling = false;
+            if (compiled is null) {
                 entry.Rejected = true;
-            return entry.Compiled;
+                if (reservedCompiled)
+                    _resourceBudget.ReleaseCompiledMethod();
+                return null;
+            }
+            entry.CompiledReserved = true;
+            entry.Compiled = compiled;
+            return compiled;
         }
     }
 
@@ -74,8 +167,11 @@ internal sealed class JitCodeCache(bool enabled, int promotionThreshold) {
     }
 
     public void Clear() {
-        lock (_gate)
+        lock (_gate) {
+            foreach (var entry in _entries.Values)
+                _resourceBudget.ReleaseEntry(entry.CompiledReserved);
             _entries.Clear();
+        }
     }
 }
 
@@ -238,6 +334,32 @@ internal sealed class JitFrame {
 /// </summary>
 internal static class JitMethodCompiler {
     private const int MaxInstructions = 4096;
+
+    internal readonly record struct CompilationCost(long WorkUnits, long HostMemoryBytes,
+        long ExpressionNodes, long SwitchTargets);
+
+    public static CompilationCost? TryEstimate(VmMethod method, PreparedMethod prepared,
+        DecodedInstruction[] code, MemoryPolicy memory) {
+        if (method.Body is null || method.Body.IlCode.Length > memory.MaxJitMethodBodyBytes ||
+            !CanCompile(method, prepared, code))
+            return null;
+
+        long switchTargets = 0;
+        foreach (var instruction in code)
+            if (instruction.SwitchTargets is { } targets)
+                switchTargets = checked(switchTargets + targets.Length);
+
+        // A switch target is represented by a constant array and each IL
+        // instruction expands to several expression nodes (try/finally,
+        // dispatch case, constants and helper call). Count both before any
+        // target array or expression node is allocated.
+        var expressionNodes = checked(16L + code.Length * 12L + switchTargets * 2L);
+        if (expressionNodes > memory.MaxJitExpressionNodes)
+            return null;
+        var workUnits = checked(expressionNodes + method.Body.IlCode.Length + switchTargets);
+        var hostMemoryBytes = checked(4096L + expressionNodes * 64L + switchTargets * 8L);
+        return new CompilationCost(workUnits, hostMemoryBytes, expressionNodes, switchTargets);
+    }
 
     public static JitCompiledMethod? TryCompile(VmMethod method, PreparedMethod prepared,
         DecodedInstruction[] code) {

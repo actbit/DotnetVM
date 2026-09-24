@@ -114,6 +114,10 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 対象外の命令を含むメソッドは昇格せず、既存インタプリタで実行します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。
 
+JIT のコンパイル処理自体も VM のリソースポリシーで制限されます。`MemoryPolicy.JitCompilationBudget` は式ツリー構築とデリゲート生成の作業量、`HostWorkBudget` はホスト CPU 作業、`HostTempAllocationByteLimit` はホスト側の一時メモリとして計上されます。さらに `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で VM 全体の保持数・入力サイズ・式ツリー複雑度を制限します。いずれかの上限を超えた場合は例外ではなく、そのメソッドをインタプリタで実行します。
+
+JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
+
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
 

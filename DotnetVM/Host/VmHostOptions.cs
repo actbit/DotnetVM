@@ -41,6 +41,21 @@ public sealed class MemoryPolicy {
     /// を intrinsic 毎に定数で保持する (全量計上ではなく実コスト近似)。</summary>
     public long HostWorkBudget { get; init; } = 10_000_000;
 
+    /// <summary>JIT 式ツリー構築と CLR デリゲート生成専用の VM-wide 作業予算。</summary>
+    public long JitCompilationBudget { get; init; } = 1_000_000;
+
+    /// <summary>VM 全体で保持できる JIT 済みメソッド数。0 は JIT コンパイルを拒否する。</summary>
+    public int MaxJitCompiledMethods { get; init; } = 256;
+
+    /// <summary>VM 全体の JIT cache entry (昇格拒否済みを含む) の上限。</summary>
+    public int MaxJitCacheEntries { get; init; } = 4096;
+
+    /// <summary>1 メソッドを式ツリーへ変換する際に許す概算ノード数。</summary>
+    public int MaxJitExpressionNodes { get; init; } = 32_768;
+
+    /// <summary>JIT 入力として許すメソッド本体サイズ。通常の loader 上限より厳しい。</summary>
+    public int MaxJitMethodBodyBytes { get; init; } = 64 * 1024;
+
     /// <summary>ロード検証 phase の入力上限 (loader hardening):
     /// Assembly バイト総量 > MaxAssemblyBytes はロード拒否。</summary>
     public long MaxAssemblyBytes { get; init; } = 64 * 1024 * 1024;
@@ -70,6 +85,11 @@ public sealed class MemoryPolicy {
         if (GcTriggerAllocationInterval < 1) throw new ArgumentOutOfRangeException(nameof(GcTriggerAllocationInterval));
         if (HostTempAllocationByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(HostTempAllocationByteLimit));
         if (HostWorkBudget < 0) throw new ArgumentOutOfRangeException(nameof(HostWorkBudget));
+        if (JitCompilationBudget < 0) throw new ArgumentOutOfRangeException(nameof(JitCompilationBudget));
+        if (MaxJitCompiledMethods < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCompiledMethods));
+        if (MaxJitCacheEntries < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCacheEntries));
+        if (MaxJitExpressionNodes < 1) throw new ArgumentOutOfRangeException(nameof(MaxJitExpressionNodes));
+        if (MaxJitMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitMethodBodyBytes));
         if (MaxAssemblyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxAssemblyBytes));
         if (MaxMetadataRows < 0) throw new ArgumentOutOfRangeException(nameof(MaxMetadataRows));
         if (MaxMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxMethodBodyBytes));

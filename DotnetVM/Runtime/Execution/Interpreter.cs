@@ -32,6 +32,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly MemoryPolicy _memory;
     private readonly bool _enableJit;
     private readonly int _jitPromotionThreshold;
+    private readonly JitResourceBudget _jitResourceBudget;
     private readonly IntrinsicRegistry _intrinsics;
     private readonly VmConsole _console;
     private readonly VmHeap _heap;

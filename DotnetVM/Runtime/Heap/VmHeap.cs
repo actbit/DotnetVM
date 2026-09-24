@@ -28,6 +28,8 @@ public sealed class VmHeap {
     private long _hostTempAllocated;
     /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget)。</summary>
     private long _hostWorkSpent;
+    /// <summary>JIT コンパイル専用の VM-wide 作業予算の消費。</summary>
+    private long _jitCompilationSpent;
     private long _liveBytes;
     private long _allocatedSinceGc;
     private int _collectionCount;
@@ -213,6 +215,32 @@ public sealed class VmHeap {
                 $"host 側作業予算 (HostWorkBudget) {_memory.HostWorkBudget:N0} を超えました。" +
                 $"+{costUnits:N0} ユニットで累計 {_hostWorkSpent + costUnits:N0}。");
         _hostWorkSpent += costUnits;
+        }
+    }
+
+    /// <summary>
+    /// JIT の式ツリー/デリゲート生成を開始する前に、CPU 作業とホスト側の
+    /// 近似メモリを原子的に予約する。上限超過は例外ではなく false を返し、
+    /// 呼出側がインタプリタへフォールバックできるようにする。
+    /// </summary>
+    internal bool TryChargeJitCompilation(long workUnits, long memoryBytes) {
+        if (workUnits < 0)
+            throw new ArgumentOutOfRangeException(nameof(workUnits));
+        if (memoryBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(memoryBytes));
+        lock (_gate) {
+            if (workUnits > _memory.JitCompilationBudget - _jitCompilationSpent ||
+                workUnits > _memory.HostWorkBudget - _hostWorkSpent ||
+                memoryBytes > _memory.HostTempAllocationByteLimit - _hostTempAllocated ||
+                memoryBytes > _memory.TotalAllocationByteLimit - _totalAllocated ||
+                memoryBytes > _memory.LiveObjectByteLimit - _liveBytes)
+                return false;
+
+            _jitCompilationSpent += workUnits;
+            _hostWorkSpent += workUnits;
+            _hostTempAllocated += memoryBytes;
+            _totalAllocated += memoryBytes;
+            return true;
         }
     }
 

@@ -36,6 +36,7 @@ public sealed partial class Interpreter {
         _memory = memory;
         _enableJit = enableJit;
         _jitPromotionThreshold = jitPromotionThreshold;
+        _jitResourceBudget = new JitResourceBudget(memory.MaxJitCacheEntries, memory.MaxJitCompiledMethods);
         _intrinsics = intrinsics;
         _console = console;
         _heap = heap;
@@ -182,7 +183,7 @@ public sealed partial class Interpreter {
             Objects = objects,
             Calls = calls,
             Exceptions = exceptions,
-            Jit = new JitCodeCache(_enableJit, _jitPromotionThreshold),
+            Jit = new JitCodeCache(_enableJit, _jitPromotionThreshold, _heap, _memory, _jitResourceBudget),
             StaticStorageRoots = staticStorageRoots,
             IntrinsicStaticRoots = intrinsicStaticRoots,
         };

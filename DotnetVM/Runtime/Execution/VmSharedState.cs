@@ -21,10 +21,19 @@ public sealed class VmSharedState : IDisposable {
     private int _disposed;
     private readonly AsyncLocal<VmObject?> _currentSynchronizationContext = new();
 
+    // Keep the original public constructor signature for binary callers.  New VM construction uses
+    // the overload below so adding the combinator quota does not turn an old call into MissingMethod.
     public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
         int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null,
         Func<DateTimeOffset>? clockProvider = null, VmRandomFill? randomFill = null,
-        TimeZoneInfo? timeZone = null) {
+        TimeZoneInfo? timeZone = null)
+        : this(maxGuestThreads, maxTaskWorkers, maxGuestWorkers, maxPendingTaskTimers,
+            shutdownTimeoutMilliseconds, culture, clockProvider, randomFill, timeZone, 16_384) { }
+
+    public VmSharedState(int maxGuestThreads, int maxTaskWorkers, int maxGuestWorkers,
+        int maxPendingTaskTimers, int shutdownTimeoutMilliseconds, CultureInfo? culture,
+        Func<DateTimeOffset>? clockProvider, VmRandomFill? randomFill, TimeZoneInfo? timeZone,
+        int maxTaskCombinatorInputs) {
         if (maxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(maxGuestThreads));
         if (maxTaskWorkers < 1)
@@ -33,6 +42,8 @@ public sealed class VmSharedState : IDisposable {
             throw new ArgumentOutOfRangeException(nameof(maxGuestWorkers));
         if (maxPendingTaskTimers < 1)
             throw new ArgumentOutOfRangeException(nameof(maxPendingTaskTimers));
+        if (maxTaskCombinatorInputs < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxTaskCombinatorInputs));
         if (shutdownTimeoutMilliseconds < 0)
             throw new ArgumentOutOfRangeException(nameof(shutdownTimeoutMilliseconds));
 
@@ -44,7 +55,8 @@ public sealed class VmSharedState : IDisposable {
         _workerBudget = new GuestWorkerBudget(maxGuestWorkers);
         GuestThreads = new GuestThreadRuntime(maxGuestThreads, _workerBudget, _shutdown.Token,
             shutdownTimeoutMilliseconds);
-        GuestTasks = new GuestTaskRuntime(maxTaskWorkers, maxPendingTaskTimers, _workerBudget, _shutdown.Token,
+        GuestTasks = new GuestTaskRuntime(maxTaskWorkers, maxPendingTaskTimers, maxTaskCombinatorInputs,
+            _workerBudget, _shutdown.Token,
             shutdownTimeoutMilliseconds);
     }
 

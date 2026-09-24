@@ -1,6 +1,6 @@
 # DotnetVM
 
-C# で実装した .NET 10 互換の CoreCLR 風 VM。実在する .NET アセンブリ (IL) をロードして実行し、**メモリ / ネットワーク / ストレージ / 命令数のリソース制約を強制**できるサンドボックスです。
+C# で実装した .NET 10 互換の CoreCLR 風 VM。実在する .NET アセンブリ (IL) をロードして実行し、**メモリ / CPU 作業 / ネットワーク / ストレージ / 命令数 / 並行 worker のリソース制約を強制**できるサンドボックスです。
 
 ```csharp
 using var vm = new VirtualMachine(new VmHostOptions {
@@ -28,10 +28,12 @@ var result = vm.Invoke("MyApp.Program", "Compute", 42);
 
 | 面 | 強制点 |
 |---|---|
-| メモリ | `VmHeap.Allocate` 入口で即拒否 (localloc / newarr はホスト側の実確保**前**に `Reserve` で検査)。GC と連動した生存上限もあり。intrinsic が VM heap 外で確保するバッファ (補間ハンドラ内部の StringBuilder 等) も累計上限に計上 |
+| メモリ | `VmHeap.Allocate` 入口で即拒否 (localloc / newarr はホスト側の実確保**前**に `Reserve` で検査)。GC と連動した生存上限もあり。intrinsic が VM heap 外で確保する一時バッファも累計上限に計上し、アセンブリ入力サイズにも上限あり |
+| CPU 作業 | 重い host 側 intrinsic の作業量を `HostWorkBudget` で制限 |
 | 命令数 | インタプリタの命令境界。intrinsic 呼出も追加消費 (IL 実行と等価) |
 | ネットワーク | ゲストの通信はすべて `NetworkGateway` (プロキシ) 経由。バイト計上 + クォータのみ VM が担い、**許可の判断はブリッジのホスト実装**が行う |
 | ストレージ | 同構造 (`StorageGateway` + `IStorageBridge`) |
+| 並行実行 | guest Thread / Task worker の個別上限と VM 全体の worker 上限、未完了 `Task.Delay` の Timer 上限を強制 |
 
 **界面の再現制御**: ブリッジが設定されていない場合、対応するファサード型 (`System.IO.File` / `System.Net.WebClient`) を**そもそも合成しません**。ゲストにその面が存在しないため、ロード/呼出の時点で fail-closed になります。
 
@@ -176,8 +178,6 @@ VirtualMachine (Host/)          組み込みファサード
 dotnet test DotnetVM.Tests
 ```
 
-197 テスト (2026-09-20 時点) → 421 テスト (2026-09-21 時点) → **779 テスト** (2026-09-23 時点、全グリーン)。
-
 ## 状況
 
 - [x] M0-M1: PE/メタデータパーサ + IL 逆アセンブラ
@@ -193,10 +193,10 @@ dotnet test DotnetVM.Tests
 - [x] C5: CoreLib IL 実行の全面化 + 差分テスト (String/整数 ToString・Parse/Convert/Math の IL 実行、ExecutionTracer で IL 実行証明、VM CoreLib (DotnetVM.CoreLib) 置換面、newobj string 構築面、例外既定文言のホスト CLR 委譲)
 - [x] C5.5: CoreLib 委譲面の全面監査 (分類ゼロ構造保証: RealCoreLibIl / VmCoreLibSubstitute / RuntimeInternal / Device + 正当化タグ)。Convert(object) / Enum IConvertible / 整数・浮動小数点書式・Parse / String ordinal・Split・Format 面を実 CoreLib IL または DotnetVM.CoreLib 置換 IL へ移行、culture 面 (Compare / 大文字小文字等) は不変カルチャ規約で監査確定
 - [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
-- [x] C6.1: Task / async-await (Task / Task<T>、Delay / Run / FromResult、Task awaiter、AsyncTaskMethodBuilder と継続 state machine)
+- [x] C6.1: Task / ValueTask / async-await (Task / Task<T>、ValueTask / ValueTask<T>、Delay / Run / FromResult、各 awaiter、ConfigureAwait、async state machine)
 - [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
 - [ ] M9: デバッガ / 実行トレース
 
-C6.1 は `Task` / `Task<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` に対応する。キャンセル token、`ValueTask`、`ConfigureAwait`、独自 awaiter は未対応。
+C6.1 は `Task` / `Task<T>` と `ValueTask` / `ValueTask<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` / `ValueTask.FromResult`、`ConfigureAwait(bool)` に対応する。`IValueTaskSource` 由来の値、キャンセル token、独自 awaiter は未対応。guest Thread と Task worker は `VmHostOptions` の個別上限と VM 全体の上限で制御されます (既定はいずれも最大 64 worker、`Task.Delay` の未完了 Timer は最大 1024)。
 
 プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。同梱の DotnetVM.CoreLib も依存ゼロのクラスライブラリで、VM の置換面として DotnetVM.dll と同じディレクトリに配置される。

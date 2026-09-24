@@ -406,15 +406,23 @@ internal static class SlotOps {
                     : StackSlot.OfFloat((double)(uint)value.Int64Value);
 
             // オーバーフロー検査つき
-            case ILOp.Conv_Ovf_I1: return Checked32(((sbyte)Checked64(op, i, isFloatSrc, f)));
-            case ILOp.Conv_Ovf_I2: return Checked32((short)Checked64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_I4: return Checked32((int)Checked64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_I8: return StackSlot.OfInt64(Checked64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_U1: return Checked32((byte)Checked64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_U2: return Checked32((ushort)Checked64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_U4: return Checked32((int)(uint)Checked64(op, i, isFloatSrc, f));
+            case ILOp.Conv_Ovf_I1: return Checked32((sbyte)CheckedSigned(op, i, isFloatSrc, f,
+                sbyte.MinValue, sbyte.MaxValue, 128.0));
+            case ILOp.Conv_Ovf_I2: return Checked32((short)CheckedSigned(op, i, isFloatSrc, f,
+                short.MinValue, short.MaxValue, 32768.0));
+            case ILOp.Conv_Ovf_I4: return Checked32((int)CheckedSigned(op, i, isFloatSrc, f,
+                int.MinValue, int.MaxValue, 2147483648.0));
+            case ILOp.Conv_Ovf_I8: return StackSlot.OfInt64(CheckedSigned(op, i, isFloatSrc, f,
+                long.MinValue, long.MaxValue, 9223372036854775808.0));
+            case ILOp.Conv_Ovf_U1: return Checked32((byte)CheckedUnsigned(op, i, isFloatSrc, f,
+                byte.MaxValue, 256.0));
+            case ILOp.Conv_Ovf_U2: return Checked32((ushort)CheckedUnsigned(op, i, isFloatSrc, f,
+                ushort.MaxValue, 65536.0));
+            case ILOp.Conv_Ovf_U4: return Checked32((int)(uint)CheckedUnsigned(op, i, isFloatSrc, f,
+                uint.MaxValue, 4294967296.0));
             case ILOp.Conv_Ovf_U8: return StackSlot.OfInt64((long)CheckedU64(op, i, isFloatSrc, f));
-            case ILOp.Conv_Ovf_I: return StackSlot.OfNativeInt(Checked64(op, i, isFloatSrc, f));
+            case ILOp.Conv_Ovf_I: return StackSlot.OfNativeInt(CheckedSigned(op, i, isFloatSrc, f,
+                long.MinValue, long.MaxValue, 9223372036854775808.0));
             case ILOp.Conv_Ovf_U: return StackSlot.OfNativeInt((long)CheckedU64(op, i, isFloatSrc, f));
             case ILOp.Conv_Ovf_I1_Un or ILOp.Conv_Ovf_I2_Un or ILOp.Conv_Ovf_I4_Un or ILOp.Conv_Ovf_I8_Un
                 or ILOp.Conv_Ovf_U1_Un or ILOp.Conv_Ovf_U2_Un or ILOp.Conv_Ovf_U4_Un or ILOp.Conv_Ovf_U8_Un
@@ -474,13 +482,31 @@ internal static class SlotOps {
         }
     }
 
-    private static long Checked64(ILOp op, long i, bool isFloat, double f) {
+    private static long CheckedSigned(ILOp op, long i, bool isFloat, double f,
+        long min, long max, double maxExclusive) {
         if (isFloat) {
-            if (double.IsNaN(f) || f < long.MinValue || f >= 9223372036854775808.0)
+            if (double.IsNaN(f) || f < min || f >= maxExclusive)
                 ThrowOverflow();
             return (long)f;
         }
+        if (i < min || i > max)
+            ThrowOverflow();
         return i;
+    }
+
+    private static ulong CheckedUnsigned(ILOp op, long i, bool isFloat, double f,
+        ulong max, double maxExclusive) {
+        if (isFloat) {
+            if (double.IsNaN(f) || f < 0 || f >= maxExclusive)
+                ThrowOverflow();
+            return (ulong)f;
+        }
+        if (i < 0)
+            ThrowOverflow();
+        var value = (ulong)i;
+        if (value > max)
+            ThrowOverflow();
+        return value;
     }
 
     private static ulong CheckedU64(ILOp op, long i, bool isFloat, double f) {

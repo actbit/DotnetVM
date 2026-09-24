@@ -44,6 +44,7 @@ public sealed partial class Interpreter {
                         // Interpreter の primary engine は VM の公開呼出し面が直接保持している。
                         if (ReferenceEquals(loader, _services.Loader) || !_engines.Remove(loader, out var engines))
                             continue;
+                        engines.Jit.Clear();
                         _heap.RemoveRootSlotSource(engines.StaticStorageRoots);
                         _heap.RemoveRootSlotSource(engines.IntrinsicStaticRoots);
                     }
@@ -134,6 +135,11 @@ public sealed partial class Interpreter {
         }
         using (_coordinator.StopTheWorld())
             _heap.RemoveRootSlotSource(_frameRootSource);
+        lock (_enginesGate) {
+            foreach (var engines in _engines.Values)
+                engines.Jit.Clear();
+            _engines.Clear();
+        }
         _coordinator.Dispose();
     }
 }

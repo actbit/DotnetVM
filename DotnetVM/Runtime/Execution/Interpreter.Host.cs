@@ -72,8 +72,8 @@ public sealed partial class Interpreter {
         try {
             var engines = EnginesFor(method);
             CloneStructArgs(method, arguments);
-            var frame = InterpreterFrame.Create(method, arguments,
-                engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
+            var prepared = engines.Preparer.Prepare(method);
+            var frame = InterpreterFrame.Create(method, arguments, prepared.LocalTypes, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             using (_coordinator.EnterRead()) {
                 lock (state.Gate)
@@ -86,7 +86,16 @@ public sealed partial class Interpreter {
             try {
                 using (_coordinator.EnterRead())
                     FixupStructLocals(frame);
-                return RunFrameWithTailCalls(ref frame, state);
+                // Dynamic expression compilation is host work rather than a
+                // guest instruction.  Do not perform it after the guest has
+                // already exhausted its instruction budget; the first
+                // interpreter instruction will report the normal quota error.
+                var compiled = HasInstructionBudget
+                    ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
+                    : null;
+                return compiled is null
+                    ? RunFrameWithTailCalls(ref frame, state)
+                    : compiled.Invoke(this, engines.Services, frame);
             } finally {
                 using (_coordinator.EnterRead()) {
                     lock (state.Gate)

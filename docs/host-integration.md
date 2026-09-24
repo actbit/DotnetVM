@@ -111,6 +111,11 @@ var options = new VmHostOptions {
         LiveObjectByteLimit = 32L << 20,
         HostTempAllocationByteLimit = 16L << 20,
         HostWorkBudget = 2_000_000,
+        JitCompilationBudget = 100_000,
+        MaxJitCompiledMethods = 128,
+        MaxJitCacheEntries = 2_048,
+        MaxJitExpressionNodes = 16_384,
+        MaxJitMethodBodyBytes = 64 * 1024,
         MaxAssemblyBytes = 8L << 20,
         MaxMetadataRows = 200_000,
         MaxMethodBodyBytes = 256 * 1024,
@@ -133,11 +138,44 @@ var options = new VmHostOptions {
 | 実行 | `InstructionQuota`, `MaxRecursionDepth` | IL 命令数、ゲスト呼出の深さ |
 | VM ヒープ | `TotalAllocationByteLimit`, `LiveObjectByteLimit` | 累計確保量、生存オブジェクト量 |
 | ホスト処理 | `HostTempAllocationByteLimit`, `HostWorkBudget` | intrinsic 内の一時バッファと CPU 作業の近似量 |
+| JIT 生成 | `JitCompilationBudget`, `HostTempAllocationByteLimit`, `HostWorkBudget` | 式ツリー構築、ホスト側デリゲート生成、その一時メモリ。超過時はインタプリタへフォールバック |
+| JIT 保持・複雑度 | `MaxJitCompiledMethods`, `MaxJitCacheEntries`, `MaxJitExpressionNodes`, `MaxJitMethodBodyBytes` | VM-wide のコンパイル済みメソッド数、cache entry 数、式ツリー規模、入力メソッド本体サイズ |
 | ローダー | `MaxAssemblyBytes`, `MaxMetadataRows`, `MaxMethodBodyBytes` | PE 入力、メタデータ、メソッド本体 |
 | 解析 | `MaxSignatureDepth`, `MaxGenericNestingDepth` | 署名・ジェネリックの再帰深度 |
 | 並行性 | `MaxGuestThreads`, `MaxTaskWorkers`, `MaxGuestWorkers` | guest Thread、Task worker、VM 全体の worker |
 | タイマー | `MaxPendingTaskTimers` | 未完了 `Task.Delay` / `CancelAfter` |
 | 結合 | `MaxTaskCombinatorInputs` | `WhenAll` / `WhenAny` / `WaitAll` の入力数 |
+
+### JIT を有効化する場合
+
+簡易 JIT は既定で無効です。性能が必要で、かつ VM 自体の実装を信頼済み TCB として
+運用できる場合だけ有効化してください。
+
+```csharp
+var options = new VmHostOptions {
+    EnableJit = true,
+    JitPromotionThreshold = 32,
+    Memory = new MemoryPolicy {
+        InstructionQuota = 5_000_000,
+        JitCompilationBudget = 100_000,
+        MaxJitCompiledMethods = 128,
+        MaxJitCacheEntries = 2_048,
+        MaxJitExpressionNodes = 16_384,
+        MaxJitMethodBodyBytes = 64 * 1024,
+    },
+};
+```
+
+JIT はスカラー命令を VM の `StackSlot` / `SlotOps` に変換する内部経路です。CLR の値・ゲスト
+オブジェクト・任意のゲスト delegate を生成コードへ渡さず、未対応命令や上限超過時は同じ
+メソッドをインタプリタへフォールバックします。JIT の命令実行も通常の命令クォータ、
+セーフポイント、GC ルート登録を通ります。
+
+一方、`System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装とその
+依存ライブラリは TCB の一部です。ゲストに式木コンパイルを許可する設定ではありません。
+TCB を最小化したい場合、または JIT の性能効果を検証していない場合は `EnableJit = false`
+（既定値）を使用してください。JIT の作業量・ホストメモリ・キャッシュ上限を超えた場合は
+管理例外をゲストへ渡さず、コンパイルを拒否してインタプリタで続行します。
 
 ## 5. I/O ブリッジと fail-closed 設計
 

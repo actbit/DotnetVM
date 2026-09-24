@@ -39,6 +39,7 @@ dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-re
 
 ### 実行方式
 - **IL インタプリタ** (主) — 事前デコードした IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
+- **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドのスカラー IL (ローカル / 算術 / 比較 / 分岐 / 変換 / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、EH、呼出、byref、ポインタはインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
 - **独自オブジェクトモデル** — CLR オブジェクトを流用しない。`VmObject` / `VmClassInstance` / `VmStructValue` / `VmArray` / `VmBoxedValue` の全生成が `VmHeap.Allocate` を通るため、アロケーション計上と GC 制御が正確
 
 ### リソース制約 (クォータ + 拒否方式)
@@ -107,6 +108,15 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
+
+### 簡易 JIT (M8)
+`VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。
+
+対象外の命令を含むメソッドは昇格せず、既存インタプリタで実行します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。
+
+JIT のコンパイル処理自体も VM のリソースポリシーで制限されます。`MemoryPolicy.JitCompilationBudget` は式ツリー構築とデリゲート生成の作業量、`HostWorkBudget` はホスト CPU 作業、`HostTempAllocationByteLimit` はホスト側の一時メモリとして計上されます。さらに `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で VM 全体の保持数・入力サイズ・式ツリー複雑度を制限します。いずれかの上限を超えた場合は例外ではなく、そのメソッドをインタプリタで実行します。
+
+JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
 
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
@@ -214,7 +224,7 @@ dotnet test DotnetVM.Tests
 - [x] C5.5: CoreLib 委譲面の全面監査 (分類ゼロ構造保証: RealCoreLibIl / VmCoreLibSubstitute / RuntimeInternal / Device + 正当化タグ)。Convert(object) / Enum IConvertible / 整数・浮動小数点書式・Parse / String ordinal・Split・Format 面を実 CoreLib IL または DotnetVM.CoreLib 置換 IL へ移行、culture 面 (Compare / 大文字小文字等) は設定カルチャのホスト委譲で監査確定
 - [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
 - [x] C6.1: Task / ValueTask / async-await (Task / Task<T>、ValueTask / ValueTask<T>、Delay / Run / FromResult、各 awaiter、ConfigureAwait、async state machine)
-- [ ] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
+- [x] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
 - [ ] M9: デバッガ / 実行トレース
 
 C6.1 は `Task` / `Task<T>` と `ValueTask` / `ValueTask<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` / `ValueTask.FromResult`、`ConfigureAwait(bool)` に対応する。`IValueTaskSource` / `IValueTaskSource<T>`、`OnCompleted` / `UnsafeOnCompleted` を使う独自 awaiter、キャンセル token、`Task.WhenAll` / `WhenAny` / `WaitAll`、および `SynchronizationContext` の捕捉・`ConfigureAwait(false)` にも対応する。guest Thread と Task worker は `VmHostOptions` の個別上限と VM 全体の上限で制御されます (既定はいずれも最大 64 worker、`Task.Delay` の未完了 Timer は最大 1024)。

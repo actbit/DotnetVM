@@ -89,6 +89,9 @@ public sealed class VmHostOptions {
     /// <summary>DateTime.Now / UtcNow / Today が読む VM 単位の時計。既定は host UTC clock。</summary>
     public Func<DateTimeOffset> ClockProvider { get; init; } = static () => DateTimeOffset.UtcNow;
 
+    /// <summary>DateTime.Now / Today の変換先となる VM 単位のタイムゾーン。既定は UTC。</summary>
+    public TimeZoneInfo TimeZone { get; init; } = TimeZoneInfo.Utc;
+
     /// <summary>Guid.NewGuid と trusted CoreLib の乱数 API が使う VM 単位の RNG。既定は host CSPRNG。</summary>
     public VmRandomFill RandomFill { get; init; } = static buffer => RandomNumberGenerator.Fill(buffer);
 

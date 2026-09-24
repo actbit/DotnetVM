@@ -55,11 +55,13 @@ public sealed class VirtualMachine : IDisposable {
             throw new ArgumentNullException(nameof(options), "Culture は null にできません。");
         if (_options.ClockProvider is null)
             throw new ArgumentNullException(nameof(options), "ClockProvider は null にできません。");
+        if (_options.TimeZone is null)
+            throw new ArgumentNullException(nameof(options), "TimeZone は null にできません。");
         if (_options.RandomFill is null)
             throw new ArgumentNullException(nameof(options), "RandomFill は null にできません。");
         _sharedState = new VmSharedState(_options.MaxGuestThreads, _options.MaxTaskWorkers,
             _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds,
-            _options.Culture, _options.ClockProvider, _options.RandomFill);
+            _options.Culture, _options.ClockProvider, _options.RandomFill, _options.TimeZone);
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _handleRoots = _handles.EnumerateRoots;
         _heap.AddRootObjectSource(_handleRoots); // ホスト保持参照 (GCHandle 相当) をルートに

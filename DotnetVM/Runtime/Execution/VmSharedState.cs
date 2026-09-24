@@ -16,12 +16,14 @@ public sealed class VmSharedState : IDisposable {
     private readonly CancellationTokenSource _shutdown = new();
     private readonly GuestWorkerBudget _workerBudget;
     private readonly Func<DateTimeOffset> _clockProvider;
+    private readonly TimeZoneInfo _timeZone;
     private readonly VmRandomFill _randomFill;
     private int _disposed;
 
     public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
         int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null,
-        Func<DateTimeOffset>? clockProvider = null, VmRandomFill? randomFill = null) {
+        Func<DateTimeOffset>? clockProvider = null, VmRandomFill? randomFill = null,
+        TimeZoneInfo? timeZone = null) {
         if (maxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(maxGuestThreads));
         if (maxTaskWorkers < 1)
@@ -36,6 +38,7 @@ public sealed class VmSharedState : IDisposable {
         var configuredCulture = culture ?? CultureInfo.InvariantCulture;
         Culture = CultureInfo.ReadOnly((CultureInfo)configuredCulture.Clone());
         _clockProvider = clockProvider ?? (static () => DateTimeOffset.UtcNow);
+        _timeZone = timeZone ?? TimeZoneInfo.Utc;
         _randomFill = randomFill ?? (static buffer => System.Security.Cryptography.RandomNumberGenerator.Fill(buffer));
         _workerBudget = new GuestWorkerBudget(maxGuestWorkers);
         GuestThreads = new GuestThreadRuntime(maxGuestThreads, _workerBudget, _shutdown.Token,
@@ -47,9 +50,11 @@ public sealed class VmSharedState : IDisposable {
     /// <summary>VM 固有の読み取り専用カルチャ設定。</summary>
     public CultureInfo Culture { get; }
 
-    internal DateTime ReadNow() => _clockProvider().LocalDateTime;
+    private DateTimeOffset ReadVmLocalInstant() => TimeZoneInfo.ConvertTime(_clockProvider(), _timeZone);
+
+    internal DateTime ReadNow() => DateTime.SpecifyKind(ReadVmLocalInstant().DateTime, DateTimeKind.Local);
     internal DateTime ReadUtcNow() => _clockProvider().UtcDateTime;
-    internal DateTime ReadToday() => _clockProvider().LocalDateTime.Date;
+    internal DateTime ReadToday() => DateTime.SpecifyKind(ReadVmLocalInstant().Date, DateTimeKind.Local);
     internal void FillRandom(Span<byte> buffer) => _randomFill(buffer);
 
     /// <summary>Guest Thread の実行と join 状態 (VM ごとに分離)。</summary>

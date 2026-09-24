@@ -49,6 +49,8 @@ public sealed class VirtualMachine : IDisposable {
             throw new ArgumentOutOfRangeException(nameof(options), "MaxGuestWorkers は 1 以上である必要があります。");
         if (_options.MaxPendingTaskTimers < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "MaxPendingTaskTimers は 1 以上である必要があります。");
+        if (_options.MaxTaskCombinatorInputs < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxTaskCombinatorInputs は 1 以上である必要があります。");
         if (_options.ShutdownTimeoutMilliseconds < 0)
             throw new ArgumentOutOfRangeException(nameof(options), "ShutdownTimeoutMilliseconds は 0 以上である必要があります。");
         if (_options.Culture is null)
@@ -61,7 +63,8 @@ public sealed class VirtualMachine : IDisposable {
             throw new ArgumentNullException(nameof(options), "RandomFill は null にできません。");
         _sharedState = new VmSharedState(_options.MaxGuestThreads, _options.MaxTaskWorkers,
             _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds,
-            _options.Culture, _options.ClockProvider, _options.RandomFill, _options.TimeZone);
+            _options.Culture, _options.ClockProvider, _options.RandomFill, _options.TimeZone,
+            _options.MaxTaskCombinatorInputs);
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _handleRoots = _handles.EnumerateRoots;
         _heap.AddRootObjectSource(_handleRoots); // ホスト保持参照 (GCHandle 相当) をルートに

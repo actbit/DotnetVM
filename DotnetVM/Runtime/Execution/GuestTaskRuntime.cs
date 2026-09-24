@@ -13,12 +13,13 @@ namespace DotnetVM.Runtime.Execution;
 internal sealed class GuestTaskRuntime(
     int maxWorkers,
     int maxPendingTimers,
+    int maxTaskCombinatorInputs,
     GuestWorkerBudget workerBudget,
     CancellationToken shutdownToken,
     int shutdownTimeoutMilliseconds) : IDisposable {
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
-    private readonly ConcurrentDictionary<VmCancellationState, Timer> _cancellationTimers = new();
+    private readonly ConcurrentDictionary<VmCancellationState, CancellationTimerRegistration> _cancellationTimers = new();
     private readonly ConcurrentDictionary<VmTaskObject, CancellationTokenRegistration> _cancellationRegistrations = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
     // ValueTask の default 値は backing Task を持たない completed state として扱う。
@@ -30,16 +31,18 @@ internal sealed class GuestTaskRuntime(
     private readonly object _lifetimeGate = new();
     private readonly int _maxWorkers = maxWorkers;
     private readonly int _maxPendingTimers = maxPendingTimers;
+    private readonly int _maxTaskCombinatorInputs = maxTaskCombinatorInputs;
     private readonly GuestWorkerBudget _workerBudget = workerBudget;
     private readonly CancellationToken _shutdownToken = shutdownToken;
     private readonly int _shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
     private int _activeWorkers;
+    private int _pendingTimerSlots;
     private int _nextWorkerId;
     private long _nextContinuationId;
     private bool _disposed;
 
     public int ActiveWorkerCount => Volatile.Read(ref _activeWorkers);
-    public int PendingTimerCount => _timers.Count + _cancellationTimers.Count;
+    public int PendingTimerCount => Volatile.Read(ref _pendingTimerSlots);
     public int CancellationRegistrationCount => _cancellationRegistrations.Count;
 
     public VmTaskObject Create(VmType type, bool completed = false, StackSlot result = default) {
@@ -59,6 +62,11 @@ internal sealed class GuestTaskRuntime(
             yield return roots;
         foreach (var roots in _continuationRoots.Values)
             yield return roots;
+        VmCancellationState[] cancellationStates;
+        lock (_lifetimeGate)
+            cancellationStates = [.. _cancellationTimers.Keys];
+        foreach (var state in cancellationStates)
+            yield return [StackSlot.OfObject(state)];
         CompletedTaskCacheEntry[] sentinels;
         lock (_lifetimeGate)
             sentinels = [.. _completedSentinels.Values];
@@ -96,16 +104,17 @@ internal sealed class GuestTaskRuntime(
                 Complete(task);
                 return;
             }
-            if (_timers.Count >= _maxPendingTimers) {
+            if (!TryReserveTimerSlotUnsafe()) {
                 _activeRoots.TryRemove(task, out _);
                 throw new GuestConcurrencyLimitExceededException(
-                    $"未完了の Task.Delay Timer 上限 ({_maxPendingTimers}) に達しました。");
+                    $"未完了の Task.Delay / CancellationTokenSource Timer 共通上限 ({_maxPendingTimers}) に達しました。");
             }
 
             _activeRoots[task] = [StackSlot.OfObject(task)];
             var timer = new Timer(_ => Complete(task), null, Timeout.Infinite, Timeout.Infinite);
             if (!_timers.TryAdd(task, timer)) {
                 timer.Dispose();
+                ReleaseTimerSlot();
                 _activeRoots.TryRemove(task, out _);
                 throw new InvalidOperationException("同一 Task に複数の Delay Timer を登録できません。");
             }
@@ -123,6 +132,8 @@ internal sealed class GuestTaskRuntime(
                 }
             } catch {
                 if (_timers.TryRemove(task, out var failedTimer))
+                    ReleaseTimerSlot();
+                if (failedTimer is not null)
                     failedTimer.Dispose();
                 if (_cancellationRegistrations.TryRemove(task, out var registration))
                     registration.Dispose();
@@ -140,39 +151,107 @@ internal sealed class GuestTaskRuntime(
         if (milliseconds < Timeout.Infinite)
             throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "millisecondsDelay");
 
-        Timer? previous = null;
+        CancellationTimerRegistration? previous = null;
         lock (_lifetimeGate) {
             ThrowIfDisposed();
-            var hadPrevious = _cancellationTimers.TryRemove(state, out previous);
-            if (milliseconds != Timeout.Infinite && !hadPrevious && PendingTimerCount >= _maxPendingTimers)
-                throw new GuestConcurrencyLimitExceededException(
-                    $"未完了の CancellationTokenSource Timer 上限 ({_maxPendingTimers}) に達しました。");
+            if (state.IsDisposed)
+                throw new ObjectDisposedException(nameof(CancellationTokenSource));
             state.DisposeTimer = CancelCancellationTimer;
-            if (milliseconds == Timeout.Infinite) {
-                // -1 disables the existing timer.  The old timer is disposed below.
+            state.ScheduleTimer = ScheduleCancellation;
+            var current = _cancellationTimers.TryGetValue(state, out var currentRegistration)
+                ? currentRegistration : null;
+            if (milliseconds == Timeout.Infinite || state.IsCancellationRequested) {
+                if (current is not null && RemoveCancellationTimerUnsafe(state, current))
+                    previous = current;
             } else {
-                var timer = new Timer(static target => {
-                    var registration = (CancellationTimerState)target!;
-                    try { registration.Source.CancelFromTimer(); }
-                    catch { /* cancellation callbacks must not terminate the host timer thread */ }
-                    finally { registration.Runtime.CancelCancellationTimer(registration.Source); }
-                }, new CancellationTimerState(this, state), Timeout.Infinite, Timeout.Infinite);
-                _cancellationTimers[state] = timer;
+                var reserved = current is null;
+                if (reserved && !TryReserveTimerSlotUnsafe())
+                    throw new GuestConcurrencyLimitExceededException(
+                        $"未完了の Task.Delay / CancellationTokenSource Timer 共通上限 ({_maxPendingTimers}) に達しました。");
+
+                CancellationTimerRegistration? replacement = null;
                 try {
-                    timer.Change(milliseconds, Timeout.Infinite);
+                    replacement = new CancellationTimerRegistration(this, state);
+                    replacement.Timer = new Timer(static target => {
+                        var registration = (CancellationTimerRegistration)target!;
+                        registration.Runtime.FireCancellationTimer(registration);
+                    }, replacement, Timeout.Infinite, Timeout.Infinite);
+                    // Publish only after Change succeeds.  The timer callback takes the same
+                    // lifetime lock before firing, so a zero-delay callback cannot observe a
+                    // half-published registration or cancel an older registration during a
+                    // replacement.
+                    replacement.Timer.Change(milliseconds, Timeout.Infinite);
+                    _cancellationTimers[state] = replacement;
+                    previous = current;
                 } catch {
-                    _cancellationTimers.TryRemove(state, out _);
-                    timer.Dispose();
+                    replacement?.Timer?.Dispose();
+                    if (reserved)
+                        ReleaseTimerSlot();
                     throw;
                 }
             }
         }
-        previous?.Dispose();
+        previous?.Timer?.Dispose();
     }
 
     private void CancelCancellationTimer(VmCancellationState state) {
-        if (_cancellationTimers.TryRemove(state, out var timer))
-            timer.Dispose();
+        CancellationTimerRegistration? registration = null;
+        lock (_lifetimeGate) {
+            if (_cancellationTimers.TryGetValue(state, out var current) &&
+                RemoveCancellationTimerUnsafe(state, current))
+                registration = current;
+        }
+        registration?.Timer?.Dispose();
+    }
+
+    private void CancelCancellationTimer(CancellationTimerRegistration registration) {
+        lock (_lifetimeGate) {
+            if (_cancellationTimers.TryGetValue(registration.Source, out var current) &&
+                ReferenceEquals(current, registration))
+                RemoveCancellationTimerUnsafe(registration.Source, registration);
+        }
+        registration.Timer?.Dispose();
+    }
+
+    private void FireCancellationTimer(CancellationTimerRegistration registration) {
+        lock (_lifetimeGate) {
+            if (!_cancellationTimers.TryGetValue(registration.Source, out var current) ||
+                !ReferenceEquals(current, registration)) {
+                registration.Timer?.Dispose();
+                return;
+            }
+            try {
+                registration.Source.CancelFromTimer();
+            } catch {
+                // Cancellation callbacks must not terminate the host timer thread.
+            } finally {
+                if (_cancellationTimers.TryGetValue(registration.Source, out current) &&
+                    ReferenceEquals(current, registration))
+                    RemoveCancellationTimerUnsafe(registration.Source, registration);
+                registration.Timer?.Dispose();
+            }
+        }
+    }
+
+    private bool RemoveCancellationTimerUnsafe(VmCancellationState state,
+        CancellationTimerRegistration registration) {
+        if (!_cancellationTimers.TryGetValue(state, out var current) ||
+            !ReferenceEquals(current, registration) ||
+            !_cancellationTimers.TryRemove(state, out _))
+            return false;
+        ReleaseTimerSlot();
+        return true;
+    }
+
+    private bool TryReserveTimerSlotUnsafe() {
+        if (_pendingTimerSlots >= _maxPendingTimers)
+            return false;
+        _pendingTimerSlots++;
+        return true;
+    }
+
+    private void ReleaseTimerSlot() {
+        Interlocked.Decrement(ref _pendingTimerSlots);
     }
 
     public void Wait(VmTaskObject task, int millisecondsTimeout) => task.Wait(millisecondsTimeout);
@@ -224,6 +303,7 @@ internal sealed class GuestTaskRuntime(
 
     /// <summary>Task.WhenAll / WhenAny が共有する VM task combinator 実行。</summary>
     public void WhenAll(VmTaskObject composite, VmTaskObject[] tasks, Func<StackSlot> result) {
+        ValidateTaskCombinatorInputCount(tasks.Length);
         if (tasks.Length == 0) {
             Complete(composite, result());
             return;
@@ -290,6 +370,7 @@ internal sealed class GuestTaskRuntime(
     }
 
     public void WhenAny(VmTaskObject composite, VmTaskObject[] tasks) {
+        ValidateTaskCombinatorInputCount(tasks.Length);
         if (tasks.Length == 0) {
             // Create() publishes the composite as a root before argument validation reaches this
             // runtime.  Remove it on the exceptional CLR path rather than leaving an unreachable
@@ -348,23 +429,28 @@ internal sealed class GuestTaskRuntime(
     }
 
     public bool WaitAll(VmTaskObject[] tasks, int millisecondsTimeout, CancellationToken cancellationToken) {
+        ValidateTaskCombinatorInputCount(tasks.Length);
         if (tasks.Length == 0)
             return true;
-        var handles = tasks.Select(task => task.CompletionWaitHandle).ToArray();
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        foreach (var handle in handles) {
+        foreach (var task in tasks) {
             var remaining = millisecondsTimeout == Timeout.Infinite
                 ? Timeout.Infinite
                 : Math.Max(0, millisecondsTimeout - (int)stopwatch.ElapsedMilliseconds);
-            var index = cancellationToken.CanBeCanceled
-                ? WaitHandle.WaitAny([handle, cancellationToken.WaitHandle], remaining)
-                : handle.WaitOne(remaining) ? 0 : WaitHandle.WaitTimeout;
-            if (index == WaitHandle.WaitTimeout)
-                return false;
-            if (cancellationToken.CanBeCanceled && index == 1)
+            try {
+                if (!task.Wait(remaining, cancellationToken))
+                    return false;
+            } catch (OperationCanceledException) {
                 throw new UnhandledGuestException("System.OperationCanceledException", null);
+            }
         }
         return true;
+    }
+
+    internal void ValidateTaskCombinatorInputCount(int count) {
+        if (count > _maxTaskCombinatorInputs)
+            throw new GuestConcurrencyLimitExceededException(
+                $"Task combinator の入力数上限 ({_maxTaskCombinatorInputs}) を超えました。");
     }
 
     private void Cancel(VmTaskObject task) {
@@ -374,7 +460,11 @@ internal sealed class GuestTaskRuntime(
 
     private sealed record TaskCancellationState(GuestTaskRuntime Runtime, VmTaskObject Task);
 
-    private sealed record CancellationTimerState(GuestTaskRuntime Runtime, VmCancellationState Source);
+    private sealed class CancellationTimerRegistration(GuestTaskRuntime runtime, VmCancellationState source) {
+        public GuestTaskRuntime Runtime { get; } = runtime;
+        public VmCancellationState Source { get; } = source;
+        public Timer? Timer { get; set; }
+    }
 
     /// <summary>
     /// guest awaiter が自前で continuation を保持する場合の登録。Task のイベントを
@@ -591,7 +681,12 @@ internal sealed class GuestTaskRuntime(
 
     private void RemoveTaskRoots(VmTaskObject task) {
         _activeRoots.TryRemove(task, out _);
-        if (_timers.TryRemove(task, out var timer))
+        Timer? timer = null;
+        lock (_lifetimeGate) {
+            if (_timers.TryRemove(task, out timer))
+                ReleaseTimerSlot();
+        }
+        if (timer is not null)
             timer.Dispose();
         if (_cancellationRegistrations.TryRemove(task, out var registration))
             registration.Dispose();
@@ -599,7 +694,7 @@ internal sealed class GuestTaskRuntime(
 
     public void Dispose() {
         Timer[] timers;
-        Timer[] cancellationTimers;
+        CancellationTimerRegistration[] cancellationTimers;
         CancellationTokenRegistration[] cancellationRegistrations;
         Thread[] workers;
         VmTaskObject[] tasks;
@@ -614,14 +709,15 @@ internal sealed class GuestTaskRuntime(
             _cancellationRegistrations.Clear();
             cancellationTimers = [.. _cancellationTimers.Values];
             _cancellationTimers.Clear();
+            _pendingTimerSlots = 0;
             workers = [.. _workers.Values];
             tasks = [.. _activeRoots.Keys];
         }
 
         foreach (var timer in timers)
             timer.Dispose();
-        foreach (var timer in cancellationTimers)
-            timer.Dispose();
+        foreach (var registration in cancellationTimers)
+            registration.Timer?.Dispose();
         foreach (var registration in cancellationRegistrations)
             registration.Dispose();
         var shutdown = new ObjectDisposedException("VirtualMachine");

@@ -41,21 +41,101 @@ internal sealed partial class CallEngine {
     };
 
     /// <summary>
-    /// A guest type may still use an ordinary legacy intrinsic when no signature binding exists
-    /// for that surface (for example the CoreLib Unsafe compatibility shim).  Once a signature
-    /// binding is registered, however, a colliding guest type must not reach it unless its
-    /// provenance is trusted or intrinsic.
+    /// Runtime binding は型の provenance が確認できた場合だけ試行する。以前は同じ FullName
+    /// に InternalCall が 1 面でも登録されていれば guest TypeDef を許可していたため、fake
+    /// System.Type 等から別の managed/runtime 面へ到達できた。また unresolved TypeRef を
+    /// 一律許可していたため、任意の AssemblyRef を付けた TypeRef が intrinsic の FullName
+    /// 照合へ落ちる抜け道になっていた。
     /// </summary>
-    private bool CanAttemptRuntimeBinding(VmType? type) => type is not null &&
-        (IsAllowedRuntimeBindingType(type) ||
-         _intrinsics.HasBindingForType(type.FullName, BindingOrigin.InternalCall) ||
-         !_intrinsics.HasBindingForType(type.FullName));
+    private static bool CanAttemptRuntimeBinding(VmType? type) => type is not null &&
+        IsAllowedRuntimeBindingType(type);
 
-    // Some CoreLib reference TypeRefs (notably Unsafe) intentionally have no VM TypeDef when the
-    // host CoreLib is not loaded.  The absence of a resolved type is not provenance evidence of a
-    // fake definition, so retain the legacy unresolved-TypeRef lookup in that narrow case.
-    private bool CanAttemptRuntimeBinding(string typeName, VmType? type) => type is null ||
-        CanAttemptRuntimeBinding(type);
+    /// <summary>
+    /// TypeRef の解決失敗は provenance の証拠ではない。CoreLib の TypeDef がロードされて
+    /// いない構成で必要な Unsafe shim だけを、期待する AssemblyRef identity と組み合わせて
+    /// 明示的に許可する。SynchronizationContext / CTS / AssemblyLoadContext などの通常の
+    /// surface は既知 framework contract なら intrinsic facade として解決されるため、ここへ
+    /// 追加して unresolved のまま許可してはいけない。
+    /// </summary>
+    private bool CanAttemptRuntimeBinding(string typeName, int typeRefRid, VmType? type) {
+        if (!CanAttemptRuntimeBinding(type))
+            return type is null && IsExplicitUnresolvedRuntimeSurface(typeName, typeRefRid);
+        // An intrinsic facade is only trusted when its TypeRef ultimately points at a known
+        // framework contract (or the current module). This closes the missing-AssemblyRef path
+        // while preserving legacy intrinsic facades such as WebClient for ordinary dispatch.
+        return type is not VmIntrinsicType || IsTrustedIntrinsicTypeRef(typeRefRid, typeName);
+    }
+
+    private bool IsExplicitUnresolvedRuntimeSurface(string typeName, int typeRefRid) {
+        if (typeName is not ("System.Runtime.CompilerServices.Unsafe" or
+            "System.Runtime.CompilerServices.RuntimeHelpers" or
+            "System.Runtime.InteropServices.MemoryMarshal" or
+            "System.Buffer"))
+            return false;
+        var scope = TerminalResolutionScope(typeRefRid);
+        if (scope.Table != TableKind.AssemblyRef)
+            return false;
+        var identity = _loader.Image.GetAssemblyRefIdentity(scope.Rid);
+        // The Unsafe package normally references System.Runtime on modern target packs, while
+        // older target packs can carry a direct Unsafe AssemblyRef. Both are pinned by token.
+        var token = identity.PublicKeyToken.ToLowerInvariant();
+        return typeName switch {
+            "System.Runtime.CompilerServices.Unsafe" =>
+                (identity.Name, token) is
+                    ("System.Private.CoreLib", "7cec85d7bea7798e") or
+                    ("System.Runtime", "b03f5f7f11d50a3a") or
+                    ("System.Runtime.CompilerServices.Unsafe", "b03f5f7f11d50a3a"),
+            "System.Runtime.CompilerServices.RuntimeHelpers" or "System.Buffer" =>
+                identity.Name == "System.Private.CoreLib" && token == "7cec85d7bea7798e",
+            "System.Runtime.InteropServices.MemoryMarshal" =>
+                (identity.Name, token) is
+                    ("System.Private.CoreLib", "7cec85d7bea7798e") or
+                    ("System.Runtime.InteropServices", "b03f5f7f11d50a3a"),
+            _ => false,
+        };
+    }
+
+    private bool IsTrustedIntrinsicTypeRef(int typeRefRid, string? typeName) {
+        var scope = TerminalResolutionScope(typeRefRid);
+        if (scope.Table != TableKind.AssemblyRef)
+            return scope.Table == TableKind.Module;
+        var identity = _loader.Image.GetAssemblyRefIdentity(scope.Rid);
+        // WebClient is an explicitly host-added device surface. Its test/contract assembly is
+        // intentionally not a BCL strong-name contract, so allow only the exact surface/contract
+        // pair when the VM has installed that facade; other names still require known BCL identity.
+        return TypeLoader.IsKnownFrameworkContract(identity) ||
+            (typeName == "System.Net.WebClient" && identity.Name == "WebClientContract" &&
+             !identity.IsStrongNamed && _loader.FindIntrinsicType(typeName) is not null);
+    }
+
+    private bool IsKnownFrameworkTypeRef(int typeRefRid) {
+        var scope = TerminalResolutionScope(typeRefRid);
+        return scope.Table == TableKind.AssemblyRef &&
+            TypeLoader.IsKnownFrameworkContract(_loader.Image.GetAssemblyRefIdentity(scope.Rid));
+    }
+
+    private bool IsTrustedTypeToken(uint token, int depth = 0) {
+        if (depth > 64)
+            return false;
+        var table = (TableKind)(token >> 24);
+        var rid = (int)(token & 0xFFFFFF);
+        return table switch {
+            TableKind.TypeDef => true,
+            TableKind.TypeRef => IsTrustedIntrinsicTypeRef(rid, null),
+            TableKind.TypeSpec => IsTrustedTypeToken(_loader.GetTypeSpecDefinitionToken(rid), depth + 1),
+            _ => false,
+        };
+    }
+
+    private bool CanAttemptRuntimeBindingForTypeSpec(int typeSpecRid, VmType type) =>
+        type is not VmIntrinsicType || IsTrustedTypeToken(_loader.GetTypeSpecDefinitionToken(typeSpecRid));
+
+    private (TableKind Table, int Rid) TerminalResolutionScope(int typeRefRid) {
+        var scope = _loader.Image.GetTypeRefName(typeRefRid).ResolutionScope;
+        while (scope.Table == TableKind.TypeRef)
+            scope = _loader.Image.GetTypeRefName(scope.Rid).ResolutionScope;
+        return scope;
+    }
 
     private VmType? TryResolveTypeRefForBinding(int typeRefRid) {
         try {

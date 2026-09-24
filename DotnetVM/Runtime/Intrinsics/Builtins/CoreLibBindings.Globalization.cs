@@ -126,7 +126,7 @@ internal static partial class CoreLibBindings {
 
         var dateTimeT = "System.DateTime";
         // 時計情報はホスト環境から読む低リスクな読み取り面。ゲストへ直接 OS P/Invoke
-        // させず、ホスト BCL の UTC / local clock を DateTime の VM 表現へコピーする。
+        // させず、VM の ClockProvider と TimeZone を DateTime の VM 表現へコピーする。
         foreach (var (getter, readClock) in new (string Getter, Func<VmSharedState, DateTime> ReadClock)[] {
             ("get_Now", static shared => shared.ReadNow()),
             ("get_UtcNow", static shared => shared.ReadUtcNow()),

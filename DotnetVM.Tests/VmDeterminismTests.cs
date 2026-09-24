@@ -28,15 +28,19 @@ public sealed class VmDeterminismTests {
 
     [Fact]
     public void DateTimeClockCanBeFixedPerVm() {
-        var instant = new DateTimeOffset(2026, 9, 24, 12, 34, 56, TimeSpan.FromHours(9));
+        var instant = new DateTimeOffset(2026, 9, 24, 12, 34, 56, TimeSpan.FromHours(-5));
+        var vmTimeZone = TimeZoneInfo.CreateCustomTimeZone(
+            "VmPlusNine", TimeSpan.FromHours(9), "VM +09", "VM +09");
+        var vmLocal = TimeZoneInfo.ConvertTime(instant, vmTimeZone);
         using var vm = CreateVm(new VmHostOptions {
             LoadHostCoreLib = true,
             ClockProvider = () => instant,
+            TimeZone = vmTimeZone,
         });
 
-        Assert.Equal(instant.LocalDateTime.Ticks, vm.Invoke("Vm.DeterminismChecks.Ops", "LocalNowTicks"));
+        Assert.Equal(vmLocal.DateTime.Ticks, vm.Invoke("Vm.DeterminismChecks.Ops", "LocalNowTicks"));
         Assert.Equal(instant.UtcDateTime.Ticks, vm.Invoke("Vm.DeterminismChecks.Ops", "UtcNowTicks"));
-        Assert.Equal(instant.LocalDateTime.Date.Ticks, vm.Invoke("Vm.DeterminismChecks.Ops", "TodayTicks"));
+        Assert.Equal(vmLocal.Date.Date.Ticks, vm.Invoke("Vm.DeterminismChecks.Ops", "TodayTicks"));
     }
 
     [Fact]

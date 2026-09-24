@@ -168,7 +168,18 @@ internal sealed class GuestTaskRuntime(
                 _completedSentinels.Add(type, sentinel);
             }
         }
-        return sentinel.Get();
+        try {
+            return sentinel.Get();
+        } catch {
+            // Lazy caches its factory exception. Do not leave that failed entry in the
+            // cache: a later call must be able to retry after a transient quota failure.
+            lock (_lifetimeGate) {
+                if (_completedSentinels.TryGetValue(type, out var current) &&
+                    ReferenceEquals(current, sentinel))
+                    _completedSentinels.Remove(type);
+            }
+            throw;
+        }
     }
 
     /// <summary>collectible ALC の型を参照する completed Task cache entry を解放する。</summary>
@@ -350,13 +361,33 @@ internal sealed class GuestTaskRuntime(
             _task = new Lazy<VmTaskObject>(() => {
                 var task = new VmTaskObject(type);
                 task.SetResult(result);
+                // Reserve holds the heap gate while the root is published and the
+                // reservation is committed. This makes GC visibility and accounting
+                // one transaction, while still allowing the root publication to be
+                // rolled back if the allocation fails.
+                using var reservation = heap.Reserve(ObjectModel.EstimateSize(task));
                 Volatile.Write(ref _root, task);
-                return heap.Allocate(task);
+                try {
+                    return reservation.Commit(task);
+                } catch {
+                    Volatile.Write(ref _root, null);
+                    throw;
+                }
             }, LazyThreadSafetyMode.ExecutionAndPublication);
         }
 
         public VmTaskObject? Root => Volatile.Read(ref _root);
-        public VmTaskObject Get() => _task.Value;
+
+        public VmTaskObject Get() {
+            try {
+                return _task.Value;
+            } catch {
+                // The factory normally clears this itself, but keep the cache entry
+                // safe if a future factory change fails after publication.
+                Volatile.Write(ref _root, null);
+                throw;
+            }
+        }
     }
 
     /// <summary>型名ではなく VM 型定義と型引数の identity による cache key 比較。</summary>

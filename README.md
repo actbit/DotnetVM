@@ -17,6 +17,24 @@ vm.LoadAssembly("MyGuest.dll");                  // DLL アセンブリをロー
 var result = vm.Invoke("MyApp.Program", "Compute", 42);
 ```
 
+## はじめに
+
+### 前提環境
+
+- ホスト: .NET SDK 10.0 以降
+- ゲスト: DLL アセンブリ (.NET 5〜.NET 10)。EXE のエントリポイントは探索せず、ホストが実行メソッドを明示します
+- 本体は依存ゼロです。`Microsoft.CodeAnalysis.CSharp` と `xunit` はテストプロジェクトだけが使用します
+
+現在は NuGet パッケージを配布していないため、ホストアプリケーションからは `DotnetVM/DotnetVM.csproj` をプロジェクト参照してください。
+
+```bash
+dotnet build DotnetVM.slnx --configuration Release
+dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-restore
+```
+
+ホストへの組み込み手順、ブリッジ実装、ポリシー設計、例外処理、運用上の注意点は
+[ホスト統合ガイド](docs/host-integration.md) にまとめています。
+
 ## 特徴
 
 ### 実行方式

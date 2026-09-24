@@ -138,6 +138,9 @@ public sealed partial class TypeLoader {
     /// 場合は自己解決)、その画像内で包含チェーンを辿る。BCL (System.Runtime 等) は
     /// trusted 実装画像への統合で救済する (global 探索ではなく identity 起点)。</summary>
     private VmClassType? ResolveNestedTypeRef(int typeRefRid) {
+        // 先に共有 helper で scope chain の cycle / 過深度 / invalid RID を検証する。
+        // その後の名前収集ループは、malformed metadata でも無限に回らない。
+        _image.GetTerminalTypeRefScope(typeRefRid);
         // TypeRef のスコープチェーン (内側 → 外側) を名前として集める
         var names = new List<string>();
         var current = typeRefRid;
@@ -186,6 +189,7 @@ public sealed partial class TypeLoader {
     /// <summary>CoreLib の実画像がロードされていないときでも、intrinsic facade として
     /// 合成したネスト型 (ConfiguredTaskAwaitable+ConfiguredTaskAwaiter 等) を解決する。</summary>
     private VmIntrinsicType? ResolveIntrinsicNestedTypeRef(int typeRefRid) {
+        _image.GetTerminalTypeRefScope(typeRefRid);
         var names = new List<string>();
         var current = typeRefRid;
         string? outerNamespace = null;
@@ -235,13 +239,21 @@ public sealed partial class TypeLoader {
     /// 必須にする。正式な AssemblyRef→TypeForwarder 解決はこの制約とは別に上で処理する。
     /// </summary>
     internal static bool IsKnownFrameworkContract(AssemblyIdentity identity) =>
-        identity.IsStrongNamed &&
-        identity.PublicKeyToken is "7cec85d7bea7798e" or "b03f5f7f11d50a3a" or "cc7b13ffcd2ddd51" &&
-        identity.Name is "System.Private.CoreLib" or "System.Runtime" or "System.Runtime.Extensions"
-            or "System.Console" or "System.Linq" or "System.Collections" or "System.Collections.Concurrent"
-            or "System.Threading" or "System.Threading.Tasks" or "System.Reflection"
-            or "System.Reflection.Emit" or "System.Runtime.InteropServices" or "System.Runtime.Loader"
-            or "System.Net.WebClient"
-            or "System.Runtime.CompilerServices.Unsafe" or "System.Threading.Tasks.Extensions"
-            or "netstandard";
+        identity.IsStrongNamed && (identity.Name, identity.PublicKeyToken) is
+            ("System.Private.CoreLib", "7cec85d7bea7798e") or
+            ("System.Runtime", "b03f5f7f11d50a3a") or
+            ("System.Runtime.Extensions", "b03f5f7f11d50a3a") or
+            ("System.Console", "b03f5f7f11d50a3a") or
+            ("System.Linq", "b03f5f7f11d50a3a") or
+            ("System.Collections", "b03f5f7f11d50a3a") or
+            ("System.Collections.Concurrent", "b03f5f7f11d50a3a") or
+            ("System.Threading", "b03f5f7f11d50a3a") or
+            ("System.Threading.Tasks", "b03f5f7f11d50a3a") or
+            ("System.Reflection", "b03f5f7f11d50a3a") or
+            ("System.Reflection.Emit", "b03f5f7f11d50a3a") or
+            ("System.Runtime.InteropServices", "b03f5f7f11d50a3a") or
+            ("System.Runtime.Loader", "b03f5f7f11d50a3a") or
+            ("System.Runtime.CompilerServices.Unsafe", "b03f5f7f11d50a3a") or
+            ("System.Threading.Tasks.Extensions", "cc7b13ffcd2ddd51") or
+            ("netstandard", "cc7b13ffcd2ddd51");
 }

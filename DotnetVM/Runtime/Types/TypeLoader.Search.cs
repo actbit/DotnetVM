@@ -112,6 +112,7 @@ public sealed partial class TypeLoader {
         var names = new List<string>();
         string? ns = null;
         var current = parent.Rid;
+        _image.GetTerminalTypeRefScope(current);
         while (true) {
             var (innerNs, innerName, scope) = _image.GetTypeRefName(current);
             names.Insert(0, innerName);

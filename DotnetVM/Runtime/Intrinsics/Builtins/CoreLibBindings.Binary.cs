@@ -147,10 +147,16 @@ internal static partial class CoreLibBindings {
             return new Guid(bytes);
         }
         static string? S(in StackSlot slot) => (slot.ObjectValue as VmString)?.Value;
-        // Guid.NewGuid は CoreLib の OS P/Invoke に到達するため、任意の native import を
-        // 許可せずホスト BCL の暗号学的 GUID 生成だけを委譲する。
+        // Guid.NewGuid は CoreLib の OS P/Invoke に到達するため、VM ごとのホスト RNG で
+        // RFC 4122 version/variant bits を設定する。乱数源は VmHostOptions.RandomFill で差し替え可能。
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "NewGuid", T, []),
-            static (ctx, _) => MakeGuidStruct(ctx, Guid.NewGuid()),
+            static (ctx, _) => {
+                Span<byte> bytes = stackalloc byte[16];
+                ctx.Shared.FillRandom(bytes);
+                bytes[7] = (byte)((bytes[7] & 0x0F) | 0x40);
+                bytes[8] = (byte)((bytes[8] & 0x3F) | 0x80);
+                return MakeGuidStruct(ctx, new Guid(bytes));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "Parse", T, ["System.String"]),
             static (ctx, a) => {

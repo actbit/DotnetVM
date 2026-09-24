@@ -178,10 +178,63 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void CompletedTaskCache_UsesStructuredTypeIdentityAndDropsCollectibleTypes() {
+        static (VmAssemblyContext Context, VmClassType Type) LoadMarker(string assemblyName) {
+            var image = AssemblyImage.Parse(TestAssemblyCompiler.CompileToBytes(
+                "namespace Vm.SameName { public sealed class Marker { } }", assemblyName));
+            var context = new VmAssemblyContext(_ => throw new InvalidOperationException());
+            var loader = new TypeLoader(image);
+            context.Register(loader);
+            loader.CompletePendingTypes();
+            return (context, Assert.IsType<VmClassType>(loader.FindTypeByFullName("Vm.SameName.Marker")));
+        }
+
+        var (collectibleContext, collectibleType) = LoadMarker("SameName.Collectible");
+        var (retainedContext, retainedType) = LoadMarker("SameName.Retained");
+        Assert.Equal(collectibleType.FullName, retainedType.FullName);
+        Assert.NotSame(collectibleType, retainedType);
+
+        using var shared = new VmSharedState();
+        var heap = new VmHeap(new MemoryPolicy());
+        var taskDefinition = new VmIntrinsicType {
+            Namespace = "System.Threading.Tasks",
+            Name = "Task`1",
+            IsValue = false,
+        };
+        var collectibleTaskType = new VmConstructedType {
+            Definition = taskDefinition,
+            TypeArguments = [collectibleType],
+        };
+        var retainedTaskType = new VmConstructedType {
+            Definition = taskDefinition,
+            TypeArguments = [retainedType],
+        };
+
+        var collectibleTask = shared.GuestTasks.CompletedSentinel(collectibleTaskType, default, heap);
+        var retainedTask = shared.GuestTasks.CompletedSentinel(retainedTaskType, default, heap);
+        Assert.NotSame(collectibleTask, retainedTask);
+        Assert.Collection(shared.GuestTasks.EnumerateRoots(), _ => { }, _ => { });
+        Assert.Collection(heap.TrackedObjects, _ => { }, _ => { });
+
+        shared.RemoveAssemblyContextCaches(collectibleContext);
+
+        Assert.DoesNotContain(shared.GuestTasks.EnumerateRoots(), roots =>
+            roots.Any(slot => ReferenceEquals(slot.ObjectValue, collectibleTask)));
+        Assert.Contains(shared.GuestTasks.EnumerateRoots(), roots =>
+            roots.Any(slot => ReferenceEquals(slot.ObjectValue, retainedTask)));
+        Assert.Single(shared.GuestTasks.EnumerateRoots());
+        Assert.Same(retainedContext, retainedType.Loader!.Context);
+    }
+
+    [Fact]
     public void CollectibleUnload_ThroughGuestApiRemovesLoaderAndTypeCachesAcrossCycles() {
         var childBytes = TestAssemblyCompiler.CompileToBytes("""
+            using System.Threading.Tasks;
             namespace Vm.AlcUnloadChild {
                 public class Marker { public static object Root = new object(); }
+                public static class Ops {
+                    public static Task<Marker> AsTask() => default(ValueTask<Marker>).AsTask();
+                }
             }
             """, "AlcUnloadChild");
         using var vm = new VirtualMachine();
@@ -205,6 +258,9 @@ public sealed class AssemblyLoadContextHardeningTests {
             vm.Invoke("Vm.AlcUnloadDriver.Ops", "Load", childBytes);
             var childLoader = Assert.Single(vm.Loaders, loader => loader.Image.Name == "AlcUnloadChild");
             var childType = Assert.IsType<VmClassType>(childLoader.FindTypeByFullName("Vm.AlcUnloadChild.Marker"));
+            var sentinel = Assert.IsType<VmTaskObject>(vm.Invoke("Vm.AlcUnloadChild.Ops", "AsTask"));
+            Assert.Contains(vm.SharedState.GuestTasks.EnumerateRoots(), roots =>
+                roots.Any(slot => ReferenceEquals(slot.ObjectValue, sentinel)));
             vm.SharedState.TypeFacades[childType] = new VmRuntimeObject { Target = childType };
             vm.SharedState.TypeInitialization.Ensure(childType, static () => { });
 
@@ -212,6 +268,8 @@ public sealed class AssemblyLoadContextHardeningTests {
 
             Assert.DoesNotContain(vm.Loaders, loader => loader.Image.Name == "AlcUnloadChild");
             Assert.DoesNotContain(childType, vm.SharedState.TypeFacades.Keys);
+            Assert.DoesNotContain(vm.SharedState.GuestTasks.EnumerateRoots(), roots =>
+                roots.Any(slot => ReferenceEquals(slot.ObjectValue, sentinel)));
             Assert.Equal(TypeInitializationStatus.NotStarted, vm.SharedState.TypeInitialization.GetStatus(childType));
         }
     }

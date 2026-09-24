@@ -1,9 +1,13 @@
 namespace DotnetVM.Host;
 
 using System.Globalization;
+using System.Security.Cryptography;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
+
+/// <summary>VM の暗号学的乱数を供給するホスト delegate。</summary>
+public delegate void VmRandomFill(Span<byte> buffer);
 
 /// <summary>
 /// メモリ/実行リソースのポリシー。すべてクォータ+拒否方式の上限。
@@ -81,6 +85,12 @@ public sealed class VmHostOptions {
 
     /// <summary>ゲスト実行中に使う CurrentCulture / CurrentUICulture。既定は従来互換の不変カルチャ。</summary>
     public CultureInfo Culture { get; init; } = CultureInfo.InvariantCulture;
+
+    /// <summary>DateTime.Now / UtcNow / Today が読む VM 単位の時計。既定は host UTC clock。</summary>
+    public Func<DateTimeOffset> ClockProvider { get; init; } = static () => DateTimeOffset.UtcNow;
+
+    /// <summary>Guid.NewGuid と trusted CoreLib の乱数 API が使う VM 単位の RNG。既定は host CSPRNG。</summary>
+    public VmRandomFill RandomFill { get; init; } = static buffer => RandomNumberGenerator.Fill(buffer);
 
     /// <summary>ネットワークポリシー (既定 = DenyAll)。</summary>
     public NetworkPolicy Network { get; init; } = new();

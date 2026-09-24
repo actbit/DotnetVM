@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
@@ -18,9 +19,11 @@ internal sealed class GuestTaskRuntime(
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
-    // default(ValueTask) が Task 表現を要求されたときに使う VM-wide の完了済み sentinel。
-    // これは通常の guest allocation ではなく、Task 型ごとに一度だけ host 側で生成する。
-    private readonly Dictionary<string, VmTaskObject> _completedSentinels = new(StringComparer.Ordinal);
+    // ValueTask の default 値は backing Task を持たない completed state として扱う。
+    // AsTask() が guest-visible Task を要求した場合に限り、通常の heap allocation を通した
+    // Task を型ごとに再利用する。Lazy は heap lock と lifetime lock の逆順取得を防ぐ。
+    private readonly Dictionary<VmType, CompletedTaskCacheEntry> _completedSentinels =
+        new(VmTypeIdentityComparer.Instance);
     private readonly ConcurrentDictionary<int, Thread> _workers = new();
     private readonly object _lifetimeGate = new();
     private readonly int _maxWorkers = maxWorkers;
@@ -53,6 +56,12 @@ internal sealed class GuestTaskRuntime(
             yield return roots;
         foreach (var roots in _continuationRoots.Values)
             yield return roots;
+        CompletedTaskCacheEntry[] sentinels;
+        lock (_lifetimeGate)
+            sentinels = [.. _completedSentinels.Values];
+        foreach (var sentinel in sentinels)
+            if (sentinel.Root is { } root)
+                yield return [StackSlot.OfObject(root)];
     }
 
     public void Complete(VmTaskObject task, StackSlot result = default) {
@@ -146,20 +155,28 @@ internal sealed class GuestTaskRuntime(
     }
 
     /// <summary>
-    /// 既定値の ValueTask が AsTask 等で内部 Task 表現を必要とするときの完了済み sentinel。
-    /// 同じ VM 内では同じ Task 型の sentinel を再利用し、呼び出しごとの VmTaskObject 生成と
-    /// guest heap quota の計上を避ける。default(T) は型ごとに同一なので最初の値を保持すればよい。
+    /// 既定値の ValueTask が AsTask で guest-visible Task を必要とするときの完了済み Task。
+    /// default(ValueTask) 自体はこのオブジェクトを必要とせず、null backing task を completed
+    /// state として使う。AsTask が初めて呼ばれた時だけ heap に割り当て、その後は型ごとに再利用する。
     /// </summary>
-    public VmTaskObject CompletedSentinel(VmType type, StackSlot result = default) {
+    public VmTaskObject CompletedSentinel(VmType type, StackSlot result, VmHeap heap) {
+        CompletedTaskCacheEntry sentinel;
         lock (_lifetimeGate) {
             ThrowIfDisposed();
-            if (_completedSentinels.TryGetValue(type.FullName, out var existing))
-                return existing;
+            if (!_completedSentinels.TryGetValue(type, out sentinel!)) {
+                sentinel = new CompletedTaskCacheEntry(type, result, heap);
+                _completedSentinels.Add(type, sentinel);
+            }
+        }
+        return sentinel.Get();
+    }
 
-            var task = new VmTaskObject(type);
-            task.SetResult(result);
-            _completedSentinels.Add(type.FullName, task);
-            return task;
+    /// <summary>collectible ALC の型を参照する completed Task cache entry を解放する。</summary>
+    public void RemoveAssemblyContextCaches(VmAssemblyContext context) {
+        lock (_lifetimeGate) {
+            foreach (var type in _completedSentinels.Keys.ToArray())
+                if (context.OwnsType(type))
+                    _completedSentinels.Remove(type);
         }
     }
 
@@ -279,6 +296,7 @@ internal sealed class GuestTaskRuntime(
             if (_disposed)
                 return;
             _disposed = true;
+            _completedSentinels.Clear();
             timers = [.. _timers.Values];
             _timers.Clear();
             workers = [.. _workers.Values];
@@ -318,5 +336,74 @@ internal sealed class GuestTaskRuntime(
     private void ThrowIfDisposed() {
         if (_disposed)
             throw new ObjectDisposedException("VirtualMachine");
+    }
+
+    /// <summary>
+    /// Publishes the task as a GC root before heap registration. That closes the window where a
+    /// concurrent collection could sweep the object after Allocate returns but before Lazy stores it.
+    /// </summary>
+    private sealed class CompletedTaskCacheEntry {
+        private readonly Lazy<VmTaskObject> _task;
+        private VmTaskObject? _root;
+
+        public CompletedTaskCacheEntry(VmType type, StackSlot result, VmHeap heap) {
+            _task = new Lazy<VmTaskObject>(() => {
+                var task = new VmTaskObject(type);
+                task.SetResult(result);
+                Volatile.Write(ref _root, task);
+                return heap.Allocate(task);
+            }, LazyThreadSafetyMode.ExecutionAndPublication);
+        }
+
+        public VmTaskObject? Root => Volatile.Read(ref _root);
+        public VmTaskObject Get() => _task.Value;
+    }
+
+    /// <summary>型名ではなく VM 型定義と型引数の identity による cache key 比較。</summary>
+    private sealed class VmTypeIdentityComparer : IEqualityComparer<VmType> {
+        public static VmTypeIdentityComparer Instance { get; } = new();
+
+        public bool Equals(VmType? x, VmType? y) {
+            if (ReferenceEquals(x, y))
+                return true;
+            if (x is null || y is null)
+                return false;
+            return (x, y) switch {
+                (VmConstructedType left, VmConstructedType right) =>
+                    Equals(left.Definition, right.Definition) && SequenceEqual(left.TypeArguments, right.TypeArguments),
+                (VmArrayType left, VmArrayType right) => Equals(left.ElementType, right.ElementType),
+                (VmMultiDimArrayType left, VmMultiDimArrayType right) =>
+                    left.Rank == right.Rank && Equals(left.ElementType, right.ElementType),
+                (VmByRefType left, VmByRefType right) => Equals(left.ElementType, right.ElementType),
+                _ => false,
+            };
+        }
+
+        public int GetHashCode(VmType type) => type switch {
+            VmConstructedType constructed => CombineHash(
+                GetHashCode(constructed.Definition), constructed.TypeArguments),
+            VmArrayType array => HashCode.Combine(typeof(VmArrayType), GetHashCode(array.ElementType)),
+            VmMultiDimArrayType array => HashCode.Combine(typeof(VmMultiDimArrayType), array.Rank, GetHashCode(array.ElementType)),
+            VmByRefType byRef => HashCode.Combine(typeof(VmByRefType), GetHashCode(byRef.ElementType)),
+            _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(type),
+        };
+
+        private bool SequenceEqual(VmType[] left, VmType[] right) {
+            if (left.Length != right.Length)
+                return false;
+            for (var index = 0; index < left.Length; index++)
+                if (!Equals(left[index], right[index]))
+                    return false;
+            return true;
+        }
+
+        private int CombineHash(int definitionHash, VmType[] arguments) {
+            var hash = new HashCode();
+            hash.Add(typeof(VmConstructedType));
+            hash.Add(definitionHash);
+            foreach (var argument in arguments)
+                hash.Add(GetHashCode(argument));
+            return hash.ToHashCode();
+        }
     }
 }

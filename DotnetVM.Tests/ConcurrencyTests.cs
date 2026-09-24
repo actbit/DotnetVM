@@ -87,6 +87,7 @@ public sealed class ConcurrencyTests {
                 public static int RunDefaultValueTaskOfT() => AwaitDefaultValueTaskOfT().GetAwaiter().GetResult();
                 public static int RunDefaultValueTaskConfigureAwait() =>
                     default(ValueTask<int>).ConfigureAwait(false).GetAwaiter().GetResult();
+                public static Task<int> DefaultValueTaskAsTask() => default(ValueTask<int>).AsTask();
                 public static int ProbeDefaultValueTaskAllocations(int count) {
                     var voidValue = default(ValueTask);
                     var value = default(ValueTask<int>);
@@ -311,6 +312,24 @@ public sealed class ConcurrencyTests {
         var after = vm.Heap.Snapshot();
         Assert.Equal(before.TotalAllocatedBytes, after.TotalAllocatedBytes);
         Assert.Equal(before.LiveBytes, after.LiveBytes);
+    }
+
+    [Fact]
+    public void DefaultValueTask_AsTaskAllocatesOneHeapTrackedTaskPerVmType() {
+        using var vm = CreateVm();
+        var before = vm.Heap.Snapshot();
+
+        var first = Assert.IsType<VmTaskObject>(vm.Invoke("Vm.ConcurrentCode", "DefaultValueTaskAsTask"));
+        var afterFirst = vm.Heap.Snapshot();
+        Assert.True(afterFirst.TotalAllocatedBytes > before.TotalAllocatedBytes);
+        Assert.True(first.IsCompleted);
+        Assert.Equal(0, first.Snapshot().Result.AsInt32);
+
+        var second = Assert.IsType<VmTaskObject>(vm.Invoke("Vm.ConcurrentCode", "DefaultValueTaskAsTask"));
+        var afterSecond = vm.Heap.Snapshot();
+        Assert.Same(first, second);
+        Assert.Equal(afterFirst.TotalAllocatedBytes, afterSecond.TotalAllocatedBytes);
+        Assert.Equal(afterFirst.LiveBytes, afterSecond.LiveBytes);
     }
 
     [Fact]

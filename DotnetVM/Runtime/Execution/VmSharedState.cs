@@ -1,3 +1,4 @@
+using DotnetVM.Host;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 using System.Globalization;
@@ -14,10 +15,13 @@ public sealed class VmSharedState : IDisposable {
     private readonly System.Threading.ThreadLocal<int> _lastSystemError = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly GuestWorkerBudget _workerBudget;
+    private readonly Func<DateTimeOffset> _clockProvider;
+    private readonly VmRandomFill _randomFill;
     private int _disposed;
 
     public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
-        int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null) {
+        int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null,
+        Func<DateTimeOffset>? clockProvider = null, VmRandomFill? randomFill = null) {
         if (maxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(maxGuestThreads));
         if (maxTaskWorkers < 1)
@@ -31,6 +35,8 @@ public sealed class VmSharedState : IDisposable {
 
         var configuredCulture = culture ?? CultureInfo.InvariantCulture;
         Culture = CultureInfo.ReadOnly((CultureInfo)configuredCulture.Clone());
+        _clockProvider = clockProvider ?? (static () => DateTimeOffset.UtcNow);
+        _randomFill = randomFill ?? (static buffer => System.Security.Cryptography.RandomNumberGenerator.Fill(buffer));
         _workerBudget = new GuestWorkerBudget(maxGuestWorkers);
         GuestThreads = new GuestThreadRuntime(maxGuestThreads, _workerBudget, _shutdown.Token,
             shutdownTimeoutMilliseconds);
@@ -40,6 +46,11 @@ public sealed class VmSharedState : IDisposable {
 
     /// <summary>VM 固有の読み取り専用カルチャ設定。</summary>
     public CultureInfo Culture { get; }
+
+    internal DateTime ReadNow() => _clockProvider().LocalDateTime;
+    internal DateTime ReadUtcNow() => _clockProvider().UtcDateTime;
+    internal DateTime ReadToday() => _clockProvider().LocalDateTime.Date;
+    internal void FillRandom(Span<byte> buffer) => _randomFill(buffer);
 
     /// <summary>Guest Thread の実行と join 状態 (VM ごとに分離)。</summary>
     internal GuestThreadRuntime GuestThreads { get; }
@@ -91,6 +102,7 @@ public sealed class VmSharedState : IDisposable {
     /// <summary>ALC 由来の VM-wide 型初期化状態と RuntimeType ファサードを解放する。</summary>
     internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
         TypeInitialization.RemoveForContext(context);
+        GuestTasks.RemoveAssemblyContextCaches(context);
         foreach (var type in TypeFacades.Keys)
             if (context.OwnsType(type))
                 TypeFacades.TryRemove(type, out _);

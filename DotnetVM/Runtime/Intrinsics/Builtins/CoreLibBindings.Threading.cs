@@ -238,7 +238,7 @@ internal static partial class CoreLibBindings {
             return ctx.Heap.Allocate(ctx.Shared.GuestTasks.Create(taskType, completed, result));
         }
         static VmTaskObject CompletedTask(IntrinsicContext ctx, bool generic, VmType? resultType, StackSlot result) =>
-            ctx.Shared.GuestTasks.CompletedSentinel(TaskType(ctx, generic, resultType), result);
+            ctx.Shared.GuestTasks.CompletedSentinel(TaskType(ctx, generic, resultType), result, ctx.Heap);
         static VmType AwaiterType(IntrinsicContext ctx, bool generic, VmType? resultType, bool valueTask) {
             var definition = FindType(ctx, valueTask
                 ? (generic ? valueTaskAwaiterOfT : valueTaskAwaiter)

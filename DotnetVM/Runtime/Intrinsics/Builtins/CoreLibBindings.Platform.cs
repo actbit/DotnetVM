@@ -73,7 +73,7 @@ internal static partial class CoreLibBindings {
         // P/Invoke 呼出元は TrustedCoreLib domain に限定し、ゲストからの直接呼出は拒否する。
         r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
                 "System.IntPtr", "System.Byte*", "System.Int32", "System.Int32"),
-            static (_, a) => {
+            static (ctx, a) => {
                 var count = a[2].AsInt32;
                 if (count < 0)
                     throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
@@ -83,7 +83,7 @@ internal static partial class CoreLibBindings {
                     if (native.ByteOffset < 0 || (long)native.ByteOffset + count > native.Bytes.Length)
                         throw new InvalidOperationException(
                             $"BCryptGenRandom がブロック外を参照します (offset={native.ByteOffset}, {count} バイト)。");
-                    RandomNumberGenerator.Fill(native.Bytes.AsSpan(native.ByteOffset, count));
+                    ctx.Shared.FillRandom(native.Bytes.AsSpan(native.ByteOffset, count));
                     return StackSlot.OfInt32(0);
                 }
                 // マネージポインタ (Marvin seed の stackalloc ulong)。既知の Int64 スロット
@@ -105,7 +105,7 @@ internal static partial class CoreLibBindings {
                                 $"BCryptGenRandom のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
                         BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
                         var writeCount = Math.Min(8, remaining);
-                        RandomNumberGenerator.Fill(bytes[..writeCount]);
+                        ctx.Shared.FillRandom(bytes[..writeCount]);
                         byRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
                         remaining -= writeCount;
                         index++;

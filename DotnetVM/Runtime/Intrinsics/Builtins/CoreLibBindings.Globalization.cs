@@ -127,13 +127,13 @@ internal static partial class CoreLibBindings {
         var dateTimeT = "System.DateTime";
         // 時計情報はホスト環境から読む低リスクな読み取り面。ゲストへ直接 OS P/Invoke
         // させず、ホスト BCL の UTC / local clock を DateTime の VM 表現へコピーする。
-        foreach (var (getter, readClock) in new (string Getter, Func<DateTime> ReadClock)[] {
-            ("get_Now", static () => DateTime.Now),
-            ("get_UtcNow", static () => DateTime.UtcNow),
-            ("get_Today", static () => DateTime.Today),
+        foreach (var (getter, readClock) in new (string Getter, Func<VmSharedState, DateTime> ReadClock)[] {
+            ("get_Now", static shared => shared.ReadNow()),
+            ("get_UtcNow", static shared => shared.ReadUtcNow()),
+            ("get_Today", static shared => shared.ReadToday()),
         }) {
             r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, getter, dateTimeT, []),
-                (ctx, _) => MakeDateTimeStruct(ctx, readClock()),
+                (ctx, _) => MakeDateTimeStruct(ctx, readClock(ctx.Shared)),
                 BindingOrigin.Managed);
         }
         // DateTime.Parse (string[, provider]): 本家 IL は culture 機構 (CultureInfo.GetCultureInfo →

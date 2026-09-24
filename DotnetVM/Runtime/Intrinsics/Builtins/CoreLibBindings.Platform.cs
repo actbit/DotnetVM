@@ -116,6 +116,58 @@ internal static partial class CoreLibBindings {
                     $"BCryptGenRandom のバッファがバイト実体ではありません ({a[1].Kind})。");
             },
             BindingOrigin.PInvokeReplacement);
+        // Unix CoreLib は同じ乱数源を Interop+Sys.GetNonCryptographicallySecureRandomBytes
+        // (SystemNative) 経由で呼ぶ。ネイティブ import は実行せず、Windows 側の
+        // BCrypt 代替と同じく VM のホスト RNG に委譲する。
+        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys", "GetNonCryptographicallySecureRandomBytes",
+                "System.Byte*", "System.Int32"),
+            static (ctx, a) => {
+                var count = a[1].AsInt32;
+                if (count < 0)
+                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
+                if (count == 0)
+                    return null;
+
+                var (native, slotRef) = ResolvePointerBase(a[0],
+                    "Interop+Sys.GetNonCryptographicallySecureRandomBytes");
+                if (native is not null) {
+                    if (native.ByteOffset < 0 || (long)native.ByteOffset + count > native.Bytes.Length)
+                        throw new InvalidOperationException(
+                            $"GetNonCryptographicallySecureRandomBytes がブロック外を参照します (offset={native.ByteOffset}, {count} バイト)。");
+                    ctx.Shared.FillRandom(native.Bytes.AsSpan(native.ByteOffset, count));
+                    return null;
+                }
+
+                // Marvin の seed は stackalloc ではなくローカル ulong のアドレスとして
+                // 渡る構成もあるため、byref の Int64 スロット列も扱う。
+                if (slotRef is not null) {
+                    slotRef.EnsureWritable();
+                    var slots = (int)(((long)count + 7) / 8);
+                    if (slotRef.Index < 0 || slots > slotRef.Container.Length - slotRef.Index)
+                        throw new InvalidOperationException(
+                            $"GetNonCryptographicallySecureRandomBytes がスロット列の範囲外を参照します (index={slotRef.Index}, {count} バイト)。");
+                    var remaining = count;
+                    var index = slotRef.Index;
+                    Span<byte> bytes = stackalloc byte[8];
+                    while (remaining > 0) {
+                        var slot = slotRef.Container[index];
+                        if (slot.Kind != StackKind.Int64)
+                            throw new InvalidOperationException(
+                                $"GetNonCryptographicallySecureRandomBytes のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
+                        BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
+                        var writeCount = Math.Min(8, remaining);
+                        ctx.Shared.FillRandom(bytes[..writeCount]);
+                        slotRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
+                        remaining -= writeCount;
+                        index++;
+                    }
+                    return null;
+                }
+
+                throw new InvalidOperationException(
+                    $"GetNonCryptographicallySecureRandomBytes のバッファがバイト実体ではありません ({a[0].Kind})。");
+            },
+            BindingOrigin.PInvokeReplacement);
         // GlobalizationMode+Settings::get_Invariant を true 固定にする (VM 規約: culture は
         // 不変カルチャ固定)。本家の DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論
         // で、本家 IL の分岐は CultureInfo::GetUserDefaultLocaleName 等の OS locale 取得

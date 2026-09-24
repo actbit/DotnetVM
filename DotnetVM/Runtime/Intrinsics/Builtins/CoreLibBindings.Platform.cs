@@ -68,6 +68,14 @@ internal static partial class CoreLibBindings {
                 "System.String", "System.Char&", "System.UInt32"),
             static (ctx, a) => GetEnvironmentVariableImpl(ctx, a),
             BindingOrigin.PInvokeReplacement);
+        // Linux CoreLib uses Interop+Sys for Marvin / Dictionary hash seeding instead of the
+        // Windows BCrypt surface.  Keep the same VM-owned random source and never execute the
+        // native P/Invoke implementation.
+        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys",
+                "GetNonCryptographicallySecureRandomBytes", "System.Byte*", "System.Int32"),
+            static (ctx, a) => FillRandomBytes(ctx, a[0], a[1].AsInt32,
+                "GetNonCryptographicallySecureRandomBytes"),
+            BindingOrigin.PInvokeReplacement);
         // Interop+BCrypt.BCryptGenRandom (Random / Marvin ハッシュ種等の乱数源 P/Invoke)。
         // 任意の native import は実行せず、ホスト暗号乱数 API に限定して委譲する。
         // P/Invoke 呼出元は TrustedCoreLib domain に限定し、ゲストからの直接呼出は拒否する。
@@ -75,45 +83,7 @@ internal static partial class CoreLibBindings {
                 "System.IntPtr", "System.Byte*", "System.Int32", "System.Int32"),
             static (ctx, a) => {
                 var count = a[2].AsInt32;
-                if (count < 0)
-                    throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
-                if (count == 0)
-                    return StackSlot.OfInt32(0);
-                if (a[1].ObjectValue is VmNativePointer native) {
-                    if (native.ByteOffset < 0 || (long)native.ByteOffset + count > native.Bytes.Length)
-                        throw new InvalidOperationException(
-                            $"BCryptGenRandom がブロック外を参照します (offset={native.ByteOffset}, {count} バイト)。");
-                    ctx.Shared.FillRandom(native.Bytes.AsSpan(native.ByteOffset, count));
-                    return StackSlot.OfInt32(0);
-                }
-                // マネージポインタ (Marvin seed の stackalloc ulong)。既知の Int64 スロット
-                // のみ扱い、他の managed バッファ表現は誤書込みを避けて fail-closed にする。
-                if (a[1].Kind == StackKind.ByRef && a[1].ObjectValue is VmByRef byRef) {
-                    if (byRef.Container.Length == 0)
-                        throw new UnhandledGuestException("System.NullReferenceException", null);
-                    var slots = (int)(((long)count + 7) / 8);
-                    if (byRef.Index < 0 || slots > byRef.Container.Length - byRef.Index)
-                        throw new InvalidOperationException(
-                            $"BCryptGenRandom がスロット列の範囲外を参照します (index={byRef.Index}, {count} バイト)。");
-                    var remaining = count;
-                    var index = byRef.Index;
-                    Span<byte> bytes = stackalloc byte[8];
-                    while (remaining > 0) {
-                        var slot = byRef.Container[index];
-                        if (slot.Kind != StackKind.Int64)
-                            throw new InvalidOperationException(
-                                $"BCryptGenRandom のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
-                        BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
-                        var writeCount = Math.Min(8, remaining);
-                        ctx.Shared.FillRandom(bytes[..writeCount]);
-                        byRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
-                        remaining -= writeCount;
-                        index++;
-                    }
-                    return StackSlot.OfInt32(0);
-                }
-                throw new InvalidOperationException(
-                    $"BCryptGenRandom のバッファがバイト実体ではありません ({a[1].Kind})。");
+                return FillRandomBytes(ctx, a[1], count, "BCryptGenRandom");
             },
             BindingOrigin.PInvokeReplacement);
         // GlobalizationMode+Settings::get_Invariant を true 固定にする (VM 規約: culture は
@@ -133,6 +103,49 @@ internal static partial class CoreLibBindings {
                 ? DefaultIntrinsics.MakeRuntimeObject(ctx, handle.Target)
                 : throw new InvalidOperationException("GetTypeFromHandle の引数が RuntimeTypeHandle ではありません。"),
             BindingOrigin.InternalCall);
+    }
+
+    private static StackSlot FillRandomBytes(IntrinsicContext ctx, StackSlot buffer, int count,
+        string operation) {
+        if (count < 0)
+            throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
+        if (count == 0)
+            return StackSlot.OfInt32(0);
+        if (buffer.ObjectValue is VmNativePointer native) {
+            if (native.ByteOffset < 0 || (long)native.ByteOffset + count > native.Bytes.Length)
+                throw new InvalidOperationException(
+                    $"{operation} がブロック外を参照します (offset={native.ByteOffset}, {count} バイト)。");
+            ctx.Shared.FillRandom(native.Bytes.AsSpan(native.ByteOffset, count));
+            return StackSlot.OfInt32(0);
+        }
+        // マネージポインタ (Marvin seed の stackalloc ulong)。既知の Int64 スロット
+        // のみ扱い、他の managed バッファ表現は誤書込みを避けて fail-closed にする。
+        if (buffer.Kind == StackKind.ByRef && buffer.ObjectValue is VmByRef byRef) {
+            if (byRef.Container.Length == 0)
+                throw new UnhandledGuestException("System.NullReferenceException", null);
+            var slots = (int)(((long)count + 7) / 8);
+            if (byRef.Index < 0 || slots > byRef.Container.Length - byRef.Index)
+                throw new InvalidOperationException(
+                    $"{operation} がスロット列の範囲外を参照します (index={byRef.Index}, {count} バイト)。");
+            var remaining = count;
+            var index = byRef.Index;
+            Span<byte> bytes = stackalloc byte[8];
+            while (remaining > 0) {
+                var slot = byRef.Container[index];
+                if (slot.Kind != StackKind.Int64)
+                    throw new InvalidOperationException(
+                        $"{operation} のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
+                BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
+                var writeCount = Math.Min(8, remaining);
+                ctx.Shared.FillRandom(bytes[..writeCount]);
+                byRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
+                remaining -= writeCount;
+                index++;
+            }
+            return StackSlot.OfInt32(0);
+        }
+        throw new InvalidOperationException(
+            $"{operation} のバッファがバイト実体ではありません ({buffer.Kind})。");
     }
 
 

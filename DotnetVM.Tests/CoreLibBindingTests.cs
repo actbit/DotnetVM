@@ -139,9 +139,9 @@ public class CoreLibBindingTests {
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "ReadLine"));
         // P/Invoke 代替バインドは監査表に載った例外面のみ (未登録 P/Invoke は fail-closed のまま、
         // PInvoke_Is_Rejected_As_OperationNotAllowed が検査)。既定登録の PInvokeReplacement は
-        // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現) と
-        // Interop+BCrypt::BCryptGenRandom (ホスト暗号乱数 API に限定した代替) の
-        // 2 面に限る (いずれも CoreLibSurfaceAudit に pinvoke-replacement として監査済み)
+        // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現)、
+        // Interop+BCrypt::BCryptGenRandom (Windows の乱数源)、Interop+Sys の Linux 乱数源の
+        // 3 面に限る (いずれも CoreLibSurfaceAudit に pinvoke-replacement として監査済み)
         var pinvokeFaces = vm.Bindings
             .Where(b => b.Origin == BindingOrigin.PInvokeReplacement)
             .Select(b => $"{b.Key.TypeFullName}::{b.Key.MethodName}")
@@ -150,6 +150,7 @@ public class CoreLibBindingTests {
         Assert.Equal(new[] {
             "Interop+BCrypt::BCryptGenRandom",
             "Interop+Kernel32::GetEnvironmentVariable",
+            "Interop+Sys::GetNonCryptographicallySecureRandomBytes",
         }, pinvokeFaces);
     }
 }

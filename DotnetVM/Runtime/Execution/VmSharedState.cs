@@ -1,5 +1,6 @@
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
+using System.Globalization;
 
 namespace DotnetVM.Runtime.Execution;
 
@@ -16,7 +17,7 @@ public sealed class VmSharedState : IDisposable {
     private int _disposed;
 
     public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
-        int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000) {
+        int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null) {
         if (maxGuestThreads < 1)
             throw new ArgumentOutOfRangeException(nameof(maxGuestThreads));
         if (maxTaskWorkers < 1)
@@ -28,12 +29,17 @@ public sealed class VmSharedState : IDisposable {
         if (shutdownTimeoutMilliseconds < 0)
             throw new ArgumentOutOfRangeException(nameof(shutdownTimeoutMilliseconds));
 
+        var configuredCulture = culture ?? CultureInfo.InvariantCulture;
+        Culture = CultureInfo.ReadOnly((CultureInfo)configuredCulture.Clone());
         _workerBudget = new GuestWorkerBudget(maxGuestWorkers);
         GuestThreads = new GuestThreadRuntime(maxGuestThreads, _workerBudget, _shutdown.Token,
             shutdownTimeoutMilliseconds);
         GuestTasks = new GuestTaskRuntime(maxTaskWorkers, maxPendingTaskTimers, _workerBudget, _shutdown.Token,
             shutdownTimeoutMilliseconds);
     }
+
+    /// <summary>VM 固有の読み取り専用カルチャ設定。</summary>
+    public CultureInfo Culture { get; }
 
     /// <summary>Guest Thread の実行と join 状態 (VM ごとに分離)。</summary>
     internal GuestThreadRuntime GuestThreads { get; }

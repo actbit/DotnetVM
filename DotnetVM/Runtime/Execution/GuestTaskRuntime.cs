@@ -18,6 +18,9 @@ internal sealed class GuestTaskRuntime(
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
+    // default(ValueTask) が Task 表現を要求されたときに使う VM-wide の完了済み sentinel。
+    // これは通常の guest allocation ではなく、Task 型ごとに一度だけ host 側で生成する。
+    private readonly Dictionary<string, VmTaskObject> _completedSentinels = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<int, Thread> _workers = new();
     private readonly object _lifetimeGate = new();
     private readonly int _maxWorkers = maxWorkers;
@@ -139,6 +142,24 @@ internal sealed class GuestTaskRuntime(
         } catch {
             _continuationRoots.TryRemove(id, out _);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 既定値の ValueTask が AsTask 等で内部 Task 表現を必要とするときの完了済み sentinel。
+    /// 同じ VM 内では同じ Task 型の sentinel を再利用し、呼び出しごとの VmTaskObject 生成と
+    /// guest heap quota の計上を避ける。default(T) は型ごとに同一なので最初の値を保持すればよい。
+    /// </summary>
+    public VmTaskObject CompletedSentinel(VmType type, StackSlot result = default) {
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            if (_completedSentinels.TryGetValue(type.FullName, out var existing))
+                return existing;
+
+            var task = new VmTaskObject(type);
+            task.SetResult(result);
+            _completedSentinels.Add(type.FullName, task);
+            return task;
         }
     }
 

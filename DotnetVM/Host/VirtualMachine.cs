@@ -51,8 +51,11 @@ public sealed class VirtualMachine : IDisposable {
             throw new ArgumentOutOfRangeException(nameof(options), "MaxPendingTaskTimers は 1 以上である必要があります。");
         if (_options.ShutdownTimeoutMilliseconds < 0)
             throw new ArgumentOutOfRangeException(nameof(options), "ShutdownTimeoutMilliseconds は 0 以上である必要があります。");
+        if (_options.Culture is null)
+            throw new ArgumentNullException(nameof(options), "Culture は null にできません。");
         _sharedState = new VmSharedState(_options.MaxGuestThreads, _options.MaxTaskWorkers,
-            _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds);
+            _options.MaxGuestWorkers, _options.MaxPendingTaskTimers, _options.ShutdownTimeoutMilliseconds,
+            _options.Culture);
         _heap = new VmHeap(_options.Memory, _options.Gc);
         _handleRoots = _handles.EnumerateRoots;
         _heap.AddRootObjectSource(_handleRoots); // ホスト保持参照 (GCHandle 相当) をルートに

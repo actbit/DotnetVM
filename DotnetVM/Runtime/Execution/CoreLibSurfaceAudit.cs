@@ -48,7 +48,7 @@ internal static class CoreLibSurfaceAudit {
     public const string JitIntrinsic = "jit-intrinsic: 実 CLR も JIT が IL を丸ごと置き換える面";
     public const string InternalCall = "internal-call: CoreLib 上で本体 IL が存在しない面 (InternalCall)";
     public const string RuntimeRepresentation = "runtime-representation: ランタイム内部表現依存で VM の表現モデルに落ちない面";
-    public const string CultureOutOfScope = "culture-out-of-scope: culture 機構スコープ外 (不変カルチャ固定) のため暫定委譲";
+    public const string CultureOutOfScope = "culture-out-of-scope: CultureInfo / CompareInfo の guest 実装が未対応のためホスト BCL へ委譲";
     public const string DeviceFace = "device: I/O は仮想デバイス / ゲートウェイ経由限定という VM 設計原則による面";
 
     /// <summary>登録済み全 intrinsic / バインドキーの分類表 (唯一の真実源)。</summary>
@@ -115,7 +115,7 @@ internal static class CoreLibSurfaceAudit {
         // 実 CLR も JIT intrinsic / ランタイム内部で処理する面と同型のため、同一意味論の
         // ホスト BCL 実装へ委譲し、戻り値は VM の System.Decimal 構造体値に正規化
         var decJ = RuntimeRepresentation +
-            " (本家 IL は Decimal ↔ DecCalc の Unsafe.As 参照再解釈で構成され VM のオブジェクト表現では IL 実行にできない。実 CLR も JIT intrinsic / 内部面として処理。ホスト同一意味論へ委譲、結果は VM 構造体値に正規化。ToString 書式面は (b) DecimalFormatting)";
+            " (本家 IL は Decimal ↔ DecCalc の Unsafe.As 参照再解釈で構成され VM のオブジェクト表現では IL 実行にできない。実 CLR も JIT intrinsic / 内部面として処理。ホスト同一意味論へ委譲、結果は VM 構造体値に正規化。Parse は VmHostOptions.Culture を使い、ToString 書式面は (b) DecimalFormatting)";
         Add("System.Decimal", "Parse", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
         Add("System.Decimal", "TryParse", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
         Add("System.Decimal", "op_Addition", CoreLibSurfaceKind.RuntimeInternal, decJ, hasThis: false);
@@ -170,9 +170,9 @@ internal static class CoreLibSurfaceAudit {
         // 本家 IL は Span / fixed char* 内部 (PadLeft/PadRight の SpanFill、Remove の
         // Substring+InnerAlloc 連鎖) と SCI 抽象化面 (SIMD ignore-case = ISimdVector static
         // abstract = VM 表現境界) で構成される。整形面はホスト ordinal 同意味論、SCI overload 群は
-        // culture 面 (下記) と同じ不変カルチャ写像で提供する
+        // culture 面 (下記) と同じ設定カルチャ委譲で提供する
         var cultureFaceJ = CultureOutOfScope +
-            "。本家 IL は CompareInfo (culture 機構) で構成され IL 移植対象外のため、不変カルチャ固定のホスト BCL 委譲を継続する (C5.5 Wave 5 で CurrentCulture から不変へ修正)";
+            "。本家 IL は CompareInfo (culture 機構) で構成され IL 移植対象外のため、VmHostOptions.Culture を適用したホスト BCL 委譲を使う";
         var stringFill = RuntimeRepresentation +
             " (本家 IL は SpanFill / InnerAlloc の fixed char* 内部 = VM 表現境界。ホスト ordinal 同意味論へ委譲)";
         Add("System.String", "Remove", CoreLibSurfaceKind.RuntimeInternal, stringFill, hasThis: true);
@@ -185,20 +185,23 @@ internal static class CoreLibSurfaceAudit {
             RuntimeRepresentation + " (連結本体は wstrcpy 生ポインタコピー面。要素の ToString は VM の暗黙 ToString フック経由で正規化)", hasThis: false);
 
         // ---- CoreLibBindings: System.TimeSpan / System.DateTime 面 (C5.5 探査テスト継続) ----
-        // culture 依存 IL 面の不変カルチャ委譲 (TimeSpan.Parse/ToString, DateTime.Parse/ToString/
+        // culture 依存 IL 面の設定カルチャ委譲 (TimeSpan.Parse/ToString, DateTime.Parse/ToString/
         // AddDays/AddYears/DateToTicks/DayOfWeek.ToString): 本家 IL は CultureInfo /
         // DateTimeFormatInfo / CompareInfo / Calendar (DaysToMonth365/366 FieldRVA static array +
         // RuntimeHelpers.CreateSpan + RuntimeFieldHandle.m_ptr) の culture 機構全面を辿るため
-        // VM 表現境界。VM 規約 (文化は不変カルチャ固定) と CLR の統合文化構成 (文化面の
-        // InvariantCulture 委譲) でクラッチ均衡する
+        // VM 表現境界。VM は外側の guest 呼出中に VmHostOptions.Culture を ambient culture として適用する
         var timeCultureJ = CultureOutOfScope +
             "。本家 IL は CultureInfo / DateTimeFormatInfo / Calendar (DaysToMonth365/366 の FieldRVA static array + RuntimeHelpers.CreateSpan 面 +" +
-            "RuntimeFieldHandle.m_ptr ByRef 読み) の culture 機構全面を辿るため、不変カルチャ固定のホスト BCL 委譲を継続する";
+            "RuntimeFieldHandle.m_ptr ByRef 読み) の culture 機構全面を辿るため、VmHostOptions.Culture を使うホスト BCL 委譲を継続する";
         Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 0);
         Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 1);
         Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 2);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
+        var hostClockJ = "host-managed-replacement: OS 時計 P/Invoke へゲストから到達させず、ホスト BCL の時刻値を DateTime 表現に変換";
+        Add("System.DateTime", "get_Now", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
+        Add("System.DateTime", "get_UtcNow", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
+        Add("System.DateTime", "get_Today", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
         Add("System.DateTime", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
         Add("System.DateTime", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
         Add("System.DateTime", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 0);
@@ -278,7 +281,7 @@ internal static class CoreLibSurfaceAudit {
         // Array コア面 (全 Sort/Reverse/IndexOf/Copy overload がここへ集約される。
         // 本家実 IL は introsort / 比較子生成 / MethodTable 内部表現で VM 表現境界)
         var arrayCoreJ = RuntimeRepresentation +
-            " (既定順序はプリミティブ数値 + 文字列不変カルチャのホスト比較と同一順序。カスタム IComparer 面はゲスト委譲機構が無いため fail-closed。多次元は RankException)";
+            " (既定順序はプリミティブ数値 + guest 呼出スコープの CurrentCulture による文字列比較。カスタム IComparer 面はゲスト委譲機構が無いため fail-closed。多次元は RankException)";
         Add("System.Array", "Sort", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 5);
         Add("System.Array", "Sort", CoreLibSurfaceKind.RuntimeInternal,
             arrayCoreJ + " (ジェネリック面は開いたキーで 1 件。比較子生成のランタイム内部を迂回する)", hasThis: false, paramCount: 1);
@@ -324,6 +327,8 @@ internal static class CoreLibSurfaceAudit {
         // 書式に culture 要素が無いためホスト委譲で完全一致。不正入力の分類も同一)
         var guidJ = RuntimeRepresentation +
             " (本家 IL は span 16 進解析 + SIMD フォーマット。ホスト同一意味論へ委譲。VM 表現は _a.._k 構造体値に正規化)";
+        Add("System.Guid", "NewGuid", CoreLibSurfaceKind.RuntimeInternal,
+            "host-managed-replacement: CoreLib の OS P/Invoke には入らず、ホスト BCL の GUID 生成 API に限定して委譲", hasThis: false, paramCount: 0);
         Add("System.Guid", "Parse", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 1);
         Add("System.Guid", "TryParse", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: false, paramCount: 2);
         Add("System.Guid", "ToString", CoreLibSurfaceKind.RuntimeInternal, guidJ, hasThis: true, paramCount: 0);
@@ -450,7 +455,7 @@ internal static class CoreLibSurfaceAudit {
         // culture 相当必須の面 (Compare / IndexOf(string) / LastIndexOf(string) /
         // StartsWith / EndsWith / 大文字小文字 / CompareTo) は本家 IL が CultureInfo /
         // CompareInfo / TextInfo (culture 機構) で構成され IL 移植対象外のため、
-        // VM 規約の不変カルチャ固定をホスト BCL 委譲 (① バインド) で提供する。
+        // VmHostOptions.Culture を適用したホスト BCL 委譲 (① バインド) で提供する。
         // ordinal 近似の IL 移植候補との ASCII+非 ASCII ファズ突合で差分が証明済み
         // (インバリアントの ß/ss 等の比較等価は ordinal では再現できない)。
         // 対して ordinal 面 (CompareOrdinal / IndexOf(char) / LastIndexOf(char) /
@@ -462,7 +467,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: false, paramCount: 2);
         // StringComparison overload 群: 本家 IL は ordinal 面と CompareInfo / SpanHelpers SIMD
         // 抽象化面 (EqualsIgnoreCase_Vector は ISimdVector static abstract = VM 表現境界) に
-        // 分かれるため culture 面と同じホスト BCL 委譲。CurrentCulture 系 SCI は不変へ写像
+        // 分かれるため culture 面と同じホスト BCL 委譲。CurrentCulture 系 SCI は設定カルチャを使用
         Add("System.String", "Compare", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ +
             "。StringComparison 分岐後 ordinal 面は String.CompareOrdinal 直呼びに置換されるが SIMD ignore-case 面が culture / GSJA 抽象化に依存するため委譲に統一", hasThis: false, paramCount: 3);
         Add("System.String", "Equals", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ +
@@ -472,17 +477,22 @@ internal static class CoreLibSurfaceAudit {
         Add("System.String", "CompareOrdinal", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (実 IL は fixed byte* 比較。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: false, paramCount: 2);
         Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
+            cultureFaceJ + "。string 面は設定カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
         Add("System.String", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            cultureFaceJ + "。IndexOf(string, StringComparison) overload (SCI 面を不変カルチャ写像)。本家 IL は SpanHelpers SIMD ignore-case 抽象化を辿るため委譲", hasThis: true, paramCount: 2);
+            cultureFaceJ + "。IndexOf(string, StringComparison) overload (CurrentCulture は VM 設定カルチャ)。本家 IL は SpanHelpers SIMD ignore-case 抽象化を辿るため委譲", hasThis: true, paramCount: 2);
         Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            cultureFaceJ + "。string 面は不変カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
+            cultureFaceJ + "。string 面は設定カルチャ委譲の ① バインド、char 面は (b) 置換面 (ロード時)。未ロード時この legacy キーが受ける", hasThis: true, paramCount: 1);
         Add("System.String", "LastIndexOf", CoreLibSurfaceKind.RuntimeInternal,
-            cultureFaceJ + "。LastIndexOf(string, StringComparison) overload (SCI 面を不変カルチャ写Map)。SIMD 抽象化のため委譲", hasThis: true, paramCount: 2);
+            cultureFaceJ + "。LastIndexOf(string, StringComparison) overload (CurrentCulture は VM 設定カルチャ)。SIMD 抽象化のため委譲", hasThis: true, paramCount: 2);
         Add("System.String", "Contains", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (実 IL は SpanHelpers SIMD intrinsic 面。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true, paramCount: 1);
         Add("System.String", "StartsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true, paramCount: 1);
         Add("System.String", "EndsWith", CoreLibSurfaceKind.RuntimeInternal, cultureFaceJ, hasThis: true, paramCount: 1);
+        var stringNormalizationJ = "pinvoke-replacement: CoreLib IL は Interop.Globalization (System.Globalization.Native) を呼ぶ。VM はホスト managed String normalization に委譲";
+        Add("System.String", "Normalize", CoreLibSurfaceKind.RuntimeInternal, stringNormalizationJ, hasThis: true, paramCount: 0);
+        Add("System.String", "Normalize", CoreLibSurfaceKind.RuntimeInternal, stringNormalizationJ, hasThis: true, paramCount: 1);
+        Add("System.String", "IsNormalized", CoreLibSurfaceKind.RuntimeInternal, stringNormalizationJ, hasThis: true, paramCount: 0);
+        Add("System.String", "IsNormalized", CoreLibSurfaceKind.RuntimeInternal, stringNormalizationJ, hasThis: true, paramCount: 1);
         Add("System.String", "Replace", CoreLibSurfaceKind.RuntimeInternal,
             RuntimeRepresentation + " (実 IL は Span ベース表現。ordinal。ロード時は (b) 置換面 StringOrdinalOps、未ロード時この legacy キー)", hasThis: true, paramCount: 2);
         Add("System.String", "Format", CoreLibSurfaceKind.RuntimeInternal,
@@ -492,7 +502,7 @@ internal static class CoreLibSurfaceAudit {
 
         // ---- CoreLibBindings: System.Char culture 面 (C5.5 Wave 5 継続) ----
         var charCultureJ = CultureOutOfScope +
-            "。本家 IL は CultureInfo.CurrentCulture.TextInfo (culture 機構) を辿るため不変カルチャ規約どおりホストの不変面へ委譲";
+            "。本家 IL は CultureInfo.CurrentCulture.TextInfo (culture 機構) を辿るため設定カルチャでホストへ委譲";
         Add("System.Char", "ToUpper", CoreLibSurfaceKind.RuntimeInternal, charCultureJ, hasThis: false, paramCount: 1);
         Add("System.Char", "ToLower", CoreLibSurfaceKind.RuntimeInternal, charCultureJ, hasThis: false, paramCount: 1);
         Add("System.Char", "GetNumericValue", CoreLibSurfaceKind.RuntimeInternal,
@@ -577,7 +587,7 @@ internal static class CoreLibSurfaceAudit {
         Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
         Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: 乱数源 P/Invoke の代替実装を決定論的ゼロ埋めで委譲 (VM 決定論規約。ネイティブ実行はしない。ハッシュ利用面の観測意味論は同一)", hasThis: false, paramCount: 4);
+            "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
             InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 
@@ -792,9 +802,9 @@ internal static class CoreLibSurfaceAudit {
         var stringSubstituteShadow = "shadowed-legacy (ロード時は ② IL 解決後の choke point で (b) 置換面に差し替え。未ロード時は ③ legacy intrinsic が受ける)";
         // culture 面 (C5.5 Wave 5 確定): 本家 IL は CultureInfo.CurrentCulture.TextInfo /
         // CompareInfo (culture 機構) を辿るため ② IL 実行では fail-closed になる。
-        // 不変カルチャ規約の同一結果を ① バインドで優先提供し、未ロード時はこの legacy キーが受ける
+        // 設定カルチャの比較を ① バインドで優先提供し、未ロード時はこの legacy キーが受ける
         var stringCultureJ = CultureOutOfScope +
-            " (本家 IL は culture 機構依存のため不変カルチャ固定のホスト委譲を ① バインドで優先提供。未ロード時この legacy キー)";
+            " (本家 IL は culture 機構依存のため VmHostOptions.Culture を適用したホスト委譲を ① バインドで優先提供。未ロード時この legacy キー)";
         Add("System.String", ".ctor", CoreLibSurfaceKind.RuntimeInternal,
             "shadowed-legacy (newobj string 構築は ObjectEngine の NewStringFromCtor が処理するため到達しない)", hasThis: true, paramCount: 0);
         foreach (var (method, hasThis, pc, kind, j) in new[] {

@@ -18,7 +18,7 @@ internal static partial class CoreLibBindings {
     /// 実 CLR もこれらの面を JIT intrinsic / ランタイム内部として処理することと同型であるため、
     /// 同一意味論のホスト BCL 実装へ委譲し、戻り値は VM の System.Decimal 構造体値に正規化する。
     /// ToString 書式面は VmCoreLibSurfaces 経由の DotnetVM.CoreLib.DecimalFormatting
-    /// (不変カルチャ固定) が担当 (Faces 置換面が先に解決されるため共存は競合しない)。</summary>
+    /// (不変カルチャ固定) が担当 (Faces 置換面が先に解決されるため共存は競合しない)。Parse は VM 設定カルチャを使う。</summary>
     private static void RegisterDecimalBindings(IntrinsicRegistry r) {
         const string T = "System.Decimal";
         const string Ret = "System.Decimal";
@@ -27,13 +27,13 @@ internal static partial class CoreLibBindings {
 
         static string? S(StackSlot[] a, int i) => (a[i].ObjectValue as VmString)?.Value;
 
-        // ---- 解析面 (Parse / TryParse): 不変カルチャ規約固定 (VM 規約)。
+        // ---- 解析面 (Parse / TryParse): guest 呼出スコープの CurrentCulture を使う。
         //      Parse 失敗は本家と同じ FormatException / OverflowException (ゲスト例外化) を投げる
         static StackSlot ParseImpl(IntrinsicContext ctx, StackSlot[] a, int styles) {
             try {
                 return StackSlot.OfValueType(MakeDecimalStruct(ctx,
                     decimal.Parse(S(a, 0) ?? "", (System.Globalization.NumberStyles)styles,
-                        System.Globalization.CultureInfo.InvariantCulture)));
+                        System.Globalization.CultureInfo.CurrentCulture)));
             } catch (FormatException) {
                 throw new UnhandledGuestException("System.FormatException", null);
             } catch (OverflowException) {
@@ -58,7 +58,7 @@ internal static partial class CoreLibBindings {
                 decimal value = 0m;
                 bool ok;
                 try {
-                    value = decimal.Parse(S(a, 0) ?? "", System.Globalization.CultureInfo.InvariantCulture);
+                    value = decimal.Parse(S(a, 0) ?? "", System.Globalization.CultureInfo.CurrentCulture);
                     ok = true;
                 } catch (FormatException) {
                     ok = false;
@@ -198,13 +198,13 @@ internal static partial class CoreLibBindings {
             static (ctx, a) => StackSlot.OfValueType(MakeDecimalStruct(ctx, decimal.Ceiling(ToDecimalValue(a[0])))), BindingOrigin.Managed);
     }
 
-    /// <summary>decimal の解析面 (不変カルチャ固定)。Parse 失敗は本家と同じ FormatException /
+    /// <summary>decimal の解析面 (guest 呼出スコープの CurrentCulture)。Parse 失敗は本家と同じ FormatException /
     /// OverflowException (ゲスト例外化) を投げる。</summary>
     private static StackSlot DecimalParse(IntrinsicContext ctx, string? s, int styles) {
         try {
             return StackSlot.OfValueType(MakeDecimalStruct(ctx,
                 decimal.Parse(s ?? "", (System.Globalization.NumberStyles)styles,
-                    System.Globalization.CultureInfo.InvariantCulture)));
+                    System.Globalization.CultureInfo.CurrentCulture)));
         } catch (FormatException) {
             throw new UnhandledGuestException("System.FormatException", null);
         } catch (OverflowException) {

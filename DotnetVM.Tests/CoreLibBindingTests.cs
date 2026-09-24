@@ -140,7 +140,7 @@ public class CoreLibBindingTests {
         // P/Invoke 代替バインドは監査表に載った例外面のみ (未登録 P/Invoke は fail-closed のまま、
         // PInvoke_Is_Rejected_As_OperationNotAllowed が検査)。既定登録の PInvokeReplacement は
         // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現) と
-        // Interop+BCrypt::BCryptGenRandom (乱数源の決定論的代替。Dictionary の Marvin 種等) の
+        // Interop+BCrypt::BCryptGenRandom (ホスト暗号乱数 API に限定した代替) の
         // 2 面に限る (いずれも CoreLibSurfaceAudit に pinvoke-replacement として監査済み)
         var pinvokeFaces = vm.Bindings
             .Where(b => b.Origin == BindingOrigin.PInvokeReplacement)

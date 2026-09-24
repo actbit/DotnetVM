@@ -5,6 +5,7 @@ using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
+using System.Text;
 
 namespace DotnetVM.Runtime.Intrinsics.Builtins;
 
@@ -22,7 +23,7 @@ internal static partial class CoreLibBindings {
             static (ctx, a) => ConcatArray(ctx, a), BindingOrigin.Managed);
         // ---- culture 相当必須面 (C5.5 Wave 5 確定): 本家 IL は CultureInfo /
         //      CompareInfo (culture 機構) で構成され culture スコープ外のため、
-        //      VM 規約の不変カルチャ固定をホスト BCL の InvariantCulture 面で委譲する
+        //      VmHostOptions.Culture で設定された CurrentCulture 面をホスト BCL へ委譲する
         //      (不変カルチャ比較 IL 移植候補とのファズ突合で非 ASCII 差分が証明済み —
         //      ordinal 近似では ß/ss 等のインバリアント等価が再現できない)。
         //      対応する ordinal / 置換面 (CompareOrdinal / IndexOf(char) / Contains /
@@ -32,10 +33,12 @@ internal static partial class CoreLibBindings {
         static string? Ns(StackSlot[] a, int i) => (a[i].ObjectValue as VmString)?.Value;
         static VmString Str(StackSlot[] a, int i) =>
             a[i].ObjectValue as VmString ?? throw new UnhandledGuestException("System.NullReferenceException", null);
+        static void ChargeCultureWork(IntrinsicContext ctx, string? left, string? right = null) =>
+            ctx.Heap.ChargeHostWork(HostWorkChars(left, right));
         r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String"),
             static (ctx, a) => {
-                ctx.Heap.ChargeHostWork(HostWorkChars(Ns(a, 0), Ns(a, 1)));
-                return StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.InvariantCulture));
+                ChargeCultureWork(ctx, Ns(a, 0), Ns(a, 1));
+                return StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), StringComparison.CurrentCulture));
             },
             BindingOrigin.Managed);
         // Equals(String, String) (op_Equality の呼び先): 本家 IL 末尾が SpanHelpers.SequenceEqual
@@ -51,56 +54,110 @@ internal static partial class CoreLibBindings {
         // EqualsIgnoreCase_Vector は ISimdVector<TVector,T> static abstract = GSJA 抽象化で
         // Vector128<T> inline 表現依存) に分かれる。SIMD 抽象化面は VM 表現境界のため、
         // SCI 面 3 overload を上記 culture 面と同じホスト BCL 委譲に統一する。
-        // CurrentCulture / CurrentCultureIgnoreCase は VM 規約 (不変カルチャ固定) どおり
-        // InvariantCulture / InvariantCultureIgnoreCase へ写像し、Ordinal 系はそのまま通す
-        static StringComparison InvariantOf(int comparison) => comparison switch {
-            0 => StringComparison.InvariantCulture,            // CurrentCulture
-            1 => StringComparison.InvariantCultureIgnoreCase, // CurrentCultureIgnoreCase
+        // CurrentCulture 系は guest 呼出スコープで設定されたカルチャを使い、Invariant / Ordinal 系はそのまま通す
+        static StringComparison ConfiguredComparison(int comparison) => comparison switch {
+            0 => StringComparison.CurrentCulture,
+            1 => StringComparison.CurrentCultureIgnoreCase,
             2 => StringComparison.InvariantCulture,
             3 => StringComparison.InvariantCultureIgnoreCase,
             4 => StringComparison.Ordinal,
             _ => StringComparison.OrdinalIgnoreCase,
         };
         r.RegisterBinding(BindingKey.Static(T, "Equals", "System.String", "System.String", "System.StringComparison"),
-            static (_, a) => StackSlot.OfInt32(string.Equals(Ns(a, 0), Ns(a, 1), InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Ns(a, 0), Ns(a, 1));
+                return StackSlot.OfInt32(string.Equals(Ns(a, 0), Ns(a, 1), ConfiguredComparison(a[2].AsInt32)) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "Equals", "System.String", "System.StringComparison"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.Equals(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.Equals(Str(a, 1).Value, ConfiguredComparison(a[2].AsInt32)) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Static(T, "Compare", "System.String", "System.String", "System.StringComparison"),
-            static (_, a) => StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), InvariantOf(a[2].AsInt32))),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Ns(a, 0), Ns(a, 1));
+                return StackSlot.OfInt32(string.Compare(Ns(a, 0), Ns(a, 1), ConfiguredComparison(a[2].AsInt32)));
+            },
             BindingOrigin.Managed);
         // CompareTo (instance): 本家 IL も CurrentCulture の Compare を呼ぶ文化面。
         // ① が ② IL より先に解決されるため、無いと IL 実行時に CompareInfo で fail-closed になる
         r.RegisterBinding(BindingKey.Instance(T, "CompareTo", "System.String"),
-            static (_, a) => StackSlot.OfInt32(string.Compare(Str(a, 0).Value, Str(a, 1).Value, StringComparison.InvariantCulture)),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(string.Compare(Str(a, 0).Value, Str(a, 1).Value, StringComparison.CurrentCulture));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "IndexOf", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Str(a, 1).Value, StringComparison.InvariantCulture)),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Str(a, 1).Value, StringComparison.CurrentCulture));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "LastIndexOf", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, StringComparison.InvariantCulture)),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, StringComparison.CurrentCulture));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "StartsWith", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.StartsWith(Str(a, 1).Value, StringComparison.InvariantCulture) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.StartsWith(Str(a, 1).Value, StringComparison.CurrentCulture) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "EndsWith", "System.String"),
-            static (_, a) => StackSlot.OfInt32(Str(a, 0).Value.EndsWith(Str(a, 1).Value, StringComparison.InvariantCulture) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.EndsWith(Str(a, 1).Value, StringComparison.CurrentCulture) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         // 大文字小文字面: 本家 IL は CultureInfo.CurrentCulture.TextInfo (culture 機構 +
-        // InternalCall) を辿る。不変カルチャ規約ではホストの不変大文字小文字化と同一結果。
+        // InternalCall) を辿るため、設定カルチャを適用した guest 呼出スコープでホスト BCL に委譲する。
         // ToUpperInvariant / ToLowerInvariant も本家 IL は TextInfo を辿るため同様に委譲する
         r.RegisterBinding(BindingKey.Instance(T, "ToUpper"),
-            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToUpperInvariant())),
+            static (ctx, a) => {
+                var value = Str(a, 0).Value;
+                ctx.Heap.ChargeHostWork(value.Length);
+                return StackSlot.OfObject(ctx.MakeString(value.ToUpper()));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "ToLower"),
-            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToLowerInvariant())),
+            static (ctx, a) => {
+                var value = Str(a, 0).Value;
+                ctx.Heap.ChargeHostWork(value.Length);
+                return StackSlot.OfObject(ctx.MakeString(value.ToLower()));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "ToUpperInvariant"),
-            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToUpperInvariant())),
+            static (ctx, a) => {
+                var value = Str(a, 0).Value;
+                ctx.Heap.ChargeHostWork(value.Length);
+                return StackSlot.OfObject(ctx.MakeString(value.ToUpperInvariant()));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "ToLowerInvariant"),
-            static (ctx, a) => StackSlot.OfObject(ctx.MakeString(Str(a, 0).Value.ToLowerInvariant())),
+            static (ctx, a) => {
+                var value = Str(a, 0).Value;
+                ctx.Heap.ChargeHostWork(value.Length);
+                return StackSlot.OfObject(ctx.MakeString(value.ToLowerInvariant()));
+            },
+            BindingOrigin.Managed);
+        // String.Normalize / IsNormalized の CoreLib 実装は Interop.Globalization の
+        // P/Invoke (System.Globalization.Native) に降りる。VM 内ではホストの managed BCL
+        // に委譲し、文字列値だけを境界越しに渡す。
+        r.RegisterBinding(BindingKey.Instance(T, "Normalize"),
+            static (ctx, a) => NormalizeString(ctx, a, hasForm: false, isCheck: false),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "Normalize", "System.Text.NormalizationForm"),
+            static (ctx, a) => NormalizeString(ctx, a, hasForm: true, isCheck: false),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "IsNormalized"),
+            static (ctx, a) => NormalizeString(ctx, a, hasForm: false, isCheck: true),
+            BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(T, "IsNormalized", "System.Text.NormalizationForm"),
+            static (ctx, a) => NormalizeString(ctx, a, hasForm: true, isCheck: true),
             BindingOrigin.Managed);
         // 1 文字の文字列生成 (InternalCall 面。char.ToString() の実 IL が string.CreateFromChar
         // を辿る — VmString 生成は既存の文字列内部面と同一経路)
@@ -109,14 +166,14 @@ internal static partial class CoreLibBindings {
             BindingOrigin.InternalCall);
         // ---- System.Char culture 面 (C5.5 Wave 5 継続): 本家 IL は
         //      CultureInfo.CurrentCulture.TextInfo (culture 機構 + InternalCall) を辿るため
-        //      不変カルチャ規約どおりホストの不変面へ委譲 (1 引数面のみ。CultureInfo 引数の
+        //      設定カルチャを使うホスト面へ委譲 (1 引数面のみ。CultureInfo 引数の
         //      overload は呼び出し側 IL が CultureInfo 構築を必要とするため当面未対応)。
         //      GetNumericValue は Unicode 数字値 (ネイティブ Unicode テーブル InternalCall)
         r.RegisterBinding(BindingKey.Static("System.Char", "ToUpper", "System.Char"),
-            static (_, a) => StackSlot.OfInt32(char.ToUpperInvariant(Ch(a, 0))),
+            static (ctx, a) => { ctx.Heap.ChargeHostWork(1); return StackSlot.OfInt32(char.ToUpper(Ch(a, 0), System.Globalization.CultureInfo.CurrentCulture)); },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Static("System.Char", "ToLower", "System.Char"),
-            static (_, a) => StackSlot.OfInt32(char.ToLowerInvariant(Ch(a, 0))),
+            static (ctx, a) => { ctx.Heap.ChargeHostWork(1); return StackSlot.OfInt32(char.ToLower(Ch(a, 0), System.Globalization.CultureInfo.CurrentCulture)); },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Static("System.Char", "GetNumericValue", "System.Char"),
             static (_, a) => StackSlot.OfFloat(char.GetNumericValue(Ch(a, 0))),
@@ -158,20 +215,28 @@ internal static partial class CoreLibBindings {
             static (ctx, a) => JoinedEnumerableFace(ctx, Ns(a, 0), a[1]),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "StartsWith", ["System.String", "System.StringComparison"]),
-            static (_, a) => StackSlot.OfInt32(
-                Str(a, 0).Value.StartsWith(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.StartsWith(Str(a, 1).Value, ConfiguredComparison(a[2].AsInt32)) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "EndsWith", ["System.String", "System.StringComparison"]),
-            static (_, a) => StackSlot.OfInt32(
-                Str(a, 0).Value.EndsWith(Str(a, 1).Value, InvariantOf(a[2].AsInt32)) ? 1 : 0),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.EndsWith(Str(a, 1).Value, ConfiguredComparison(a[2].AsInt32)) ? 1 : 0);
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "IndexOf", ["System.String", "System.StringComparison"]),
-            static (_, a) => StackSlot.OfInt32(
-                Str(a, 0).Value.IndexOf(Str(a, 1).Value, InvariantOf(a[2].AsInt32))),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.IndexOf(Str(a, 1).Value, ConfiguredComparison(a[2].AsInt32)));
+            },
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(T, "LastIndexOf", ["System.String", "System.StringComparison"]),
-            static (_, a) => StackSlot.OfInt32(
-                Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, InvariantOf(a[2].AsInt32))),
+            static (ctx, a) => {
+                ChargeCultureWork(ctx, Str(a, 0).Value, Str(a, 1).Value);
+                return StackSlot.OfInt32(Str(a, 0).Value.LastIndexOf(Str(a, 1).Value, ConfiguredComparison(a[2].AsInt32)));
+            },
             BindingOrigin.Managed);
     }
 
@@ -200,6 +265,20 @@ internal static partial class CoreLibBindings {
     }
 
     private static char Ch(StackSlot[] a, int i) => (char)a[i].AsInt32;
+
+    private static StackSlot? NormalizeString(IntrinsicContext ctx, StackSlot[] a, bool hasForm, bool isCheck) {
+        var value = (a[0].ObjectValue as VmString)?.Value
+            ?? throw new UnhandledGuestException("System.NullReferenceException", null);
+        ctx.Heap.ChargeHostWork(value.Length);
+        var form = hasForm ? (NormalizationForm)a[1].AsInt32 : NormalizationForm.FormC;
+        try {
+            if (isCheck)
+                return StackSlot.OfInt32(value.IsNormalized(form) ? 1 : 0);
+            return StackSlot.OfObject(ctx.MakeString(value.Normalize(form)));
+        } catch (ArgumentException ex) {
+            throw new UnhandledGuestException("System.ArgumentException", ex.Message);
+        }
+    }
 
     private static StackSlot? ConcatArray(IntrinsicContext ctx, StackSlot[] a) {
         if (a[0].Kind != StackKind.Object || a[0].ObjectValue is not VmArray array)

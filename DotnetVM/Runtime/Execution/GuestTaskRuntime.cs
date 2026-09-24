@@ -18,6 +18,7 @@ internal sealed class GuestTaskRuntime(
     int shutdownTimeoutMilliseconds) : IDisposable {
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
+    private readonly ConcurrentDictionary<VmTaskObject, CancellationTokenRegistration> _cancellationRegistrations = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
     // ValueTask の default 値は backing Task を持たない completed state として扱う。
     // AsTask() が guest-visible Task を要求した場合に限り、通常の heap allocation を通した
@@ -79,9 +80,16 @@ internal sealed class GuestTaskRuntime(
         RemoveTaskRoots(task);
     }
 
-    public void Delay(VmTaskObject task, int milliseconds) {
+    public void Delay(VmTaskObject task, int milliseconds) => Delay(task, milliseconds, default);
+
+    public void Delay(VmTaskObject task, int milliseconds, CancellationToken cancellationToken) {
         lock (_lifetimeGate) {
             ThrowIfDisposed();
+            if (cancellationToken.IsCancellationRequested) {
+                task.SetCanceled();
+                _activeRoots.TryRemove(task, out _);
+                return;
+            }
             if (milliseconds == 0) {
                 Complete(task);
                 return;
@@ -101,9 +109,21 @@ internal sealed class GuestTaskRuntime(
             }
             try {
                 timer.Change(milliseconds, Timeout.Infinite);
+                if (cancellationToken.CanBeCanceled) {
+                    var registration = cancellationToken.Register(static state => {
+                        var target = (GuestTaskRuntime.TaskCancellationState)state!;
+                        target.Runtime.Cancel(target.Task);
+                    }, new TaskCancellationState(this, task));
+                    if (task.IsCompleted)
+                        registration.Dispose();
+                    else
+                        _cancellationRegistrations[task] = registration;
+                }
             } catch {
                 if (_timers.TryRemove(task, out var failedTimer))
                     failedTimer.Dispose();
+                if (_cancellationRegistrations.TryRemove(task, out var registration))
+                    registration.Dispose();
                 _activeRoots.TryRemove(task, out _);
                 throw;
             }
@@ -122,7 +142,8 @@ internal sealed class GuestTaskRuntime(
         }
     }
 
-    public void ScheduleContinuation(VmTaskObject awaited, StackSlot stateMachine, Action<StackSlot> resume) {
+    public void ScheduleContinuation(VmTaskObject awaited, StackSlot stateMachine, Action<StackSlot> resume,
+        StackSlot? contextRoot = null) {
         var state = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef byRef
             ? byRef.Read()
             : stateMachine;
@@ -138,7 +159,9 @@ internal sealed class GuestTaskRuntime(
         var id = Interlocked.Increment(ref _nextContinuationId);
         lock (_lifetimeGate) {
             ThrowIfDisposed();
-            _continuationRoots[id] = [StackSlot.OfObject(awaited), detachedRef];
+            _continuationRoots[id] = contextRoot is { } root
+                ? [StackSlot.OfObject(awaited), detachedRef, root]
+                : [StackSlot.OfObject(awaited), detachedRef];
         }
         try {
             StartWorker(null, [StackSlot.OfObject(awaited), detachedRef], () => {
@@ -151,6 +174,162 @@ internal sealed class GuestTaskRuntime(
         } catch {
             _continuationRoots.TryRemove(id, out _);
             throw;
+        }
+    }
+
+    /// <summary>Task.WhenAll / WhenAny が共有する VM task combinator 実行。</summary>
+    public void WhenAll(VmTaskObject composite, VmTaskObject[] tasks, Func<StackSlot> result) {
+        if (tasks.Length == 0) {
+            Complete(composite, result());
+            return;
+        }
+        var roots = new StackSlot[tasks.Length + 1];
+        roots[0] = StackSlot.OfObject(composite);
+        for (var i = 0; i < tasks.Length; i++)
+            roots[i + 1] = StackSlot.OfObject(tasks[i]);
+        try {
+            StartWorker(composite, roots, () => {
+                foreach (var task in tasks)
+                    task.Wait();
+                return result();
+            }, value => Complete(composite, value), ex => CompleteHostException(composite, ex));
+        } catch (Exception ex) {
+            CompleteHostException(composite, ex);
+            throw;
+        }
+    }
+
+    public void WhenAny(VmTaskObject composite, VmTaskObject[] tasks) {
+        if (tasks.Length == 0)
+            return; // CLR: WhenAny(empty) never completes.
+        if (tasks.Length > 64)
+            throw new UnhandledGuestException("System.ArgumentException", "WhenAny は 64 個以下の Task を要求します。");
+        var roots = new StackSlot[tasks.Length + 1];
+        roots[0] = StackSlot.OfObject(composite);
+        var handles = new WaitHandle[tasks.Length];
+        for (var i = 0; i < tasks.Length; i++) {
+            roots[i + 1] = StackSlot.OfObject(tasks[i]);
+            handles[i] = tasks[i].CompletionWaitHandle;
+        }
+        try {
+            StartWorker(composite, roots, () => {
+                var index = WaitHandle.WaitAny(handles);
+                return StackSlot.OfObject(tasks[index]);
+            }, value => Complete(composite, value), ex => CompleteHostException(composite, ex));
+        } catch (Exception ex) {
+            CompleteHostException(composite, ex);
+            throw;
+        }
+    }
+
+    internal void Post(VmObject context, VmDelegate callback, StackSlot state, Action invoke) {
+        var roots = new[] {
+            StackSlot.OfObject(context), StackSlot.OfObject(callback), state,
+        };
+        StartWorker(null, roots, () => {
+            _shutdownToken.ThrowIfCancellationRequested();
+            invoke();
+            return default;
+        }, onSuccess: null, onError: _ => { });
+    }
+
+    public bool WaitAll(VmTaskObject[] tasks, int millisecondsTimeout, CancellationToken cancellationToken) {
+        if (tasks.Length > 64)
+            throw new UnhandledGuestException("System.ArgumentException", "WaitAll は 64 個以下の Task を要求します。");
+        if (tasks.Length == 0)
+            return true;
+        var handles = tasks.Select(task => task.CompletionWaitHandle).ToArray();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        foreach (var handle in handles) {
+            var remaining = millisecondsTimeout == Timeout.Infinite
+                ? Timeout.Infinite
+                : Math.Max(0, millisecondsTimeout - (int)stopwatch.ElapsedMilliseconds);
+            var index = cancellationToken.CanBeCanceled
+                ? WaitHandle.WaitAny([handle, cancellationToken.WaitHandle], remaining)
+                : handle.WaitOne(remaining) ? 0 : WaitHandle.WaitTimeout;
+            if (index == WaitHandle.WaitTimeout)
+                return false;
+            if (cancellationToken.CanBeCanceled && index == 1)
+                throw new UnhandledGuestException("System.OperationCanceledException", null);
+        }
+        return true;
+    }
+
+    private void Cancel(VmTaskObject task) {
+        task.SetCanceled();
+        RemoveTaskRoots(task);
+    }
+
+    private sealed record TaskCancellationState(GuestTaskRuntime Runtime, VmTaskObject Task);
+
+    /// <summary>
+    /// guest awaiter が自前で continuation を保持する場合の登録。Task のイベントを
+    /// 待つ代わりに、渡された host callback が呼ばれた時点で guest worker を起動する。
+    /// callback・awaiter・state machine は callback が遅延実行されても GC から消えないよう
+    /// continuation root として保持する。
+    /// </summary>
+    internal ExternalContinuation RegisterExternalContinuation(StackSlot stateMachine,
+        StackSlot[] extraRoots, VmDelegate callback, Action<StackSlot> resume) {
+        var state = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef byRef
+            ? byRef.Read()
+            : stateMachine;
+        StackSlot detached;
+        if (state.ObjectValue is VmStructValue machine)
+            detached = StackSlot.OfValueType(machine.Clone());
+        else if (state.ObjectValue is VmClassInstance)
+            detached = state;
+        else
+            throw new InvalidOperationException("async state machine は VM オブジェクトである必要があります。");
+        var stateContainer = new[] { detached };
+        var detachedRef = StackSlot.OfByRef(new VmByRef(stateContainer, 0));
+        var id = Interlocked.Increment(ref _nextContinuationId);
+        var roots = new StackSlot[extraRoots.Length + 2];
+        Array.Copy(extraRoots, roots, extraRoots.Length);
+        roots[^2] = detachedRef;
+        roots[^1] = StackSlot.OfObject(callback);
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            _continuationRoots[id] = roots;
+        }
+        return new ExternalContinuation(this, id, roots, detachedRef, resume);
+    }
+
+    internal sealed class ExternalContinuation {
+        private readonly GuestTaskRuntime _owner;
+        private readonly long _id;
+        private readonly StackSlot[] _roots;
+        private readonly StackSlot _stateMachine;
+        private readonly Action<StackSlot> _resume;
+        private int _signalled;
+
+        public ExternalContinuation(GuestTaskRuntime owner, long id, StackSlot[] roots,
+            StackSlot stateMachine, Action<StackSlot> resume) {
+            _owner = owner;
+            _id = id;
+            _roots = roots;
+            _stateMachine = stateMachine;
+            _resume = resume;
+        }
+
+        public void Signal() {
+            if (Interlocked.Exchange(ref _signalled, 1) != 0)
+                return;
+            try {
+                _owner.StartWorker(null, _roots, () => {
+                    _owner._shutdownToken.ThrowIfCancellationRequested();
+                    _resume(_stateMachine);
+                    return default;
+                }, onSuccess: null, onError: _ => { },
+                    onFinished: () => _owner._continuationRoots.TryRemove(_id, out _));
+            } catch {
+                _owner._continuationRoots.TryRemove(_id, out _);
+                throw;
+            }
+        }
+
+        public void Cancel() {
+            if (Interlocked.Exchange(ref _signalled, 1) == 0)
+                _owner._continuationRoots.TryRemove(_id, out _);
         }
     }
 
@@ -194,7 +373,8 @@ internal sealed class GuestTaskRuntime(
     /// <summary>TaskAwaiter/ValueTaskAwaiter.OnCompleted から渡される guest delegate を
     /// worker 上で一度だけ実行する。awaiter の直接利用でも no-op にせず、state machine
     /// 継続と同じ worker quota・shutdown 規約を通す。</summary>
-    public void ScheduleCallback(VmTaskObject awaited, StackSlot callback, Action<StackSlot> invoke) {
+    public void ScheduleCallback(VmTaskObject awaited, StackSlot callback, Action<StackSlot> invoke,
+        StackSlot? contextRoot = null) {
         var value = callback.Kind == StackKind.ByRef && callback.ObjectValue is VmByRef byRef
             ? byRef.Read()
             : callback;
@@ -203,7 +383,9 @@ internal sealed class GuestTaskRuntime(
         var id = Interlocked.Increment(ref _nextContinuationId);
         lock (_lifetimeGate) {
             ThrowIfDisposed();
-            _continuationRoots[id] = [StackSlot.OfObject(awaited), value];
+            _continuationRoots[id] = contextRoot is { } root
+                ? [StackSlot.OfObject(awaited), value, root]
+                : [StackSlot.OfObject(awaited), value];
         }
         try {
             StartWorker(null, [StackSlot.OfObject(awaited), value], () => {
@@ -297,6 +479,8 @@ internal sealed class GuestTaskRuntime(
         _activeRoots.TryRemove(task, out _);
         if (_timers.TryRemove(task, out var timer))
             timer.Dispose();
+        if (_cancellationRegistrations.TryRemove(task, out var registration))
+            registration.Dispose();
     }
 
     public void Dispose() {
@@ -310,6 +494,7 @@ internal sealed class GuestTaskRuntime(
             _completedSentinels.Clear();
             timers = [.. _timers.Values];
             _timers.Clear();
+            _cancellationRegistrations.Clear();
             workers = [.. _workers.Values];
             tasks = [.. _activeRoots.Keys];
         }

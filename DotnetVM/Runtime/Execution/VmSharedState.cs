@@ -19,6 +19,7 @@ public sealed class VmSharedState : IDisposable {
     private readonly TimeZoneInfo _timeZone;
     private readonly VmRandomFill _randomFill;
     private int _disposed;
+    private readonly AsyncLocal<VmObject?> _currentSynchronizationContext = new();
 
     public VmSharedState(int maxGuestThreads = 64, int maxTaskWorkers = 64, int maxGuestWorkers = 64,
         int maxPendingTaskTimers = 1024, int shutdownTimeoutMilliseconds = 5_000, CultureInfo? culture = null,
@@ -93,6 +94,20 @@ public sealed class VmSharedState : IDisposable {
     internal readonly System.Collections.Concurrent.ConcurrentDictionary<DotnetVM.Runtime.Types.VmType, DotnetVM.Runtime.Objects.VmRuntimeObject> TypeFacades = new();
 
     internal CancellationToken ShutdownToken => _shutdown.Token;
+
+    /// <summary>現在の guest 実行論理フローに設定された SynchronizationContext。</summary>
+    internal VmObject? CurrentSynchronizationContext {
+        get => _currentSynchronizationContext.Value;
+        set => _currentSynchronizationContext.Value = value;
+    }
+
+    /// <summary>continuation / Post の実行中だけ guest context を復元する。</summary>
+    internal void RunWithSynchronizationContext(VmObject? context, Action action) {
+        var previous = _currentSynchronizationContext.Value;
+        _currentSynchronizationContext.Value = context;
+        try { action(); }
+        finally { _currentSynchronizationContext.Value = previous; }
+    }
 
     internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 

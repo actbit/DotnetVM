@@ -121,6 +121,9 @@ public sealed class IntrinsicContext {
 
     internal Func<VmDelegate, StackSlot[], StackSlot?>? InvokeGuestDelegate { get; set; }
 
+    /// <summary>ホスト側ランタイムが guest の instance method を VM 呼出ゲート経由で実行するフック。</summary>
+    internal Func<StackSlot, string, StackSlot[], StackSlot?>? InvokeGuestInstanceMethod { get; set; }
+
     internal Action<StackSlot>? RunGuestStateMachine { get; set; }
 
     /// <summary>Blocking host waits release VM execution leases so other guest threads can run.</summary>

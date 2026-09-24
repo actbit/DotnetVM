@@ -31,6 +31,9 @@ public static class ObjectGraphWalker {
                 CollectFromSlot(snapshot.Result, visit);
                 CollectFromSlot(snapshot.GuestException, visit);
                 break;
+            case VmCancellationState:
+            case VmSynchronizationContextState:
+                break;
             case VmDelegate @delegate:
                 foreach (var invocation in @delegate.Invocations)
                     CollectFromSlot(invocation.Target, visit);

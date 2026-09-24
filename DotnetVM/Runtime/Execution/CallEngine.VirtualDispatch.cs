@@ -131,6 +131,39 @@ internal sealed partial class CallEngine {
         return FindMethodByScanThroughChain(receiverType, name, paramCount);
     }
 
+    /// <summary>
+    /// Runtime binding が保持する guest object の callback から instance method を呼ぶ。
+    /// 明示的 interface 実装は短いメソッド名でも拾う。IValueTaskSource のように
+    /// TypeLoader が facade interface だけを合成する面を、guest IL のまま実行するための入口。
+    /// </summary>
+    public StackSlot? InvokeGuestInstanceMethod(in StackSlot receiver, string name, StackSlot[] parameters) {
+        var method = TryDispatchVirtual(name, parameters.Length, receiver);
+        if (method is null && receiver.ObjectValue is VmByRef byRef)
+            method = TryDispatchVirtual(name, parameters.Length, byRef.Read());
+        if (method is null) {
+            var value = receiver.Kind == StackKind.ByRef && receiver.ObjectValue is VmByRef reference
+                ? reference.Read() : receiver;
+            var type = value.ObjectValue switch {
+                VmClassInstance instance => (VmType)instance.ClassType,
+                VmIntrinsicInstance instance => instance.InstanceType,
+                _ => null,
+            };
+            for (var current = type; method is null && current is not null; current = current.BaseType) {
+                method = current.Methods.FirstOrDefault(candidate =>
+                    candidate.Signature.HasThis && candidate.Signature.ParamTypes.Length == parameters.Length &&
+                    (candidate.Name == name || candidate.Name.EndsWith("." + name, StringComparison.Ordinal)));
+            }
+        }
+        if (method is null)
+            throw new UnhandledGuestException("System.NotSupportedException",
+                $"guest instance method {name} ({parameters.Length} 引数) が見つかりません。");
+
+        var args = new StackSlot[parameters.Length + 1];
+        args[0] = receiver;
+        Array.Copy(parameters, 0, args, 1, parameters.Length);
+        return invoker.Invoke(method, args, null);
+    }
+
     /// <summary>配列レシーバのインターフェース面を SZArrayHelper 経由で合成する。
     /// CLR では SZArray が IList&lt;T&gt; 等を暗黙実装し、呼出は SZArrayHelper の実体へ
     /// 振り分けられる (コンパイラ支援)。VM も同一に振り分ける:

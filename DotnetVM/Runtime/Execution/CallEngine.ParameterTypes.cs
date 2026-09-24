@@ -118,6 +118,9 @@ internal sealed partial class CallEngine {
             ? context!.MethodArgs[type.VarNumber].FullName : $"!!{type.VarNumber}",
         SigKind.GenericVar => type.VarNumber < (context?.ClassArgs.Length ?? 0)
             ? context!.ClassArgs[type.VarNumber].FullName : $"!{type.VarNumber}",
+        SigKind.GenericInst when type.Args is not null =>
+            TryResolveTypeName(type.Token, context) + "<" +
+            string.Join(", ", type.Args.Select(argument => ParamTypeName(argument, context))) + ">",
         _ => "",
     };
 

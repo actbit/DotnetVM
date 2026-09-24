@@ -252,9 +252,10 @@ public sealed class IntrinsicContext {
 public delegate StackSlot? IntrinsicImpl(IntrinsicContext context, StackSlot[] args);
 
 /// <summary>
-/// CoreLib のランタイムバインドを VM 起動時に登録するプロバイダー。
+/// CoreLib のランタイムバインドを VM 起動時に登録する、特権的な TCB (trusted computing base) 拡張。
 /// 実行時の VM 状態へは登録時ではなく、登録した <see cref="IntrinsicImpl"/> に渡される
 /// <see cref="IntrinsicContext"/> 経由でアクセスする。
+/// プロバイダーと登録実装はホスト権限で動く信頼済みコードであり、未信頼コードに渡してはならない。
 /// </summary>
 public interface ICoreLibBindingProvider {
     /// <summary>VM 起動時にバインドを登録する。重複キーの登録は失敗する。</summary>
@@ -302,6 +303,8 @@ public sealed class IntrinsicRegistry {
     /// 起動時に登録済みのランタイムバインドを、指定キーに限って置き換える。
     /// カスタムプロバイダーが組み込み CoreLib バインドを差し替える場合に使う。
     /// キーが未登録の場合は例外。
+    /// これは CoreLib の動作をホスト権限の任意コードへ委譲できる、特権的な TCB 拡張点である。
+    /// 信頼済みホスト管理コードだけが呼び出し、未信頼のプロバイダー実装やゲスト入力を登録してはならない。
     /// </summary>
     public void ReplaceBinding(BindingKey key, IntrinsicImpl impl, BindingOrigin origin) {
         lock (_gate) {

@@ -78,6 +78,13 @@ public sealed class ConcurrencyTests {
                 public static int RunCompletedAwait() => Task.FromResult(41).GetAwaiter().GetResult();
                 public static int RunValueTaskAsync() => AddAfterDelayValueTask(40).GetAwaiter().GetResult();
                 public static int RunValueTaskCompleted() => ValueTask.FromResult(41).GetAwaiter().GetResult();
+                private static async Task<int> AwaitDefaultValueTask() {
+                    await default(ValueTask);
+                    return 41;
+                }
+                private static async Task<int> AwaitDefaultValueTaskOfT() => await default(ValueTask<int>);
+                public static int RunDefaultValueTask() => AwaitDefaultValueTask().GetAwaiter().GetResult();
+                public static int RunDefaultValueTaskOfT() => AwaitDefaultValueTaskOfT().GetAwaiter().GetResult();
                 public static int RunValueTaskValueCtor() => new ValueTask<int>(41).GetAwaiter().GetResult();
                 public static int RunValueTaskTaskCtor() => new ValueTask<int>(Task.FromResult(41)).GetAwaiter().GetResult();
                 public static int RunConfigureAwait() => AddAfterConfigureAwait(41).GetAwaiter().GetResult();
@@ -195,6 +202,8 @@ public sealed class ConcurrencyTests {
         Assert.Equal(41, Call(type, "RunCompletedAwait"));
         Assert.Equal(42, Call(type, "RunValueTaskAsync"));
         Assert.Equal(41, Call(type, "RunValueTaskCompleted"));
+        Assert.Equal(41, Call(type, "RunDefaultValueTask"));
+        Assert.Equal(0, Call(type, "RunDefaultValueTaskOfT"));
         Assert.Equal(41, Call(type, "RunValueTaskValueCtor"));
         Assert.Equal(41, Call(type, "RunValueTaskTaskCtor"));
         Assert.Equal(42, Call(type, "RunConfigureAwait"));
@@ -248,6 +257,23 @@ public sealed class ConcurrencyTests {
         using var vm = CreateVm();
 
         Assert.Equal(41, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskCompleted"));
+    }
+
+    [Fact]
+    public void DefaultValueTasks_MatchClrCompletedSuccessBehavior() {
+        var (_, assembly) = TestAssemblyCompiler.Compile(Source, "DefaultValueTaskClrOracle");
+        var clrType = assembly.GetType("Vm.ConcurrentCode")!;
+        using var vm = CreateVm();
+
+        foreach (var (method, expected) in new[] {
+            ("RunDefaultValueTask", 41),
+            ("RunDefaultValueTaskOfT", 0),
+        }) {
+            var clr = (int)clrType.GetMethod(method)!.Invoke(null, null)!;
+            var actual = vm.Invoke("Vm.ConcurrentCode", method);
+            Assert.Equal(expected, clr);
+            Assert.Equal(clr, actual);
+        }
     }
 
     [Fact]

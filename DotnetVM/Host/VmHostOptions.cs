@@ -116,6 +116,7 @@ public sealed class VmHostOptions {
     /// 追加または置換用の CoreLib バインドプロバイダー。既定バインドと併用する場合は
     /// 新しいキーは RegisterBinding、既定の特定キーは ReplaceBinding で登録できる。
     /// 既定バインド全体を置き換える場合は <see cref="UseDefaultCoreLibBindings"/> を false にする。
+    /// プロバイダーと登録実装は VM の TCB に加わるホスト権限の特権コードであり、信頼済み実装だけを指定する。
     /// </summary>
     public IReadOnlyList<ICoreLibBindingProvider> CoreLibBindingProviders { get; init; } = [];
 

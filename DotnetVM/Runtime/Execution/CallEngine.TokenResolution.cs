@@ -71,7 +71,8 @@ internal sealed partial class CallEngine {
                     // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
                     var callerDomain = CallerDomainOfLoader();
                     var bindingType = TryResolveTypeRefForBinding(parent.Rid);
-                    if (CanAttemptRuntimeBinding(typeName, bindingType) &&
+                    var bindingAllowed = CanAttemptRuntimeBinding(typeName, parent.Rid, bindingType);
+                    if (bindingAllowed &&
                         TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound)) {
                         return new CallTarget {
                             Arity = arity,
@@ -117,7 +118,8 @@ internal sealed partial class CallEngine {
                                 HasThis = faceMethod.Signature.HasThis,
                             };
                     }
-                    if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
+                    if (bindingAllowed &&
+                        _intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = impl,
@@ -129,7 +131,8 @@ internal sealed partial class CallEngine {
                         };
                     // 継承面のフォールバック: 派生ファサード型から基底連鎖を辿って解決する
                     // (例: InvalidOperationException::get_Message → System.Exception に登録された面)
-                    if (_objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, arity, signature.HasThis, out var inherited)) {
+                    if (bindingAllowed &&
+                        _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, arity, signature.HasThis, out var inherited)) {
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = inherited,
@@ -144,8 +147,17 @@ internal sealed partial class CallEngine {
                     // そのメソッドを実体として解決する。callvirt でも Call 側でレシーバの
                     // 実行時型による仮想ディスパッチが効くため、宣言解決の直接化は安全。
                     // ただし表現境界 (委譲継続面) の実型 IL には落ちない (① → ③ → ④ のみ)
-                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClass &&
-                        !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
+                    VmClassType? realClass;
+                    try {
+                        realClass = _loader.ResolveTypeRefType(parent.Rid) as VmClassType;
+                    } catch (AssemblyDependencyNotFoundException)
+                        when (IsKnownFrameworkTypeRef(parent.Rid)) {
+                        // A missing/untrusted runtime surface must fail closed at the binding
+                        // gate, rather than escape as an arbitrary dependency load.
+                        throw new OperationNotAllowedException(
+                            $"intrinsic {typeName}::{name} は provenance が確認できないため拒否されました。");
+                    }
+                    if (realClass is not null && !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
                         var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes, signature.ReturnType);
                         if (resolved is { Body: not null })
                             return new CallTarget {
@@ -204,9 +216,11 @@ internal sealed partial class CallEngine {
 
         // 構築ファサード型 (BCL 汎用インターフェース等) → ランタイムバインド / intrinsic 面
         if (constructed.Definition is VmIntrinsicType facade) {
+            var bindingAllowed = CanAttemptRuntimeBindingForTypeSpec(typeSpecRid, facade);
             var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
             // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
-            if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, CallerDomainOfLoader(), out var boundImpl)) {
+            if (bindingAllowed &&
+                TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, CallerDomainOfLoader(), out var boundImpl)) {
                 return new CallTarget {
                     Arity = arity,
                     Intrinsic = boundImpl,
@@ -218,8 +232,9 @@ internal sealed partial class CallEngine {
                     ClassArgs = constructed.TypeArguments,
                 };
             }
-            if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
-                _objectEngine.TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl)) {
+            if (bindingAllowed &&
+                (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var impl) ||
+                _objectEngine.TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl))) {
                 return new CallTarget {
                     Arity = arity,
                     Intrinsic = impl,
@@ -331,7 +346,8 @@ internal sealed partial class CallEngine {
                     .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
                 var methodSpecCaller = CallerDomainOfLoader();
                 var methodSpecBindingType = TryResolveTypeRefForBinding(parent.Rid);
-                if (CanAttemptRuntimeBinding(typeName, methodSpecBindingType) &&
+                var bindingAllowed = CanAttemptRuntimeBinding(typeName, parent.Rid, methodSpecBindingType);
+                if (bindingAllowed &&
                     (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, methodSpecCaller, out var boundImpl) ||
                      TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl))) {
                     return new CallTarget {
@@ -377,8 +393,9 @@ internal sealed partial class CallEngine {
                         MethodArgs = methodArgs,
                     };
                 }
-                if (_intrinsics.TryGet(new IntrinsicKey(typeName, name, specArity, signature.HasThis), out var impl) ||
-                    _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, specArity, signature.HasThis, out impl)) {
+                if (bindingAllowed &&
+                    (_intrinsics.TryGet(new IntrinsicKey(typeName, name, specArity, signature.HasThis), out var impl) ||
+                    _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, specArity, signature.HasThis, out impl))) {
                     return new CallTarget {
                         Arity = specArity,
                         Intrinsic = impl,
@@ -428,14 +445,16 @@ internal sealed partial class CallEngine {
                 var constructed = _objectEngine.ResolveConstructedParent(parent.Rid, context);
                 if (constructed.Definition is VmIntrinsicType facade) {
                     var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
+                    var bindingAllowed = CanAttemptRuntimeBindingForTypeSpec(parent.Rid, facade);
                     var concreteParams = signature.ParamTypes
                         .Select(t => SubstitutedParamTypeName(t, methodArgs)).ToArray();
                     var openParams = signature.ParamTypes
                         .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
-                    if (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, concreteParams,
-                            CallerDomainOfLoader(), out var facadeImpl) ||
+                    if (bindingAllowed &&
+                        (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, concreteParams,
+                             CallerDomainOfLoader(), out var facadeImpl) ||
                         TryGetResolvedBinding(facade.FullName, name, signature.HasThis, openParams,
-                            CallerDomainOfLoader(), out facadeImpl)) {
+                            CallerDomainOfLoader(), out facadeImpl))) {
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = facadeImpl,
@@ -448,7 +467,8 @@ internal sealed partial class CallEngine {
                             ParamTypeNames = concreteParams,
                         };
                     }
-                    if (_intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var facadeLegacy)) {
+                    if (bindingAllowed &&
+                        _intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var facadeLegacy)) {
                         return new CallTarget {
                             Arity = arity,
                             Intrinsic = facadeLegacy,

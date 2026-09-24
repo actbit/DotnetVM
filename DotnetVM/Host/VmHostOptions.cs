@@ -149,8 +149,16 @@ public sealed class VmHostOptions {
     /// </summary>
     public int MaxGuestWorkers { get; init; } = 64;
 
-    /// <summary>未完了の Task.Delay が保持できる host Timer 数。-1 の無限 Delay も 1 件として数える。</summary>
+    /// <summary>未完了の Task.Delay と CancellationTokenSource timer が共有する host Timer 数。
+    /// -1 の無限 Delay/CancelAfter も 1 件として数える。</summary>
     public int MaxPendingTaskTimers { get; init; } = 1024;
+
+    /// <summary>
+    /// Task.WhenAll / WhenAny / WaitAll が受け付ける入力 Task 数の上限。入力の host 配列、
+    /// completion registration、GC root 配列が guest 配列とは別に確保されるため、明示的な
+    /// host fan-out quota として検査する。
+    /// </summary>
+    public int MaxTaskCombinatorInputs { get; init; } = 16_384;
 
     /// <summary>
     /// VM.Dispose が worker の停止を待つ最大時間 (ミリ秒)。通常は worker が

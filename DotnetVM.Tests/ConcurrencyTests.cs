@@ -148,6 +148,7 @@ public sealed class ConcurrencyTests {
                         ValueTaskSourceOnCompletedFlags flags) {
                         Interlocked.Increment(ref OnCompletedCalls);
                         Flags = (int)flags;
+                        continuation(state);
                     }
                 }
                 public static int ProbeValueTaskSourceLaziness() {
@@ -166,6 +167,19 @@ public sealed class ConcurrencyTests {
                     TrackingSource.Flags = 0;
                     var valueTask = new ValueTask<int>(new TrackingSource(), 7);
                     valueTask.GetAwaiter().OnCompleted(() => { });
+                    Thread.Sleep(25);
+                    return TrackingSource.Flags;
+                }
+                public static int ProbeConfiguredValueTaskSourceFlags(bool capture, bool useUnsafe) {
+                    TrackingSource.StatusCalls = 0;
+                    TrackingSource.OnCompletedCalls = 0;
+                    TrackingSource.Flags = 0;
+                    var valueTask = new ValueTask<int>(new TrackingSource(), 7);
+                    var awaiter = valueTask.ConfigureAwait(capture).GetAwaiter();
+                    if (useUnsafe)
+                        awaiter.UnsafeOnCompleted(() => { });
+                    else
+                        awaiter.OnCompleted(() => { });
                     Thread.Sleep(25);
                     return TrackingSource.Flags;
                 }
@@ -192,6 +206,12 @@ public sealed class ConcurrencyTests {
                 public static int RunWaitAll() {
                     Task.WaitAll(new Task[] { Task.Delay(1), Task.FromResult(1) });
                     return 2;
+                }
+                public static int WaitAllMany() {
+                    var tasks = new Task[10000];
+                    for (var i = 0; i < tasks.Length; i++) tasks[i] = Task.FromResult(0);
+                    Task.WaitAll(tasks);
+                    return tasks.Length;
                 }
                 public static int RunGenericWhenAll() {
                     var values = Task.WhenAll(Task.FromResult(2), Task.FromResult(3)).GetAwaiter().GetResult();
@@ -376,6 +396,26 @@ public sealed class ConcurrencyTests {
                     _ = Task.Delay(10000);
                     return -1;
                 }
+                public static int MixedTimerQuota() {
+                    var sources = new CancellationTokenSource[2];
+                    for (var i = 0; i < sources.Length; i++) {
+                        sources[i] = new CancellationTokenSource();
+                        sources[i].CancelAfter(10000);
+                    }
+                    var delays = new Task[2];
+                    for (var i = 0; i < delays.Length; i++)
+                        delays[i] = Task.Delay(10000);
+                    return 0;
+                }
+                public static int CombinatorInputQuota() {
+                    var tasks = new[] { Task.FromResult(0), Task.FromResult(0), Task.FromResult(0) };
+                    try { _ = Task.WhenAny(tasks); return -1; }
+                    catch (Exception) { return 1; }
+                }
+                public static int CombinatorTwoInputQuota() {
+                    _ = Task.WhenAny(Task.FromResult(0), Task.FromResult(0));
+                    return -1;
+                }
 
                 public static Task StartLongTask() => Task.Run((Action)HoldLongTaskWorker);
             }
@@ -447,6 +487,11 @@ public sealed class ConcurrencyTests {
         Assert.Equal(15, Call(type, "DisposedCancellationSource"));
         Assert.Equal(1, Call(type, "ProbeValueTaskSourceLaziness"));
         Assert.Equal(3, Call(type, "ProbeValueTaskSourceFlags"));
+        foreach (var (capture, useUnsafe, expected) in new[] {
+            (true, false, 3), (false, false, 2),
+            (true, true, 1), (false, true, 0),
+        })
+            Assert.Equal(expected, Call(type, "ProbeConfiguredValueTaskSourceFlags", capture, useUnsafe));
         Assert.Equal(0, Call(type, "CaptureSynchronizationContext", true));
     }
 
@@ -589,6 +634,22 @@ public sealed class ConcurrencyTests {
     }
 
     [Fact]
+    public void ConfiguredValueTaskSourceFlags_MatchClrForAllRegistrationModes() {
+        var (_, assembly) = TestAssemblyCompiler.Compile(Source, "ConfiguredValueTaskSourceFlagsClrOracle");
+        var clrType = assembly.GetType("Vm.ConcurrentCode")!;
+        using var vm = CreateVm();
+
+        foreach (var (capture, useUnsafe) in new[] {
+            (true, false), (false, false), (true, true), (false, true),
+        }) {
+            var args = new object?[] { capture, useUnsafe };
+            var expected = (int)clrType.GetMethod("ProbeConfiguredValueTaskSourceFlags")!.Invoke(null, args)!;
+            var actual = vm.Invoke("Vm.ConcurrentCode", "ProbeConfiguredValueTaskSourceFlags", args);
+            Assert.Equal(expected, actual);
+        }
+    }
+
+    [Fact]
     public void SynchronizationContext_IsCapturedUnlessConfigureAwaitFalse() {
         using var vm = CreateVm();
 
@@ -724,6 +785,48 @@ public sealed class ConcurrencyTests {
 
         vm.Dispose();
         Assert.Equal(0, vm.SharedState.GuestTasks.PendingTimerCount);
+    }
+
+    [Fact]
+    public void CancellationAndDelayTimersShareOneQuota() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxPendingTaskTimers = 3,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "MixedTimerQuota"));
+        Assert.Equal(3, vm.SharedState.GuestTasks.PendingTimerCount);
+        vm.Dispose();
+        Assert.Equal(0, vm.SharedState.GuestTasks.PendingTimerCount);
+    }
+
+    [Fact]
+    public void WaitAllManyDoesNotRequireOneKernelHandlePerTask() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxTaskCombinatorInputs = 12_000,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Equal(10_000, vm.Invoke("Vm.ConcurrentCode", "WaitAllMany"));
+    }
+
+    [Fact]
+    public void TaskCombinatorInputQuotaIsCheckedBeforeHostFanout() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxTaskCombinatorInputs = 2,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            vm.Invoke("Vm.ConcurrentCode", "CombinatorInputQuota"));
+
+        using var twoInputVm = CreateVm(new VmHostOptions {
+            MaxTaskCombinatorInputs = 1,
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+            twoInputVm.Invoke("Vm.ConcurrentCode", "CombinatorTwoInputQuota"));
     }
 
     [Fact]

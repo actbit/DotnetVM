@@ -149,6 +149,13 @@ public sealed class VmTaskObject : VmObject {
 
     internal void Wait(CancellationToken cancellationToken) => _completed.Wait(cancellationToken);
 
+    /// <summary>
+    /// WaitAll が Task ごとに順番に待つための待機 primitive。CompletionWaitHandle を取得せず、
+    /// 大量の入力 Task に対して ManualResetEventSlim の kernel handle を実体化しない。
+    /// </summary>
+    internal bool Wait(int millisecondsTimeout, CancellationToken cancellationToken) =>
+        _completed.Wait(millisecondsTimeout, cancellationToken);
+
     public (StackSlot Result, StackSlot GuestException, Exception? HostException) Snapshot() {
         lock (_gate)
             return (_result, _guestException, _hostException);
@@ -220,6 +227,8 @@ public sealed class VmCancellationState : VmObject {
 
     /// <summary>GuestTaskRuntime removes any CancelAfter timer through this callback.</summary>
     internal Action<VmCancellationState>? DisposeTimer { get; set; }
+    /// <summary>When the state belongs to a VM, CancelAfter is routed through its quota owner.</summary>
+    internal Action<VmCancellationState, int>? ScheduleTimer { get; set; }
 
     public VmCancellationState(VmType type) {
         _type = type;
@@ -238,13 +247,24 @@ public sealed class VmCancellationState : VmObject {
     internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
     public void Cancel() {
         ThrowIfDisposed();
-        _source.Cancel();
+        try {
+            _source.Cancel();
+        } finally {
+            // CancelAfter の timer は cancellation callback の実行中も quota slot と root を
+            // 保持し続けるため、callback が例外を返す場合を含めて必ず解除する。
+            DisposeTimer?.Invoke(this);
+        }
     }
     public void CancelAfter(int millisecondsDelay) {
         ThrowIfDisposed();
-        // The runtime owns the timer so that it can enforce the VM timer quota and tear it down
-        // during VM disposal instead of leaking a host ThreadPool timer.
-        throw new InvalidOperationException("CancellationTokenSource.CancelAfter は GuestTaskRuntime 経由で呼び出してください。");
+        if (millisecondsDelay < Timeout.Infinite)
+            throw new ArgumentOutOfRangeException(nameof(millisecondsDelay));
+        // VM-owned states use the quota-tracked timer. Standalone states retain the public
+        // object API's original host-CTS behavior for compatibility.
+        if (ScheduleTimer is { } schedule)
+            schedule(this, millisecondsDelay);
+        else
+            _source.CancelAfter(millisecondsDelay);
     }
     internal void CancelFromTimer() {
         if (Volatile.Read(ref _disposed) == 0)

@@ -5,6 +5,18 @@ using DotnetVM.Policy;
 namespace DotnetVM.Runtime.Types;
 
 public sealed partial class TypeLoader {
+    /// <summary>構築型 TypeSpec の GenericInst 定義トークンを取得する。runtime binding の
+    /// provenance 検査で、解決後の facade だけでなく元の TypeRef scope も確認するために使う。</summary>
+    internal uint GetTypeSpecDefinitionToken(int typeSpecRid) {
+        var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
+        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray(),
+            _image.Limits?.MaxSignatureDepth ?? 64,
+            _image.Limits?.MaxGenericNestingDepth ?? 64).Type;
+        if (sigType.Kind != SigKind.GenericInst)
+            throw new BadImageFormatException($"TypeSpec 0x02{typeSpecRid:X6} は GenericInst ではありません。");
+        return sigType.Token;
+    }
+
     /// <summary>TypeRef rid を解決する。解決順:
     /// ① Context 登録済みの実アセンブリ (AssemblyRef スコープの依存解決 / Module スコープの自己参照 /
     ///    TypeRef スコープのネスト型) → ② intrinsic ファサード → ③ ファサード無し時のネスト/自己解決 →
@@ -28,7 +40,9 @@ public sealed partial class TypeLoader {
                 return real;
         }
 
-        // ② intrinsic ファサード (CoreLib 未ロード時の既定面)
+        // ② intrinsic ファサード (CoreLib 未ロード時の既定面)。legacy intrinsic の型解決は
+        // ここで維持するが、runtime binding 側は TypeRef の AssemblyRef identity を別途検証
+        // する。型の FullName だけでは trusted provenance とはみなさない。
         if (_intrinsicTypes.TryGetValue(fullName, out var intrinsic))
             return intrinsic;
         if (scopeTable == TableKind.TypeRef && ResolveIntrinsicNestedTypeRef(typeRefRid) is { } intrinsicNested)
@@ -220,11 +234,14 @@ public sealed partial class TypeLoader {
     /// 名前だけでは fake System.Runtime.dll を区別できないため、既知の strong-name token を
     /// 必須にする。正式な AssemblyRef→TypeForwarder 解決はこの制約とは別に上で処理する。
     /// </summary>
-    private static bool IsKnownFrameworkContract(AssemblyIdentity identity) =>
+    internal static bool IsKnownFrameworkContract(AssemblyIdentity identity) =>
         identity.IsStrongNamed &&
         identity.PublicKeyToken is "7cec85d7bea7798e" or "b03f5f7f11d50a3a" or "cc7b13ffcd2ddd51" &&
         identity.Name is "System.Private.CoreLib" or "System.Runtime" or "System.Runtime.Extensions"
             or "System.Console" or "System.Linq" or "System.Collections" or "System.Collections.Concurrent"
             or "System.Threading" or "System.Threading.Tasks" or "System.Reflection"
-            or "System.Reflection.Emit" or "System.Runtime.InteropServices" or "netstandard";
+            or "System.Reflection.Emit" or "System.Runtime.InteropServices" or "System.Runtime.Loader"
+            or "System.Net.WebClient"
+            or "System.Runtime.CompilerServices.Unsafe" or "System.Threading.Tasks.Extensions"
+            or "netstandard";
 }

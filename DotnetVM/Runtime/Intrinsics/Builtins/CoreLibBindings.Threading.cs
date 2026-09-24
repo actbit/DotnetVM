@@ -377,10 +377,13 @@ internal static partial class CoreLibBindings {
         }
         static CancellationToken CancellationTokenOf(in StackSlot slot) =>
             CancellationRuntime.State(slot)?.Token ?? default;
-        static VmTaskObject[] TaskArray(in StackSlot slot) {
+        static VmTaskObject[] TaskArray(IntrinsicContext ctx, in StackSlot slot) {
             var value = ReadValue(slot);
             if (value.ObjectValue is not VmArray array)
                 throw new UnhandledGuestException("System.ArgumentException", "Task 配列が必要です。");
+            // guest VmArray のサイズだけでは、ここから作る host task 配列・roots・registration
+            // の fan-out を制限できない。host 側配列を確保する前に VM-wide quota を検査する。
+            ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(array.Length);
             var tasks = new VmTaskObject[array.Length];
             for (var i = 0; i < tasks.Length; i++)
                 tasks[i] = array.Elements[i].ObjectValue as VmTaskObject
@@ -407,8 +410,10 @@ internal static partial class CoreLibBindings {
         }
         static VmTaskObject[] TaskSpan(IntrinsicContext ctx, in StackSlot slot) {
             var (reference, length, _) = ReadOnlySpanParts(ctx, slot);
-            if (reference.ObjectValue is not VmByRef byRef || length < 0 || byRef.Index + length > byRef.Container.Length)
+            if (reference.ObjectValue is not VmByRef byRef || length < 0 || byRef.Index < 0 ||
+                byRef.Index > byRef.Container.Length || length > byRef.Container.Length - byRef.Index)
                 throw new UnhandledGuestException("System.ArgumentException", "ReadOnlySpan の範囲が不正です。");
+            ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(length);
             var tasks = new VmTaskObject[length];
             for (var i = 0; i < length; i++)
                 tasks[i] = byRef.Container[byRef.Index + i].ObjectValue as VmTaskObject
@@ -697,14 +702,14 @@ internal static partial class CoreLibBindings {
 
         RegisterBinding(r, BindingKey.Static(task, "WhenAll", "System.Threading.Tasks.Task[]"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var composite = NewTask(ctx, generic: false);
                 ctx.Shared.GuestTasks.WhenAll(composite, tasks, static () => default);
                 return StackSlot.OfObject(composite);
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAll", "System.Threading.Tasks.Task`1<!!0>[]"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var resultType = TaskArrayResultType(ctx, a[0]);
                 var compositeResultType = new VmArrayType { ElementType = resultType };
                 var composite = NewTask(ctx, generic: true, resultType: compositeResultType);
@@ -716,7 +721,7 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny", "System.Threading.Tasks.Task[]"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var taskType = FindType(ctx, task);
                 var composite = NewTask(ctx, generic: true, resultType: taskType);
                 ctx.Shared.GuestTasks.WhenAny(composite, tasks);
@@ -724,7 +729,7 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny", "System.Threading.Tasks.Task`1<!!0>[]"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var resultType = TaskArrayResultType(ctx, a[0]);
                 var elementTaskType = TaskType(ctx, generic: true, resultType);
                 var composite = NewTask(ctx, generic: true, elementTaskType);
@@ -778,6 +783,7 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny", "System.Threading.Tasks.Task", "System.Threading.Tasks.Task"),
             (ctx, a) => {
+                ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(2);
                 var composite = NewTask(ctx, generic: true, FindType(ctx, task));
                 ctx.Shared.GuestTasks.WhenAny(composite, [
                     ReadValue(a[0]).ObjectValue as VmTaskObject
@@ -789,6 +795,7 @@ internal static partial class CoreLibBindings {
         RegisterBinding(r, BindingKey.Static(task, "WhenAny",
                 "System.Threading.Tasks.Task`1<!!0>", "System.Threading.Tasks.Task`1<!!0>"),
             (ctx, a) => {
+                ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(2);
                 var resultType = ResultType(ctx, fromMethod: true) ?? ctx.Types.FindIntrinsicType("System.Object")!;
                 var composite = NewTask(ctx, generic: true, TaskType(ctx, generic: true, resultType));
                 ctx.Shared.GuestTasks.WhenAny(composite, [
@@ -800,14 +807,14 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(tasks, Timeout.Infinite, default));
                 ThrowTaskFailures(tasks);
                 return null;
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.Int32"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var completed = SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(
                     tasks, ValidateTimeout(a[1].AsInt32, "millisecondsTimeout"), default));
                 if (completed) ThrowTaskFailures(tasks);
@@ -815,7 +822,7 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.TimeSpan"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 var completed = SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(
                     tasks, ValidateTimeout(TimeSpanMilliseconds(a[1]), "timeout"), default));
                 if (completed) ThrowTaskFailures(tasks);
@@ -823,7 +830,7 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.Threading.CancellationToken"),
             (ctx, a) => {
-                var tasks = TaskArray(a[0]);
+                var tasks = TaskArray(ctx, a[0]);
                 SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(tasks, Timeout.Infinite,
                     CancellationTokenOf(a[1])));
                 ThrowTaskFailures(tasks);
@@ -931,9 +938,11 @@ internal static partial class CoreLibBindings {
                 var generic = awaiter.ObjectValue is VmStructValue value &&
                     (value.TypeArguments.Length > 0 || (value.StructType as VmConstructedType)?.TypeArguments.Length > 0);
                 var resultType = generic ? AwaiterResultType(ctx, a[1]) : null;
+                var sourceFlags = (CapturesSynchronizationContext(a[1])
+                    ? ValueTaskRuntime.UseSchedulingContext : 0) |
+                    (flowExecutionContext ? ValueTaskRuntime.FlowExecutionContext : 0);
                 var awaitedSourceTask = ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token,
-                    ValueTaskRuntime.UseSchedulingContext |
-                    (flowExecutionContext ? ValueTaskRuntime.FlowExecutionContext : 0));
+                    sourceFlags);
                 var continuation = new Action<StackSlot>(state => ctx.Shared.RunWithSynchronizationContext(
                     capturedContext, () => resume(state)));
                 ctx.Shared.GuestTasks.ScheduleContinuation(awaitedSourceTask, a[2], continuation,
@@ -991,6 +1000,8 @@ internal static partial class CoreLibBindings {
                 var generic = awaiter.ObjectValue is VmStructValue value &&
                     (value.TypeArguments.Length > 0 || (value.StructType as VmConstructedType)?.TypeArguments.Length > 0);
                 var resultType = generic ? AwaiterResultType(ctx, a[0]) : null;
+                if (!CapturesSynchronizationContext(a[0]))
+                    sourceFlags &= ~ValueTaskRuntime.UseSchedulingContext;
                 var sourceTask = ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token, sourceFlags,
                     forceSourceRegistration: true);
                 var sourceCallback = a.Length > 1 ? a[1] : default;

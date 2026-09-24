@@ -9,9 +9,30 @@ using DotnetVM.Runtime.Types;
 namespace DotnetVM.Runtime.Intrinsics.Builtins;
 
 internal static partial class CoreLibBindings {
+    private static void RegisterTimeSpanConstruction(IntrinsicRegistry r) {
+        const string timeSpan = "System.TimeSpan";
+        static StackSlot FromMilliseconds(IntrinsicContext ctx, double milliseconds) {
+            var type = ctx.Types.FindIntrinsicType(timeSpan)
+                ?? throw new InvalidOperationException("TimeSpan facade が見つかりません。");
+            return StackSlot.OfValueType(new VmStructValue(type,
+                [StackSlot.OfInt64(TimeSpan.FromMilliseconds(milliseconds).Ticks)]));
+        }
+        r.RegisterBinding(BindingKey.StaticWithReturn(timeSpan, "FromMilliseconds", timeSpan,
+                ["System.Int64"]),
+            (ctx, a) => FromMilliseconds(ctx, a[0].Int64Value), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(timeSpan, "FromMilliseconds", "System.Int64"),
+            (ctx, a) => FromMilliseconds(ctx, a[0].Int64Value), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.StaticWithReturn(timeSpan, "FromMilliseconds", timeSpan,
+                ["System.Double"]),
+            (ctx, a) => FromMilliseconds(ctx, a[0].DoubleValue), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(timeSpan, "FromMilliseconds", "System.Double"),
+            (ctx, a) => FromMilliseconds(ctx, a[0].DoubleValue), BindingOrigin.Managed);
+    }
+
     // ---- System.Threading.Thread / Monitor ----
 
     private static void RegisterThreading(IntrinsicRegistry r) {
+        RegisterTimeSpanConstruction(r);
         // Thread は VM delegate をホスト worker thread 上で実行する。ゲスト IL への再入は
         // Interpreter のスレッド別フレームと共有 quota / heap を通る。
         const string thread = "System.Threading.Thread";
@@ -206,6 +227,11 @@ internal static partial class CoreLibBindings {
                     if (field.ObjectValue is VmTaskObject wrappedTask)
                         return wrappedTask;
 
+                if (valueTask && ValueTaskRuntime.TryGetSourceValue(value, out var source, out var token)) {
+                    var resultType = generic ? ValueTaskResultType(ctx, value) : null;
+                    return ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token);
+                }
+
                 // default(ValueTask) / default(ValueTask<T>) has no backing Task. CLR treats
                 // that zero-initialized value as completed successfully. Only AsTask needs a
                 // Task-shaped representation; direct completion/result queries stay allocation-free.
@@ -269,7 +295,7 @@ internal static partial class CoreLibBindings {
             if (value.ObjectValue is VmStructValue awaiter &&
                 awaiter.StructType.FullName.Contains("Configured", StringComparison.Ordinal) &&
                 awaiter.Fields.Length > 1)
-                return awaiter.Fields[1].AsInt32 != 0;
+                return awaiter.Fields[^1].AsInt32 != 0;
             return true;
         }
         static VmTaskObject AwaitedTask(IntrinsicContext ctx, in StackSlot slot) {
@@ -279,6 +305,12 @@ internal static partial class CoreLibBindings {
                 throw new UnhandledGuestException("System.InvalidOperationException", "Task awaiter が初期化されていません。");
             if (value.Fields[0].ObjectValue is VmTaskObject taskObject)
                 return taskObject;
+            if (ValueTaskRuntime.TryGetSourceAwaiter(awaiterValue, out var source, out var token)) {
+                var generic = value.TypeArguments.Length > 0 ||
+                    (value.StructType as VmConstructedType)?.TypeArguments.Length > 0;
+                var resultType = generic ? AwaiterResultType(ctx, awaiterValue) : null;
+                return ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token);
+            }
             if (IsCompletedAwaiter(awaiterValue)) {
                 var generic = value.TypeArguments.Length > 0 ||
                     (value.StructType as VmConstructedType)?.TypeArguments.Length > 0;
@@ -389,20 +421,16 @@ internal static partial class CoreLibBindings {
                 ? task.TypeArguments[0]
                 : ctx.Types.FindIntrinsicType("System.Object")!;
         }
-        static void ThrowTaskFailure(VmTaskObject task) {
-            var snapshot = task.Snapshot();
-            if (task.IsCanceled)
-                throw new UnhandledGuestException("System.OperationCanceledException", null);
-            if (snapshot.GuestException.Kind != StackKind.Empty) {
-                var typeName = snapshot.GuestException.ObjectValue switch {
-                    VmExceptionObject exception => exception.ExceptionType.FullName,
-                    VmClassInstance exception => exception.ClassType.FullName,
-                    _ => "System.Exception",
-                };
-                throw new UnhandledGuestException(typeName, null);
+        static void ThrowTaskFailures(IEnumerable<VmTaskObject> tasks) {
+            // Task.WaitAll always reports child failures as AggregateException.  Keep this as a
+            // guest exception even when a child is a VM exception, so guest catch blocks observe
+            // the same surface as CLR code instead of the first child exception directly.
+            foreach (var task in tasks) {
+                var snapshot = task.Snapshot();
+                if (task.IsCanceled || snapshot.GuestException.Kind != StackKind.Empty ||
+                    snapshot.HostException is not null)
+                    throw new UnhandledGuestException("System.AggregateException", null);
             }
-            if (snapshot.HostException is not null)
-                throw snapshot.HostException;
         }
         static VmType? ResultType(IntrinsicContext ctx, bool fromMethod) => fromMethod
             ? ctx.MethodTypeArguments.FirstOrDefault()
@@ -423,7 +451,8 @@ internal static partial class CoreLibBindings {
         }
 
         static StackSlot NewConfiguredAwaitable(IntrinsicContext ctx, bool generic, bool valueTask,
-            VmType? resultType, VmTaskObject? taskObject, bool continueOnCapturedContext) {
+            VmType? resultType, VmTaskObject? taskObject, StackSlot source, short token,
+            bool continueOnCapturedContext) {
             var name = valueTask
                 ? (generic ? configuredValueTaskOfT : configuredValueTask)
                 : (generic ? configuredTaskOfT : configuredTask);
@@ -431,10 +460,12 @@ internal static partial class CoreLibBindings {
             var type = generic
                 ? new VmConstructedType { Definition = definition, TypeArguments = [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] }
                 : definition;
-            return StackSlot.OfValueType(new VmStructValue(type, [
-                taskObject is null ? default : StackSlot.OfObject(taskObject),
-                StackSlot.OfInt32(continueOnCapturedContext ? 1 : 0),
-            ],
+            var fields = taskObject is not null
+                ? new[] { StackSlot.OfObject(taskObject), StackSlot.OfInt32(continueOnCapturedContext ? 1 : 0) }
+                : source.ObjectValue is not null
+                    ? new[] { source, StackSlot.OfInt32(token), StackSlot.OfInt32(continueOnCapturedContext ? 1 : 0) }
+                    : new[] { default(StackSlot), StackSlot.OfInt32(continueOnCapturedContext ? 1 : 0) };
+            return StackSlot.OfValueType(new VmStructValue(type, fields,
                 generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
         }
         static VmType ConfiguredAwaiterType(IntrinsicContext ctx, bool generic, bool valueTask, VmType? resultType) {
@@ -453,20 +484,34 @@ internal static partial class CoreLibBindings {
         static StackSlot NewAwaiter(IntrinsicContext ctx, bool generic, bool valueTask,
             VmType? resultType, in StackSlot source) {
             var completed = valueTask && IsDefaultValueTask(source);
+            if (valueTask && ValueTaskRuntime.TryGetSourceValue(source, out var valueTaskSource, out var valueTaskToken))
+                return StackSlot.OfValueType(new VmStructValue(AwaiterType(ctx, generic, resultType, valueTask),
+                    [valueTaskSource, StackSlot.OfInt32(valueTaskToken)],
+                    generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
             var taskObject = completed ? null : AsTask(ctx, source, generic, valueTask);
             return StackSlot.OfValueType(new VmStructValue(AwaiterType(ctx, generic, resultType, valueTask),
                 [taskObject is null ? default : StackSlot.OfObject(taskObject)],
                 generic ? [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!] : []));
         }
 
+        static bool ValueTaskIsCompleted(IntrinsicContext ctx, in StackSlot value,
+            bool generic) {
+            if (IsDefaultValueTask(value))
+                return true;
+            if (ValueTaskRuntime.TryGetSourceValue(value, out var source, out var token))
+                return ValueTaskRuntime.GetStatus(ctx, source, token) != 0;
+            return AsTask(ctx, value, generic, valueTask: true).IsCompleted;
+        }
+
         static void RegisterTaskType(IntrinsicRegistry registry, string typeName, bool generic, bool valueTask) {
             RegisterBinding(registry, BindingKey.Instance(typeName, "get_IsCompleted"),
-                (ctx, a) => StackSlot.OfInt32(valueTask && IsDefaultValueTask(a[0])
-                    || AsTask(ctx, a[0], generic, valueTask).IsCompleted ? 1 : 0));
+                (ctx, a) => StackSlot.OfInt32(valueTask
+                    ? (ValueTaskIsCompleted(ctx, a[0], generic) ? 1 : 0)
+                    : (AsTask(ctx, a[0], generic, valueTask).IsCompleted ? 1 : 0)));
             RegisterBinding(registry, BindingKey.Instance(typeName, "GetAwaiter"),
                 (ctx, a) => NewAwaiter(ctx, generic, valueTask,
-                    generic ? (valueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false)) : null,
-                    a[0]));
+                        generic ? (valueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false)) : null,
+                        a[0]));
             if (!valueTask) {
                 RegisterBinding(registry, BindingKey.Instance(typeName, "Wait"),
                     (ctx, a) => { SuspendHostWait(ctx, AsTask(ctx, a[0]).Wait); return null; });
@@ -485,11 +530,24 @@ internal static partial class CoreLibBindings {
                 RegisterBinding(registry, BindingKey.Instance(typeName, "AsTask"),
                     (ctx, a) => StackSlot.OfObject(AsTask(ctx, a[0], generic, valueTask)));
             }
-                RegisterBinding(registry, BindingKey.Instance(typeName, "ConfigureAwait", "System.Boolean"),
-                    (ctx, a) => NewConfiguredAwaitable(ctx, generic, valueTask,
-                        generic ? (valueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false)) : null,
-                        valueTask && IsDefaultValueTask(a[0]) ? null : AsTask(ctx, a[0], generic, valueTask),
-                        a[1].AsInt32 != 0));
+            RegisterBinding(registry, BindingKey.Instance(typeName, "ConfigureAwait", "System.Boolean"),
+                (ctx, a) => {
+                    var resultType = generic
+                        ? (valueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false))
+                        : null;
+                    var source = default(StackSlot);
+                    short token = 0;
+                    VmTaskObject? taskObject = null;
+                    var isDefault = valueTask && IsDefaultValueTask(a[0]);
+                    if (!isDefault && valueTask && ValueTaskRuntime.TryGetSourceValue(a[0], out source, out token)) {
+                        // Keep source/token in the configured awaitable; ConfigureAwait itself is
+                        // not allowed to query the source.
+                    } else if (!isDefault) {
+                        taskObject = AsTask(ctx, a[0], generic, valueTask);
+                    }
+                    return NewConfiguredAwaitable(ctx, generic, valueTask, resultType,
+                        taskObject, source, token, a[1].AsInt32 != 0);
+                });
         }
 
         static StackSlot StartTaskWorker(IntrinsicContext ctx, StackSlot[] a, VmType? resultType, bool generic,
@@ -522,6 +580,13 @@ internal static partial class CoreLibBindings {
             return StackSlot.OfObject(running);
         }
 
+        RegisterBinding(r, BindingKey.InstanceByArity(valueTask, ".ctor", 2),
+            (ctx, a) => ValueTaskRuntime.ConstructFromSource(ctx, generic: false, resultType: null,
+                a[0], a[1], unchecked((short)a[2].AsInt32)));
+        RegisterBinding(r, BindingKey.InstanceByArity(valueTaskOfT, ".ctor", 2),
+            (ctx, a) => ValueTaskRuntime.ConstructFromSource(ctx, generic: true,
+                ResultType(ctx, fromMethod: false), a[0], a[1], unchecked((short)a[2].AsInt32)));
+
         RegisterTaskType(r, task, generic: false, valueTask: false);
         RegisterTaskType(r, taskOfT, generic: true, valueTask: false);
         RegisterTaskType(r, valueTask, generic: false, valueTask: true);
@@ -534,14 +599,19 @@ internal static partial class CoreLibBindings {
                 var resultType = generic
                     ? (isValueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false))
                     : null;
-                var completed = isValueTask && IsDefaultValueTask(a[0]);
-                var taskObject = completed ? null : AsTask(ctx, a[0], generic, isValueTask);
                 var configuredValue = ReadValue(a[0]);
-                var fields = new[] {
-                    taskObject is null ? default : StackSlot.OfObject(taskObject),
-                    configuredValue.ObjectValue is VmStructValue configured && configured.Fields.Length > 1
-                        ? configured.Fields[1] : StackSlot.OfInt32(1),
-                };
+                var configured = configuredValue.ObjectValue as VmStructValue
+                    ?? throw new UnhandledGuestException("System.InvalidOperationException", "Configured awaitable が初期化されていません。");
+                var captures = configured.Fields.Length == 0 ? 1 : configured.Fields[^1].AsInt32;
+                StackSlot[] fields;
+                if (isValueTask && ValueTaskRuntime.TryGetSourceValue(configuredValue, out var source, out var token))
+                    fields = [source, StackSlot.OfInt32(token), StackSlot.OfInt32(captures)];
+                else {
+                    var taskObject = configured.Fields.Length > 0
+                        ? configured.Fields[0].ObjectValue as VmTaskObject : null;
+                    fields = [taskObject is null ? default : StackSlot.OfObject(taskObject),
+                        StackSlot.OfInt32(captures)];
+                }
                 return StackSlot.OfValueType(new VmStructValue(
                     ConfiguredAwaiterType(ctx, generic, isValueTask, resultType),
                     fields,
@@ -703,7 +773,7 @@ internal static partial class CoreLibBindings {
             (ctx, a) => {
                 var tasks = TaskSpan(ctx, a[0]);
                 SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(tasks, Timeout.Infinite, default));
-                foreach (var item in tasks) ThrowTaskFailure(item);
+                ThrowTaskFailures(tasks);
                 return null;
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny", "System.Threading.Tasks.Task", "System.Threading.Tasks.Task"),
@@ -732,7 +802,7 @@ internal static partial class CoreLibBindings {
             (ctx, a) => {
                 var tasks = TaskArray(a[0]);
                 SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(tasks, Timeout.Infinite, default));
-                foreach (var item in tasks) ThrowTaskFailure(item);
+                ThrowTaskFailures(tasks);
                 return null;
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.Int32"),
@@ -740,25 +810,23 @@ internal static partial class CoreLibBindings {
                 var tasks = TaskArray(a[0]);
                 var completed = SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(
                     tasks, ValidateTimeout(a[1].AsInt32, "millisecondsTimeout"), default));
-                if (!completed) throw new UnhandledGuestException("System.TimeoutException", null);
-                foreach (var item in tasks) ThrowTaskFailure(item);
-                return null;
+                if (completed) ThrowTaskFailures(tasks);
+                return StackSlot.OfInt32(completed ? 1 : 0);
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.TimeSpan"),
             (ctx, a) => {
                 var tasks = TaskArray(a[0]);
                 var completed = SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(
                     tasks, ValidateTimeout(TimeSpanMilliseconds(a[1]), "timeout"), default));
-                if (!completed) throw new UnhandledGuestException("System.TimeoutException", null);
-                foreach (var item in tasks) ThrowTaskFailure(item);
-                return null;
+                if (completed) ThrowTaskFailures(tasks);
+                return StackSlot.OfInt32(completed ? 1 : 0);
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]", "System.Threading.CancellationToken"),
             (ctx, a) => {
                 var tasks = TaskArray(a[0]);
                 SuspendHostWait(ctx, () => ctx.Shared.GuestTasks.WaitAll(tasks, Timeout.Infinite,
                     CancellationTokenOf(a[1])));
-                foreach (var item in tasks) ThrowTaskFailure(item);
+                ThrowTaskFailures(tasks);
                 return null;
             });
 
@@ -771,8 +839,13 @@ internal static partial class CoreLibBindings {
             ("System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter", true, true),
         }) {
             RegisterBinding(r, BindingKey.Instance(typeName, "get_IsCompleted"),
-                (ctx, a) => StackSlot.OfInt32(IsCompletedAwaiter(a[0])
-                    || AwaitedTask(ctx, a[0]).IsCompleted ? 1 : 0));
+                (ctx, a) => {
+                    if (awaiterIsValueTask && ValueTaskRuntime.TryGetSourceAwaiter(a[0], out var source, out var token)) {
+                        return StackSlot.OfInt32(ValueTaskRuntime.GetStatus(ctx, source, token) != 0 ? 1 : 0);
+                    }
+                    return StackSlot.OfInt32(IsCompletedAwaiter(a[0])
+                        || AwaitedTask(ctx, a[0]).IsCompleted ? 1 : 0);
+                });
             RegisterBinding(r, BindingKey.Instance(typeName, "GetResult"),
                 (ctx, a) => {
                     if (awaiterIsValueTask && IsCompletedAwaiter(a[0])) {
@@ -783,12 +856,17 @@ internal static partial class CoreLibBindings {
                             return null;
                         return DefaultValueTaskResult(ctx, generic: true, AwaiterResultType(ctx, a[0]));
                     }
+                    if (awaiterIsValueTask && ValueTaskRuntime.TryGetSourceAwaiter(a[0], out var source, out var token)) {
+                        var result = ValueTaskRuntime.GetResult(ctx, source, token);
+                        return generic ? result : null;
+                    }
                     return TaskResult(ctx, AwaitedTask(ctx, a[0]));
                 });
             RegisterBinding(r, BindingKey.Instance(typeName, "OnCompleted", "System.Action"),
-                (ctx, a) => RegisterAwaiterCallback(ctx, a));
+                (ctx, a) => RegisterAwaiterCallback(ctx, a,
+                    ValueTaskRuntime.UseSchedulingContext | ValueTaskRuntime.FlowExecutionContext));
             RegisterBinding(r, BindingKey.Instance(typeName, "UnsafeOnCompleted", "System.Action"),
-                (ctx, a) => RegisterAwaiterCallback(ctx, a));
+                (ctx, a) => RegisterAwaiterCallback(ctx, a, ValueTaskRuntime.UseSchedulingContext));
         }
 
         RegisterBuilderType(r, builder, generic: false, valueTask: false);
@@ -836,18 +914,32 @@ internal static partial class CoreLibBindings {
                     return null;
                 });
             RegisterBinding(registry, BindingKey.Instance(typeName, "AwaitOnCompleted", "!!0&", "!!1&"),
-                (ctx, a) => RegisterContinuation(ctx, a));
+                (ctx, a) => RegisterContinuation(ctx, a, flowExecutionContext: true));
             RegisterBinding(registry, BindingKey.Instance(typeName, "AwaitUnsafeOnCompleted", "!!0&", "!!1&"),
-                (ctx, a) => RegisterContinuation(ctx, a));
+                (ctx, a) => RegisterContinuation(ctx, a, flowExecutionContext: false));
             RegisterBinding(registry, BindingKey.Instance(typeName, "SetStateMachine",
                     "System.Runtime.CompilerServices.IAsyncStateMachine"),
                 static (_, _) => null);
         }
 
-        static StackSlot? RegisterContinuation(IntrinsicContext ctx, StackSlot[] a) {
+        static StackSlot? RegisterContinuation(IntrinsicContext ctx, StackSlot[] a, bool flowExecutionContext) {
             var resume = ctx.RunGuestStateMachine ?? throw new InvalidOperationException("guest state machine runner が初期化されていません。");
             var capturedContext = CapturesSynchronizationContext(a[1])
                 ? ctx.Shared.CurrentSynchronizationContext : null;
+            if (ValueTaskRuntime.TryGetSourceAwaiter(a[1], out var source, out var token)) {
+                var awaiter = ReadValue(a[1]);
+                var generic = awaiter.ObjectValue is VmStructValue value &&
+                    (value.TypeArguments.Length > 0 || (value.StructType as VmConstructedType)?.TypeArguments.Length > 0);
+                var resultType = generic ? AwaiterResultType(ctx, a[1]) : null;
+                var awaitedSourceTask = ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token,
+                    ValueTaskRuntime.UseSchedulingContext |
+                    (flowExecutionContext ? ValueTaskRuntime.FlowExecutionContext : 0));
+                var continuation = new Action<StackSlot>(state => ctx.Shared.RunWithSynchronizationContext(
+                    capturedContext, () => resume(state)));
+                ctx.Shared.GuestTasks.ScheduleContinuation(awaitedSourceTask, a[2], continuation,
+                    capturedContext is null ? null : StackSlot.OfObject(capturedContext));
+                return null;
+            }
             if (TryAwaitedTask(ctx, a[1], out var awaited)) {
                 var continuation = new Action<StackSlot>(state => ctx.Shared.RunWithSynchronizationContext(
                     capturedContext, () => resume(state)));
@@ -893,7 +985,27 @@ internal static partial class CoreLibBindings {
             return null;
         }
 
-        static StackSlot? RegisterAwaiterCallback(IntrinsicContext ctx, StackSlot[] a) {
+        static StackSlot? RegisterAwaiterCallback(IntrinsicContext ctx, StackSlot[] a, int sourceFlags) {
+            if (ValueTaskRuntime.TryGetSourceAwaiter(a[0], out var source, out var token)) {
+                var awaiter = ReadValue(a[0]);
+                var generic = awaiter.ObjectValue is VmStructValue value &&
+                    (value.TypeArguments.Length > 0 || (value.StructType as VmConstructedType)?.TypeArguments.Length > 0);
+                var resultType = generic ? AwaiterResultType(ctx, a[0]) : null;
+                var sourceTask = ValueTaskRuntime.AsTask(ctx, source, generic, resultType, token, sourceFlags,
+                    forceSourceRegistration: true);
+                var sourceCallback = a.Length > 1 ? a[1] : default;
+                var sourceInvoke = ctx.InvokeGuestDelegate ?? throw new InvalidOperationException("guest delegate runner が初期化されていません。");
+                var sourceContext = CapturesSynchronizationContext(a[0])
+                    ? ctx.Shared.CurrentSynchronizationContext : null;
+                ctx.Shared.GuestTasks.ScheduleCallback(sourceTask, sourceCallback, value => {
+                    void Run() {
+                        if (value.ObjectValue is VmDelegate continuation)
+                            _ = sourceInvoke(continuation, [value]);
+                    }
+                    ctx.Shared.RunWithSynchronizationContext(sourceContext, Run);
+                }, sourceContext is null ? null : StackSlot.OfObject(sourceContext));
+                return null;
+            }
             var awaited = AwaitedTask(ctx, a[0]);
             var callback = a.Length > 1 ? a[1] : default;
             var invoke = ctx.InvokeGuestDelegate ?? throw new InvalidOperationException("guest delegate runner が初期化されていません。");

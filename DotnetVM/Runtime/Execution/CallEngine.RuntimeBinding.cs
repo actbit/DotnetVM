@@ -26,32 +26,36 @@ internal sealed partial class CallEngine {
     private BindingDomain CallerDomainOfLoader() =>
         _loader.IsTrustedCoreLib ? BindingDomain.TrustedCoreLib : BindingDomain.Guest;
 
-    private static bool IsTaskSurface(string typeName) => typeName is
-        "System.Threading.Tasks.Task" or "System.Threading.Tasks.Task`1" or
-        "System.Threading.Tasks.ValueTask" or "System.Threading.Tasks.ValueTask`1" or
-        "System.Runtime.CompilerServices.TaskAwaiter" or "System.Runtime.CompilerServices.TaskAwaiter`1" or
-        "System.Runtime.CompilerServices.ValueTaskAwaiter" or "System.Runtime.CompilerServices.ValueTaskAwaiter`1" or
-        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable" or "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1" or
-        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable+ConfiguredTaskAwaiter" or
-        "System.Runtime.CompilerServices.ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter" or
-        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable" or "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1" or
-        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter" or
-        "System.Runtime.CompilerServices.ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter" or
-        "System.Runtime.CompilerServices.AsyncTaskMethodBuilder" or
-        "System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1" or
-        "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder" or
-        "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1";
-
     /// <summary>
-    /// Task 系の署名 binding は FullName だけで fake TypeDef に適用してはいけない。
-    /// CoreLib 実型は trusted loader、CoreLib 未ロード時は TypeLoader が明示的に合成した
-    /// intrinsic facade のみを許可する。
+    /// Runtime binding は FullName だけで guest TypeDef に適用してはいけない。CoreLib
+    /// 実型は trusted loader、CoreLib 未ロード時は TypeLoader が明示的に合成した intrinsic
+    /// facade のみを許可する。対象型を Task だけに列挙しないことで、CancellationToken、
+    /// SynchronizationContext、ValueTask など全 runtime surface に同じ provenance policy を
+    /// 適用する。
     /// </summary>
-    private static bool IsAllowedTaskSurface(VmType? type) => type switch {
+    private static bool IsAllowedRuntimeBindingType(VmType? type) => type switch {
         VmIntrinsicType => true,
         VmClassType cls => cls.Loader?.IsTrustedCoreLib == true,
+        VmConstructedType constructed => IsAllowedRuntimeBindingType(constructed.Definition),
         _ => false,
     };
+
+    /// <summary>
+    /// A guest type may still use an ordinary legacy intrinsic when no signature binding exists
+    /// for that surface (for example the CoreLib Unsafe compatibility shim).  Once a signature
+    /// binding is registered, however, a colliding guest type must not reach it unless its
+    /// provenance is trusted or intrinsic.
+    /// </summary>
+    private bool CanAttemptRuntimeBinding(VmType? type) => type is not null &&
+        (IsAllowedRuntimeBindingType(type) ||
+         _intrinsics.HasBindingForType(type.FullName, BindingOrigin.InternalCall) ||
+         !_intrinsics.HasBindingForType(type.FullName));
+
+    // Some CoreLib reference TypeRefs (notably Unsafe) intentionally have no VM TypeDef when the
+    // host CoreLib is not loaded.  The absence of a resolved type is not provenance evidence of a
+    // fake definition, so retain the legacy unresolved-TypeRef lookup in that narrow case.
+    private bool CanAttemptRuntimeBinding(string typeName, VmType? type) => type is null ||
+        CanAttemptRuntimeBinding(type);
 
     private VmType? TryResolveTypeRefForBinding(int typeRefRid) {
         try {
@@ -61,9 +65,6 @@ internal sealed partial class CallEngine {
             return null;
         }
     }
-
-    private bool IsAllowedTaskBinding(string typeName, VmType? resolvedType) =>
-        !IsTaskSurface(typeName) || IsAllowedTaskSurface(resolvedType ?? _loader.FindIntrinsicType(typeName));
 
     /// <summary>caller domain を考慮したバインド照合。trusted caller は特権面を優先し、
     /// 汎用面にも到達できる。guest caller は汎用面のみ (特権面は遮断)。</summary>
@@ -100,7 +101,7 @@ internal sealed partial class CallEngine {
     private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result,
         BindingDomain callerDomain, VmType[]? classArgs = null) {
         result = null;
-        if (IsTaskSurface(method.DeclaringType.FullName) && !IsAllowedTaskSurface(method.DeclaringType))
+        if (!CanAttemptRuntimeBinding(method.DeclaringType))
             return false;
         var names = ParamTypeNamesOf(method, methodArgs, classArgs);
         if (names is null || names.Any(string.IsNullOrEmpty)) {

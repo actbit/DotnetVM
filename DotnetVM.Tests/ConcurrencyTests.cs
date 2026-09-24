@@ -135,6 +135,41 @@ public sealed class ConcurrencyTests {
                 public static int AwaitValueTaskSource() =>
                     new ValueTask<int>(new Source(), 0).GetAwaiter().GetResult();
 
+                private sealed class TrackingSource : IValueTaskSource<int> {
+                    public static int StatusCalls;
+                    public static int OnCompletedCalls;
+                    public static int Flags;
+                    public ValueTaskSourceStatus GetStatus(short token) {
+                        Interlocked.Increment(ref StatusCalls);
+                        return ValueTaskSourceStatus.Succeeded;
+                    }
+                    public int GetResult(short token) => token == 7 ? 45 : throw new InvalidOperationException("token");
+                    public void OnCompleted(Action<object?> continuation, object? state, short token,
+                        ValueTaskSourceOnCompletedFlags flags) {
+                        Interlocked.Increment(ref OnCompletedCalls);
+                        Flags = (int)flags;
+                    }
+                }
+                public static int ProbeValueTaskSourceLaziness() {
+                    TrackingSource.StatusCalls = 0;
+                    TrackingSource.OnCompletedCalls = 0;
+                    var valueTask = new ValueTask<int>(new TrackingSource(), 7);
+                    var afterConstruction = TrackingSource.StatusCalls + TrackingSource.OnCompletedCalls;
+                    var awaiter = valueTask.GetAwaiter();
+                    var afterGetAwaiter = TrackingSource.StatusCalls + TrackingSource.OnCompletedCalls;
+                    _ = awaiter.IsCompleted;
+                    return afterConstruction * 100 + afterGetAwaiter * 10 + TrackingSource.StatusCalls;
+                }
+                public static int ProbeValueTaskSourceFlags() {
+                    TrackingSource.StatusCalls = 0;
+                    TrackingSource.OnCompletedCalls = 0;
+                    TrackingSource.Flags = 0;
+                    var valueTask = new ValueTask<int>(new TrackingSource(), 7);
+                    valueTask.GetAwaiter().OnCompleted(() => { });
+                    Thread.Sleep(25);
+                    return TrackingSource.Flags;
+                }
+
                 public static int CancelledDelay() {
                     using var cts = new CancellationTokenSource();
                     var task = Task.Delay(1000, cts.Token);
@@ -165,6 +200,94 @@ public sealed class ConcurrencyTests {
                 public static int RunWhenAny() {
                     var winner = Task.WhenAny(Task.FromResult(7), Task.FromResult(8)).GetAwaiter().GetResult();
                     return winner.GetAwaiter().GetResult();
+                }
+
+                public static int WhenAllSingleFault() {
+                    var tasks = new[] { FaultAsync() };
+                    try { Task.WhenAll(tasks).GetAwaiter().GetResult(); return -1; }
+                    catch (InvalidOperationException) { return 1; }
+                }
+                public static int WhenAllMultipleFaults() {
+                    var tasks = new[] { FaultAsync(), FaultAsync() };
+                    try { Task.WhenAll(tasks).GetAwaiter().GetResult(); return -1; }
+                    catch (InvalidOperationException) { return 1; }
+                    catch (AggregateException) { return 2; }
+                }
+                public static int WhenAllCanceled() {
+                    using var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    var tasks = new Task[] { Task.Delay(100, cts.Token) };
+                    try { Task.WhenAll(tasks).GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                public static int WhenAllFaultAndCanceled() {
+                    using var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    var tasks = new Task[] { FaultAsync(), Task.Delay(100, cts.Token) };
+                    try { Task.WhenAll(tasks).GetAwaiter().GetResult(); return -1; }
+                    catch (InvalidOperationException) { return 1; }
+                    catch (OperationCanceledException) { return 2; }
+                }
+                public static int WhenAnyEmpty() {
+                    try { _ = Task.WhenAny(new Task[0]); return -1; }
+                    catch (ArgumentException) { return 1; }
+                }
+                public static int WhenAnyMany() {
+                    var tasks = new Task<int>[128];
+                    for (var i = 0; i < tasks.Length; i++) tasks[i] = Task.FromResult(i);
+                    return Task.WhenAny(tasks).GetAwaiter().GetResult().GetAwaiter().GetResult();
+                }
+                public static int WaitAllTimeoutInt() =>
+                    Task.WaitAll(new[] { Task.Delay(100) }, 1) ? -1 : 1;
+                public static int WaitAllTimeoutTimeSpan() =>
+                    Task.WaitAll(new[] { Task.Delay(100) }, TimeSpan.FromMilliseconds(1)) ? -1 : 1;
+                public static int WaitAllMultipleFaults() {
+                    try { Task.WaitAll(new[] { FaultAsync(), FaultAsync() }); return -1; }
+                    catch (AggregateException) { return 1; }
+                }
+                public static int WaitAllCanceled() {
+                    using var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    try { Task.WaitAll(new[] { Task.Delay(100, cts.Token) }); return -1; }
+                    catch (AggregateException) { return 1; }
+                }
+                public static int WaitAllFaultAndCanceled() {
+                    using var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    try { Task.WaitAll(new Task[] { FaultAsync(), Task.Delay(100, cts.Token) }); return -1; }
+                    catch (AggregateException) { return 1; }
+                }
+                public static int AutoCancelInt() {
+                    using var cts = new CancellationTokenSource(1);
+                    try { Task.Delay(1000, cts.Token).GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                public static int AutoCancelTimeSpan() {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1));
+                    try { Task.Delay(1000, cts.Token).GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                public static int CancelAfterInt() {
+                    using var cts = new CancellationTokenSource();
+                    cts.CancelAfter(1);
+                    try { Task.Delay(1000, cts.Token).GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                public static int CancelAfterTimeSpan() {
+                    using var cts = new CancellationTokenSource();
+                    cts.CancelAfter(TimeSpan.FromMilliseconds(1));
+                    try { Task.Delay(1000, cts.Token).GetAwaiter().GetResult(); return -1; }
+                    catch (OperationCanceledException) { return 1; }
+                }
+                public static int DisposedCancellationSource() {
+                    var cts = new CancellationTokenSource();
+                    var token = cts.Token;
+                    cts.Dispose();
+                    var result = token.CanBeCanceled && !token.IsCancellationRequested ? 1 : 0;
+                    try { cts.Cancel(); } catch (ObjectDisposedException) { result |= 2; }
+                    try { cts.CancelAfter(1); } catch (ObjectDisposedException) { result |= 4; }
+                    try { _ = cts.Token; } catch (ObjectDisposedException) { result |= 8; }
+                    return result;
                 }
 
                 private static async Task<int> CaptureSynchronizationContextAsync(bool configureAwait) {
@@ -306,6 +429,24 @@ public sealed class ConcurrencyTests {
         Assert.Equal(2, Call(type, "RunWhenAll"));
         Assert.Equal(5, Call(type, "RunGenericWhenAll"));
         Assert.Equal(7, Call(type, "RunWhenAny"));
+        Assert.Equal(1, Call(type, "WhenAllSingleFault"));
+        Assert.Equal(1, Call(type, "WhenAllMultipleFaults"));
+        Assert.Equal(1, Call(type, "WhenAllCanceled"));
+        Assert.Equal(1, Call(type, "WhenAllFaultAndCanceled"));
+        Assert.Equal(1, Call(type, "WhenAnyEmpty"));
+        Assert.Equal(0, Call(type, "WhenAnyMany"));
+        Assert.Equal(1, Call(type, "WaitAllTimeoutInt"));
+        Assert.Equal(1, Call(type, "WaitAllTimeoutTimeSpan"));
+        Assert.Equal(1, Call(type, "WaitAllMultipleFaults"));
+        Assert.Equal(1, Call(type, "WaitAllCanceled"));
+        Assert.Equal(1, Call(type, "WaitAllFaultAndCanceled"));
+        Assert.Equal(1, Call(type, "AutoCancelInt"));
+        Assert.Equal(1, Call(type, "AutoCancelTimeSpan"));
+        Assert.Equal(1, Call(type, "CancelAfterInt"));
+        Assert.Equal(1, Call(type, "CancelAfterTimeSpan"));
+        Assert.Equal(15, Call(type, "DisposedCancellationSource"));
+        Assert.Equal(1, Call(type, "ProbeValueTaskSourceLaziness"));
+        Assert.Equal(3, Call(type, "ProbeValueTaskSourceFlags"));
         Assert.Equal(0, Call(type, "CaptureSynchronizationContext", true));
     }
 
@@ -467,6 +608,20 @@ public sealed class ConcurrencyTests {
         Assert.Equal(2, vm.Invoke("Vm.ConcurrentCode", "RunWaitAll"));
         Assert.Equal(5, vm.Invoke("Vm.ConcurrentCode", "RunGenericWhenAll"));
         Assert.Equal(7, vm.Invoke("Vm.ConcurrentCode", "RunWhenAny"));
+        foreach (var (method, expected) in new[] {
+            ("WhenAllSingleFault", 1), ("WhenAllMultipleFaults", 1),
+            ("WhenAllCanceled", 1), ("WhenAllFaultAndCanceled", 1),
+            ("WhenAnyEmpty", 1), ("WhenAnyMany", 0),
+            ("WaitAllTimeoutInt", 1), ("WaitAllTimeoutTimeSpan", 1),
+            ("WaitAllMultipleFaults", 1), ("WaitAllCanceled", 1),
+            ("WaitAllFaultAndCanceled", 1), ("AutoCancelInt", 1),
+            ("AutoCancelTimeSpan", 1), ("CancelAfterInt", 1),
+            ("CancelAfterTimeSpan", 1), ("DisposedCancellationSource", 15),
+            ("ProbeValueTaskSourceLaziness", 1), ("ProbeValueTaskSourceFlags", 3),
+        }) {
+            try { Assert.Equal(expected, vm.Invoke("Vm.ConcurrentCode", method)); }
+            catch (Exception ex) { throw new Xunit.Sdk.XunitException($"{method}: {ex}", ex); }
+        }
     }
 
     [Fact]

@@ -312,7 +312,10 @@ internal sealed partial class ObjectEngine {
                         ctorArgs[0] = StackSlot.OfObject(facadeInstance);
                         gate.ConsumeInstruction();
                         gate.CheckSafepoint();
-                        intrinsicCtor(_intrinsicContext, ctorArgs);
+                        var intrinsicResult = intrinsicCtor(_intrinsicContext, ctorArgs);
+                        if (intrinsicResult is { Kind: StackKind.ValueType } valueTaskValue) {
+                            return valueTaskValue;
+                        }
                         return StackSlot.OfObject(facadeInstance);
                     }
                     if (typeName == "System.Threading.Tasks.ValueTask" && name == ".ctor") {

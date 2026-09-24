@@ -377,6 +377,19 @@ public sealed class IntrinsicRegistry {
         }
     }
 
+    /// <summary>指定型に署名バインドが登録されているか (provenance policy 用)。</summary>
+    public bool HasBindingForType(string typeFullName) {
+        lock (_gate)
+            return _bindings.Keys.Any(key => string.Equals(key.TypeFullName, typeFullName,
+                StringComparison.Ordinal));
+    }
+
+    public bool HasBindingForType(string typeFullName, BindingOrigin origin) {
+        lock (_gate)
+            return _bindings.Any(pair => string.Equals(pair.Key.TypeFullName, typeFullName,
+                StringComparison.Ordinal) && pair.Value.Origin == origin);
+    }
+
     /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。
     /// domain は BindingKey 側に保持されるためここでは origin のみを返す。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings {

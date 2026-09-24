@@ -198,6 +198,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 2);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
+        Add("System.TimeSpan", "FromMilliseconds", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ,
+            hasThis: false, paramCount: 1);
         var hostClockJ = "host-managed-replacement: OS 時計 P/Invoke へゲストから到達させず、ホスト BCL の時刻値を DateTime 表現に変換";
         Add("System.DateTime", "get_Now", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
         Add("System.DateTime", "get_UtcNow", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
@@ -365,6 +367,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Threading.CancellationTokenSource", "get_Token", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationTokenSource", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationTokenSource", "Cancel", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "CancelAfter", CoreLibSurfaceKind.RuntimeInternal, cancellationJ,
+            hasThis: true, paramCount: 1);
         Add("System.Threading.CancellationTokenSource", "Dispose", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationToken", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationToken", "get_CanBeCanceled", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
@@ -413,6 +417,7 @@ internal static class CoreLibSurfaceAudit {
             Add(type, "SetStateMachine", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
         }
         foreach (var type in new[] { "System.Threading.Tasks.ValueTask", "System.Threading.Tasks.ValueTask`1" }) {
+            Add(type, ".ctor", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 2);
             Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "AsTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);

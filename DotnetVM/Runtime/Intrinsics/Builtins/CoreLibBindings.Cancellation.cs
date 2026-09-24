@@ -15,32 +15,94 @@ internal static partial class CoreLibBindings {
         const string token = "System.Threading.CancellationToken";
         const string source = "System.Threading.CancellationTokenSource";
 
-        static VmIntrinsicInstance SourceInstance(in StackSlot slot) =>
-            slot.ObjectValue as VmIntrinsicInstance
+        static VmObject SourceObject(in StackSlot slot) =>
+            slot.ObjectValue as VmObject
             ?? throw new UnhandledGuestException("System.NullReferenceException", null);
 
+        static VmCancellationState EnsureState(IntrinsicContext ctx, in StackSlot slot) {
+            var instance = SourceObject(slot);
+            var existing = CancellationRuntime.State(slot);
+            if (existing is not null)
+                return existing;
+            var type = ctx.Types.FindIntrinsicType(source) ?? instance.Type;
+            var state = ctx.Heap.Allocate(new VmCancellationState(type));
+            switch (instance) {
+                case VmIntrinsicInstance intrinsic when intrinsic.State.Length > 0:
+                    intrinsic.State[0] = StackSlot.OfObject(state);
+                    break;
+                case VmClassInstance @class when @class.Fields.Length > 0:
+                    @class.Fields[0] = StackSlot.OfObject(state);
+                    break;
+                default:
+                    throw new UnhandledGuestException("System.InvalidOperationException", "CancellationTokenSource の状態を初期化できません。");
+            }
+            return state;
+        }
+
+        static int ConstructorDelay(IntrinsicContext ctx, in StackSlot slot) {
+            if (slot.Kind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt)
+                return slot.AsInt32;
+            return TimeSpanMilliseconds(slot);
+        }
+
+        static VmCancellationState LiveState(in StackSlot slot) {
+            var state = CancellationRuntime.State(slot)
+                ?? throw new UnhandledGuestException("System.InvalidOperationException", "CancellationTokenSource が初期化されていません。");
+            if (state.IsDisposed)
+                throw new UnhandledGuestException("System.ObjectDisposedException", "CancellationTokenSource");
+            return state;
+        }
+
+        static void Initialize(IntrinsicContext ctx, StackSlot[] args, int delay) {
+            var state = EnsureState(ctx, args[0]);
+            if (delay < Timeout.Infinite)
+                throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "millisecondsDelay");
+            if (delay != Timeout.Infinite)
+                ctx.Shared.GuestTasks.ScheduleCancellation(state, delay);
+        }
+
         r.Register(IntrinsicKey.Instance(source, ".ctor", 0), (ctx, a) => {
-            var type = ctx.Types.FindIntrinsicType(source)!;
-            SourceInstance(a[0]).State[0] = StackSlot.OfObject(ctx.Heap.Allocate(new VmCancellationState(type)));
+            _ = EnsureState(ctx, a[0]);
             return null;
         });
         r.Register(IntrinsicKey.Instance(source, ".ctor", 1), (ctx, a) => {
-            var type = ctx.Types.FindIntrinsicType(source)!;
-            SourceInstance(a[0]).State[0] = StackSlot.OfObject(ctx.Heap.Allocate(new VmCancellationState(type)));
+            Initialize(ctx, a, ConstructorDelay(ctx, a[1]));
             return null;
         });
+        r.RegisterBinding(BindingKey.Instance(source, ".ctor", "System.Int32"),
+            (ctx, a) => { Initialize(ctx, a, a[1].AsInt32); return null; }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(source, ".ctor", "System.TimeSpan"),
+            (ctx, a) => { Initialize(ctx, a, TimeSpanMilliseconds(a[1])); return null; }, BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(source, "get_Token"), (ctx, a) => {
-            var state = CancellationRuntime.State(a[0]);
-            return CancellationRuntime.Token(ctx, state);
+            return CancellationRuntime.Token(ctx, LiveState(a[0]));
         }, BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(source, "get_IsCancellationRequested"),
             (ctx, a) => StackSlot.OfInt32(CancellationRuntime.State(a[0]).IsCancellationRequested ? 1 : 0),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(source, "Cancel"), (ctx, a) => {
-            CancellationRuntime.State(a[0]).Cancel();
+            LiveState(a[0]).Cancel();
             return null;
         }, BindingOrigin.Managed);
-        r.RegisterBinding(BindingKey.Instance(source, "Dispose"), static (_, _) => null, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(source, "CancelAfter", "System.Int32"), (ctx, a) => {
+            var state = LiveState(a[0]);
+            var delay = a[1].AsInt32;
+            if (delay < Timeout.Infinite)
+                throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "millisecondsDelay");
+            ctx.Shared.GuestTasks.ScheduleCancellation(state, delay);
+            return null;
+        }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(source, "CancelAfter", "System.TimeSpan"), (ctx, a) => {
+            var state = LiveState(a[0]);
+            var delay = TimeSpanMilliseconds(a[1]);
+            if (delay < Timeout.Infinite)
+                throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "delay");
+            ctx.Shared.GuestTasks.ScheduleCancellation(state, delay);
+            return null;
+        }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Instance(source, "Dispose"), (ctx, a) => {
+            CancellationRuntime.State(a[0])?.Dispose();
+            return null;
+        }, BindingOrigin.Managed);
 
         r.RegisterBinding(BindingKey.Instance(token, "get_IsCancellationRequested"),
             (ctx, a) => StackSlot.OfInt32(CancellationRuntime.State(a[0])?.IsCancellationRequested == true ? 1 : 0),
@@ -117,6 +179,7 @@ internal static class CancellationRuntime {
 
     internal static StackSlot Token(IntrinsicContext ctx, VmCancellationState state) {
         var type = ctx.Types.FindIntrinsicType("System.Threading.CancellationToken")!;
+        _ = state.SourceToken; // CTS.Token throws after CTS.Dispose; an already-issued token does not.
         return StackSlot.OfValueType(new VmStructValue(type, [StackSlot.OfObject(state)]));
     }
 

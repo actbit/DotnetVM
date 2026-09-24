@@ -255,6 +255,8 @@ internal sealed partial class CallEngine {
             or "System.Runtime.CompilerServices.TaskAwaiter`1"
             or "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder"
             or "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1"
+            or "System.Threading.Tasks.ValueTask"
+            or "System.Threading.Tasks.ValueTask`1"
             or "System.Runtime.CompilerServices.ValueTaskAwaiter"
             or "System.Runtime.CompilerServices.ValueTaskAwaiter`1"
             or "System.Runtime.CompilerServices.ConfiguredTaskAwaitable+ConfiguredTaskAwaiter"

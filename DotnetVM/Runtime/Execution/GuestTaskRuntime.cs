@@ -18,6 +18,7 @@ internal sealed class GuestTaskRuntime(
     int shutdownTimeoutMilliseconds) : IDisposable {
     private readonly ConcurrentDictionary<VmTaskObject, StackSlot[]> _activeRoots = new();
     private readonly ConcurrentDictionary<VmTaskObject, Timer> _timers = new();
+    private readonly ConcurrentDictionary<VmCancellationState, Timer> _cancellationTimers = new();
     private readonly ConcurrentDictionary<VmTaskObject, CancellationTokenRegistration> _cancellationRegistrations = new();
     private readonly ConcurrentDictionary<long, StackSlot[]> _continuationRoots = new();
     // ValueTask の default 値は backing Task を持たない completed state として扱う。
@@ -38,7 +39,8 @@ internal sealed class GuestTaskRuntime(
     private bool _disposed;
 
     public int ActiveWorkerCount => Volatile.Read(ref _activeWorkers);
-    public int PendingTimerCount => _timers.Count;
+    public int PendingTimerCount => _timers.Count + _cancellationTimers.Count;
+    public int CancellationRegistrationCount => _cancellationRegistrations.Count;
 
     public VmTaskObject Create(VmType type, bool completed = false, StackSlot result = default) {
         lock (_lifetimeGate) {
@@ -130,6 +132,49 @@ internal sealed class GuestTaskRuntime(
         }
     }
 
+    /// <summary>
+    /// Schedules a VM-owned CTS timer.  Using this runtime rather than the host CTS.CancelAfter
+    /// implementation makes timer accounting and VM shutdown deterministic.
+    /// </summary>
+    public void ScheduleCancellation(VmCancellationState state, int milliseconds) {
+        if (milliseconds < Timeout.Infinite)
+            throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "millisecondsDelay");
+
+        Timer? previous = null;
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            var hadPrevious = _cancellationTimers.TryRemove(state, out previous);
+            if (milliseconds != Timeout.Infinite && !hadPrevious && PendingTimerCount >= _maxPendingTimers)
+                throw new GuestConcurrencyLimitExceededException(
+                    $"未完了の CancellationTokenSource Timer 上限 ({_maxPendingTimers}) に達しました。");
+            state.DisposeTimer = CancelCancellationTimer;
+            if (milliseconds == Timeout.Infinite) {
+                // -1 disables the existing timer.  The old timer is disposed below.
+            } else {
+                var timer = new Timer(static target => {
+                    var registration = (CancellationTimerState)target!;
+                    try { registration.Source.CancelFromTimer(); }
+                    catch { /* cancellation callbacks must not terminate the host timer thread */ }
+                    finally { registration.Runtime.CancelCancellationTimer(registration.Source); }
+                }, new CancellationTimerState(this, state), Timeout.Infinite, Timeout.Infinite);
+                _cancellationTimers[state] = timer;
+                try {
+                    timer.Change(milliseconds, Timeout.Infinite);
+                } catch {
+                    _cancellationTimers.TryRemove(state, out _);
+                    timer.Dispose();
+                    throw;
+                }
+            }
+        }
+        previous?.Dispose();
+    }
+
+    private void CancelCancellationTimer(VmCancellationState state) {
+        if (_cancellationTimers.TryRemove(state, out var timer))
+            timer.Dispose();
+    }
+
     public void Wait(VmTaskObject task, int millisecondsTimeout) => task.Wait(millisecondsTimeout);
 
     public void Run(VmTaskObject task, StackSlot[] roots, Func<StackSlot> work) {
@@ -150,7 +195,7 @@ internal sealed class GuestTaskRuntime(
         StackSlot detached;
         if (state.ObjectValue is VmStructValue machine)
             detached = StackSlot.OfValueType(machine.Clone());
-        else if (state.ObjectValue is VmClassInstance)
+        else if (state.ObjectValue is VmObject)
             detached = state;
         else
             throw new InvalidOperationException("async state machine は VM オブジェクトである必要があります。");
@@ -187,38 +232,107 @@ internal sealed class GuestTaskRuntime(
         roots[0] = StackSlot.OfObject(composite);
         for (var i = 0; i < tasks.Length; i++)
             roots[i + 1] = StackSlot.OfObject(tasks[i]);
-        try {
-            StartWorker(composite, roots, () => {
-                foreach (var task in tasks)
-                    task.Wait();
-                return result();
-            }, value => Complete(composite, value), ex => CompleteHostException(composite, ex));
-        } catch (Exception ex) {
-            CompleteHostException(composite, ex);
-            throw;
+        PublishTaskRoots(composite, roots);
+
+        var registrations = new IDisposable[tasks.Length];
+        var registrationGate = new object();
+        var remaining = tasks.Length;
+        void FinalizeWhenAll() {
+            if (Interlocked.Decrement(ref remaining) != 0)
+                return;
+            lock (registrationGate) {
+                foreach (var registration in registrations)
+                    registration?.Dispose();
+            }
+
+            // CLR precedence is fault > cancellation > success.  Inspect every child before
+            // materializing a generic result array; reading a failed Task<T>.Result is invalid.
+            var firstGuestFault = default(StackSlot);
+            Exception? firstHostFault = null;
+            var canceled = false;
+            foreach (var task in tasks) {
+                var snapshot = task.Snapshot();
+                if (snapshot.GuestException.Kind != StackKind.Empty) {
+                    if (firstGuestFault.Kind == StackKind.Empty)
+                        firstGuestFault = snapshot.GuestException;
+                } else if (snapshot.HostException is not null) {
+                    firstHostFault ??= snapshot.HostException;
+                } else if (task.IsCanceled) {
+                    canceled = true;
+                }
+            }
+
+            try {
+                if (firstGuestFault.Kind != StackKind.Empty) {
+                    CompleteGuestException(composite, firstGuestFault);
+                } else if (firstHostFault is not null) {
+                    CompleteHostException(composite, firstHostFault);
+                } else if (canceled) {
+                    composite.SetCanceled();
+                    RemoveTaskRoots(composite);
+                } else {
+                    Complete(composite, result());
+                }
+            } catch (Exception ex) {
+                CompleteHostException(composite, ex);
+            }
+        }
+
+        for (var i = 0; i < tasks.Length; i++) {
+            var registration = tasks[i].RegisterCompletion(FinalizeWhenAll);
+            lock (registrationGate) {
+                if (Volatile.Read(ref remaining) == 0)
+                    registration.Dispose();
+                else
+                    registrations[i] = registration;
+            }
         }
     }
 
     public void WhenAny(VmTaskObject composite, VmTaskObject[] tasks) {
-        if (tasks.Length == 0)
-            return; // CLR: WhenAny(empty) never completes.
-        if (tasks.Length > 64)
-            throw new UnhandledGuestException("System.ArgumentException", "WhenAny は 64 個以下の Task を要求します。");
+        if (tasks.Length == 0) {
+            // Create() publishes the composite as a root before argument validation reaches this
+            // runtime.  Remove it on the exceptional CLR path rather than leaving an unreachable
+            // task rooted forever.
+            RemoveTaskRoots(composite);
+            throw new UnhandledGuestException("System.ArgumentException", "少なくとも 1 つの Task が必要です。");
+        }
         var roots = new StackSlot[tasks.Length + 1];
         roots[0] = StackSlot.OfObject(composite);
-        var handles = new WaitHandle[tasks.Length];
         for (var i = 0; i < tasks.Length; i++) {
             roots[i + 1] = StackSlot.OfObject(tasks[i]);
-            handles[i] = tasks[i].CompletionWaitHandle;
         }
-        try {
-            StartWorker(composite, roots, () => {
-                var index = WaitHandle.WaitAny(handles);
-                return StackSlot.OfObject(tasks[index]);
-            }, value => Complete(composite, value), ex => CompleteHostException(composite, ex));
-        } catch (Exception ex) {
-            CompleteHostException(composite, ex);
-            throw;
+        PublishTaskRoots(composite, roots);
+
+        var registrations = new IDisposable[tasks.Length];
+        var registrationGate = new object();
+        var winner = -1;
+        void CompleteWinner(int index) {
+            if (Interlocked.CompareExchange(ref winner, index, -1) != -1)
+                return;
+            lock (registrationGate) {
+                foreach (var registration in registrations)
+                    registration?.Dispose();
+            }
+            Complete(composite, StackSlot.OfObject(tasks[index]));
+        }
+
+        for (var i = 0; i < tasks.Length; i++) {
+            var index = i;
+            var registration = tasks[i].RegisterCompletion(() => CompleteWinner(index));
+            lock (registrationGate) {
+                if (Volatile.Read(ref winner) != -1)
+                    registration.Dispose();
+                else
+                    registrations[i] = registration;
+            }
+        }
+    }
+
+    private void PublishTaskRoots(VmTaskObject task, StackSlot[] roots) {
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            _activeRoots[task] = roots;
         }
     }
 
@@ -234,8 +348,6 @@ internal sealed class GuestTaskRuntime(
     }
 
     public bool WaitAll(VmTaskObject[] tasks, int millisecondsTimeout, CancellationToken cancellationToken) {
-        if (tasks.Length > 64)
-            throw new UnhandledGuestException("System.ArgumentException", "WaitAll は 64 個以下の Task を要求します。");
         if (tasks.Length == 0)
             return true;
         var handles = tasks.Select(task => task.CompletionWaitHandle).ToArray();
@@ -261,6 +373,8 @@ internal sealed class GuestTaskRuntime(
     }
 
     private sealed record TaskCancellationState(GuestTaskRuntime Runtime, VmTaskObject Task);
+
+    private sealed record CancellationTimerState(GuestTaskRuntime Runtime, VmCancellationState Source);
 
     /// <summary>
     /// guest awaiter が自前で continuation を保持する場合の登録。Task のイベントを
@@ -485,6 +599,8 @@ internal sealed class GuestTaskRuntime(
 
     public void Dispose() {
         Timer[] timers;
+        Timer[] cancellationTimers;
+        CancellationTokenRegistration[] cancellationRegistrations;
         Thread[] workers;
         VmTaskObject[] tasks;
         lock (_lifetimeGate) {
@@ -494,13 +610,20 @@ internal sealed class GuestTaskRuntime(
             _completedSentinels.Clear();
             timers = [.. _timers.Values];
             _timers.Clear();
+            cancellationRegistrations = [.. _cancellationRegistrations.Values];
             _cancellationRegistrations.Clear();
+            cancellationTimers = [.. _cancellationTimers.Values];
+            _cancellationTimers.Clear();
             workers = [.. _workers.Values];
             tasks = [.. _activeRoots.Keys];
         }
 
         foreach (var timer in timers)
             timer.Dispose();
+        foreach (var timer in cancellationTimers)
+            timer.Dispose();
+        foreach (var registration in cancellationRegistrations)
+            registration.Dispose();
         var shutdown = new ObjectDisposedException("VirtualMachine");
         foreach (var task in tasks)
             task.SetHostException(shutdown);

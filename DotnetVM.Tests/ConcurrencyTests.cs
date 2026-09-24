@@ -85,6 +85,21 @@ public sealed class ConcurrencyTests {
                 private static async Task<int> AwaitDefaultValueTaskOfT() => await default(ValueTask<int>);
                 public static int RunDefaultValueTask() => AwaitDefaultValueTask().GetAwaiter().GetResult();
                 public static int RunDefaultValueTaskOfT() => AwaitDefaultValueTaskOfT().GetAwaiter().GetResult();
+                public static int RunDefaultValueTaskConfigureAwait() =>
+                    default(ValueTask<int>).ConfigureAwait(false).GetAwaiter().GetResult();
+                public static int ProbeDefaultValueTaskAllocations(int count) {
+                    var voidValue = default(ValueTask);
+                    var value = default(ValueTask<int>);
+                    var completed = 0;
+                    for (var i = 0; i < count; i++) {
+                        if (voidValue.IsCompleted) completed++;
+                        voidValue.GetAwaiter().GetResult();
+                        if (value.IsCompleted) completed++;
+                        completed += value.GetAwaiter().GetResult();
+                        completed += value.Result;
+                    }
+                    return completed;
+                }
                 public static int RunValueTaskValueCtor() => new ValueTask<int>(41).GetAwaiter().GetResult();
                 public static int RunValueTaskTaskCtor() => new ValueTask<int>(Task.FromResult(41)).GetAwaiter().GetResult();
                 public static int RunConfigureAwait() => AddAfterConfigureAwait(41).GetAwaiter().GetResult();
@@ -204,6 +219,7 @@ public sealed class ConcurrencyTests {
         Assert.Equal(41, Call(type, "RunValueTaskCompleted"));
         Assert.Equal(41, Call(type, "RunDefaultValueTask"));
         Assert.Equal(0, Call(type, "RunDefaultValueTaskOfT"));
+        Assert.Equal(0, Call(type, "RunDefaultValueTaskConfigureAwait"));
         Assert.Equal(41, Call(type, "RunValueTaskValueCtor"));
         Assert.Equal(41, Call(type, "RunValueTaskTaskCtor"));
         Assert.Equal(42, Call(type, "RunConfigureAwait"));
@@ -268,12 +284,33 @@ public sealed class ConcurrencyTests {
         foreach (var (method, expected) in new[] {
             ("RunDefaultValueTask", 41),
             ("RunDefaultValueTaskOfT", 0),
+            ("RunDefaultValueTaskConfigureAwait", 0),
         }) {
             var clr = (int)clrType.GetMethod(method)!.Invoke(null, null)!;
             var actual = vm.Invoke("Vm.ConcurrentCode", method);
             Assert.Equal(expected, clr);
             Assert.Equal(clr, actual);
         }
+    }
+
+    [Fact]
+    public void DefaultValueTask_InspectionDoesNotConsumeGuestAllocationQuota() {
+        using var vm = CreateVm(new VmHostOptions {
+            MaxGuestThreads = 16,
+            Memory = new MemoryPolicy {
+                InstructionQuota = 100_000_000,
+                TotalAllocationByteLimit = 1_000_000,
+            },
+        });
+        // 初回呼出しの型初期化による allocation を回帰対象から切り離す。
+        Assert.Equal(0, vm.Invoke("Vm.ConcurrentCode", "ProbeDefaultValueTaskAllocations", 0));
+        var before = vm.Heap.Snapshot();
+
+        Assert.Equal(20_000, vm.Invoke("Vm.ConcurrentCode", "ProbeDefaultValueTaskAllocations", 10_000));
+
+        var after = vm.Heap.Snapshot();
+        Assert.Equal(before.TotalAllocatedBytes, after.TotalAllocatedBytes);
+        Assert.Equal(before.LiveBytes, after.LiveBytes);
     }
 
     [Fact]
@@ -290,6 +327,7 @@ public sealed class ConcurrencyTests {
 
         Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "RunConfigureAwait"));
         Assert.Equal(42, vm.Invoke("Vm.ConcurrentCode", "RunValueTaskConfigureAwait"));
+        Assert.Equal(0, vm.Invoke("Vm.ConcurrentCode", "RunDefaultValueTaskConfigureAwait"));
     }
 
     [Fact]

@@ -118,7 +118,8 @@ public sealed partial class TypeLoader {
         var task = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task", IsValue = false, Parent = @object };
         Add(task);
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task`1", IsValue = false, Parent = task }, [0u]);
-        // ValueTask は Task と同じ VM task object を値型ラッパー越しに公開する。
+        // Task-backed ValueTask は同じ VM task object を値型ラッパー越しに公開する。
+        // zero-initialized ValueTask は binding 側の completed-state 表現で扱う。
         // async ValueTask<T> のコンパイラ生成 state machine が参照する面もここで
         // 明示的に合成し、同名の guest 型へ binding が誤適用されないようにする。
         var valueTask = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask", IsValue = true, Parent = valueType };

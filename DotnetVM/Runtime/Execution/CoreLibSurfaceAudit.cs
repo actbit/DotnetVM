@@ -198,6 +198,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.TimeSpan", "ToString", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: true, paramCount: 2);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 1);
         Add("System.TimeSpan", "Parse", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ, hasThis: false, paramCount: 2);
+        Add("System.TimeSpan", "FromMilliseconds", CoreLibSurfaceKind.RuntimeInternal, timeCultureJ,
+            hasThis: false, paramCount: 1);
         var hostClockJ = "host-managed-replacement: OS 時計 P/Invoke へゲストから到達させず、ホスト BCL の時刻値を DateTime 表現に変換";
         Add("System.DateTime", "get_Now", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
         Add("System.DateTime", "get_UtcNow", CoreLibSurfaceKind.RuntimeInternal, hostClockJ, hasThis: false, paramCount: 0);
@@ -365,6 +367,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Threading.CancellationTokenSource", "get_Token", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationTokenSource", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationTokenSource", "Cancel", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
+        Add("System.Threading.CancellationTokenSource", "CancelAfter", CoreLibSurfaceKind.RuntimeInternal, cancellationJ,
+            hasThis: true, paramCount: 1);
         Add("System.Threading.CancellationTokenSource", "Dispose", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationToken", "get_IsCancellationRequested", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
         Add("System.Threading.CancellationToken", "get_CanBeCanceled", CoreLibSurfaceKind.RuntimeInternal, cancellationJ, hasThis: true);
@@ -413,6 +417,7 @@ internal static class CoreLibSurfaceAudit {
             Add(type, "SetStateMachine", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
         }
         foreach (var type in new[] { "System.Threading.Tasks.ValueTask", "System.Threading.Tasks.ValueTask`1" }) {
+            Add(type, ".ctor", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 2);
             Add(type, "get_IsCompleted", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "GetAwaiter", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
             Add(type, "AsTask", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true);
@@ -612,7 +617,7 @@ internal static class CoreLibSurfaceAudit {
         Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
         Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
-             "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
+            "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
         Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,

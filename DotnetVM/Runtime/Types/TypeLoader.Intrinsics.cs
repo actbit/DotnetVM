@@ -19,6 +19,7 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System", Name = "Void", IsValue = true });
         Add(new VmIntrinsicType { Namespace = "System", Name = "String", IsValue = false, Parent = @object });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Exception", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System", Name = "TimeSpan", IsValue = true, Parent = valueType });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Console", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Math", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Convert", IsValue = false });

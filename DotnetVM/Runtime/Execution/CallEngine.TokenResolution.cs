@@ -71,7 +71,7 @@ internal sealed partial class CallEngine {
                     // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
                     var callerDomain = CallerDomainOfLoader();
                     var bindingType = TryResolveTypeRefForBinding(parent.Rid);
-                    if (IsAllowedTaskBinding(typeName, bindingType) &&
+                    if (CanAttemptRuntimeBinding(typeName, bindingType) &&
                         TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound)) {
                         return new CallTarget {
                             Arity = arity,
@@ -249,7 +249,7 @@ internal sealed partial class CallEngine {
         }
 
         var definition = (VmClassType)constructed.Definition;
-        if (IsAllowedTaskBinding(definition.FullName, definition)) {
+        if (CanAttemptRuntimeBinding(definition)) {
             var realParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
             if (TryGetResolvedBinding(definition.FullName, name, signature.HasThis, realParamNames,
                     CallerDomainOfLoader(), out var realBound))
@@ -331,7 +331,7 @@ internal sealed partial class CallEngine {
                     .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
                 var methodSpecCaller = CallerDomainOfLoader();
                 var methodSpecBindingType = TryResolveTypeRefForBinding(parent.Rid);
-                if (IsAllowedTaskBinding(typeName, methodSpecBindingType) &&
+                if (CanAttemptRuntimeBinding(typeName, methodSpecBindingType) &&
                     (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, methodSpecCaller, out var boundImpl) ||
                      TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl))) {
                     return new CallTarget {

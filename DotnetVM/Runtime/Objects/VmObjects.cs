@@ -84,6 +84,7 @@ public sealed class VmTaskObject : VmObject {
     private Exception? _hostException;
     private bool _isCanceled;
     private bool _isCompleted;
+    private List<Action>? _completionCallbacks;
 
     public VmTaskObject(VmType type) => _type = type;
 
@@ -91,39 +92,51 @@ public sealed class VmTaskObject : VmObject {
     public bool IsCompleted { get { lock (_gate) return _isCompleted; } }
 
     public void SetResult(StackSlot result = default) {
+        Action[] callbacks;
         lock (_gate) {
             if (_isCompleted) return;
             _result = result;
             _isCompleted = true;
             _completed.Set();
+            callbacks = TakeCompletionCallbacks();
         }
+        InvokeCompletionCallbacks(callbacks);
     }
 
     public void SetGuestException(StackSlot exception) {
+        Action[] callbacks;
         lock (_gate) {
             if (_isCompleted) return;
             _guestException = exception;
             _isCompleted = true;
             _completed.Set();
+            callbacks = TakeCompletionCallbacks();
         }
+        InvokeCompletionCallbacks(callbacks);
     }
 
     public void SetHostException(Exception exception) {
+        Action[] callbacks;
         lock (_gate) {
             if (_isCompleted) return;
             _hostException = exception;
             _isCompleted = true;
             _completed.Set();
+            callbacks = TakeCompletionCallbacks();
         }
+        InvokeCompletionCallbacks(callbacks);
     }
 
     public void SetCanceled() {
+        Action[] callbacks;
         lock (_gate) {
             if (_isCompleted) return;
             _isCanceled = true;
             _isCompleted = true;
             _completed.Set();
+            callbacks = TakeCompletionCallbacks();
         }
+        InvokeCompletionCallbacks(callbacks);
     }
 
     public void Wait() => _completed.Wait();
@@ -140,6 +153,59 @@ public sealed class VmTaskObject : VmObject {
         lock (_gate)
             return (_result, _guestException, _hostException);
     }
+
+    /// <summary>
+    /// Registers a callback which is invoked exactly once when this task completes.  Unlike a
+    /// WaitHandle this scales to an arbitrary number of tasks and does not consume an OS wait
+    /// handle slot.  The callback is invoked synchronously when the task is already complete,
+    /// matching Task continuation registration's eager-completion behavior.
+    /// </summary>
+    internal IDisposable RegisterCompletion(Action callback) {
+        ArgumentNullException.ThrowIfNull(callback);
+        var invokeNow = false;
+        lock (_gate) {
+            if (_isCompleted)
+                invokeNow = true;
+            else
+                (_completionCallbacks ??= []).Add(callback);
+        }
+        if (invokeNow) {
+            callback();
+            return EmptyCompletionRegistration.Instance;
+        }
+        return new CompletionRegistration(this, callback);
+    }
+
+    private Action[] TakeCompletionCallbacks() {
+        if (_completionCallbacks is not { Count: > 0 } callbacks)
+            return [];
+        _completionCallbacks = null;
+        return [.. callbacks];
+    }
+
+    private static void InvokeCompletionCallbacks(Action[] callbacks) {
+        foreach (var callback in callbacks) {
+            try { callback(); }
+            catch { /* completion observers must not break task publication */ }
+        }
+    }
+
+    private void RemoveCompletionCallback(Action callback) {
+        lock (_gate)
+            _completionCallbacks?.Remove(callback);
+    }
+
+    private sealed class CompletionRegistration(VmTaskObject owner, Action callback) : IDisposable {
+        private VmTaskObject? _owner = owner;
+        private readonly Action _callback = callback;
+
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.RemoveCompletionCallback(_callback);
+    }
+
+    private sealed class EmptyCompletionRegistration : IDisposable {
+        public static readonly EmptyCompletionRegistration Instance = new();
+        public void Dispose() { }
+    }
 }
 
 /// <summary>
@@ -149,12 +215,52 @@ public sealed class VmTaskObject : VmObject {
 public sealed class VmCancellationState : VmObject {
     private readonly VmType _type;
     private readonly CancellationTokenSource _source = new();
+    private readonly CancellationToken _token;
+    private int _disposed;
 
-    public VmCancellationState(VmType type) => _type = type;
+    /// <summary>GuestTaskRuntime removes any CancelAfter timer through this callback.</summary>
+    internal Action<VmCancellationState>? DisposeTimer { get; set; }
+
+    public VmCancellationState(VmType type) {
+        _type = type;
+        _token = _source.Token;
+    }
     public override VmType Type => _type;
-    public CancellationToken Token => _source.Token;
+    /// <summary>The token remains usable after the source itself has been disposed.</summary>
+    public CancellationToken Token => _token;
+    internal CancellationToken SourceToken {
+        get {
+            ThrowIfDisposed();
+            return _token;
+        }
+    }
     public bool IsCancellationRequested => _source.IsCancellationRequested;
-    public void Cancel() => _source.Cancel();
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+    public void Cancel() {
+        ThrowIfDisposed();
+        _source.Cancel();
+    }
+    public void CancelAfter(int millisecondsDelay) {
+        ThrowIfDisposed();
+        // The runtime owns the timer so that it can enforce the VM timer quota and tear it down
+        // during VM disposal instead of leaking a host ThreadPool timer.
+        throw new InvalidOperationException("CancellationTokenSource.CancelAfter は GuestTaskRuntime 経由で呼び出してください。");
+    }
+    internal void CancelFromTimer() {
+        if (Volatile.Read(ref _disposed) == 0)
+            _source.Cancel();
+    }
+    public void Dispose() {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        DisposeTimer?.Invoke(this);
+        _source.Dispose();
+    }
+
+    private void ThrowIfDisposed() {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(CancellationTokenSource));
+    }
 }
 
 /// <summary>VM SynchronizationContext の identity。キュー自体は VM runtime が管理する。</summary>

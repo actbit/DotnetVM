@@ -416,6 +416,10 @@ public sealed class ConcurrencyTests {
                     _ = Task.WhenAny(Task.FromResult(0), Task.FromResult(0));
                     return -1;
                 }
+                public static int CombinatorNullArgument() {
+                    try { _ = Task.WhenAny(Task.FromResult(0), (Task)null!); return -1; }
+                    catch (Exception) { return 1; }
+                }
 
                 public static Task StartLongTask() => Task.Run((Action)HoldLongTaskWorker);
             }
@@ -825,8 +829,20 @@ public sealed class ConcurrencyTests {
             MaxTaskCombinatorInputs = 1,
             Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
         });
-        Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
-            twoInputVm.Invoke("Vm.ConcurrentCode", "CombinatorTwoInputQuota"));
+        var quotaRootsBefore = twoInputVm.SharedState.GuestTasks.EnumerateRoots().Count();
+        for (var i = 0; i < 1_000; i++) {
+            Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+                twoInputVm.Invoke("Vm.ConcurrentCode", "CombinatorTwoInputQuota"));
+        }
+        Assert.Equal(quotaRootsBefore, twoInputVm.SharedState.GuestTasks.EnumerateRoots().Count());
+
+        using var nullInputVm = CreateVm(new VmHostOptions {
+            Memory = new MemoryPolicy { InstructionQuota = 100_000_000 },
+        });
+        var nullRootsBefore = nullInputVm.SharedState.GuestTasks.EnumerateRoots().Count();
+        for (var i = 0; i < 1_000; i++)
+            Assert.Equal(1, nullInputVm.Invoke("Vm.ConcurrentCode", "CombinatorNullArgument"));
+        Assert.Equal(nullRootsBefore, nullInputVm.SharedState.GuestTasks.EnumerateRoots().Count());
     }
 
     [Fact]

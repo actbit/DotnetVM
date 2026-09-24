@@ -370,20 +370,25 @@ internal sealed class GuestTaskRuntime(
     }
 
     public void WhenAny(VmTaskObject composite, VmTaskObject[] tasks) {
-        ValidateTaskCombinatorInputCount(tasks.Length);
-        if (tasks.Length == 0) {
-            // Create() publishes the composite as a root before argument validation reaches this
-            // runtime.  Remove it on the exceptional CLR path rather than leaving an unreachable
-            // task rooted forever.
+        try {
+            ValidateTaskCombinatorInputCount(tasks.Length);
+            if (tasks.Length == 0)
+                throw new UnhandledGuestException("System.ArgumentException", "少なくとも 1 つの Task が必要です。");
+            if (tasks.Any(static task => task is null))
+                throw new UnhandledGuestException("System.ArgumentException", "Task 配列に null 要素があります。");
+
+            var roots = new StackSlot[tasks.Length + 1];
+            roots[0] = StackSlot.OfObject(composite);
+            for (var i = 0; i < tasks.Length; i++)
+                roots[i + 1] = StackSlot.OfObject(tasks[i]);
+            PublishTaskRoots(composite, roots);
+        } catch {
+            // Create() publishes a root before this method can validate quota or arguments.
+            // Every exceptional path must undo that publication, including direct callers that
+            // bypass the intrinsic overload's pre-validation.
             RemoveTaskRoots(composite);
-            throw new UnhandledGuestException("System.ArgumentException", "少なくとも 1 つの Task が必要です。");
+            throw;
         }
-        var roots = new StackSlot[tasks.Length + 1];
-        roots[0] = StackSlot.OfObject(composite);
-        for (var i = 0; i < tasks.Length; i++) {
-            roots[i + 1] = StackSlot.OfObject(tasks[i]);
-        }
-        PublishTaskRoots(composite, roots);
 
         var registrations = new IDisposable[tasks.Length];
         var registrationGate = new object();

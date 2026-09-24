@@ -783,26 +783,26 @@ internal static partial class CoreLibBindings {
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny", "System.Threading.Tasks.Task", "System.Threading.Tasks.Task"),
             (ctx, a) => {
+                var first = ReadValue(a[0]).ObjectValue as VmTaskObject
+                    ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.");
+                var second = ReadValue(a[1]).ObjectValue as VmTaskObject
+                    ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.");
                 ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(2);
                 var composite = NewTask(ctx, generic: true, FindType(ctx, task));
-                ctx.Shared.GuestTasks.WhenAny(composite, [
-                    ReadValue(a[0]).ObjectValue as VmTaskObject
-                        ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です."),
-                    ReadValue(a[1]).ObjectValue as VmTaskObject
-                        ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.")]);
+                ctx.Shared.GuestTasks.WhenAny(composite, [first, second]);
                 return StackSlot.OfObject(composite);
             });
         RegisterBinding(r, BindingKey.Static(task, "WhenAny",
                 "System.Threading.Tasks.Task`1<!!0>", "System.Threading.Tasks.Task`1<!!0>"),
             (ctx, a) => {
+                var first = ReadValue(a[0]).ObjectValue as VmTaskObject
+                    ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.");
+                var second = ReadValue(a[1]).ObjectValue as VmTaskObject
+                    ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.");
                 ctx.Shared.GuestTasks.ValidateTaskCombinatorInputCount(2);
                 var resultType = ResultType(ctx, fromMethod: true) ?? ctx.Types.FindIntrinsicType("System.Object")!;
                 var composite = NewTask(ctx, generic: true, TaskType(ctx, generic: true, resultType));
-                ctx.Shared.GuestTasks.WhenAny(composite, [
-                    ReadValue(a[0]).ObjectValue as VmTaskObject
-                        ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です."),
-                    ReadValue(a[1]).ObjectValue as VmTaskObject
-                        ?? throw new UnhandledGuestException("System.ArgumentException", "Task が必要です.")]);
+                ctx.Shared.GuestTasks.WhenAny(composite, [first, second]);
                 return StackSlot.OfObject(composite);
             });
         RegisterBinding(r, BindingKey.Static(task, "WaitAll", "System.Threading.Tasks.Task[]"),

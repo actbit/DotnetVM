@@ -1,4 +1,5 @@
 using DotnetVM.Host;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Objects;
@@ -8,6 +9,49 @@ using Xunit;
 namespace DotnetVM.Tests;
 
 public sealed class GuestTaskRuntimeHardeningTests {
+    [Fact]
+    public void WhenAnyRejectedInputsDoNotLeakRootsOrLiveHeapBytes() {
+        using var quotaShared = new VmSharedState(maxGuestThreads: 64, maxTaskWorkers: 64,
+            maxGuestWorkers: 64, maxPendingTaskTimers: 1_024, shutdownTimeoutMilliseconds: 5_000,
+            culture: null, clockProvider: null, randomFill: null, timeZone: null,
+            maxTaskCombinatorInputs: 1);
+        var quotaHeap = new VmHeap(new MemoryPolicy());
+        quotaHeap.AddRootSlotSource(quotaShared.GuestTasks.EnumerateRoots);
+        var taskType = new VmIntrinsicType {
+            Namespace = "System.Threading.Tasks",
+            Name = "Task",
+            IsValue = false,
+        };
+        var completed = quotaShared.GuestTasks.Create(taskType, completed: true);
+        var baselineLiveBytes = quotaHeap.Collect().LiveBytes;
+
+        for (var i = 0; i < 2_000; i++) {
+            var composite = quotaHeap.Allocate(quotaShared.GuestTasks.Create(taskType));
+            Assert.Throws<GuestConcurrencyLimitExceededException>(() =>
+                quotaShared.GuestTasks.WhenAny(composite, [completed, completed]));
+        }
+
+        Assert.Empty(quotaShared.GuestTasks.EnumerateRoots());
+        Assert.Equal(baselineLiveBytes, quotaHeap.Collect().LiveBytes);
+
+        using var nullShared = new VmSharedState(maxGuestThreads: 64, maxTaskWorkers: 64,
+            maxGuestWorkers: 64, maxPendingTaskTimers: 1_024, shutdownTimeoutMilliseconds: 5_000,
+            culture: null, clockProvider: null, randomFill: null, timeZone: null,
+            maxTaskCombinatorInputs: 2);
+        var nullHeap = new VmHeap(new MemoryPolicy());
+        nullHeap.AddRootSlotSource(nullShared.GuestTasks.EnumerateRoots);
+        var nullTask = nullShared.GuestTasks.Create(taskType, completed: true);
+        var nullBaselineLiveBytes = nullHeap.Collect().LiveBytes;
+        for (var i = 0; i < 2_000; i++) {
+            var composite = nullHeap.Allocate(nullShared.GuestTasks.Create(taskType));
+            Assert.Throws<UnhandledGuestException>(() =>
+                nullShared.GuestTasks.WhenAny(composite, [nullTask, null!]));
+        }
+
+        Assert.Empty(nullShared.GuestTasks.EnumerateRoots());
+        Assert.Equal(nullBaselineLiveBytes, nullHeap.Collect().LiveBytes);
+    }
+
     [Fact]
     public void CompletedDelayReleasesItsQuotaSlot() {
         using var shared = new VmSharedState(maxPendingTaskTimers: 1);

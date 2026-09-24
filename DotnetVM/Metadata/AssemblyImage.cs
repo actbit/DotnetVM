@@ -123,10 +123,39 @@ public sealed class AssemblyImage {
 
     /// <summary>TypeRef の名前空間名 + 型名と解決スコープ。</summary>
     public (string Namespace, string Name, (TableKind Table, int Rid) ResolutionScope) GetTypeRefName(int typeRefRid) {
+        var typeRefCount = Tables.GetRowCount(TableKind.TypeRef);
+        if (typeRefRid < 1 || typeRefRid > typeRefCount)
+            throw new BadImageFormatException(
+                $"TypeRef rid {typeRefRid} は範囲外です (行数 {typeRefCount})。");
         var scope = Tables.DecodeCoded(TableKind.TypeRef, typeRefRid, 0, CodedIndexKind.ResolutionScope);
+        var targetCount = Tables.GetRowCount(scope.Table);
+        if (scope.Rid < 1 || scope.Rid > targetCount)
+            throw new BadImageFormatException(
+                $"TypeRef rid {typeRefRid} の ResolutionScope {scope.Table} rid {scope.Rid} は範囲外です (行数 {targetCount})。");
         var ns = GetString(Tables.GetRowIndex(TableKind.TypeRef, typeRefRid, 2));
         var name = GetString(Tables.GetRowIndex(TableKind.TypeRef, typeRefRid, 1));
         return (ns, name, scope);
+    }
+
+    /// <summary>TypeRef の ResolutionScope を終端まで辿る。悪意あるメタデータの
+    /// self-cycle / 相互 cycle / 過深度が loader の CPU を占有しないよう、全呼出側で
+    /// この上限と visited RID 検査を共有する。</summary>
+    internal (TableKind Table, int Rid) GetTerminalTypeRefScope(int typeRefRid) {
+        const int maxDepth = 64;
+        var visited = new HashSet<int>();
+        for (var depth = 0; ; depth++) {
+            if (depth >= maxDepth)
+                throw new BadImageFormatException(
+                    $"TypeRef ResolutionScope のネストが上限 {maxDepth} を超えています。");
+            if (!visited.Add(typeRefRid))
+                throw new BadImageFormatException(
+                    $"TypeRef ResolutionScope に cycle が存在します (rid {typeRefRid})。");
+
+            var scope = GetTypeRefName(typeRefRid).ResolutionScope;
+            if (scope.Table != TableKind.TypeRef)
+                return scope;
+            typeRefRid = scope.Rid;
+        }
     }
 
     /// <summary>MethodDef の名前。</summary>

@@ -1,5 +1,6 @@
 using DotnetVM.Host;
 using DotnetVM.Metadata;
+using DotnetVM.Runtime.Types;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -45,6 +46,24 @@ public class AssemblyIdentityTests {
         var reference = new AssemblyIdentity("MyLib", new Version(1, 0, 0, 0), "", "");
         Assert.True(reference.Matches(new AssemblyIdentity("mylib", new Version(2, 0, 0, 0), "", "")));
         Assert.False(reference.Matches(new AssemblyIdentity("OtherLib", new Version(1, 0, 0, 0), "", "")));
+    }
+
+    [Fact]
+    public void KnownFrameworkContract_RequiresExactNameAndTokenPair() {
+        Assert.True(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("System.Private.CoreLib", new Version(10, 0), "", "7cec85d7bea7798e")));
+        Assert.True(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("System.Runtime", new Version(10, 0), "", "b03f5f7f11d50a3a")));
+        Assert.True(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("netstandard", new Version(2, 1), "", "cc7b13ffcd2ddd51")));
+
+        // Known names and known tokens must not form an independent cross-product.
+        Assert.False(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("System.Runtime", new Version(10, 0), "", "7cec85d7bea7798e")));
+        Assert.False(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("System.Private.CoreLib", new Version(10, 0), "", "b03f5f7f11d50a3a")));
+        Assert.False(TypeLoader.IsKnownFrameworkContract(
+            new AssemblyIdentity("System.Net.WebClient", new Version(1, 0), "", "b03f5f7f11d50a3a")));
     }
 
     /// <summary>ゲストが別アセンブリを参照する場合、AssemblyRef の identity が解析できる

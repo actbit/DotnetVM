@@ -98,7 +98,10 @@ internal sealed partial class CallEngine {
     private bool IsTrustedIntrinsicTypeRef(int typeRefRid, string? typeName) {
         var scope = TerminalResolutionScope(typeRefRid);
         if (scope.Table != TableKind.AssemblyRef)
-            return scope.Table == TableKind.Module;
+            // Module-scoped TypeRef は guest 自身の宣言を意味する。実 TypeDef が無い
+            // 場合に intrinsic facade へ落ちるため、untrusted loader では FullName
+            // runtime binding の provenance として扱わない。
+            return scope.Table == TableKind.Module && _loader.IsTrustedCoreLib;
         var identity = _loader.Image.GetAssemblyRefIdentity(scope.Rid);
         // WebClient is an explicitly host-added device surface. Its test/contract assembly is
         // intentionally not a BCL strong-name contract, so allow only the exact surface/contract
@@ -131,10 +134,7 @@ internal sealed partial class CallEngine {
         type is not VmIntrinsicType || IsTrustedTypeToken(_loader.GetTypeSpecDefinitionToken(typeSpecRid));
 
     private (TableKind Table, int Rid) TerminalResolutionScope(int typeRefRid) {
-        var scope = _loader.Image.GetTypeRefName(typeRefRid).ResolutionScope;
-        while (scope.Table == TableKind.TypeRef)
-            scope = _loader.Image.GetTypeRefName(scope.Rid).ResolutionScope;
-        return scope;
+        return _loader.Image.GetTerminalTypeRefScope(typeRefRid);
     }
 
     private VmType? TryResolveTypeRefForBinding(int typeRefRid) {

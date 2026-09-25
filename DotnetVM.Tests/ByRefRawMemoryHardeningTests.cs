@@ -103,12 +103,12 @@ public sealed class ByRefRawMemoryHardeningTests {
     }
 
     [Fact]
-    public void ByRefMethodFallsBackFromJitWithoutChangingResult() {
+    public void ManagedByRefMethodPromotesToJitWithoutChangingResult() {
         using var vm = CreateVm(enableJit: true);
         Assert.Equal(42, vm.Invoke("Vm.Raw", "ArrayElementAddress"));
         var method = vm.Loaders[0].FindTypeByFullName("Vm.Raw")!.Methods
             .Single(candidate => candidate.Name == "ArrayElementAddress");
-        Assert.False(vm.IsJitCompiled(method));
+        Assert.True(vm.IsJitCompiled(method));
     }
 
     [Fact]

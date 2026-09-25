@@ -2,6 +2,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using DotnetVM.Host;
 using DotnetVM.IL;
+using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
@@ -230,6 +231,11 @@ internal sealed class JitFrame {
         _frame.Ip = next;
     }
 
+    public void LoadArgumentAddress(int index, int next) {
+        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(_frame.Arguments, index)));
+        _frame.Ip = next;
+    }
+
     public void LoadLocal(int index, int next) {
         _frame.Stack.Push(SlotOps.PushCopyOfValue(_frame.Locals[index]));
         _frame.Ip = next;
@@ -237,6 +243,11 @@ internal sealed class JitFrame {
 
     public void StoreLocal(int index, int next) {
         _frame.Locals[index] = SlotOps.StoreCopyOfValue(_frame.Stack.Pop());
+        _frame.Ip = next;
+    }
+
+    public void LoadLocalAddress(int index, int next) {
+        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(_frame.Locals, index)));
         _frame.Ip = next;
     }
 
@@ -267,6 +278,11 @@ internal sealed class JitFrame {
 
     public void Drop(int next) {
         _ = _frame.Stack.Pop();
+        _frame.Ip = next;
+    }
+
+    public void SetReadonly(int next) {
+        _frame.PendingReadonly = true;
         _frame.Ip = next;
     }
 
@@ -354,6 +370,16 @@ internal sealed class JitFrame {
         _frame.Ip = next;
     }
 
+    public void LoadArrayAddress(int next) {
+        var index = _frame.Stack.Pop().AsInt32;
+        var array = MemoryOps.GetArray(_frame.Stack.Pop());
+        MemoryOps.CheckArrayBounds(array, index);
+        var isReadOnly = _frame.PendingReadonly;
+        _frame.PendingReadonly = false;
+        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, isReadOnly)));
+        _frame.Ip = next;
+    }
+
     public void LoadArray(MemoryOps.ArrayElementKind kind, int next) {
         _frame.Stack.Push(MemoryOps.ArrayLoad(_frame, kind));
         _frame.Ip = next;
@@ -404,6 +430,13 @@ internal sealed class JitFrame {
         _frame.Ip = next;
     }
 
+    public void LoadFieldAddress(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        _frame.Stack.Push(objects.FieldAddress(_frame.Stack.Pop(), field));
+        _frame.Ip = next;
+    }
+
     public void LoadStaticField(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         _frame.Stack.Push(SlotOps.PushCopyOfValue(objects.StaticFieldLocation(token, _frame.Context,
@@ -417,6 +450,125 @@ internal sealed class JitFrame {
         EnsureFieldWritable(field);
         objects.StaticFieldLocation(token, _frame.Context, _frame.Method.DynamicTokens)
             .Write(_frame.Stack.Pop());
+        _frame.Ip = next;
+    }
+
+    public void LoadStaticFieldAddress(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        _frame.Stack.Push(objects.TryGetStaticFieldRvaAddress(token) ??
+            StackSlot.OfByRef(objects.StaticFieldLocation(token, _frame.Context,
+                _frame.Method.DynamicTokens)));
+        _frame.Ip = next;
+    }
+
+    public void LoadIndirect(ILOp op, int next) {
+        _frame.Stack.Push(MemoryOps.LoadIndirect(op, _frame.Stack.Pop()));
+        _frame.Ip = next;
+    }
+
+    public void StoreIndirect(ILOp op, int next) {
+        var value = _frame.Stack.Pop();
+        MemoryOps.StoreIndirect(op, _frame.Stack.Pop(), value);
+        _frame.Ip = next;
+    }
+
+    public void LoadObject(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var address = _frame.Stack.Pop();
+        if (address.ObjectValue is VmNativePointer native) {
+            var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+            var size = MemoryOps.SizeOfType(type);
+            EnsureNativeRange(native, size, "ldobj");
+            _frame.Stack.Push(MemoryOps.ValueFromBytes(
+                native.Bytes.AsSpan(native.ByteOffset, size).ToArray(), type, size));
+        } else if (address.ObjectValue is VmByRef byRef) {
+            _frame.Stack.Push(SlotOps.PushCopyOfValue(byRef.Slot));
+        } else {
+            throw new InvalidOperationException($"ldobj のアドレスが不正です: {SlotOps.Describe(address)}");
+        }
+        _frame.Ip = next;
+    }
+
+    public void StoreObject(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var value = _frame.Stack.Pop();
+        var address = _frame.Stack.Pop();
+        if (address.ObjectValue is VmNativePointer native) {
+            var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+            var size = MemoryOps.SizeOfType(type);
+            EnsureNativeRange(native, size, "stobj");
+            var bytes = MemoryOps.BytesOfValue(value, type, size);
+            Array.Copy(bytes, 0, native.Bytes, native.ByteOffset, size);
+        } else if (address.ObjectValue is VmByRef byRef) {
+            byRef.Write(SlotOps.StoreCopyOfValue(value));
+        } else {
+            throw new InvalidOperationException($"stobj のアドレスが不正です: {SlotOps.Describe(address)}");
+        }
+        _frame.Ip = next;
+    }
+
+    public void CopyObject(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var source = _frame.Stack.Pop();
+        var destination = _frame.Stack.Pop();
+        var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var size = MemoryOps.SizeOfType(type);
+        if (source.ObjectValue is VmNativePointer sourceNative &&
+            destination.ObjectValue is VmNativePointer destinationNative) {
+            EnsureNativeRange(sourceNative, size, "cpobj");
+            EnsureNativeRange(destinationNative, size, "cpobj");
+            Array.Copy(sourceNative.Bytes, sourceNative.ByteOffset,
+                destinationNative.Bytes, destinationNative.ByteOffset, size);
+        } else if (source.ObjectValue is VmNativePointer sourceOnly) {
+            EnsureNativeRange(sourceOnly, size, "cpobj");
+            if (destination.ObjectValue is not VmByRef destinationByRef)
+                throw new InvalidOperationException("cpobj の宛先が不正です。");
+            destinationByRef.Write(SlotOps.StoreCopyOfValue(MemoryOps.ValueFromBytes(
+                sourceOnly.Bytes.AsSpan(sourceOnly.ByteOffset, size).ToArray(), type, size)));
+        } else if (destination.ObjectValue is VmNativePointer destinationOnly) {
+            EnsureNativeRange(destinationOnly, size, "cpobj");
+            if (source.ObjectValue is not VmByRef sourceByRef)
+                throw new InvalidOperationException("cpobj のソースが不正です。");
+            var bytes = MemoryOps.BytesOfValue(sourceByRef.Read(), type, size);
+            Array.Copy(bytes, 0, destinationOnly.Bytes, destinationOnly.ByteOffset, size);
+        } else if (source.ObjectValue is VmByRef sourceByRef &&
+                   destination.ObjectValue is VmByRef destinationByRef) {
+            destinationByRef.Write(SlotOps.StoreCopyOfValue(sourceByRef.Read()));
+        } else {
+            throw new InvalidOperationException("cpobj のアドレスが不正です。");
+        }
+        _frame.Ip = next;
+    }
+
+    public void InitObject(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var address = _frame.Stack.Pop();
+        var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        if (address.ObjectValue is VmNativePointer native) {
+            var size = MemoryOps.SizeOfType(type);
+            EnsureNativeRange(native, size, "initobj");
+            Array.Clear(native.Bytes, native.ByteOffset, size);
+        } else if (address.ObjectValue is VmByRef byRef) {
+            byRef.Write(_services.Objects.DefaultForType(type, _services.Loader));
+        } else {
+            throw new InvalidOperationException($"initobj のアドレスが不正です: {SlotOps.Describe(address)}");
+        }
+        _frame.Ip = next;
+    }
+
+    private static void EnsureNativeRange(VmNativePointer pointer, int size, string operation) {
+        if (pointer.ByteOffset < 0 || (long)pointer.ByteOffset + size > pointer.Bytes.Length)
+            throw new InvalidOperationException($"{operation} がブロック外を参照します。");
+    }
+
+    public void Unbox(int token, int next) {
+        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var value = _frame.Stack.Pop();
+        if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+            throw new UnhandledGuestException("System.InvalidCastException",
+                $"{SlotOps.Describe(value)} を {target.FullName} として unbox できません。");
+        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(boxed.Fields, 0)));
         _frame.Ip = next;
     }
 
@@ -467,6 +619,54 @@ internal sealed class JitFrame {
         _frame.Ip = next;
     }
 
+    public void LoadToken(int token, int next) {
+        if (_frame.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true) {
+            VmObject handle = dynamicReference switch {
+                VmType dynamicType => _services.Heap.Allocate(new VmTypeHandle { Target = dynamicType }),
+                VmMethod dynamicMethod => _services.Heap.Allocate(new VmMethodHandle { Target = dynamicMethod }),
+                VmField dynamicField => _services.Heap.Allocate(new VmFieldHandle { Target = dynamicField }),
+                _ => throw new NotSupportedException("動的 ldtoken の参照種別は未対応です."),
+            };
+            _frame.Stack.Push(StackSlot.OfObject(handle));
+            _frame.Ip = next;
+            return;
+        }
+
+        var loader = _services.Loader;
+        var tokenTable = (TableKind)((uint)token >> 24);
+        var tokenRid = (int)((uint)token & 0xFFFFFF);
+        switch (tokenTable) {
+            case TableKind.Field: {
+                var rva = loader.Image.GetFieldRva(tokenRid);
+                if (rva == 0)
+                    throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
+                var handle = _services.Heap.Allocate(new VmFieldRvaData {
+                    Data = loader.Image.GetRvaDataToEnd(rva),
+                });
+                _frame.Stack.Push(StackSlot.OfObject(handle));
+                break;
+            }
+            case TableKind.TypeDef or TableKind.TypeRef or TableKind.TypeSpec: {
+                var type = _interpreter.JitObjectsFor(_frame.Method).ResolveTypeToken(
+                    token, _frame.Context, _frame.Method.DynamicTokens);
+                _frame.Stack.Push(StackSlot.OfObject(
+                    _services.Heap.Allocate(new VmTypeHandle { Target = type })));
+                break;
+            }
+            case TableKind.MethodDef: {
+                var method = loader.GetMethodByToken((uint)token)
+                    ?? throw new BadImageFormatException($"MethodDef rid {tokenRid} を解決できません。");
+                _frame.Stack.Push(StackSlot.OfObject(
+                    _services.Heap.Allocate(new VmMethodHandle { Target = method })));
+                break;
+            }
+            default:
+                throw new NotSupportedException(
+                    $"ldtoken は Field/Type/Method トークンのみ対応しています (要求: {tokenTable})。");
+        }
+        _frame.Ip = next;
+    }
+
     public void Cast(int token, bool isInst, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
@@ -506,10 +706,11 @@ internal sealed class JitFrame {
 }
 
 /// <summary>
-/// Expression-tree compiler for the first JIT tier.  Calls, EH, byrefs,
-/// pointers and runtime-dependent instructions deliberately fall back to the
-/// interpreter. The supported tier also reuses VM call/object/array helpers so
-/// ordinary non-EH methods can be promoted without exposing CLR objects.
+/// Expression-tree compiler for the first JIT tier.  Calls, EH, unmanaged
+/// pointers, typed references and runtime-dependent instructions deliberately
+/// fall back to the interpreter. Managed ByRefs use the VM's slot containers,
+/// and the supported tier reuses VM call/object/array helpers so ordinary
+/// non-EH methods can be promoted without exposing CLR objects.
 /// </summary>
 internal static class JitMethodCompiler {
     private const int MaxInstructions = 4096;
@@ -594,21 +795,27 @@ internal static class JitMethodCompiler {
             return false;
 
         var offsets = new HashSet<int>(code.Select(instruction => instruction.Offset));
-        foreach (var instruction in code) {
+        for (var i = 0; i < code.Length; i++) {
+            var instruction = code[i];
             if (!IsSupported(instruction.Op))
                 return false;
             if (instruction.Op is ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3
                 && (int)(instruction.Op - ILOp.Ldarg_0) >= method.Signature.ParamTypes.Length + (method.Signature.HasThis ? 1 : 0))
                 return false;
-            if (instruction.Op is ILOp.Ldarg or ILOp.Ldarg_S or ILOp.Starg or ILOp.Starg_S)
+            if (instruction.Op is ILOp.Ldarg or ILOp.Ldarg_S or ILOp.Ldarga or ILOp.Ldarga_S
+                or ILOp.Starg or ILOp.Starg_S)
                 if ((uint)instruction.IntOperand >= (uint)(method.Signature.ParamTypes.Length + (method.Signature.HasThis ? 1 : 0)))
                     return false;
             if (instruction.Op is ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3
                 && (int)(instruction.Op - ILOp.Ldloc_0) >= prepared.LocalTypes.Length)
                 return false;
-            if (instruction.Op is ILOp.Ldloc or ILOp.Ldloc_S or ILOp.Stloc or ILOp.Stloc_S)
+            if (instruction.Op is ILOp.Ldloc or ILOp.Ldloc_S or ILOp.Ldloca or ILOp.Ldloca_S
+                or ILOp.Stloc or ILOp.Stloc_S)
                 if ((uint)instruction.IntOperand >= (uint)prepared.LocalTypes.Length)
                     return false;
+            if (instruction.Op == ILOp.Readonly &&
+                (i + 1 >= code.Length || code[i + 1].Op != ILOp.Ldelema))
+                return false;
             if (instruction.OperandKind is IlOperandKind.ShortBrTarget or IlOperandKind.BrTarget &&
                 !offsets.Contains(instruction.IntOperand))
                 return false;
@@ -621,16 +828,19 @@ internal static class JitMethodCompiler {
 
     private static bool ContainsUnsupportedType(SigType type) => type.Kind switch {
         SigKind.GenericVar or SigKind.GenericMethodVar or SigKind.GenericInst
-            or SigKind.ByRef or SigKind.Pointer or SigKind.TypedByRef => true,
+            or SigKind.Pointer or SigKind.TypedByRef => true,
+        SigKind.ByRef => type.Inner is not null && ContainsUnsupportedType(type.Inner),
         SigKind.SzArray or SigKind.Array => type.Inner is not null && ContainsUnsupportedType(type.Inner),
         _ => false,
     };
 
     private static bool IsSupported(ILOp op) => op switch {
         ILOp.Nop or ILOp.Break or
-        ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3 or ILOp.Ldarg_S or ILOp.Ldarg or
+        ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3 or ILOp.Ldarg_S or ILOp.Ldarg
+            or ILOp.Ldarga_S or ILOp.Ldarga or
         ILOp.Starg_S or ILOp.Starg or
-        ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3 or ILOp.Ldloc_S or ILOp.Ldloc or
+        ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3 or ILOp.Ldloc_S or ILOp.Ldloc
+            or ILOp.Ldloca_S or ILOp.Ldloca or
         ILOp.Stloc_0 or ILOp.Stloc_1 or ILOp.Stloc_2 or ILOp.Stloc_3 or ILOp.Stloc_S or ILOp.Stloc or
         ILOp.Ldnull or ILOp.Ldc_I4_M1 or ILOp.Ldc_I4_0 or ILOp.Ldc_I4_1 or ILOp.Ldc_I4_2
             or ILOp.Ldc_I4_3 or ILOp.Ldc_I4_4 or ILOp.Ldc_I4_5 or ILOp.Ldc_I4_6 or ILOp.Ldc_I4_7
@@ -642,6 +852,10 @@ internal static class JitMethodCompiler {
             or ILOp.Bge or ILOp.Bgt or ILOp.Ble or ILOp.Blt or ILOp.Bne_Un or ILOp.Bge_Un
             or ILOp.Bgt_Un or ILOp.Ble_Un or ILOp.Blt_Un or ILOp.Switch or
         ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un or
+        ILOp.Ldind_I1 or ILOp.Ldind_U1 or ILOp.Ldind_I2 or ILOp.Ldind_U2 or ILOp.Ldind_I4
+            or ILOp.Ldind_U4 or ILOp.Ldind_I8 or ILOp.Ldind_I or ILOp.Ldind_R4 or ILOp.Ldind_R8
+            or ILOp.Ldind_Ref or ILOp.Stind_Ref or ILOp.Stind_I or ILOp.Stind_I1 or ILOp.Stind_I2
+            or ILOp.Stind_I4 or ILOp.Stind_I8 or ILOp.Stind_R4 or ILOp.Stind_R8 or
         ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Div or ILOp.Div_Un or ILOp.Rem or ILOp.Rem_Un
             or ILOp.And or ILOp.Or or ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un
             or ILOp.Add_Ovf or ILOp.Add_Ovf_Un or ILOp.Sub_Ovf or ILOp.Sub_Ovf_Un
@@ -656,11 +870,12 @@ internal static class JitMethodCompiler {
             or ILOp.Ldstr or ILOp.Call or ILOp.Callvirt or ILOp.Newobj or ILOp.Newarr or ILOp.Ldlen
             or ILOp.Ldelem_I1 or ILOp.Ldelem_U1 or ILOp.Ldelem_I2 or ILOp.Ldelem_U2 or ILOp.Ldelem_I4
             or ILOp.Ldelem_U4 or ILOp.Ldelem_I8 or ILOp.Ldelem_I or ILOp.Ldelem_R4 or ILOp.Ldelem_R8
-            or ILOp.Ldelem_Ref or ILOp.Ldelem or ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2
+            or ILOp.Ldelem_Ref or ILOp.Ldelem or ILOp.Ldelema or ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2
             or ILOp.Stelem_I4 or ILOp.Stelem_I8 or ILOp.Stelem_R4 or ILOp.Stelem_R8 or ILOp.Stelem_Ref
-            or ILOp.Stelem or ILOp.Ldfld or ILOp.Stfld or ILOp.Ldsfld or ILOp.Stsfld or ILOp.Box
-            or ILOp.Unbox_Any or ILOp.Castclass or ILOp.Isinst or ILOp.Throw or ILOp.Ckfinite
-            or ILOp.Sizeof or ILOp.Ret => true,
+            or ILOp.Stelem or ILOp.Ldfld or ILOp.Ldflda or ILOp.Stfld or ILOp.Ldsfld or ILOp.Ldsflda
+            or ILOp.Stsfld or ILOp.Ldobj or ILOp.Stobj or ILOp.Cpobj or ILOp.Initobj or ILOp.Box
+            or ILOp.Unbox or ILOp.Unbox_Any or ILOp.Castclass or ILOp.Isinst or ILOp.Throw
+            or ILOp.Ckfinite or ILOp.Ldtoken or ILOp.Readonly or ILOp.Sizeof or ILOp.Ret => true,
         _ => false,
     };
 
@@ -673,12 +888,16 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.LoadArgument), Constant((int)(op - ILOp.Ldarg_0)), Constant(next));
         if (op is ILOp.Ldarg_S or ILOp.Ldarg)
             return Call(frame, nameof(JitFrame.LoadArgument), Constant(instruction.IntOperand), Constant(next));
+        if (op is ILOp.Ldarga_S or ILOp.Ldarga)
+            return Call(frame, nameof(JitFrame.LoadArgumentAddress), Constant(instruction.IntOperand), Constant(next));
         if (op is ILOp.Starg_S or ILOp.Starg)
             return Call(frame, nameof(JitFrame.StoreArgument), Constant(instruction.IntOperand), Constant(next));
         if (op is ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3)
             return Call(frame, nameof(JitFrame.LoadLocal), Constant((int)(op - ILOp.Ldloc_0)), Constant(next));
         if (op is ILOp.Ldloc_S or ILOp.Ldloc)
             return Call(frame, nameof(JitFrame.LoadLocal), Constant(instruction.IntOperand), Constant(next));
+        if (op is ILOp.Ldloca_S or ILOp.Ldloca)
+            return Call(frame, nameof(JitFrame.LoadLocalAddress), Constant(instruction.IntOperand), Constant(next));
         if (op is ILOp.Stloc_0 or ILOp.Stloc_1 or ILOp.Stloc_2 or ILOp.Stloc_3)
             return Call(frame, nameof(JitFrame.StoreLocal), Constant((int)(op - ILOp.Stloc_0)), Constant(next));
         if (op is ILOp.Stloc_S or ILOp.Stloc)
@@ -699,6 +918,8 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.Duplicate), Constant(next));
         if (op == ILOp.Pop)
             return Call(frame, nameof(JitFrame.Drop), Constant(next));
+        if (op == ILOp.Readonly)
+            return Call(frame, nameof(JitFrame.SetReadonly), Constant(next));
         if (op is ILOp.Br or ILOp.Br_S or ILOp.BrFalse or ILOp.BrFalse_S or ILOp.BrTrue or ILOp.BrTrue_S
             or ILOp.Beq or ILOp.Beq_S or ILOp.Bge or ILOp.Bge_S or ILOp.Bgt or ILOp.Bgt_S
             or ILOp.Ble or ILOp.Ble_S or ILOp.Blt or ILOp.Blt_S or ILOp.Bne_Un or ILOp.Bne_Un_S
@@ -710,6 +931,10 @@ internal static class JitMethodCompiler {
                 Expression.Constant(instruction.SwitchTargets!.Select(target => offsets[target]).ToArray()), Constant(next));
         if (op is ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un)
             return Call(frame, nameof(JitFrame.Compare), Constant(op), Constant(next));
+        if (IsIndirectLoad(op))
+            return Call(frame, nameof(JitFrame.LoadIndirect), Constant(op), Constant(next));
+        if (IsIndirectStore(op))
+            return Call(frame, nameof(JitFrame.StoreIndirect), Constant(op), Constant(next));
         if (op is ILOp.Call or ILOp.Callvirt)
             return Call(frame, nameof(JitFrame.Call), Constant(instruction.IntOperand),
                 Constant(op == ILOp.Callvirt), Constant(next));
@@ -727,6 +952,8 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.NewArray), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Ldlen)
             return Call(frame, nameof(JitFrame.LoadArrayLength), Constant(next));
+        if (op == ILOp.Ldelema)
+            return Call(frame, nameof(JitFrame.LoadArrayAddress), Constant(next));
         if (IsArrayLoad(op))
             return op == ILOp.Ldelem
                 ? Call(frame, nameof(JitFrame.LoadArrayByType), Constant(instruction.IntOperand), Constant(next))
@@ -737,14 +964,28 @@ internal static class JitMethodCompiler {
                 : Call(frame, nameof(JitFrame.StoreArray), Constant(ArrayKind(op)), Constant(next));
         if (op == ILOp.Ldfld)
             return Call(frame, nameof(JitFrame.LoadField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldflda)
+            return Call(frame, nameof(JitFrame.LoadFieldAddress), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Stfld)
             return Call(frame, nameof(JitFrame.StoreField), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Ldsfld)
             return Call(frame, nameof(JitFrame.LoadStaticField), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldsflda)
+            return Call(frame, nameof(JitFrame.LoadStaticFieldAddress), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Stsfld)
             return Call(frame, nameof(JitFrame.StoreStaticField), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Box)
             return Call(frame, nameof(JitFrame.Box), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldobj)
+            return Call(frame, nameof(JitFrame.LoadObject), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Stobj)
+            return Call(frame, nameof(JitFrame.StoreObject), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Cpobj)
+            return Call(frame, nameof(JitFrame.CopyObject), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Initobj)
+            return Call(frame, nameof(JitFrame.InitObject), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Unbox)
+            return Call(frame, nameof(JitFrame.Unbox), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Unbox_Any)
             return Call(frame, nameof(JitFrame.UnboxAny), Constant(instruction.IntOperand), Constant(next));
         if (op is ILOp.Castclass or ILOp.Isinst)
@@ -756,6 +997,8 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.CheckFinite), Constant(next));
         if (op == ILOp.Sizeof)
             return Call(frame, nameof(JitFrame.SizeOf), Constant(instruction.IntOperand), Constant(next));
+        if (op == ILOp.Ldtoken)
+            return Call(frame, nameof(JitFrame.LoadToken), Constant(instruction.IntOperand), Constant(next));
         if (op == ILOp.Ret)
             return Call(frame, nameof(JitFrame.Return), Expression.Constant(hasReturnValue));
         throw new InvalidOperationException($"未対応の JIT 命令です: {op}");
@@ -775,6 +1018,11 @@ internal static class JitMethodCompiler {
     private static ConstantExpression Constant(bool value) => Expression.Constant(value);
     private static ConstantExpression Constant(ILOp value) => Expression.Constant(value);
     private static ConstantExpression Constant(MemoryOps.ArrayElementKind value) => Expression.Constant(value);
+    private static bool IsIndirectLoad(ILOp op) => op is ILOp.Ldind_I1 or ILOp.Ldind_U1 or ILOp.Ldind_I2
+        or ILOp.Ldind_U2 or ILOp.Ldind_I4 or ILOp.Ldind_U4 or ILOp.Ldind_I8 or ILOp.Ldind_I
+        or ILOp.Ldind_R4 or ILOp.Ldind_R8 or ILOp.Ldind_Ref;
+    private static bool IsIndirectStore(ILOp op) => op is ILOp.Stind_Ref or ILOp.Stind_I or ILOp.Stind_I1
+        or ILOp.Stind_I2 or ILOp.Stind_I4 or ILOp.Stind_I8 or ILOp.Stind_R4 or ILOp.Stind_R8;
     private static bool IsBinary(ILOp op) => op is ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Div or ILOp.Div_Un
         or ILOp.Rem or ILOp.Rem_Un or ILOp.And or ILOp.Or or ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un
         or ILOp.Add_Ovf or ILOp.Add_Ovf_Un or ILOp.Sub_Ovf or ILOp.Sub_Ovf_Un or ILOp.Mul_Ovf or ILOp.Mul_Ovf_Un;

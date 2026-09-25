@@ -166,9 +166,9 @@ var options = new VmHostOptions {
 };
 ```
 
-JIT は非 EH のスカラー、呼出、配列、フィールド、box/cast 命令を VM の `StackSlot` / `SlotOps` と
-既存の VM オブジェクト操作へ変換する内部経路です。CLR の値・ゲストオブジェクト・任意のゲスト
-delegate を生成コードへ渡さず、未対応命令や上限超過時は同じメソッドをインタプリタへ
+JIT は非 EH のスカラー、呼出、配列、フィールド、box/cast、managed ByRef、間接アクセス、値型コピー、
+`ldtoken` 命令を VM の `StackSlot` / `SlotOps` と既存の VM オブジェクト操作へ変換する内部経路です。
+CLR の値・ゲストオブジェクト・任意のゲスト delegate を生成コードへ渡さず、未対応命令や上限超過時は同じメソッドをインタプリタへ
 フォールバックします。JIT の命令実行も通常の命令クォータ、
 セーフポイント、GC ルート登録を通ります。
 

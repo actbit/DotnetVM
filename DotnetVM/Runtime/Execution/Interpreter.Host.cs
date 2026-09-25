@@ -73,7 +73,7 @@ public sealed partial class Interpreter {
             var engines = EnginesFor(method);
             CloneStructArgs(method, arguments);
             var prepared = engines.Preparer.Prepare(method);
-            var frame = InterpreterFrame.Create(method, arguments, prepared, method.Body.MaxStack);
+            var frame = InterpreterFrame.Create(method, arguments, prepared, prepared.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             using (_coordinator.EnterRead()) {
                 lock (state.Gate)
@@ -144,7 +144,7 @@ public sealed partial class Interpreter {
                 compiled.TryInvokeLeaf(this, arguments, out result);
                 return true;
             }
-            var frame = InterpreterFrame.Create(method, arguments, compiled.Prepared, method.Body.MaxStack);
+            var frame = InterpreterFrame.Create(method, arguments, compiled.Prepared, compiled.Prepared.MaxStack);
             frame.Context = context;
             // The caller is executing under an instruction-batch read lease,
             // so a collector cannot observe this half-registered frame.
@@ -199,7 +199,6 @@ public sealed partial class Interpreter {
     }
 
     private VmMethod PrepareInvocation(VmMethod method, StackSlot[] arguments, GenericContext? context) {
-        EnsureStaticMethodTypeInitialized(method, context);
         if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
             // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する
             if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)
@@ -210,6 +209,12 @@ public sealed partial class Interpreter {
                 };
             method = substituted;
         }
+        // Validate guest IL before running a static constructor. Otherwise a
+        // malformed method could initialize guest state before fail-closed
+        // preparation has a chance to reject it.
+        if (method.Body is not null)
+            EnginesFor(method).Preparer.Prepare(method);
+        EnsureStaticMethodTypeInitialized(method, context);
         return method;
     }
 
@@ -229,8 +234,9 @@ public sealed partial class Interpreter {
                         ThrowNoBody(method);
                     var engines = EnginesFor(method);
                     CloneStructArgs(method, request.Arguments);
+                    var nextPrepared = engines.Preparer.Prepare(method);
                     var nextFrame = InterpreterFrame.Create(method, request.Arguments,
-                        engines.Preparer.Prepare(method), method.Body.MaxStack);
+                        nextPrepared, nextPrepared.MaxStack);
                     nextFrame.Context = request.Context;
 
                     using (_coordinator.EnterRead()) {

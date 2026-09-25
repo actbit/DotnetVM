@@ -79,21 +79,27 @@ public sealed class EvaluationStack {
     public readonly int MaxStack;
 
     public EvaluationStack(int maxStack) {
-        MaxStack = Math.Max(maxStack, 8);
+        if (maxStack < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxStack));
+        // The verifier proves the required depth before a frame is created.
+        // Keep the actual capacity equal to that proof instead of silently
+        // rounding hostile metadata up to eight slots.
+        MaxStack = maxStack;
         _slots = new StackSlot[this.MaxStack];
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Push(in StackSlot slot) {
         if (Count == _slots.Length)
-            throw new InvalidOperationException("評価スタックがオーバーフローしました (maxstack 超過)。");
+            throw new BadImageFormatException(
+                $"評価スタックがオーバーフローしました (Count={Count}, MaxStack={MaxStack})。");
         _slots[Count++] = slot;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public StackSlot Pop() {
         if (Count == 0)
-            throw new InvalidOperationException("評価スタックが空です (pop できません)。");
+            throw new BadImageFormatException("評価スタックが空です (pop できません)。");
         var slot = _slots[--Count];
         _slots[Count] = default;
         return slot;
@@ -103,14 +109,14 @@ public sealed class EvaluationStack {
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref StackSlot Peek() {
         if (Count == 0)
-            throw new InvalidOperationException("評価スタックが空です (peek できません)。");
+            throw new BadImageFormatException("評価スタックが空です (peek できません)。");
         return ref _slots[Count - 1];
     }
 
     /// <summary>上から depth 番目を参照 (dup や二項演算の両辺参照用)。</summary>
     public ref StackSlot PeekAt(int depth) {
         if (depth < 0 || depth >= Count)
-            throw new InvalidOperationException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
+            throw new BadImageFormatException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
         return ref _slots[Count - 1 - depth];
     }
 

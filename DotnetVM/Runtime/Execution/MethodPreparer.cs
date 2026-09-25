@@ -33,6 +33,12 @@ internal sealed class MethodPreparer(TypeLoader loader) {
         var prepared = new PreparedMethod(localTypes, code) {
             Clauses = ResolveExceptionClauses(method, code),
         };
+        _ = IlStackVerifier.Verify(method, loader, localTypes, code, prepared.Clauses);
+        // Keep the declared capacity after verification.  Some intrinsic
+        // surfaces expose a host implementation whose runtime stack shape is
+        // wider than the metadata signature even though the guest IL is
+        // structurally valid; the declared maxstack remains the hard cap.
+        prepared.MaxStack = method.Body?.MaxStack ?? 0;
         return prepared;
     }
 
@@ -96,6 +102,8 @@ internal sealed class PreparedMethod {
     public readonly DecodedInstruction[] Code;
     public readonly Dictionary<int, int> OffsetMap;
     public readonly StackSlot[] InitialLocals;
+    /// <summary>検証済みメソッドに対する実行時評価スタックの宣言容量。</summary>
+    public int MaxStack { get; set; }
 
     public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
         LocalTypes = localTypes;

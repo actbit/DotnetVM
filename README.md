@@ -116,6 +116,9 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
+`ExecutionTraceOptions.MaxEvents` に加えて `MaxFrames` で保持数を制限でき、超過分は `DroppedEventCount` / `DroppedFrameCount` に計上されます。診断機能がゲストのリソース上限を迂回しないよう、既定値にも上限があります。
+
+IL メソッドは実行前に評価スタック verifier を通過します。スタック underflow/overflow、分岐 merge の高さ不一致、`ret` / `call` の形状不一致、引数・ローカル範囲外、prefix の誤配置は `BadImageFormatException` として fail-closed になります。
 
 ### 簡易 JIT (M8)
 `VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` に加えて managed ByRef (`ldarga` / `ldloca` / `ldelema` / `ldflda` / `ldsflda`)、間接アクセス、値型コピー、`ldtoken` も VM オブジェクトモデルの操作として実行します。

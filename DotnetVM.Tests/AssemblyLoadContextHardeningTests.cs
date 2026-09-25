@@ -483,6 +483,48 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void DynamicMethod_RejectsMalformedEvaluationStackBeforeDelegateCreation() {
+        var loader = CreateLoader("DynamicMethodStackInput");
+        var heap = new VmHeap(new MemoryPolicy());
+
+        var underflow = NewDynamicMethod(loader, heap, "stackUnderflow");
+        underflow.EmitOpcode((ushort)ILOp.Pop);
+        underflow.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => underflow.CreateMethod());
+
+        var nonVoid = new VmDynamicMethodBuilder(loader, heap, "invalidRet",
+            new SigType(SigKind.I4), [], maxMethodBodyBytes: 128);
+        nonVoid.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => nonVoid.CreateMethod());
+
+        var merge = NewDynamicMethod(loader, heap, "stackMerge");
+        var target = merge.DefineLabel();
+        merge.EmitOpcode((ushort)ILOp.Ldc_I4_0);
+        merge.EmitLabel((ushort)ILOp.BrFalse, target);
+        merge.EmitOpcode((ushort)ILOp.Ldc_I4_1);
+        merge.MarkLabel(target);
+        merge.EmitOpcode((ushort)ILOp.Pop);
+        merge.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => merge.CreateMethod());
+    }
+
+    [Fact]
+    public void DynamicMethod_RejectsStackOverflowAndDanglingPrefix() {
+        var loader = CreateLoader("DynamicMethodStackLimitInput");
+        var heap = new VmHeap(new MemoryPolicy());
+
+        var overflow = NewDynamicMethod(loader, heap, "stackOverflow");
+        for (var i = 0; i < 9; i++)
+            overflow.EmitOpcode((ushort)ILOp.Ldc_I4_0);
+        Assert.Throws<BadImageFormatException>(() => overflow.CreateMethod());
+
+        var prefix = NewDynamicMethod(loader, heap, "danglingPrefix");
+        prefix.EmitSByte((ushort)ILOp.Unaligned, 3);
+        prefix.EmitOpcode((ushort)ILOp.Ret);
+        Assert.Throws<BadImageFormatException>(() => prefix.CreateMethod());
+    }
+
+    [Fact]
     public void DynamicMethod_RejectsShortAndWideArgumentIndexesOutsideSignature() {
         var loader = CreateLoader("DynamicMethodArgumentInput");
         var heap = new VmHeap(new MemoryPolicy());

@@ -10,9 +10,14 @@ public sealed class ExecutionTraceOptions {
     /// <summary>保存する命令イベントの最大数。超過分は破棄される。</summary>
     public int MaxEvents { get; init; } = 100_000;
 
+    /// <summary>保存するフレーム開始記録の最大数。超過分は破棄される。</summary>
+    public int MaxFrames { get; init; } = 100_000;
+
     internal void Validate() {
         if (MaxEvents < 1)
             throw new ArgumentOutOfRangeException(nameof(MaxEvents), "MaxEvents は 1 以上である必要があります。");
+        if (MaxFrames < 1)
+            throw new ArgumentOutOfRangeException(nameof(MaxFrames), "MaxFrames は 1 以上である必要があります。");
     }
 }
 

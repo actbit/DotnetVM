@@ -16,6 +16,14 @@ public sealed class ExecutionDiagnosticsTests {
         }
         """;
 
+    private const string NestedSource = """
+        namespace Vm.M9;
+        public static class NestedTraceTarget {
+            public static int Outer(int value) => Inner(value) + 1;
+            private static int Inner(int value) => value * 2;
+        }
+        """;
+
     [Fact]
     public void Tracer_Records_Instruction_Events_In_Execution_Order() {
         var pe = TestAssemblyCompiler.CompileToBytes(Source, "M9Trace");
@@ -52,6 +60,44 @@ public sealed class ExecutionDiagnosticsTests {
 
         Assert.Single(vm.Tracer.Events);
         Assert.True(vm.Tracer.DroppedEventCount > 0);
+    }
+
+    [Fact]
+    public void Tracer_Enforces_Frame_Limit_And_Counts_Drops() {
+        var pe = TestAssemblyCompiler.CompileToBytes(NestedSource, "M9FrameLimit");
+        using var vm = new VirtualMachine();
+        vm.LoadAssembly(new MemoryStream(pe));
+
+        vm.Tracer.Start(new ExecutionTraceOptions { MaxEvents = 1_000, MaxFrames = 1 });
+        Assert.Equal(7, vm.Invoke("Vm.M9.NestedTraceTarget", "Outer", 3));
+        vm.Tracer.Stop();
+
+        Assert.Single(vm.Tracer.Frames);
+        Assert.Equal("Outer", vm.Tracer.Frames[0].MethodName);
+        Assert.True(vm.Tracer.DroppedFrameCount >= 1);
+    }
+
+    [Fact]
+    public void Tracer_Start_Resets_Frame_Drop_Count() {
+        var pe = TestAssemblyCompiler.CompileToBytes(NestedSource, "M9FrameReset");
+        using var vm = new VirtualMachine();
+        vm.LoadAssembly(new MemoryStream(pe));
+
+        vm.Tracer.Start(new ExecutionTraceOptions { MaxEvents = 100, MaxFrames = 1 });
+        _ = vm.Invoke("Vm.M9.NestedTraceTarget", "Outer", 1);
+        Assert.True(vm.Tracer.DroppedFrameCount > 0);
+
+        vm.Tracer.Start(new ExecutionTraceOptions { MaxEvents = 100, MaxFrames = 1 });
+        Assert.Empty(vm.Tracer.Frames);
+        Assert.Equal(0, vm.Tracer.DroppedFrameCount);
+        vm.Tracer.Stop();
+    }
+
+    [Fact]
+    public void Tracer_Rejects_Invalid_Frame_Limit() {
+        var tracer = new ExecutionTracer();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            tracer.Start(new ExecutionTraceOptions { MaxFrames = 0 }));
     }
 
     [Fact]

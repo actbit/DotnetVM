@@ -118,6 +118,32 @@ JIT のコンパイル処理自体も VM のリソースポリシーで制限さ
 
 JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
 
+### JIT の速度比較
+
+JIT の有無を同じゲストアセンブリで比較するため、`DotnetVM.BenchmarkGuest` に
+算術・分岐ループ (`ArithmeticLoop(100_000)`) を用意し、`DotnetVM.Benchmarks` から
+VM を実行します。JIT 有効側は `JitPromotionThreshold = 1` とし、コンパイルを含まない
+ウォームアップ後に 9 サンプル (各 5 回実行) の中央値を比較します。ロード、JIT コンパイル、
+ウォームアップは計測時間に含めません。
+
+```bash
+dotnet build DotnetVM.slnx --configuration Release
+dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
+```
+
+2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で
+実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+
+| モード | 中央値 (ms) | 最小 (ms) | 最大 (ms) |
+|---|---:|---:|---:|
+| JIT 無効 | 2,208.028 | 2,143.601 | 2,317.687 |
+| JIT 有効 | 2,062.002 | 2,020.806 | 2,177.946 |
+
+このスカラー・ループでは `JIT 無効 / JIT 有効 = 1.07x` で、JIT 有効側が約 6% 高速でした。
+これは VM JIT が各命令でクォータ・セーフポイント・フレーム管理を維持した上での値であり、
+CLR のネイティブ JIT と同じ速度特性を意味しません。ベンチマークを追加・変更した場合は、
+上記コマンドを実行して README の実測値も更新してください。
+
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。
 

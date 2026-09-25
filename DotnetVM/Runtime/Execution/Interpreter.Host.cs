@@ -57,55 +57,75 @@ public sealed partial class Interpreter {
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
     public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
         _shared.ThrowIfDisposed();
+        VmLifetime.EnsureLive(method);
+        foreach (var argument in arguments)
+            VmLifetime.EnsureLive(argument);
         var state = CurrentState;
         using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared.Culture) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
-        method = PrepareInvocation(method, arguments, context);
-        if (method.Body is null)
-            ThrowNoBody(method);
-        if (state.Depth >= _memory.MaxRecursionDepth)
-            throw new UnhandledGuestException("System.StackOverflowException",
-                $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
-        state.Depth++;
+        var entered = false;
         try {
-            var engines = EnginesFor(method);
-            CloneStructArgs(method, arguments);
-            var prepared = engines.Preparer.Prepare(method);
-            var frame = InterpreterFrame.Create(method, arguments, prepared.LocalTypes, method.Body.MaxStack);
-            frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
-            using (_coordinator.EnterRead()) {
-                lock (state.Gate)
-                    state.Frames.Add(frame);
-            }
-            // 実行トレース: IL 本体を実行したフレームのみ記録する
-            // (intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されない)
-            if (_tracer is { } tracer)
-                tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+            method = PrepareInvocation(method, arguments, context);
+            if (method.Body is null)
+                ThrowNoBody(method);
+            if (state.Depth >= _memory.MaxRecursionDepth)
+                throw new UnhandledGuestException("System.StackOverflowException",
+                    $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
+            state.Depth++;
+            entered = true;
             try {
-                using (_coordinator.EnterRead())
-                    FixupStructLocals(frame);
-                // Dynamic expression compilation is host work rather than a
-                // guest instruction.  Do not perform it after the guest has
-                // already exhausted its instruction budget; the first
-                // interpreter instruction will report the normal quota error.
-                var compiled = HasInstructionBudget
-                    ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
-                    : null;
-                return compiled is null
-                    ? RunFrameWithTailCalls(ref frame, state)
-                    : compiled.Invoke(this, engines.Services, frame);
-            } finally {
+                var engines = EnginesFor(method);
+                CloneStructArgs(method, arguments);
+                var prepared = engines.Preparer.Prepare(method);
+                var frame = InterpreterFrame.Create(method, arguments, prepared.LocalTypes, method.Body.MaxStack, prepared.Code);
+                frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
                 using (_coordinator.EnterRead()) {
                     lock (state.Gate)
-                        state.Frames.Remove(frame);
+                        state.Frames.Add(frame);
+                }
+                // 実行トレース: IL 本体を実行したフレームのみ記録する
+                // (intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されない)
+                if (_tracer is { } tracer)
+                    tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                try {
+                    using (_coordinator.EnterRead())
+                        FixupStructLocals(frame);
+                    // Dynamic expression compilation is host work rather than a
+                    // guest instruction.  Do not perform it after the guest has
+                    // already exhausted its instruction budget; the first
+                    // interpreter instruction will report the normal quota error.
+                    var compiled = HasInstructionBudget
+                        ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
+                        : null;
+                    return compiled is null
+                        ? RunFrameWithTailCalls(ref frame, state)
+                        : compiled.Invoke(this, engines.Services, frame);
+                } finally {
+                    using (_coordinator.EnterRead()) {
+                        lock (state.Gate)
+                            state.Frames.Remove(frame);
+                    }
+                }
+            } finally {
+                state.Depth--;
+                if (state.Depth == 0) {
+                    try {
+                        FlushPendingAssemblyContextCaches();
+                    } finally {
+                        // A ThreadLocal retains its value until the host thread
+                        // exits. Do not retain completed thread states in the
+                        // VM-wide root registry for the lifetime of a long-lived VM.
+                        _executionStates.TryRemove(state, out _);
+                    }
                 }
             }
         } finally {
-            state.Depth--;
-            if (state.Depth == 0)
-                FlushPendingAssemblyContextCaches();
+            // Preparation/type initialization can fail before Depth is entered.
+            // Those failed attempts must not leave an otherwise idle state behind.
+            if (!entered && state.Depth == 0)
+                _executionStates.TryRemove(state, out _);
         }
 
     }
@@ -157,8 +177,9 @@ public sealed partial class Interpreter {
                         ThrowNoBody(method);
                     var engines = EnginesFor(method);
                     CloneStructArgs(method, request.Arguments);
+                    var nextPrepared = engines.Preparer.Prepare(method);
                     var nextFrame = InterpreterFrame.Create(method, request.Arguments,
-                        engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
+                        nextPrepared.LocalTypes, method.Body.MaxStack, nextPrepared.Code);
                     nextFrame.Context = request.Context;
 
                     using (_coordinator.EnterRead()) {

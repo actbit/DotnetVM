@@ -363,6 +363,7 @@ public sealed class VmFieldRvaData : VmObject {
         new() { Namespace = "System", Name = "RuntimeFieldHandle", IsValue = true };
 
     public required ReadOnlyMemory<byte> Data { get; init; }
+    internal TypeLoader? OwnerLoader { get; init; }
 
     public override VmType Type => HandleType;
 }
@@ -450,7 +451,12 @@ public sealed class VmAssemblyObject : VmObject {
 
     public required TypeLoader Loader { get; init; }
 
-    public override VmType Type => (VmType?)Loader.FindTypeByFullName("System.Reflection.Assembly") ?? AssemblyFacade;
+    public override VmType Type {
+        get {
+            Loader.EnsureLive();
+            return (VmType?)Loader.FindTypeByFullName("System.Reflection.Assembly") ?? AssemblyFacade;
+        }
+    }
 }
 
 /// <summary>
@@ -473,6 +479,12 @@ public sealed class VmAssemblyLoadContext : VmObject {
     /// <summary>ロード操作と Unload を直列化する lifetime gate。</summary>
     internal object LifetimeGate => _unloadGate;
 
+    internal void EnsureLive() {
+        if (IsUnloaded || Context.IsRetired)
+            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext),
+                "AssemblyLoadContext はアンロード済みです。");
+    }
+
     internal void Unload() {
         if (IsDefault)
             throw new InvalidOperationException("AssemblyLoadContext.Default はアンロードできません。");
@@ -484,6 +496,7 @@ public sealed class VmAssemblyLoadContext : VmObject {
             // これ以降のロードを直ちに拒否し、UnloadAction のキャッシュ掃除と
             // 並行するロードが新しい強参照を作らないようにする。
             Volatile.Write(ref _unloaded, 1);
+            Context.Retire();
             UnloadAction?.Invoke();
         }
     }

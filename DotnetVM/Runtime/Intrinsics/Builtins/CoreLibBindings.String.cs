@@ -621,26 +621,34 @@ internal static partial class CoreLibBindings {
                     $"Buffer.Memmove がブロック外を参照します (dst offset={dstNative.ByteOffset}, {count * stride} バイト, ブロック {dstNative.Bytes.Length} バイト)。");
             for (var i = 0; i < count; i++) {
                 if (dstRef is not null) {
+                    var sourceNative = srcNative ?? throw new InvalidOperationException(
+                        "Buffer.Memmove のバイト入力がありません。");
                     // バイト実体 → スロット列
                     dstRef.Container[dstRef.Index + i] =
-                        ReadNativeElement(srcNative!, srcNative.ByteOffset + i * stride, elementName);
+                        ReadNativeElement(sourceNative, sourceNative.ByteOffset + i * stride, elementName);
                 } else {
+                    var destinationNative = dstNative ?? throw new InvalidOperationException(
+                        "Buffer.Memmove のバイト出力がありません。");
+                    var sourceRef = srcRef ?? throw new InvalidOperationException(
+                        "Buffer.Memmove のスロット入力がありません。");
                     // スロット列 → バイト実体
-                    WriteNativeElement(dstNative!, dstNative.ByteOffset + i * stride,
-                        srcRef!.Container[srcRef.Index + i], elementName);
+                    WriteNativeElement(destinationNative, destinationNative.ByteOffset + i * stride,
+                        sourceRef.Container[sourceRef.Index + i], elementName);
                 }
             }
             return null;
         }
         var byteCount = count * stride;
+        var destination = dstNative ?? throw new InvalidOperationException("Buffer.Memmove の出力がありません。");
+        var source = srcNative ?? throw new InvalidOperationException("Buffer.Memmove の入力がありません。");
         // 境界検査: 実 CLR では未定義動作になる参照先の越境は VM では拒否する
-        if ((long)dstNative!.ByteOffset + byteCount > dstNative.Bytes.Length ||
-            (long)srcNative!.ByteOffset + byteCount > srcNative.Bytes.Length)
+        if ((long)destination.ByteOffset + byteCount > destination.Bytes.Length ||
+            (long)source.ByteOffset + byteCount > source.Bytes.Length)
             throw new InvalidOperationException(
-                $"Buffer.Memmove がブロック外を参照します (dst offset={dstNative.ByteOffset}, src offset={srcNative.ByteOffset}, " +
-                $"{byteCount} バイト, ブロック {dstNative.Bytes.Length} / {srcNative.Bytes.Length} バイト)。");
+                $"Buffer.Memmove がブロック外を参照します (dst offset={destination.ByteOffset}, src offset={source.ByteOffset}, " +
+                $"{byteCount} バイト, ブロック {destination.Bytes.Length} / {source.Bytes.Length} バイト)。");
         // Array.Copy は同一配列内の重なりを memmove と同じく正しく扱う
-        Array.Copy(srcNative.Bytes, srcNative.ByteOffset, dstNative.Bytes, dstNative.ByteOffset, byteCount);
+        Array.Copy(source.Bytes, source.ByteOffset, destination.Bytes, destination.ByteOffset, byteCount);
         return null;
     }
 

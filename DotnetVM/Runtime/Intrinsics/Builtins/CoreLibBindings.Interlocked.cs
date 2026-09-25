@@ -38,11 +38,8 @@ internal static partial class CoreLibBindings {
         // パラメータ型名は VM 表現と CoreLib 署名の実型 (統合後) 完全名で鍵化する。
         // i4 統合面 (byte/sbyte/short/ushort/bool/char/int が i4 スロットに載る) は 1 面で受け、
         // i8 / float / double / nint / nuint は別キーで鍵化
-        static string[] I(string t) => [t];
-        const string I4 = "System.Int32", I8 = "System.Int64", R4 = "System.Single", R8 = "System.Double";
+        const string I4 = "System.Int32", I8 = "System.Int64";
         const string Ref1 = "&";
-        void InstanceFace(string name, string[] paramTypes, IntrinsicImpl impl) =>
-            r.RegisterBinding(BindingKey.StaticWithReturn(T, name, paramTypes[0].TrimEnd('&'), paramTypes), impl, BindingOrigin.InternalCall);
 
         // Increment(ref T) / Decrement(ref T): (ref int,int) と (ref long,long) の両面.
         foreach (var (ty, tyName) in new[] { (I4, "System.Int32"), (I8, "System.Int64") }) {

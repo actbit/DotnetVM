@@ -102,8 +102,9 @@ public sealed class InterpreterFrame {
     /// <summary>readonly. プレフィックスが次の ldelema に適用されるか。</summary>
     public bool PendingReadonly;
 
-    public static InterpreterFrame Create(VmMethod method, StackSlot[] arguments, SigType[] localTypes, int maxStack) {
-        var code = method.DecodeIl();
+    public static InterpreterFrame Create(VmMethod method, StackSlot[] arguments, SigType[] localTypes, int maxStack,
+        DecodedInstruction[]? preparedCode = null) {
+        var code = preparedCode ?? method.DecodeIl();
         var offsetMap = new Dictionary<int, int>(code.Length * 2);
         for (var i = 0; i < code.Length; i++)
             offsetMap[code[i].Offset] = i;

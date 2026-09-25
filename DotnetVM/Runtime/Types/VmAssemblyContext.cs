@@ -20,20 +20,48 @@ public sealed class VmAssemblyContext(
     private readonly VmAssemblyContext? _parent = parent;
     private readonly Func<string, bool> _pathExists = pathExists ?? File.Exists;
     internal Guid Identity { get; } = Guid.NewGuid();
+    private int _retired;
+
+    /// <summary>Unload 開始後は新しい解決/登録を一切許可しない。</summary>
+    internal bool IsRetired => Volatile.Read(ref _retired) != 0;
+
+    internal void Retire() {
+        lock (_gate)
+            Volatile.Write(ref _retired, 1);
+    }
+
+    internal void EnsureActive() {
+        if (IsRetired)
+            throw new ObjectDisposedException(nameof(VmAssemblyContext),
+                "AssemblyLoadContext はアンロード済みです。");
+    }
 
     /// <summary>ロード済みアセンブリの TypeLoader 一覧 (ロード順)。</summary>
-    public IReadOnlyList<TypeLoader> Loaders { get { lock (_gate) return _loaders.ToArray(); } }
+    public IReadOnlyList<TypeLoader> Loaders {
+        get {
+            lock (_gate) {
+                EnsureActive();
+                return _loaders.ToArray();
+            }
+        }
+    }
+
+    /// <summary>Unload 処理がキャッシュ掃除に使う内部スナップショット。</summary>
+    internal TypeLoader[] SnapshotLoaders() { lock (_gate) return [.. _loaders]; }
 
     /// <summary>ロード済みアセンブリを単純名で取得 (無ければ null)。</summary>
     public TypeLoader? FindBySimpleName(string simpleName) {
-        lock (_gate)
+        lock (_gate) {
+            EnsureActive();
             if (_bySimpleName.TryGetValue(simpleName, out var loader))
                 return loader;
+        }
         return _parent?.FindBySimpleName(simpleName);
     }
 
     /// <summary>ロード済みアセンブリを完全な AssemblyName identity で取得する。</summary>
     public TypeLoader? FindByIdentity(AssemblyIdentity identity) {
+        EnsureActive();
         foreach (var loader in Loaders)
             if (identity.MatchesExactly(loader.Image.Identity))
                 return loader;
@@ -54,6 +82,7 @@ public sealed class VmAssemblyContext(
     /// <summary>アセンブリをコンテキストに登録する (VirtualMachine.LoadAssembly から呼ぶ)。</summary>
     internal void Register(TypeLoader loader) {
         lock (_gate) {
+            EnsureActive();
             if (_loaders.Contains(loader))
                 return;
             _loaders.Add(loader);
@@ -88,8 +117,10 @@ public sealed class VmAssemblyContext(
     /// </summary>
     public TypeLoader? TryResolveAssembly(string simpleName, AssemblyImage requesting) {
         TypeLoader? loaded;
-        lock (_gate)
+        lock (_gate) {
+            EnsureActive();
             loaded = _bySimpleName.GetValueOrDefault(simpleName);
+        }
         if (loaded is not null)
             return loaded;
         return TryDiscoverFromDirectory(simpleName, requesting) ?? _parent?.TryResolveAssembly(simpleName, requesting);
@@ -102,6 +133,7 @@ public sealed class VmAssemblyContext(
     /// ①ロード済みを identity 照合 → ②同一ディレクトリ探索 (identity 照合)。
     /// </summary>
     public TypeLoader? TryResolveAssembly(AssemblyIdentity reference, AssemblyImage requesting) {
+        EnsureActive();
         // ① ロード済みアセンブリを identity で照合 (ロード数は小さいため線形で十分)
         foreach (var loader in Loaders) {
             if (reference.Matches(loader.Image.Identity))
@@ -134,6 +166,7 @@ public sealed class VmAssemblyContext(
         // ロード完了まで待つのではなく、単純名辞書への登録は Register が行うので、
         // ここでは二重ロードを避けるためロード中マークを置いて再入を検知したら null を返す
         lock (_gate) {
+            EnsureActive();
             if (!_loading.Add(fullPath))
                 return null;
         }

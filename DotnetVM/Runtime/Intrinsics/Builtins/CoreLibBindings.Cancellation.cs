@@ -77,7 +77,7 @@ internal static partial class CoreLibBindings {
             return CancellationRuntime.Token(ctx, LiveState(a[0]));
         }, BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(source, "get_IsCancellationRequested"),
-            (ctx, a) => StackSlot.OfInt32(CancellationRuntime.State(a[0]).IsCancellationRequested ? 1 : 0),
+            (ctx, a) => StackSlot.OfInt32(LiveState(a[0]).IsCancellationRequested ? 1 : 0),
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(source, "Cancel"), (ctx, a) => {
             LiveState(a[0]).Cancel();

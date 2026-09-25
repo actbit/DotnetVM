@@ -25,20 +25,26 @@ public readonly record struct DecodedInstruction(
 public static class IlDecoder {
     /// <summary>IL 本体を全命令にデコードする。分岐が命令境界以外を指す場合は BadImageFormatException。</summary>
     public static DecodedInstruction[] Decode(ReadOnlySpan<byte> il) {
-        var instructions = new List<DecodedInstruction>(il.Length / 3 + 1);
-        var reader = new SpanReader(il);
-        while (!reader.EndOfBuffer) {
-            var offset = reader.Offset;
-            var instruction = DecodeOne(il, reader);
-            instructions.Add(instruction);
-            reader.Advance(instruction.Size);
-            if (reader.Offset > il.Length)
-                throw new BadImageFormatException($"IL 命令がメソッド本体を超えています (offset {offset})。");
-        }
+        try {
+            var instructions = new List<DecodedInstruction>(il.Length / 3 + 1);
+            var reader = new SpanReader(il);
+            while (!reader.EndOfBuffer) {
+                var offset = reader.Offset;
+                var instruction = DecodeOne(il, reader);
+                instructions.Add(instruction);
+                reader.Advance(instruction.Size);
+                if (reader.Offset > il.Length)
+                    throw new BadImageFormatException($"IL 命令がメソッド本体を超えています (offset {offset})。");
+            }
 
-        var result = instructions.ToArray();
-        ValidateBranchTargets(result, il.Length);
-        return result;
+            var result = instructions.ToArray();
+            ValidateBranchTargets(result, il.Length);
+            return result;
+        } catch (BadImageFormatException) {
+            throw;
+        } catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) {
+            throw new BadImageFormatException("IL の命令形式が不正です。", ex);
+        }
     }
 
     private static DecodedInstruction DecodeOne(ReadOnlySpan<byte> il, SpanReader reader) {

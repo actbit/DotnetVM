@@ -608,7 +608,7 @@ public class CoreLibFacesIlTests {
                 AssertSame("StylesParseFaces", s, styles);
         }
         // null 入力の ArgumentNullException 分類
-        AssertSame("DoubleParseFaces", null);
+        AssertSame("DoubleParseFaces", (string?)null);
     }
 
     [Fact]

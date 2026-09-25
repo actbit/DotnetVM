@@ -16,6 +16,15 @@ public sealed class ExecutionTracer {
     private readonly List<ExecutionFrame> _frames = [];
     private readonly object _gate = new();
 
+    public ExecutionTracer(int maxEvents = 100_000) {
+        if (maxEvents < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxEvents));
+        MaxEvents = maxEvents;
+    }
+
+    /// <summary>保持する最大イベント数。古いフレームから破棄して bounded に保つ。</summary>
+    public int MaxEvents { get; }
+
     /// <summary>記録済みフレーム (記録順)。読み取り専用ビュー。</summary>
     public IReadOnlyList<ExecutionFrame> Frames { get { lock (_gate) return _frames.ToArray(); } }
 
@@ -46,6 +55,8 @@ public sealed class ExecutionTracer {
         lock (_gate) {
             if (_enabled)
                 _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
+            if (_frames.Count > MaxEvents)
+                _frames.RemoveRange(0, _frames.Count - MaxEvents);
         }
     }
 }

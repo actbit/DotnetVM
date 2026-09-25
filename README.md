@@ -38,9 +38,17 @@ dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-re
 ## 特徴
 
 ### 実行方式
-- **IL インタプリタ** (主) — 事前デコードした IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
+- **IL インタプリタ** (主) — メソッド単位でキャッシュしたデコード済み IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
 - **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / managed ByRef / box / cast / `ldtoken` / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、unmanaged pointer、typed reference、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
 - **独自オブジェクトモデル** — CLR オブジェクトを流用しない。`VmObject` / `VmClassInstance` / `VmStructValue` / `VmArray` / `VmBoxedValue` の全生成が `VmHeap.Allocate` を通るため、アロケーション計上と GC 制御が正確
+
+### 実行ホットパスの最適化
+- デコード済み IL、分岐オフセット、ローカル初期値などの不変メタデータをメソッド/loader 単位で共有し、呼出しごとの再デコード・再構築を避けます
+- 命令実行の read lease と JIT フレームを値型化し、命令ごとの lease/closure/frame オブジェクト割り当てをなくします。実行状態の GC ルート登録もホスト thread ごとに一度だけ行います
+- メタデータ署名解析は `ReadOnlySpan<byte>` を直接受け取り、native memory の `ldobj` / `stobj` / `cpobj` / `cpblk` / `initblk` は `Span<byte>`、`stackalloc`、`BinaryPrimitives` を使います
+- `MethodDef` の不変呼出ターゲット、評価スタックの小さい操作、配列境界確認は通常の全ゲスト経路でキャッシュ/インライン化します
+- `VmHeap.Allocate` はクラス実体、配列、ボックス、intrinsic 実体の共通型についてサイズ判定の再ディスパッチを避けます。クォータ検査、会計、GC 用ヒープ登録は同じ経路に残ります
+- これらはベンチマーク専用の分岐ではありません。命令クォータ、セーフポイント、GC ルート、ByRef 所有権、loader アンロード、境界検査は変更せず、managed ByRef を CLR の生バイト列として再解釈することもありません
 
 ### リソース制約 (クォータ + 拒否方式)
 超過は `ResourceExhaustedException` 系の**管理例外**として拒否され、ゲストの `catch` には握りつぶされません。
@@ -135,22 +143,28 @@ dotnet build DotnetVM.slnx --configuration Release
 dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
 ```
 
-2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で
-実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
+最適化後のコードを実行した結果は次のとおりです。値は実行環境や負荷で変動します。
 
-| パターン (入力) | CoreCLR (ms) | VM interpreter (ms) | VM JIT (ms) | interpreter / CoreCLR | JIT / CoreCLR | interpreter / JIT |
-|---|---:|---:|---:|---:|---:|---:|
-| Arithmetic (100,000) | 0.836 | 2,122.945 | 2,056.153 | 2,538.8x | 2,458.9x | 1.03x |
-| Branches (100,000) | 2.014 | 1,982.856 | 1,894.130 | 984.3x | 940.2x | 1.05x |
-| Array access (10,000) | 0.118 | 317.975 | 300.199 | 2,683.3x | 2,533.3x | 1.06x |
-| Method calls (100,000) | 0.521 | 2,261.004 | 2,139.330 | 4,335.6x | 4,102.3x | 1.06x |
-| Object allocation (10,000) | 0.246 | 2,827.280 | 2,797.550 | 11,479.0x | 11,358.3x | 1.01x |
+| パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.805 | 1,944.108 | 1,063.670 | 45.3% | 1,837.696 | 955.202 | 48.0% | 1.11x |
+| Branches (100,000) | 1.843 | 2,098.228 | 1,006.932 | 52.0% | 1,978.085 | 898.421 | 54.6% | 1.12x |
+| Array access (10,000) | 0.106 | 297.485 | 163.757 | 45.0% | 279.503 | 144.034 | 48.5% | 1.14x |
+| Method calls (100,000) | 0.520 | 2,119.416 | 986.856 | 53.4% | 1,975.761 | 571.500 | 71.1% | 1.73x |
+| Object allocation (10,000) | 0.228 | 2,307.112 | 2,070.939 | 10.2% | 2,307.804 | 2,033.294 | 11.9% | 1.02x |
 
-この測定では VM JIT は interpreter より 1.01〜1.06 倍高速でした。一方、CoreCLR は
+`master interp/JIT` は変更前の `origin/master` (`1897c72`) を同じ条件で測定した値、
+改善率は `1 - current / master` です。この測定では interpreter は 10.2〜53.4%、
+JIT は 11.9〜71.1% 高速化し、VM JIT は interpreter より 1.02〜1.73 倍高速でした。一方、CoreCLR は
 ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
 フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
 CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で
 変動するため、ベンチマークを追加・変更した場合は上記コマンドで README の実測値も更新してください。
+
+今回の `VmHeap.Allocate` の型別サイズ経路は、クォータと GC の意味論を変えずに共通型の型判定を省くものです。
+標準ベンチマークでは Object allocation の変化は計測誤差の範囲に留まったため、次の調査対象は
+`newobj` の型/constructor 解決、インスタンスストレージ生成、constructor 実行フレームです。
 
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。

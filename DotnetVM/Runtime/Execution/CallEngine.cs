@@ -1,4 +1,5 @@
 using DotnetVM.Metadata;
+using System.Collections.Concurrent;
 using System.Threading;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.IL;
@@ -27,4 +28,8 @@ internal sealed partial class CallEngine(
     private readonly VmCoreLibSurfaces? _coreLibSurfaces = services.CoreLibSurfaces;
     private readonly InterpreterServices _services = services;
     private readonly AsyncLocal<Dictionary<VmExpressionObject, StackSlot>?> _expressionScope = new();
+    // MethodDef tokens are immutable within a loader and do not depend on a
+    // generic caller context.  Cache their target object so a hot guest call
+    // does not allocate and populate the same CallTarget on every iteration.
+    private readonly ConcurrentDictionary<int, CallTarget> _methodDefTargets = new();
 }

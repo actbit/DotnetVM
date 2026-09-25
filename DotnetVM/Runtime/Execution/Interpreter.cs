@@ -27,7 +27,7 @@ namespace DotnetVM.Runtime.Execution;
 /// </summary>
 public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
-    private const int SafepointInterval = 1024;
+    internal const int SafepointInterval = 1024;
 
     private readonly MemoryPolicy _memory;
     private readonly bool _enableJit;
@@ -69,7 +69,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         public int Depth;
         public long InstructionCount;
     }
-    private readonly ThreadLocal<ExecutionState> _currentExecution = new(() => new ExecutionState());
+    private readonly ThreadLocal<ExecutionState> _currentExecution;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
     private readonly VmExecutionCoordinator _coordinator = new();
     private long _instructionCount;
@@ -88,11 +88,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
 
     private ExecutionState CurrentState {
-        get {
-            var state = _currentExecution.Value!;
-            _executionStates.TryAdd(state, 0);
-            return state;
-        }
+        get => _currentExecution.Value!;
     }
 
     void IExecutionGate.ConsumeInstruction() => ConsumeInstruction();
@@ -133,7 +129,11 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     // allowing the generated delegate to bracket each instruction safely.
     internal void ConsumeJitInstruction() => ConsumeInstruction();
     internal void CheckJitSafepoint() => CheckSafepoint();
-    internal IDisposable EnterJitInstruction() => _coordinator.EnterInstruction();
+    internal VmExecutionCoordinator.InstructionLease EnterJitInstruction() => _coordinator.EnterInstruction();
+    internal VmExecutionCoordinator.InstructionLease EnterJitInstructionInBatch() =>
+        _coordinator.EnterInstructionInBatch();
+    internal VmExecutionCoordinator.InstructionBatchLease EnterJitInstructionBatch() =>
+        _coordinator.EnterInstructionBatch();
     internal CallEngine JitCallsFor(VmMethod method) => EnginesFor(method).Calls;
     internal ObjectEngine JitObjectsFor(VmMethod method) => EnginesFor(method).Objects;
     internal ExceptionDispatcher JitExceptionsFor(VmMethod method) => EnginesFor(method).Exceptions;
@@ -149,11 +149,24 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         var eh = engines.Exceptions;
         var calls = engines.Calls;
         var objects = engines.Objects;
-        while (true) {
+        var instructionBatch = default(VmExecutionCoordinator.InstructionBatchLease);
+        var batchInstructions = 0;
+        try {
             CheckSafepoint();
-            using var instructionLease = _coordinator.EnterInstruction();
-            ConsumeInstruction();
-            var instruction = frame.Code[frame.Ip];
+            instructionBatch = _coordinator.EnterInstructionBatch();
+            while (true) {
+                if (batchInstructions >= SafepointInterval) {
+                    instructionBatch.Dispose();
+                    instructionBatch = default;
+                    CheckSafepoint();
+                    instructionBatch = _coordinator.EnterInstructionBatch();
+                    batchInstructions = 0;
+                }
+                CheckSafepoint();
+                batchInstructions++;
+                using var instructionLease = _coordinator.EnterInstructionInBatch();
+                ConsumeInstruction();
+                var instruction = frame.Code[frame.Ip];
             var isPrefix = IsPrefix(instruction.Op);
             var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
             var readonlyAddress = frame.PendingReadonly && !isPrefix &&
@@ -465,8 +478,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         frame.Stack.Push(objects.FieldAddress(objSlot, field, readonlyAddress));
                         break;
                     }
-                    var location = objects.FieldLocation(objSlot, field);
-                    frame.Stack.Push(SlotOps.PushCopyOfValue(location.Read()));
+                    frame.Stack.Push(SlotOps.PushCopyOfValue(objects.ReadField(objSlot, field)));
                     break;
                 }
                 case ILOp.Stfld: {
@@ -477,7 +489,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     // VnString レシーバはバイト実体 (真実源) に直接書く
                     if (objects.TryStoreStringField(objSlot, field, value))
                         break;
-                    objects.FieldLocation(objSlot, field).Write(SlotOps.StoreCopyOfValue(value));
+                    objects.WriteField(objSlot, field, value);
                     break;
                 }
                 case ILOp.Ldsfld: {
@@ -529,7 +541,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"ldobj がブロック外を参照します (offset={ldNative.ByteOffset}, {ldSize} バイト)。");
                         frame.Stack.Push(MemoryOps.ValueFromBytes(
-                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize).ToArray(), ldType, ldSize));
+                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize), ldType, ldSize));
                         break;
                     }
                     var byref = address.ObjectValue as VmByRef
@@ -548,8 +560,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (stNative.ByteOffset < 0 || (long)stNative.ByteOffset + stSize > stNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"stobj がブロック外を参照します (offset={stNative.ByteOffset}, {stSize} バイト)。");
-                        var stBytes = MemoryOps.BytesOfValue(value, stType, stSize);
-                        Array.Copy(stBytes, 0, stNative.Bytes, stNative.ByteOffset, stSize);
+                        Span<byte> stBytes = stackalloc byte[8];
+                        MemoryOps.BytesOfValue(value, stType, stSize, stBytes);
+                        stBytes[..stSize].CopyTo(stNative.Bytes.AsSpan(stNative.ByteOffset, stSize));
                         break;
                     }
                     var byref = stAddress.ObjectValue as VmByRef
@@ -568,14 +581,15 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             (long)dstNative.ByteOffset + cpSize > dstNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         dstNative.EnsureWritable();
-                        Array.Copy(srcNative.Bytes, srcNative.ByteOffset, dstNative.Bytes, dstNative.ByteOffset, cpSize);
+                        srcNative.Bytes.AsSpan(srcNative.ByteOffset, cpSize)
+                            .CopyTo(dstNative.Bytes.AsSpan(dstNative.ByteOffset, cpSize));
                         break;
                     }
                     if (src.ObjectValue is VmNativePointer srcOnly) {
                         if (srcOnly.ByteOffset < 0 || (long)srcOnly.ByteOffset + cpSize > srcOnly.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         var value = MemoryOps.ValueFromBytes(
-                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
+                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize), cpType, cpSize);
                         if (dst.ObjectValue is not VmByRef dstManaged)
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の宛先がマネージ参照ではありません。");
@@ -587,11 +601,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の送信元がマネージ参照ではありません。");
                         var srcValue = srcManaged.Read();
-                        var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
+                        Span<byte> dstBytes = stackalloc byte[8];
+                        MemoryOps.BytesOfValue(srcValue, cpType, cpSize, dstBytes);
                         if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         dstOnly.EnsureWritable();
-                        Array.Copy(dstBytes, 0, dstOnly.Bytes, dstOnly.ByteOffset, cpSize);
+                        dstBytes[..cpSize].CopyTo(dstOnly.Bytes.AsSpan(dstOnly.ByteOffset, cpSize));
                         break;
                     }
                     var srcRef = src.ObjectValue as VmByRef
@@ -946,9 +961,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     throw new NotSupportedException(
                         $"IL 命令 {IlOpcodeTable.Get(instruction.Op)?.Name ?? instruction.Op.ToString()} は未対応です (ジェネリック/JIT は今後のフェーズで実装)。");
             }
-            if (volatileAccess)
-                Thread.MemoryBarrier();
-            frame.Ip++;
+                if (volatileAccess)
+                    Thread.MemoryBarrier();
+                frame.Ip++;
+            }
+        } finally {
+            instructionBatch.Dispose();
         }
     }
 

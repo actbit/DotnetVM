@@ -105,9 +105,12 @@ public static class StringOrdinalOps {
         if (needle.Length == 0)
             return from <= haystack.Length ? from : -1;
         var limit = haystack.Length - needle.Length;
+        var first = needle[0];
         for (var start = from; start <= limit; start++) {
+            if (haystack[start] != first)
+                continue;
             var matched = true;
-            for (var i = 0; i < needle.Length; i++) {
+            for (var i = 1; i < needle.Length; i++) {
                 if (haystack[start + i] != needle[i]) {
                     matched = false;
                     break;
@@ -123,41 +126,41 @@ public static class StringOrdinalOps {
     //      RemoveEmptyEntries では空要素を数えない、詳細は SplitCore の doc 参照) ----
 
     public static string[] SplitChar(string value, char separator) =>
-        SplitCore(value, [separator], null, null, int.MaxValue, StringSplitOptions.None);
+        SplitCore(value, null, separator, null, null, int.MaxValue, StringSplitOptions.None);
 
     public static string[] SplitCharCount(string value, char separator, int count) {
         ValidateCount(count);
-        return SplitCore(value, [separator], null, null, count, StringSplitOptions.None);
+        return SplitCore(value, null, separator, null, null, count, StringSplitOptions.None);
     }
 
     public static string[] SplitCharOptions(string value, char separator, StringSplitOptions options) {
         ValidateOptions(options);
-        return SplitCore(value, [separator], null, null, int.MaxValue, options);
+        return SplitCore(value, null, separator, null, null, int.MaxValue, options);
     }
 
     public static string[] SplitCharFull(string value, char separator, int count, StringSplitOptions options) {
         ValidateCount(count);
         ValidateOptions(options);
-        return SplitCore(value, [separator], null, null, count, options);
+        return SplitCore(value, null, separator, null, null, count, options);
     }
 
     public static string[] SplitCharArray(string value, char[]? separators) =>
-        SplitCore(value, separators, null, null, int.MaxValue, StringSplitOptions.None);
+        SplitCore(value, separators, null, null, null, int.MaxValue, StringSplitOptions.None);
 
     public static string[] SplitCharArrayCount(string value, char[]? separators, int count) {
         ValidateCount(count);
-        return SplitCore(value, separators, null, null, count, StringSplitOptions.None);
+        return SplitCore(value, separators, null, null, null, count, StringSplitOptions.None);
     }
 
     public static string[] SplitCharArrayOptions(string value, char[]? separators, StringSplitOptions options) {
         ValidateOptions(options);
-        return SplitCore(value, separators, null, null, int.MaxValue, options);
+        return SplitCore(value, separators, null, null, null, int.MaxValue, options);
     }
 
     public static string[] SplitCharArrayFull(string value, char[]? separators, int count, StringSplitOptions options) {
         ValidateCount(count);
         ValidateOptions(options);
-        return SplitCore(value, separators, null, null, count, options);
+        return SplitCore(value, separators, null, null, null, count, options);
     }
 
     public static string[] SplitStringOptions(string value, string? separator, StringSplitOptions options) {
@@ -185,18 +188,18 @@ public static class StringOrdinalOps {
                 result[0] = value;
             return result;
         }
-        return SplitCore(value, null, separator, null, count, options);
+        return SplitCore(value, null, null, separator, null, count, options);
     }
 
     public static string[] SplitStringsOptions(string value, string?[]? separators, StringSplitOptions options) {
         ValidateOptions(options);
-        return SplitCore(value, null, null, separators, int.MaxValue, options);
+        return SplitCore(value, null, null, null, separators, int.MaxValue, options);
     }
 
     public static string[] SplitStringsFull(string value, string?[]? separators, int count, StringSplitOptions options) {
         ValidateCount(count);
         ValidateOptions(options);
-        return SplitCore(value, null, null, separators, count, options);
+        return SplitCore(value, null, null, null, separators, count, options);
     }
 
     private static void ValidateCount(int count) {
@@ -209,7 +212,7 @@ public static class StringOrdinalOps {
             throw new ArgumentException("Invalid enumeration value.", "options");
     }
 
-    /// <summary>共通核。charSeps / singleSep / stringSeps のちょうど 1 つが有効。
+    /// <summary>共通核。charSeps / singleChar / singleSep / stringSeps のちょうど 1 つが有効。
     /// char[] 系統と string[] 系統では null / 空 = 本家どおり空白 (char.IsWhiteSpace)
     /// 区切り。singleSep は非 null で渡ること (string 単独系統の null / 空 は
     /// SplitStringCore が分割点なしとして先に処理する — 本家どおり)。
@@ -218,8 +221,8 @@ public static class StringOrdinalOps {
     /// 追加済み数が上限に達した後も消費・スキップを続け、非空要素が count - 1 個
     /// 揃った時点の残りを最終要素とする。count = 1 は分割せず全体 1 要素
     /// (空入力 + RemoveEmptyEntries のときのみ空配列)。</summary>
-    private static string[] SplitCore(string value, char[]? charSeps, string? singleSep,
-        string?[]? stringSeps, int count, StringSplitOptions options) {
+    private static string[] SplitCore(string value, char[]? charSeps, char? singleChar,
+        string? singleSep, string?[]? stringSeps, int count, StringSplitOptions options) {
         if (count == 0)
             return new string[0];
         var omitEmpty = options == StringSplitOptions.RemoveEmptyEntries;
@@ -234,7 +237,7 @@ public static class StringOrdinalOps {
         var start = 0;
         var i = 0;
         while (i < length) {
-            var sepLength = MatchSeparator(value, i, charSeps, singleSep, stringSeps);
+            var sepLength = MatchSeparator(value, i, charSeps, singleChar, singleSep, stringSeps);
             if (sepLength > 0) {
                 var part = value.Substring(start, i - start);
                 i += sepLength;
@@ -268,7 +271,9 @@ public static class StringOrdinalOps {
     /// (不一致は 0)。string[] セパレータは本家どおり配列順に照合し、最初に一致した
     /// 非 null / 非空の要素を使う。</summary>
     private static int MatchSeparator(string value, int index,
-        char[]? charSeps, string? singleSep, string?[]? stringSeps) {
+        char[]? charSeps, char? singleChar, string? singleSep, string?[]? stringSeps) {
+        if (singleChar is { } single)
+            return value[index] == single ? 1 : 0;
         if (charSeps is not null && charSeps.Length != 0) {
             var c = value[index];
             for (var i = 0; i < charSeps.Length; i++)
@@ -295,7 +300,9 @@ public static class StringOrdinalOps {
     private static bool OrdinalStartsWith(string value, int index, string sep) {
         if (sep.Length == 0 || index + sep.Length > value.Length)
             return false;
-        for (var i = 0; i < sep.Length; i++)
+        if (value[index] != sep[0])
+            return false;
+        for (var i = 1; i < sep.Length; i++)
             if (value[index + i] != sep[i])
                 return false;
         return true;

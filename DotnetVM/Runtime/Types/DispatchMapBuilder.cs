@@ -131,7 +131,7 @@ internal sealed class DispatchMapBuilder {
     private void MapExplicitInterfaceImplementation(DispatchMaps maps, int memberRefRid, VmMethod body) {
         try {
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+                _loader.Image.GetMemberRefSignature(memberRefRid),
                 _loader.Image.Limits?.MaxSignatureDepth ?? 64,
                 _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var name = _loader.GetMemberRefName(memberRefRid);

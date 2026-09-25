@@ -1,4 +1,5 @@
 using DotnetVM.Metadata;
+using System.Collections.Concurrent;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
 using DotnetVM.Runtime.Objects;
@@ -31,10 +32,23 @@ internal sealed partial class ObjectEngine(
     /// <summary>静的 FieldRVA データフィールドのアドレス (トークンごとに 1 つ。例: Char.Latin1CharInfo の
     /// &lt;PrivateImplementationDetails&gt; 初期化データ)。GC グラフ源 (Interpreter が到達可能性に使う)。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, VmNativePointer> _rvaFieldAddresses = new();
+    // MethodDef/Field tokens are immutable within this loader.  Keep their
+    // resolved objects beside the object engine so hot newobj/ldfld paths do
+    // not re-enter TypeLoader.MetadataGate on every iteration.
+    private readonly ConcurrentDictionary<int, VmMethod> _methodDefConstructors = new();
+    private readonly ConcurrentDictionary<int, VmField> _fieldTokens = new();
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;
 
     /// <summary>intrinsic 静的フィールド / FieldRVA データアドレスの実体一覧 (GC グラフ源)。</summary>
     public IEnumerable<VmNativePointer> RvaFieldAddresses => _rvaFieldAddresses.Values;
+
+    private void InvokeGuest(VmMethod method, StackSlot[] arguments, GenericContext? context = null) {
+        if (invoker is Interpreter interpreter &&
+            interpreter.TryInvokeCompiled(method, arguments, context, out _))
+            return;
+        invoker.Invoke(method, arguments, context);
+    }
+
 }

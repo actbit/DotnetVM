@@ -170,6 +170,17 @@ public sealed class InterpreterFrame {
         };
     }
 
+    internal static InterpreterFrame Create(VmMethod method, StackSlot[] arguments,
+        PreparedMethod prepared, int maxStack) => new() {
+            Method = method,
+            Code = prepared.Code,
+            OffsetMap = prepared.OffsetMap,
+            Arguments = arguments,
+            Locals = (StackSlot[])prepared.InitialLocals.Clone(),
+            LocalTypes = prepared.LocalTypes,
+            Stack = new EvaluationStack(maxStack),
+        };
+
     /// <summary>署名型に対する既定値スロット (ローカル変数のゼロ初期化)。</summary>
     public static StackSlot DefaultValue(SigType type) => type.Kind switch {
         SigKind.I4 or SigKind.Boolean or SigKind.Char or SigKind.I1 or SigKind.U1

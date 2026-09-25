@@ -120,11 +120,15 @@ JIT はゲストに CLR の動的コード生成 API を公開する機能では
 
 ### JIT の速度比較
 
-JIT の有無を同じゲストアセンブリで比較するため、`DotnetVM.BenchmarkGuest` に
-算術・分岐ループ (`ArithmeticLoop(100_000)`) を用意し、`DotnetVM.Benchmarks` から
-VM を実行します。JIT 有効側は `JitPromotionThreshold = 1` とし、コンパイルを含まない
-ウォームアップ後に 9 サンプル (各 5 回実行) の中央値を比較します。ロード、JIT コンパイル、
-ウォームアップは計測時間に含めません。
+`DotnetVM.BenchmarkGuest` の同じ Release ビルド済みゲストアセンブリを、次の 3 通りで比較します。
+
+1. **CoreCLR** — ゲストメソッドを CoreCLR 上で型付き delegate から直接実行 (通常の CoreCLR JIT)
+2. **VM interpreter** — `EnableJit = false`
+3. **VM JIT** — `EnableJit = true`, `JitPromotionThreshold = 1`
+
+ワークロードは算術、分岐、配列アクセス、メソッド呼出、オブジェクト確保の 5 パターンです。
+各パターンは CLR 実行結果を期待値として VM の結果を検証します。ロード・JIT コンパイル・
+ウォームアップを計測から除外し、9 サンプル (各 5 回実行) の中央値を表示します。
 
 ```bash
 dotnet build DotnetVM.slnx --configuration Release
@@ -134,15 +138,19 @@ dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configurat
 2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で
 実行した結果は次のとおりです。値は実行環境や負荷で変動します。
 
-| モード | 中央値 (ms) | 最小 (ms) | 最大 (ms) |
-|---|---:|---:|---:|
-| JIT 無効 | 2,208.028 | 2,143.601 | 2,317.687 |
-| JIT 有効 | 2,062.002 | 2,020.806 | 2,177.946 |
+| パターン (入力) | CoreCLR (ms) | VM interpreter (ms) | VM JIT (ms) | interpreter / CoreCLR | JIT / CoreCLR | interpreter / JIT |
+|---|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.836 | 2,122.945 | 2,056.153 | 2,538.8x | 2,458.9x | 1.03x |
+| Branches (100,000) | 2.014 | 1,982.856 | 1,894.130 | 984.3x | 940.2x | 1.05x |
+| Array access (10,000) | 0.118 | 317.975 | 300.199 | 2,683.3x | 2,533.3x | 1.06x |
+| Method calls (100,000) | 0.521 | 2,261.004 | 2,139.330 | 4,335.6x | 4,102.3x | 1.06x |
+| Object allocation (10,000) | 0.246 | 2,827.280 | 2,797.550 | 11,479.0x | 11,358.3x | 1.01x |
 
-このスカラー・ループでは `JIT 無効 / JIT 有効 = 1.07x` で、JIT 有効側が約 6% 高速でした。
-これは VM JIT が各命令でクォータ・セーフポイント・フレーム管理を維持した上での値であり、
-CLR のネイティブ JIT と同じ速度特性を意味しません。ベンチマークを追加・変更した場合は、
-上記コマンドを実行して README の実測値も更新してください。
+この測定では VM JIT は interpreter より 1.01〜1.06 倍高速でした。一方、CoreCLR は
+ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
+フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
+CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で
+変動するため、ベンチマークを追加・変更した場合は上記コマンドで README の実測値も更新してください。
 
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。

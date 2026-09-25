@@ -1,5 +1,3 @@
-using System.Reflection;
-using DotnetVM.Host;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -233,19 +231,14 @@ public class CoreLibSurfaceGapProbeTests {
         }
         """;
 
-    private static readonly Lazy<(Assembly Clr, byte[] Bytes)> Compiled = new(() => {
-        var bytes = TestAssemblyCompiler.CompileToBytes(Source, "C5GapProbeAsm");
-        return (Assembly.Load(bytes), bytes);
-    });
+    private static readonly Lazy<CompiledTestAssembly> Compiled = new(() =>
+        new CompiledTestAssembly(Source, "C5GapProbeAsm"));
 
     private static object? InvokeClr(string method, params object?[] args) =>
-        Compiled.Value.Clr.GetType("Vm.Probe.Ops")!.GetMethod(method,
-            BindingFlags.Public | BindingFlags.Static)!.Invoke(null, args);
+        Compiled.Value.InvokeClr("Vm.Probe.Ops", method, args);
 
     private static object? InvokeVm(string method, params object?[] args) {
-        using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
+        using var vm = Compiled.Value.CreateVm();
         return vm.Invoke("Vm.Probe.Ops", method, args);
     }
 

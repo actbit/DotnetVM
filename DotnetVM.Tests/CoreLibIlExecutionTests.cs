@@ -1,5 +1,3 @@
-using System.Reflection;
-using DotnetVM.Host;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -70,21 +68,14 @@ public class CoreLibIlExecutionTests {
 
     private const string Input = "abcdefgh";
 
-    private static readonly Lazy<(Assembly Clr, byte[] Bytes)> Compiled = new(() => {
-        var bytes = TestAssemblyCompiler.CompileToBytes(Source, "C5Asm");
-        return (Assembly.Load(bytes), bytes);
-    });
+    private static readonly Lazy<CompiledTestAssembly> Compiled = new(() =>
+        new CompiledTestAssembly(Source, "C5Asm"));
 
     private static object? RunClr(string method) =>
-        Compiled.Value.Clr.GetType("Vm.C5.StringOps")!.GetMethod(method, BindingFlags.Public | BindingFlags.Static)!
-            .Invoke(null, [Input]);
+        Compiled.Value.InvokeClr("Vm.C5.StringOps", method, Input);
 
-    private static VirtualMachine CreateVm(bool loadCoreLib) {
-        var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = loadCoreLib });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
-        return vm;
-    }
+    private static DotnetVM.Host.VirtualMachine CreateVm(bool loadCoreLib) =>
+        Compiled.Value.CreateVm(loadCoreLib);
 
     /// <summary>CoreLib あり/なしの両 VM と CLR の 3 方突合 (IL 実行と legacy 委譲の結果不変性)。</summary>
     private static void AssertSameEverywhere(string method) {

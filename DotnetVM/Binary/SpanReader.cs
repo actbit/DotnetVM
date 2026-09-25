@@ -26,7 +26,7 @@ public ref struct SpanReader {
     }
 
     public void Advance(int count) {
-        if (count < 0 || _offset + count > _buffer.Length)
+        if (count < 0 || count > _buffer.Length - _offset)
             throw new ArgumentOutOfRangeException(nameof(count));
         _offset += count;
     }
@@ -80,6 +80,8 @@ public ref struct SpanReader {
         int shift = 0;
         while (true) {
             var b = ReadByte();
+            if (shift == 28 && (b & 0x80) != 0 || shift == 28 && (b & 0x7F) > 0x0F)
+                throw new FormatException("uleb128 が uint32 の範囲を超えています。");
             result |= (uint)(b & 0x7F) << shift;
             if ((b & 0x80) == 0)
                 return result;
@@ -133,7 +135,9 @@ public ref struct SpanReader {
     }
 
     private void CheckAvailable(int count) {
-        if (_offset + count > _buffer.Length)
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if (count > _buffer.Length - _offset)
             throw new EndOfStreamException($"バッファ末尾を超えて読もうとしました (offset={_offset}, requested={count}, length={_buffer.Length})。");
     }
 }

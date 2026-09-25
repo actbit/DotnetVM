@@ -25,20 +25,28 @@ public readonly record struct DecodedInstruction(
 public static class IlDecoder {
     /// <summary>IL 本体を全命令にデコードする。分岐が命令境界以外を指す場合は BadImageFormatException。</summary>
     public static DecodedInstruction[] Decode(ReadOnlySpan<byte> il) {
-        var instructions = new List<DecodedInstruction>(il.Length / 3 + 1);
-        var reader = new SpanReader(il);
-        while (!reader.EndOfBuffer) {
-            var offset = reader.Offset;
-            var instruction = DecodeOne(il, reader);
-            instructions.Add(instruction);
-            reader.Advance(instruction.Size);
-            if (reader.Offset > il.Length)
-                throw new BadImageFormatException($"IL 命令がメソッド本体を超えています (offset {offset})。");
-        }
+        try {
+            var instructions = new List<DecodedInstruction>(il.Length / 3 + 1);
+            var reader = new SpanReader(il);
+            while (!reader.EndOfBuffer) {
+                var offset = reader.Offset;
+                var instruction = DecodeOne(il, reader);
+                instructions.Add(instruction);
+                reader.Advance(instruction.Size);
+                if (reader.Offset > il.Length)
+                    throw new BadImageFormatException($"IL 命令がメソッド本体を超えています (offset {offset})。");
+            }
 
-        var result = instructions.ToArray();
-        ValidateBranchTargets(result, il.Length);
-        return result;
+            var result = instructions.ToArray();
+            ValidateBranchTargets(result, il.Length);
+            return result;
+        } catch (EndOfStreamException ex) {
+            throw new BadImageFormatException("IL オペランドが途中で終わっています。", ex);
+        } catch (ArgumentOutOfRangeException ex) {
+            throw new BadImageFormatException("IL オペランドの範囲が不正です。", ex);
+        } catch (OverflowException ex) {
+            throw new BadImageFormatException("IL オペランドのサイズがオーバーフローしました。", ex);
+        }
     }
 
     private static DecodedInstruction DecodeOne(ReadOnlySpan<byte> il, SpanReader reader) {
@@ -85,12 +93,17 @@ public static class IlDecoder {
             }
             case IlOperandKind.Switch: {
                 var count = reader.ReadUInt32();
-                var targets = new int[count];
-                var baseOffset = offset + 5 + 4 * (int)count;
-                for (var i = 0; i < count; i++)
+                if (count > int.MaxValue || count > (uint)(reader.Remaining / 4))
+                    throw new BadImageFormatException(
+                        $"switch のターゲット数 {count:N0} が IL の残りサイズに対して不正です。");
+                var countInt = (int)count;
+                var size = checked(5 + 4 * countInt);
+                var targets = new int[countInt];
+                var baseOffset = checked(offset + size);
+                for (var i = 0; i < countInt; i++)
                     targets[i] = baseOffset + reader.ReadInt32();
                 return new DecodedInstruction(offset, op, info.Operand,
-                    5 + 4 * (int)count, targets.Length, 0, 0, targets);
+                    size, targets.Length, 0, 0, targets);
             }
             case IlOperandKind.Method:
             case IlOperandKind.Signature:

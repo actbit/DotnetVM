@@ -22,8 +22,13 @@ public sealed class RvaMap {
     public int GetOffset(int rva) {
         foreach (var s in _sections) {
             var size = Math.Max(s.VirtualSize, s.RawSize);
-            if (rva >= s.Rva && rva < s.Rva + size)
-                return s.FileOffset + (rva - s.Rva);
+            var sectionEnd = (long)s.Rva + size;
+            if (rva >= s.Rva && rva < sectionEnd) {
+                var fileOffset = (long)s.FileOffset + rva - s.Rva;
+                if (fileOffset < 0 || fileOffset > int.MaxValue)
+                    throw new BadImageFormatException($"RVA 0x{rva:X} のファイルオフセットが範囲外です。");
+                return (int)fileOffset;
+            }
         }
         throw new BadImageFormatException($"RVA 0x{rva:X} はどのセクションにも属しません。");
     }

@@ -87,6 +87,6 @@ public sealed class GuidHeap {
         var offset = (long)(index - 1) * 16;
         if (offset < 0 || offset > _data.Length - 16)
             throw new BadImageFormatException($"#GUID インデックス {index} が範囲外です。");
-        return new Guid(_data.Span.Slice((int)offset, 16).ToArray());
+        return new Guid(_data.Span.Slice((int)offset, 16));
     }
 }

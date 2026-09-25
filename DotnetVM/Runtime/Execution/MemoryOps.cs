@@ -76,6 +76,7 @@ internal static class MemoryOps {
         return ArrayElementKind.Object;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VmArray GetArray(in StackSlot slot) {
         if (slot.Kind == StackKind.Object && slot.ObjectValue is VmArray array)
             return array;
@@ -85,6 +86,7 @@ internal static class MemoryOps {
             $"配列でないオブジェクトに配列命令を適用しました: {SlotOps.Describe(slot)}");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CheckArrayBounds(VmArray array, int index) {
         if ((uint)index >= (uint)array.Length)
             throw new UnhandledGuestException("System.IndexOutOfRangeException",
@@ -165,7 +167,7 @@ internal static class MemoryOps {
                 (long)dst.ByteOffset + size > dst.Bytes.Length || (long)src.ByteOffset + size > src.Bytes.Length)
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"cpblk が仮想メモリブロックの範囲外です (size={size}, dst offset={dst.ByteOffset}/{dst.Bytes.Length}, src offset={src.ByteOffset}/{src.Bytes.Length})。");
-            Array.Copy(src.Bytes, src.ByteOffset, dst.Bytes, dst.ByteOffset, size);
+            src.Bytes.AsSpan(src.ByteOffset, size).CopyTo(dst.Bytes.AsSpan(dst.ByteOffset, size));
             return;
         }
         // StackSlot の 1 要素は int/参照/値型のいずれにもなり得るため、8 バイト丸めで
@@ -190,7 +192,7 @@ internal static class MemoryOps {
             if (dst.ByteOffset < 0 || (long)dst.ByteOffset + size > dst.Bytes.Length)
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"initblk が仮想メモリブロックの範囲外です (size={size}, offset={dst.ByteOffset}/{dst.Bytes.Length})。");
-            Array.Fill(dst.Bytes, fill, dst.ByteOffset, size);
+            dst.Bytes.AsSpan(dst.ByteOffset, size).Fill(fill);
             return;
         }
         if (dstSlot.ObjectValue is VmByRef)
@@ -456,7 +458,7 @@ internal static class MemoryOps {
 
     /// <summary>IL 値列 (LE バイト) → VM スロットへ展開する補助面。
     /// typeof から構成を取り出し, VM 表現を使って "ldobj 型", "cpobj 型" も走る</summary>
-    public static StackSlot ValueFromBytes(byte[] bytes, VmType type, int size)
+    public static StackSlot ValueFromBytes(ReadOnlySpan<byte> bytes, VmType type, int size)
     {
         // プリミティブ値は VM の統合スロットで表す (int/char/bool 等は i4 スロット)
         var typeName = PrimitiveStorageTypeName(type);
@@ -498,37 +500,41 @@ internal static class MemoryOps {
     }
 
     /// <summary>VM スロット値を LE バイト列へ展開する (stobj/unmanaged ポインタ書き込み用)。</summary>
-    public static byte[] BytesOfValue(in StackSlot value, VmType type, int size)
+    public static void BytesOfValue(in StackSlot value, VmType type, int size, Span<byte> destination)
     {
-        var bytes = new byte[size];
+        if (size is not (1 or 2 or 4 or 8))
+            throw new InvalidOperationException($"unmanaged ポインタへの {type.FullName} (要素幅 {size} バイト) の書き込みに対応していません。");
+        if ((uint)size > (uint)destination.Length)
+            throw new ArgumentException("出力バッファが値型のサイズより小さくなっています。", nameof(destination));
+        var bytes = destination[..size];
         var typeName = type.FullName;
         if (size == 1)
         {
             bytes[0] = (byte)value.AsInt32;
-            return bytes;
+            return;
         }
         if (size == 2)
         {
             BinaryPrimitives.WriteUInt16LittleEndian(bytes, (ushort)value.AsInt32);
-            return bytes;
+            return;
         }
         if (size == 4)
         {
             var v = typeName == "System.Single"
-                ? BitConverter.ToInt32(BitConverter.GetBytes((float)value.DoubleValue), 0)
+                ? BitConverter.SingleToInt32Bits((float)value.DoubleValue)
                 : value.AsInt32;
             BinaryPrimitives.WriteInt32LittleEndian(bytes, v);
-            return bytes;
+            return;
         }
         if (size == 8)
         {
             if (typeName == "System.Double")
             {
                 BinaryPrimitives.WriteDoubleLittleEndian(bytes, value.DoubleValue);
-                return bytes;
+                return;
             }
             BinaryPrimitives.WriteInt64LittleEndian(bytes, value.Int64Value);
-            return bytes;
+            return;
         }
         throw new InvalidOperationException($"unmanaged ポインタへの {typeName} (要素幅 {size} バイト) の書き込みに対応していません。");
     }

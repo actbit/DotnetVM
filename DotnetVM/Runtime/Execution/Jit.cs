@@ -187,11 +187,11 @@ internal sealed class JitCodeCache(
 /// this keeps VM object ownership, copying rules, exceptions and GC roots
 /// identical on both execution paths.
 /// </summary>
-internal sealed class JitFrame {
+internal struct JitFrame {
     private readonly Interpreter _interpreter;
     private readonly InterpreterServices _services;
     private readonly InterpreterFrame _frame;
-    private IDisposable? _instructionLease;
+    private VmExecutionCoordinator.InstructionLease _instructionLease;
 
     public JitFrame(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) {
         _interpreter = interpreter;
@@ -212,12 +212,15 @@ internal sealed class JitFrame {
             _interpreter.ConsumeJitInstruction();
         } catch {
             _instructionLease.Dispose();
-            _instructionLease = null;
+            _instructionLease = default;
             throw;
         }
     }
 
-    public void EndInstruction() => Interlocked.Exchange(ref _instructionLease, null)?.Dispose();
+    public void EndInstruction() {
+        _instructionLease.Dispose();
+        _instructionLease = default;
+    }
 
     public void NoOp(int next) => _frame.Ip = next;
 
@@ -484,7 +487,7 @@ internal sealed class JitFrame {
             var size = MemoryOps.SizeOfType(type);
             EnsureNativeRange(native, size, "ldobj");
             _frame.Stack.Push(MemoryOps.ValueFromBytes(
-                native.Bytes.AsSpan(native.ByteOffset, size).ToArray(), type, size));
+                native.Bytes.AsSpan(native.ByteOffset, size), type, size));
         } else if (address.ObjectValue is VmByRef byRef) {
             _frame.Stack.Push(SlotOps.PushCopyOfValue(byRef.Slot));
         } else {
@@ -501,8 +504,9 @@ internal sealed class JitFrame {
             var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
             var size = MemoryOps.SizeOfType(type);
             EnsureNativeRange(native, size, "stobj", writable: true);
-            var bytes = MemoryOps.BytesOfValue(value, type, size);
-            Array.Copy(bytes, 0, native.Bytes, native.ByteOffset, size);
+            Span<byte> bytes = stackalloc byte[8];
+            MemoryOps.BytesOfValue(value, type, size, bytes);
+            bytes[..size].CopyTo(native.Bytes.AsSpan(native.ByteOffset, size));
         } else if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(SlotOps.StoreCopyOfValue(value));
         } else {
@@ -521,20 +525,21 @@ internal sealed class JitFrame {
             destination.ObjectValue is VmNativePointer destinationNative) {
             EnsureNativeRange(sourceNative, size, "cpobj");
             EnsureNativeRange(destinationNative, size, "cpobj", writable: true);
-            Array.Copy(sourceNative.Bytes, sourceNative.ByteOffset,
-                destinationNative.Bytes, destinationNative.ByteOffset, size);
+            sourceNative.Bytes.AsSpan(sourceNative.ByteOffset, size)
+                .CopyTo(destinationNative.Bytes.AsSpan(destinationNative.ByteOffset, size));
         } else if (source.ObjectValue is VmNativePointer sourceOnly) {
             EnsureNativeRange(sourceOnly, size, "cpobj");
             if (destination.ObjectValue is not VmByRef destinationByRef)
                 throw InvalidAddress("cpobj", destination);
             destinationByRef.Write(SlotOps.StoreCopyOfValue(MemoryOps.ValueFromBytes(
-                sourceOnly.Bytes.AsSpan(sourceOnly.ByteOffset, size).ToArray(), type, size)));
+                sourceOnly.Bytes.AsSpan(sourceOnly.ByteOffset, size), type, size)));
         } else if (destination.ObjectValue is VmNativePointer destinationOnly) {
             EnsureNativeRange(destinationOnly, size, "cpobj", writable: true);
             if (source.ObjectValue is not VmByRef sourceByRef)
                 throw InvalidAddress("cpobj", source);
-            var bytes = MemoryOps.BytesOfValue(sourceByRef.Read(), type, size);
-            Array.Copy(bytes, 0, destinationOnly.Bytes, destinationOnly.ByteOffset, size);
+            Span<byte> bytes = stackalloc byte[8];
+            MemoryOps.BytesOfValue(sourceByRef.Read(), type, size, bytes);
+            bytes[..size].CopyTo(destinationOnly.Bytes.AsSpan(destinationOnly.ByteOffset, size));
         } else if (source.ObjectValue is VmByRef sourceByRef &&
                    destination.ObjectValue is VmByRef destinationByRef) {
             destinationByRef.Write(SlotOps.StoreCopyOfValue(sourceByRef.Read()));

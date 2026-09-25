@@ -69,7 +69,7 @@ public sealed partial class TypeLoader {
             FieldSignature signature;
             try {
                 signature = SignatureDecoder.DecodeFieldSignature(
-                    _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)).ToArray(),
+                    _image.GetBlob(_image.Tables.GetRowIndex(TableKind.Field, rid, 2)),
                     _image.Limits?.MaxSignatureDepth ?? 64,
                     _image.Limits?.MaxGenericNestingDepth ?? 64);
             } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {
@@ -96,7 +96,7 @@ public sealed partial class TypeLoader {
             MethodSignature signature;
             try {
                 signature = SignatureDecoder.DecodeMethodSignature(
-                    _image.GetMethodSignature(rid).ToArray(),
+                    _image.GetMethodSignature(rid),
                     _image.Limits?.MaxSignatureDepth ?? 64,
                     _image.Limits?.MaxGenericNestingDepth ?? 64);
             } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException) {

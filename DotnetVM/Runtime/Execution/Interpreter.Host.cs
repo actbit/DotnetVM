@@ -73,7 +73,7 @@ public sealed partial class Interpreter {
             var engines = EnginesFor(method);
             CloneStructArgs(method, arguments);
             var prepared = engines.Preparer.Prepare(method);
-            var frame = InterpreterFrame.Create(method, arguments, prepared.LocalTypes, method.Body.MaxStack);
+            var frame = InterpreterFrame.Create(method, arguments, prepared, method.Body.MaxStack);
             frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
             using (_coordinator.EnterRead()) {
                 lock (state.Gate)
@@ -158,7 +158,7 @@ public sealed partial class Interpreter {
                     var engines = EnginesFor(method);
                     CloneStructArgs(method, request.Arguments);
                     var nextFrame = InterpreterFrame.Create(method, request.Arguments,
-                        engines.Preparer.Prepare(method).LocalTypes, method.Body.MaxStack);
+                        engines.Preparer.Prepare(method), method.Body.MaxStack);
                     nextFrame.Context = request.Context;
 
                     using (_coordinator.EnterRead()) {

@@ -69,7 +69,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         public int Depth;
         public long InstructionCount;
     }
-    private readonly ThreadLocal<ExecutionState> _currentExecution = new(() => new ExecutionState());
+    private readonly ThreadLocal<ExecutionState> _currentExecution;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
     private readonly VmExecutionCoordinator _coordinator = new();
     private long _instructionCount;
@@ -88,11 +88,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
 
     private ExecutionState CurrentState {
-        get {
-            var state = _currentExecution.Value!;
-            _executionStates.TryAdd(state, 0);
-            return state;
-        }
+        get => _currentExecution.Value!;
     }
 
     void IExecutionGate.ConsumeInstruction() => ConsumeInstruction();
@@ -133,7 +129,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     // allowing the generated delegate to bracket each instruction safely.
     internal void ConsumeJitInstruction() => ConsumeInstruction();
     internal void CheckJitSafepoint() => CheckSafepoint();
-    internal IDisposable EnterJitInstruction() => _coordinator.EnterInstruction();
+    internal VmExecutionCoordinator.InstructionLease EnterJitInstruction() => _coordinator.EnterInstruction();
     internal CallEngine JitCallsFor(VmMethod method) => EnginesFor(method).Calls;
     internal ObjectEngine JitObjectsFor(VmMethod method) => EnginesFor(method).Objects;
     internal ExceptionDispatcher JitExceptionsFor(VmMethod method) => EnginesFor(method).Exceptions;
@@ -529,7 +525,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"ldobj がブロック外を参照します (offset={ldNative.ByteOffset}, {ldSize} バイト)。");
                         frame.Stack.Push(MemoryOps.ValueFromBytes(
-                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize).ToArray(), ldType, ldSize));
+                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize), ldType, ldSize));
                         break;
                     }
                     var byref = address.ObjectValue as VmByRef
@@ -548,8 +544,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (stNative.ByteOffset < 0 || (long)stNative.ByteOffset + stSize > stNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"stobj がブロック外を参照します (offset={stNative.ByteOffset}, {stSize} バイト)。");
-                        var stBytes = MemoryOps.BytesOfValue(value, stType, stSize);
-                        Array.Copy(stBytes, 0, stNative.Bytes, stNative.ByteOffset, stSize);
+                        Span<byte> stBytes = stackalloc byte[8];
+                        MemoryOps.BytesOfValue(value, stType, stSize, stBytes);
+                        stBytes[..stSize].CopyTo(stNative.Bytes.AsSpan(stNative.ByteOffset, stSize));
                         break;
                     }
                     var byref = stAddress.ObjectValue as VmByRef
@@ -568,14 +565,15 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             (long)dstNative.ByteOffset + cpSize > dstNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         dstNative.EnsureWritable();
-                        Array.Copy(srcNative.Bytes, srcNative.ByteOffset, dstNative.Bytes, dstNative.ByteOffset, cpSize);
+                        srcNative.Bytes.AsSpan(srcNative.ByteOffset, cpSize)
+                            .CopyTo(dstNative.Bytes.AsSpan(dstNative.ByteOffset, cpSize));
                         break;
                     }
                     if (src.ObjectValue is VmNativePointer srcOnly) {
                         if (srcOnly.ByteOffset < 0 || (long)srcOnly.ByteOffset + cpSize > srcOnly.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         var value = MemoryOps.ValueFromBytes(
-                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
+                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize), cpType, cpSize);
                         if (dst.ObjectValue is not VmByRef dstManaged)
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の宛先がマネージ参照ではありません。");
@@ -587,11 +585,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の送信元がマネージ参照ではありません。");
                         var srcValue = srcManaged.Read();
-                        var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
+                        Span<byte> dstBytes = stackalloc byte[8];
+                        MemoryOps.BytesOfValue(srcValue, cpType, cpSize, dstBytes);
                         if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         dstOnly.EnsureWritable();
-                        Array.Copy(dstBytes, 0, dstOnly.Bytes, dstOnly.ByteOffset, cpSize);
+                        dstBytes[..cpSize].CopyTo(dstOnly.Bytes.AsSpan(dstOnly.ByteOffset, cpSize));
                         break;
                     }
                     var srcRef = src.ObjectValue as VmByRef

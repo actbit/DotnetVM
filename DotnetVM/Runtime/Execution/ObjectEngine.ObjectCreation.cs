@@ -248,7 +248,7 @@ internal sealed partial class ObjectEngine {
             if (parent.Table == TableKind.TypeSpec)
                 return NewConstructedObject(token, rid, parent.Rid, caller);
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(rid).ToArray(),
+                _loader.Image.GetMemberRefSignature(rid),
                 _loader.Image.Limits?.MaxSignatureDepth ?? 64,
                 _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var facadeParamCount = signature.ParamTypes.Length;
@@ -429,7 +429,7 @@ internal sealed partial class ObjectEngine {
     private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
         var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
         var signature = SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+            _loader.Image.GetMemberRefSignature(memberRefRid),
             _loader.Image.Limits?.MaxSignatureDepth ?? 64,
             _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
         var paramCount = signature.ParamTypes.Length;

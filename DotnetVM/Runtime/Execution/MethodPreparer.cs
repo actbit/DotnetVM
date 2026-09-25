@@ -8,18 +8,16 @@ namespace DotnetVM.Runtime.Execution;
 /// <summary>メソッドの事前準備キャッシュ: ローカル変数署名のデコード結果と、IL オフセット基準の
 /// EH 句を命令インデックス基準に解決した結果をメソッドごとに 1 回だけ計算して保持する。</summary>
 internal sealed class MethodPreparer(TypeLoader loader) {
-    private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
-    private readonly object _gate = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<VmMethod, PreparedMethod> _prepared = new();
 
-    public PreparedMethod Prepare(VmMethod method) {
-        lock (_gate)
-            return PrepareCore(method);
-    }
+    public PreparedMethod Prepare(VmMethod method) =>
+        _prepared.GetOrAdd(method, static (candidate, preparer) => preparer.PrepareCore(candidate), this);
 
     private PreparedMethod PrepareCore(VmMethod method) {
         if (_prepared.TryGetValue(method, out var cached))
             return cached;
 
+        var code = method.DecodeIl();
         SigType[] localTypes = method.Body?.DynamicLocalTypes ?? [];
         if (method.Body is { } body && body.DynamicLocalTypes is null && body.LocalVarSigToken != 0) {
             var table = (TableKind)(body.LocalVarSigToken >> 24);
@@ -27,20 +25,19 @@ internal sealed class MethodPreparer(TypeLoader loader) {
             if (table != TableKind.StandAloneSig)
                 throw new BadImageFormatException($"ローカル変数署名トークン 0x{body.LocalVarSigToken:X8} が不正です。");
             localTypes = SignatureDecoder.DecodeLocalsSignature(
-                loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)).ToArray(),
+                loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)),
                 loader.Image.Limits?.MaxSignatureDepth ?? 64,
                 loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
         }
 
-        var prepared = new PreparedMethod(localTypes) {
-            Clauses = ResolveExceptionClauses(method),
+        var prepared = new PreparedMethod(localTypes, code) {
+            Clauses = ResolveExceptionClauses(method, code),
         };
-        _prepared[method] = prepared;
         return prepared;
     }
 
     /// <summary>EH 句 (IL オフセット基準) を命令インデックス基準に解決する。</summary>
-    private static PreparedClause[]? ResolveExceptionClauses(VmMethod method) {
+    private static PreparedClause[]? ResolveExceptionClauses(VmMethod method, DecodedInstruction[] code) {
         var raw = method.Body?.ExceptionClauses;
         if (raw is null || raw.Length == 0)
             return null;
@@ -55,7 +52,6 @@ internal sealed class MethodPreparer(TypeLoader loader) {
             raw = sorted;
         }
 
-        var code = method.DecodeIl();
         var offsetToIndex = new Dictionary<int, int>(code.Length * 2);
         for (var i = 0; i < code.Length; i++)
             offsetToIndex[code[i].Offset] = i;
@@ -95,8 +91,23 @@ internal sealed class MethodPreparer(TypeLoader loader) {
 }
 
 /// <summary>メソッドの事前準備結果 (ローカル型 + 解決済み EH 句)。</summary>
-internal sealed class PreparedMethod(SigType[] localTypes) {
-    public readonly SigType[] LocalTypes = localTypes;
+internal sealed class PreparedMethod {
+    public readonly SigType[] LocalTypes;
+    public readonly DecodedInstruction[] Code;
+    public readonly Dictionary<int, int> OffsetMap;
+    public readonly StackSlot[] InitialLocals;
+
+    public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
+        LocalTypes = localTypes;
+        Code = code;
+        OffsetMap = new Dictionary<int, int>(code.Length * 2);
+        for (var i = 0; i < code.Length; i++)
+            OffsetMap[code[i].Offset] = i;
+
+        InitialLocals = new StackSlot[localTypes.Length];
+        for (var i = 0; i < localTypes.Length; i++)
+            InitialLocals[i] = InterpreterFrame.DefaultValue(localTypes[i]);
+    }
 
     /// <summary>解決済み EH 句 (命令インデックス基準)。EH の無いメソッドは null。</summary>
     public PreparedClause[]? Clauses;

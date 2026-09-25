@@ -17,17 +17,30 @@ internal sealed class VmExecutionCoordinator {
         return new ReadLease(_world, null);
     }
 
-    public IDisposable EnterInstruction() {
+    // This is deliberately a value lease.  Guest instructions are the hottest
+    // synchronization path; returning IDisposable here used to allocate a
+    // ReadLease and a closure for every instruction.
+    public InstructionLease EnterInstruction() {
         _world.EnterReadLock();
-        var depths = s_instructionDepth ??= new Dictionary<VmExecutionCoordinator, int>();
-        depths[this] = depths.GetValueOrDefault(this) + 1;
-        return new ReadLease(_world, () => {
-            var remaining = depths[this] - 1;
-            if (remaining == 0)
-                depths.Remove(this);
-            else
-                depths[this] = remaining;
-        });
+        try {
+            var depths = s_instructionDepth ??= new Dictionary<VmExecutionCoordinator, int>();
+            depths[this] = depths.GetValueOrDefault(this) + 1;
+            return new InstructionLease(this);
+        } catch {
+            _world.ExitReadLock();
+            throw;
+        }
+    }
+
+    private void ExitInstruction() {
+        var depths = s_instructionDepth
+            ?? throw new InvalidOperationException("ゲスト命令の実行深度がありません。");
+        var remaining = depths[this] - 1;
+        if (remaining == 0)
+            depths.Remove(this);
+        else
+            depths[this] = remaining;
+        _world.ExitReadLock();
     }
 
     public IDisposable StopTheWorld() {
@@ -69,6 +82,18 @@ internal sealed class VmExecutionCoordinator {
                 return;
             onExit?.Invoke();
             current.ExitReadLock();
+        }
+    }
+
+    internal struct InstructionLease : IDisposable {
+        private VmExecutionCoordinator? _owner;
+
+        internal InstructionLease(VmExecutionCoordinator owner) => _owner = owner;
+
+        public void Dispose() {
+            var owner = _owner;
+            _owner = null;
+            owner?.ExitInstruction();
         }
     }
 

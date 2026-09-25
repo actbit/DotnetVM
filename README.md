@@ -38,9 +38,16 @@ dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-re
 ## 特徴
 
 ### 実行方式
-- **IL インタプリタ** (主) — 事前デコードした IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
+- **IL インタプリタ** (主) — メソッド単位でキャッシュしたデコード済み IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
 - **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / managed ByRef / box / cast / `ldtoken` / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、unmanaged pointer、typed reference、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
 - **独自オブジェクトモデル** — CLR オブジェクトを流用しない。`VmObject` / `VmClassInstance` / `VmStructValue` / `VmArray` / `VmBoxedValue` の全生成が `VmHeap.Allocate` を通るため、アロケーション計上と GC 制御が正確
+
+### 実行ホットパスの最適化
+- デコード済み IL、分岐オフセット、ローカル初期値などの不変メタデータをメソッド/loader 単位で共有し、呼出しごとの再デコード・再構築を避けます
+- 命令実行の read lease と JIT フレームを値型化し、命令ごとの lease/closure/frame オブジェクト割り当てをなくします。実行状態の GC ルート登録もホスト thread ごとに一度だけ行います
+- メタデータ署名解析は `ReadOnlySpan<byte>` を直接受け取り、native memory の `ldobj` / `stobj` / `cpobj` / `cpblk` / `initblk` は `Span<byte>`、`stackalloc`、`BinaryPrimitives` を使います
+- `MethodDef` の不変呼出ターゲット、評価スタックの小さい操作、配列境界確認は通常の全ゲスト経路でキャッシュ/インライン化します
+- これらはベンチマーク専用の分岐ではありません。命令クォータ、セーフポイント、GC ルート、ByRef 所有権、loader アンロード、境界検査は変更せず、managed ByRef を CLR の生バイト列として再解釈することもありません
 
 ### リソース制約 (クォータ + 拒否方式)
 超過は `ResourceExhaustedException` 系の**管理例外**として拒否され、ゲストの `catch` には握りつぶされません。
@@ -135,18 +142,20 @@ dotnet build DotnetVM.slnx --configuration Release
 dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
 ```
 
-2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で
-実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
+最適化後のコードを実行した結果は次のとおりです。値は実行環境や負荷で変動します。
 
-| パターン (入力) | CoreCLR (ms) | VM interpreter (ms) | VM JIT (ms) | interpreter / CoreCLR | JIT / CoreCLR | interpreter / JIT |
-|---|---:|---:|---:|---:|---:|---:|
-| Arithmetic (100,000) | 0.836 | 2,122.945 | 2,056.153 | 2,538.8x | 2,458.9x | 1.03x |
-| Branches (100,000) | 2.014 | 1,982.856 | 1,894.130 | 984.3x | 940.2x | 1.05x |
-| Array access (10,000) | 0.118 | 317.975 | 300.199 | 2,683.3x | 2,533.3x | 1.06x |
-| Method calls (100,000) | 0.521 | 2,261.004 | 2,139.330 | 4,335.6x | 4,102.3x | 1.06x |
-| Object allocation (10,000) | 0.246 | 2,827.280 | 2,797.550 | 11,479.0x | 11,358.3x | 1.01x |
+| パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.783 | 1,944.108 | 1,518.203 | 21.9% | 1,837.696 | 1,352.477 | 26.4% | 1.12x |
+| Branches (100,000) | 1.860 | 2,098.228 | 1,417.283 | 32.5% | 1,978.085 | 1,265.530 | 36.0% | 1.12x |
+| Array access (10,000) | 0.112 | 297.485 | 226.602 | 23.8% | 279.503 | 206.025 | 26.3% | 1.10x |
+| Method calls (100,000) | 0.515 | 2,119.416 | 1,436.620 | 32.2% | 1,975.761 | 1,304.774 | 34.0% | 1.10x |
+| Object allocation (10,000) | 0.256 | 2,307.112 | 2,231.141 | 3.3% | 2,307.804 | 2,194.109 | 4.9% | 1.02x |
 
-この測定では VM JIT は interpreter より 1.01〜1.06 倍高速でした。一方、CoreCLR は
+`master interp/JIT` は変更前の `origin/master` (`1897c72`) を同じ条件で測定した値、
+改善率は `1 - current / master` です。この測定では interpreter は 3.3〜32.5%、
+JIT は 4.9〜36.0% 高速化し、VM JIT は interpreter より 1.02〜1.12 倍高速でした。一方、CoreCLR は
 ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
 フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
 CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で

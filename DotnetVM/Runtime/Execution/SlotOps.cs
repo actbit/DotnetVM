@@ -207,6 +207,22 @@ internal static class SlotOps {
         return OfKind(resultKind, SignedInt64(op, x, y));
     }
 
+    // Expression-tree leaf JIT helpers.  By-value wrappers let generated leaf
+    // delegates pass array/temporary expressions without creating a VM frame or
+    // a managed ByRef expression node; the semantics stay in the canonical
+    // in-parameter implementations above.
+    public static StackSlot LeafBinaryArithmetic(ILOp op, StackSlot left, StackSlot right) =>
+        BinaryArithmetic(op, in left, in right);
+
+    public static StackSlot LeafUnaryArithmetic(ILOp op, StackSlot value) =>
+        UnaryArithmetic(op, in value);
+
+    public static StackSlot LeafConvertValue(ILOp op, StackSlot value) =>
+        ConvertValue(op, in value);
+
+    public static bool LeafCompare(ILOp op, StackSlot left, StackSlot right) =>
+        Compare(op, in left, in right);
+
     private static StackSlot OfKind(StackKind kind, long value) => kind switch {
         StackKind.NativeInt => StackSlot.OfNativeInt(value),
         _ => StackSlot.OfInt64(value),

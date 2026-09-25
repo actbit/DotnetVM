@@ -21,27 +21,33 @@ internal enum TypeInitializationStatus : byte {
 internal sealed class TypeInitializationTracker {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<TypeInitializationKey, Entry> _entries = new();
 
+    public bool IsCompleted(VmType type) {
+        if (!_entries.TryGetValue(TypeInitializationKey.For(type), out var entry))
+            return false;
+        return Volatile.Read(ref entry.Status) == (int)TypeInitializationStatus.Completed;
+    }
+
     public void Ensure(VmType type, Action initializer) {
         ArgumentNullException.ThrowIfNull(type);
         ArgumentNullException.ThrowIfNull(initializer);
 
         var entry = _entries.GetOrAdd(TypeInitializationKey.For(type), static _ => new Entry());
         lock (entry.Gate) {
-            while (entry.Status == TypeInitializationStatus.Initializing) {
+            while ((TypeInitializationStatus)entry.Status == TypeInitializationStatus.Initializing) {
                 // CLR の型初期化は同一実行フローからの再入を許す。
                 if (entry.OwnerThreadId == Environment.CurrentManagedThreadId)
                     return;
                 Monitor.Wait(entry.Gate);
             }
 
-            if (entry.Status == TypeInitializationStatus.Completed)
+            if ((TypeInitializationStatus)entry.Status == TypeInitializationStatus.Completed)
                 return;
-            if (entry.Status == TypeInitializationStatus.Failed) {
+            if ((TypeInitializationStatus)entry.Status == TypeInitializationStatus.Failed) {
                 entry.Failure!.Throw();
                 return;
             }
 
-            entry.Status = TypeInitializationStatus.Initializing;
+            entry.Status = (int)TypeInitializationStatus.Initializing;
             entry.OwnerThreadId = Environment.CurrentManagedThreadId;
         }
 
@@ -49,13 +55,13 @@ internal sealed class TypeInitializationTracker {
             // guest IL 実行中は entry.Gate も VM-wide gate も保持しない。
             initializer();
             lock (entry.Gate) {
-                entry.Status = TypeInitializationStatus.Completed;
+                entry.Status = (int)TypeInitializationStatus.Completed;
                 entry.OwnerThreadId = 0;
                 Monitor.PulseAll(entry.Gate);
             }
         } catch (Exception ex) {
             lock (entry.Gate) {
-                entry.Status = TypeInitializationStatus.Failed;
+                entry.Status = (int)TypeInitializationStatus.Failed;
                 entry.Failure = ExceptionDispatchInfo.Capture(ex);
                 entry.OwnerThreadId = 0;
                 Monitor.PulseAll(entry.Gate);
@@ -68,7 +74,7 @@ internal sealed class TypeInitializationTracker {
         if (!_entries.TryGetValue(TypeInitializationKey.For(type), out var entry))
             return TypeInitializationStatus.NotStarted;
         lock (entry.Gate)
-            return entry.Status;
+            return (TypeInitializationStatus)entry.Status;
     }
 
     /// <summary>ALC アンロード時に、その型またはその型引数を含む初期化状態を破棄する。</summary>
@@ -82,7 +88,7 @@ internal sealed class TypeInitializationTracker {
 
     private sealed class Entry {
         public readonly object Gate = new();
-        public TypeInitializationStatus Status;
+        public int Status;
         public int OwnerThreadId;
         public ExceptionDispatchInfo? Failure;
     }

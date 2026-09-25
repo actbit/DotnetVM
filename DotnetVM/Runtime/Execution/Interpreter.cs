@@ -27,7 +27,7 @@ namespace DotnetVM.Runtime.Execution;
 /// </summary>
 public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameRunner {
 
-    private const int SafepointInterval = 1024;
+    internal const int SafepointInterval = 1024;
 
     private readonly MemoryPolicy _memory;
     private readonly bool _enableJit;
@@ -130,6 +130,10 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     internal void ConsumeJitInstruction() => ConsumeInstruction();
     internal void CheckJitSafepoint() => CheckSafepoint();
     internal VmExecutionCoordinator.InstructionLease EnterJitInstruction() => _coordinator.EnterInstruction();
+    internal VmExecutionCoordinator.InstructionLease EnterJitInstructionInBatch() =>
+        _coordinator.EnterInstructionInBatch();
+    internal VmExecutionCoordinator.InstructionBatchLease EnterJitInstructionBatch() =>
+        _coordinator.EnterInstructionBatch();
     internal CallEngine JitCallsFor(VmMethod method) => EnginesFor(method).Calls;
     internal ObjectEngine JitObjectsFor(VmMethod method) => EnginesFor(method).Objects;
     internal ExceptionDispatcher JitExceptionsFor(VmMethod method) => EnginesFor(method).Exceptions;
@@ -145,11 +149,24 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         var eh = engines.Exceptions;
         var calls = engines.Calls;
         var objects = engines.Objects;
-        while (true) {
+        var instructionBatch = default(VmExecutionCoordinator.InstructionBatchLease);
+        var batchInstructions = 0;
+        try {
             CheckSafepoint();
-            using var instructionLease = _coordinator.EnterInstruction();
-            ConsumeInstruction();
-            var instruction = frame.Code[frame.Ip];
+            instructionBatch = _coordinator.EnterInstructionBatch();
+            while (true) {
+                if (batchInstructions >= SafepointInterval) {
+                    instructionBatch.Dispose();
+                    instructionBatch = default;
+                    CheckSafepoint();
+                    instructionBatch = _coordinator.EnterInstructionBatch();
+                    batchInstructions = 0;
+                }
+                CheckSafepoint();
+                batchInstructions++;
+                using var instructionLease = _coordinator.EnterInstructionInBatch();
+                ConsumeInstruction();
+                var instruction = frame.Code[frame.Ip];
             var isPrefix = IsPrefix(instruction.Op);
             var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
             var readonlyAddress = frame.PendingReadonly && !isPrefix &&
@@ -461,8 +478,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         frame.Stack.Push(objects.FieldAddress(objSlot, field, readonlyAddress));
                         break;
                     }
-                    var location = objects.FieldLocation(objSlot, field);
-                    frame.Stack.Push(SlotOps.PushCopyOfValue(location.Read()));
+                    frame.Stack.Push(SlotOps.PushCopyOfValue(objects.ReadField(objSlot, field)));
                     break;
                 }
                 case ILOp.Stfld: {
@@ -473,7 +489,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     // VnString レシーバはバイト実体 (真実源) に直接書く
                     if (objects.TryStoreStringField(objSlot, field, value))
                         break;
-                    objects.FieldLocation(objSlot, field).Write(SlotOps.StoreCopyOfValue(value));
+                    objects.WriteField(objSlot, field, value);
                     break;
                 }
                 case ILOp.Ldsfld: {
@@ -945,9 +961,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     throw new NotSupportedException(
                         $"IL 命令 {IlOpcodeTable.Get(instruction.Op)?.Name ?? instruction.Op.ToString()} は未対応です (ジェネリック/JIT は今後のフェーズで実装)。");
             }
-            if (volatileAccess)
-                Thread.MemoryBarrier();
-            frame.Ip++;
+                if (volatileAccess)
+                    Thread.MemoryBarrier();
+                frame.Ip++;
+            }
+        } finally {
+            instructionBatch.Dispose();
         }
     }
 

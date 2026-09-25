@@ -246,8 +246,26 @@ public sealed class VmHeap {
 
     /// <summary>オブジェクトをヒープに登録し、サイズを計上する。上限超過は拒否。</summary>
     public T Allocate<T>(T obj) where T : VmObject {
+        return AllocateCore(obj, ObjectModel.EstimateSize(obj));
+    }
+
+    // These overloads keep the hot allocation sites from re-dispatching
+    // through ObjectModel.EstimateSize's object-type switch.  The size
+    // formulas are the same shared formulas used by quota reservations.
+    internal VmClassInstance Allocate(VmClassInstance obj) =>
+        AllocateCore(obj, ObjectModel.EstimateFieldStorageSize(obj.Fields.Length));
+
+    internal VmArray Allocate(VmArray obj) =>
+        AllocateCore(obj, ObjectModel.EstimateArraySize(obj.Elements.Length));
+
+    internal VmBoxedValue Allocate(VmBoxedValue obj) =>
+        AllocateCore(obj, ObjectModel.EstimateFieldStorageSize(obj.Fields.Length));
+
+    internal VmIntrinsicInstance Allocate(VmIntrinsicInstance obj) =>
+        AllocateCore(obj, ObjectModel.EstimateFieldStorageSize(obj.State.Length));
+
+    private T AllocateCore<T>(T obj, long size) where T : VmObject {
         lock (_gate) {
-            var size = ObjectModel.EstimateSize(obj);
             CheckQuota(size);
             Charge(size);
             _objects.Add(obj);

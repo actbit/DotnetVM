@@ -16,8 +16,23 @@ namespace DotnetVM.Runtime.Execution;
 /// a VM frame instead of exposing CLR values to generated code; all values still
 /// cross the VM boundary as <see cref="StackSlot"/> instances.
 /// </summary>
-internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry) {
+internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry,
+    PreparedMethod prepared,
+    Func<Interpreter, StackSlot[], StackSlot>? leaf = null) {
     private readonly Func<JitFrame, StackSlot> _entry = entry;
+    private readonly Func<Interpreter, StackSlot[], StackSlot>? _leaf = leaf;
+
+    internal PreparedMethod Prepared { get; } = prepared;
+    internal bool HasLeaf => _leaf is not null;
+
+    internal bool TryInvokeLeaf(Interpreter interpreter, StackSlot[] arguments, out StackSlot result) {
+        if (_leaf is null) {
+            result = default;
+            return false;
+        }
+        result = _leaf(interpreter, arguments);
+        return true;
+    }
 
     public StackSlot Invoke(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) =>
         _entry(new JitFrame(interpreter, services, frame));
@@ -172,6 +187,11 @@ internal sealed class JitCodeCache(
             return _entries.TryGetValue(method, out var entry) && entry.Compiled is not null;
     }
 
+    internal JitCompiledMethod? GetCompiled(VmMethod method) {
+        lock (_gate)
+            return _entries.TryGetValue(method, out var entry) ? entry.Compiled : null;
+    }
+
     public void Clear() {
         lock (_gate) {
             foreach (var entry in _entries.Values)
@@ -191,7 +211,10 @@ internal struct JitFrame {
     private readonly Interpreter _interpreter;
     private readonly InterpreterServices _services;
     private readonly InterpreterFrame _frame;
+    private VmExecutionCoordinator.InstructionBatchLease _instructionBatch;
     private VmExecutionCoordinator.InstructionLease _instructionLease;
+    private int _batchInstructions;
+    private bool _instructionActive;
 
     public JitFrame(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) {
         _interpreter = interpreter;
@@ -203,16 +226,38 @@ internal struct JitFrame {
     public bool Returned { get; private set; }
     public StackSlot ReturnValue { get; private set; }
 
+    public void BeginExecution() {
+        _interpreter.CheckJitSafepoint();
+        _instructionBatch = _interpreter.EnterJitInstructionBatch();
+        _batchInstructions = 0;
+    }
+
+    public void EndExecution() {
+        _instructionLease.Dispose();
+        _instructionLease = default;
+        _instructionBatch.Dispose();
+        _instructionBatch = default;
+    }
+
     // These two methods bracket every generated instruction.  The try/finally
     // in the generated expression makes the coordinator lease exception-safe.
     public void BeginInstruction() {
+        if (_batchInstructions >= Interpreter.SafepointInterval) {
+            _instructionBatch.Dispose();
+            _instructionBatch = default;
+            _interpreter.CheckJitSafepoint();
+            _instructionBatch = _interpreter.EnterJitInstructionBatch();
+            _batchInstructions = 0;
+        }
         _interpreter.CheckJitSafepoint();
-        _instructionLease = _interpreter.EnterJitInstruction();
+        _instructionLease = _interpreter.EnterJitInstructionInBatch();
+        _instructionActive = true;
         try {
             _interpreter.ConsumeJitInstruction();
         } catch {
             _instructionLease.Dispose();
             _instructionLease = default;
+            _instructionActive = false;
             throw;
         }
     }
@@ -220,6 +265,10 @@ internal struct JitFrame {
     public void EndInstruction() {
         _instructionLease.Dispose();
         _instructionLease = default;
+        if (_instructionActive) {
+            _instructionActive = false;
+            _batchInstructions++;
+        }
     }
 
     public void NoOp(int next) => _frame.Ip = next;
@@ -352,6 +401,39 @@ internal struct JitFrame {
         _frame.Ip = next;
     }
 
+    /// <summary>
+    /// Fast path for a non-virtual MethodDef call from generated code.  The
+    /// target is still required to be an already compiled, non-generic guest
+    /// method; all other cases return through the regular call gate.
+    /// </summary>
+    public void CallDirect(int token, int next) {
+        if (_frame.Context is not null ||
+            _frame.Method.DynamicTokens?.ContainsKey(unchecked((uint)token)) == true) {
+            Call(token, isCallvirt: false, next);
+            return;
+        }
+
+        var target = _services.Loader.GetMethodByToken((uint)token);
+        if (target is null || target.Body is null || target.Signature.GenericParamCount != 0) {
+            Call(token, isCallvirt: false, next);
+            return;
+        }
+
+        var arity = target.Signature.ParamTypes.Length + (target.Signature.HasThis ? 1 : 0);
+        var arguments = new StackSlot[arity];
+        for (var i = arity - 1; i >= 0; i--)
+            arguments[i] = _frame.Stack.Pop();
+        if (!_interpreter.TryInvokeCompiled(target, arguments, null, out var value)) {
+            for (var i = 0; i < arguments.Length; i++)
+                _frame.Stack.Push(arguments[i]);
+            Call(token, isCallvirt: false, next);
+            return;
+        }
+        if (SlotOps.SignatureReturnsValue(target.Signature))
+            _frame.Stack.Push(value);
+        _frame.Ip = next;
+    }
+
     public void NewObject(int token, int next) {
         if (_interpreter.JitObjectsFor(_frame.Method).NewObject(token, _frame) is { } value)
             _frame.Stack.Push(value);
@@ -417,8 +499,7 @@ internal struct JitFrame {
     public void LoadField(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
-        var location = objects.FieldLocation(_frame.Stack.Pop(), field);
-        _frame.Stack.Push(SlotOps.PushCopyOfValue(location.Read()));
+        _frame.Stack.Push(SlotOps.PushCopyOfValue(objects.ReadField(_frame.Stack.Pop(), field)));
         _frame.Ip = next;
     }
 
@@ -429,7 +510,7 @@ internal struct JitFrame {
         var value = _frame.Stack.Pop();
         var receiver = _frame.Stack.Pop();
         if (!objects.TryStoreStringField(receiver, field, value))
-            objects.FieldLocation(receiver, field).Write(SlotOps.StoreCopyOfValue(value));
+            objects.WriteField(receiver, field, value);
         _frame.Ip = next;
     }
 
@@ -749,6 +830,11 @@ internal static class JitMethodCompiler {
         // dispatch case, constants and helper call). Count both before any
         // target array or expression node is allocated.
         var expressionNodes = checked(16L + code.Length * 12L + switchTargets * 2L);
+        // A primitive straight-line leaf also gets a second, frame-free
+        // delegate.  Reserve its expression and compile work up front rather
+        // than letting the specialization bypass JIT resource accounting.
+        if (IsLeafCandidate(method, prepared, code) || IsConstructorLeafCandidate(method, prepared, code))
+            expressionNodes = checked(expressionNodes + 8L + code.Length * 8L);
         if (expressionNodes > memory.MaxJitExpressionNodes)
             return null;
         var workUnits = checked(expressionNodes + method.Body.IlCode.Length + switchTargets);
@@ -779,18 +865,47 @@ internal static class JitMethodCompiler {
                 cases[i] = Expression.SwitchCase(instructionBody, Expression.Constant(i));
             }
 
-            var returnLabel = Expression.Label(typeof(StackSlot), "jitReturn");
-            var invalidIp = Expression.Throw(Expression.New(
-                typeof(InvalidOperationException).GetConstructor([typeof(string)])!,
-                Expression.Constant($"JIT フレームの命令位置が不正です: {method}")));
-            var loopBody = Expression.Block(
-                Expression.Switch(Expression.Property(frame, nameof(JitFrame.InstructionPointer)),
-                    invalidIp, null, cases),
-                Expression.IfThen(Expression.Property(frame, nameof(JitFrame.Returned)),
-                    Expression.Break(returnLabel, Expression.Property(frame, nameof(JitFrame.ReturnValue)))));
-            var body = Expression.Loop(loopBody, returnLabel);
+            Expression execution;
+            if (IsStraightLine(code)) {
+                var operations = new List<Expression>(code.Length * 2 + 2) {
+                    Expression.Call(frame, Method(nameof(JitFrame.BeginExecution))),
+                };
+                for (var i = 0; i < code.Length; i++) {
+                    var instructionBody = Expression.TryFinally(
+                        Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginInstruction))),
+                            BuildOperation(frame, code[i], i + 1, offsets,
+                                SlotOps.SignatureReturnsValue(method.Signature))),
+                        Expression.Call(frame, Method(nameof(JitFrame.EndInstruction))));
+                    operations.Add(instructionBody);
+                }
+                operations.Add(Expression.Property(frame, nameof(JitFrame.ReturnValue)));
+                execution = Expression.Block(operations);
+            } else {
+                var returnLabel = Expression.Label(typeof(StackSlot), "jitReturn");
+                var invalidIp = Expression.Throw(Expression.New(
+                    typeof(InvalidOperationException).GetConstructor([typeof(string)])!,
+                    Expression.Constant($"JIT フレームの命令位置が不正です: {method}")));
+                var loopBody = Expression.Block(
+                    Expression.Switch(Expression.Property(frame, nameof(JitFrame.InstructionPointer)),
+                        invalidIp, null, cases),
+                    Expression.IfThen(Expression.Property(frame, nameof(JitFrame.Returned)),
+                        Expression.Break(returnLabel, Expression.Property(frame, nameof(JitFrame.ReturnValue)))));
+                var loop = Expression.Loop(loopBody, returnLabel);
+                execution = Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginExecution))), loop);
+            }
+            var body = Expression.TryFinally(
+                execution,
+                Expression.Call(frame, Method(nameof(JitFrame.EndExecution))));
             var lambda = Expression.Lambda<Func<JitFrame, StackSlot>>(body, frame).Compile();
-            return new JitCompiledMethod(lambda);
+            Func<Interpreter, StackSlot[], StackSlot>? leaf = null;
+            try {
+                leaf = TryCompileLeaf(method, prepared, code);
+            } catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                or NotSupportedException or PlatformNotSupportedException) {
+                // The frame-based delegate remains valid even when the
+                // allocation-free leaf specialization is not expressible.
+            }
+            return new JitCompiledMethod(lambda, prepared, leaf);
         } catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
             or NotSupportedException or PlatformNotSupportedException) {
             // An expression compiler limitation is a normal JIT rejection, not
@@ -849,6 +964,216 @@ internal static class JitMethodCompiler {
         SigKind.SzArray or SigKind.Array => type.Inner is not null && ContainsUnsupportedType(type.Inner),
         _ => false,
     };
+
+    private static bool IsStraightLine(DecodedInstruction[] code) {
+        if (code.Length == 0 || code[^1].Op != ILOp.Ret)
+            return false;
+        for (var i = 0; i < code.Length - 1; i++)
+            if (code[i].OperandKind is IlOperandKind.ShortBrTarget or IlOperandKind.BrTarget ||
+                code[i].Op == ILOp.Switch || code[i].Op == ILOp.Ret)
+                return false;
+        return true;
+    }
+
+    private static Func<Interpreter, StackSlot[], StackSlot>? TryCompileLeaf(VmMethod method,
+        PreparedMethod prepared, DecodedInstruction[] code) {
+        if (IsConstructorLeafCandidate(method, prepared, code))
+            return TryCompileConstructorLeaf(method, code);
+        if (!IsLeafCandidate(method, prepared, code))
+            return null;
+
+        var interpreter = Expression.Parameter(typeof(Interpreter), "interpreter");
+        var arguments = Expression.Parameter(typeof(StackSlot[]), "arguments");
+        var statements = new List<Expression>(code.Length + 1);
+        var stack = new List<Expression>();
+        var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var binary = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafBinaryArithmetic))!;
+        var unary = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafUnaryArithmetic))!;
+        var convert = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafConvertValue))!;
+        var compare = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafCompare))!;
+        var ofInt32 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt32), [typeof(int)])!;
+        var ofInt64 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt64), [typeof(long)])!;
+        var ofFloat = typeof(StackSlot).GetMethod(nameof(StackSlot.OfFloat), [typeof(double)])!;
+        var nullProperty = typeof(StackSlot).GetProperty(nameof(StackSlot.Null))!;
+
+        for (var i = 0; i < code.Length; i++) {
+            var instruction = code[i];
+            statements.Add(Expression.Call(interpreter, consume));
+            switch (instruction.Op) {
+                case ILOp.Nop or ILOp.Break:
+                    break;
+                case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
+                    stack.Add(Expression.ArrayIndex(arguments,
+                        Expression.Constant((int)(instruction.Op - ILOp.Ldarg_0))));
+                    break;
+                case ILOp.Ldarg_S or ILOp.Ldarg:
+                    stack.Add(Expression.ArrayIndex(arguments, Expression.Constant(instruction.IntOperand)));
+                    break;
+                case ILOp.Ldnull:
+                    stack.Add(Expression.Property(null, nullProperty));
+                    break;
+                case ILOp.Ldc_I4_M1:
+                    stack.Add(Expression.Call(ofInt32, Expression.Constant(-1)));
+                    break;
+                case >= ILOp.Ldc_I4_0 and <= ILOp.Ldc_I4_8:
+                    stack.Add(Expression.Call(ofInt32,
+                        Expression.Constant((int)(instruction.Op - ILOp.Ldc_I4_0))));
+                    break;
+                case ILOp.Ldc_I4_S or ILOp.Ldc_I4:
+                    stack.Add(Expression.Call(ofInt32, Expression.Constant(instruction.IntOperand)));
+                    break;
+                case ILOp.Ldc_I8:
+                    stack.Add(Expression.Call(ofInt64, Expression.Constant(instruction.LongOperand)));
+                    break;
+                case ILOp.Ldc_R4 or ILOp.Ldc_R8:
+                    stack.Add(Expression.Call(ofFloat, Expression.Constant(instruction.DoubleOperand)));
+                    break;
+                case ILOp.Pop:
+                    if (stack.Count == 0)
+                        return null;
+                    stack.RemoveAt(stack.Count - 1);
+                    break;
+                case ILOp.Neg or ILOp.Not:
+                    if (stack.Count == 0)
+                        return null;
+                    var unaryValue = stack[^1];
+                    stack[^1] = Expression.Call(unary, Expression.Constant(instruction.Op), unaryValue);
+                    break;
+                case ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Div or ILOp.Div_Un or ILOp.Rem or ILOp.Rem_Un
+                    or ILOp.And or ILOp.Or or ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un
+                    or ILOp.Add_Ovf or ILOp.Add_Ovf_Un or ILOp.Sub_Ovf or ILOp.Sub_Ovf_Un
+                    or ILOp.Mul_Ovf or ILOp.Mul_Ovf_Un:
+                    if (stack.Count < 2)
+                        return null;
+                    var right = stack[^1];
+                    var left = stack[^2];
+                    stack.RemoveRange(stack.Count - 2, 2);
+                    stack.Add(Expression.Call(binary, Expression.Constant(instruction.Op), left, right));
+                    break;
+                case ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un:
+                    if (stack.Count < 2)
+                        return null;
+                    var compareRight = stack[^1];
+                    var compareLeft = stack[^2];
+                    stack.RemoveRange(stack.Count - 2, 2);
+                    var compared = Expression.Call(compare, Expression.Constant(instruction.Op),
+                        compareLeft, compareRight);
+                    stack.Add(Expression.Call(ofInt32, Expression.Condition(compared,
+                        Expression.Constant(1), Expression.Constant(0))));
+                    break;
+                case ILOp.Conv_I1 or ILOp.Conv_I2 or ILOp.Conv_I4 or ILOp.Conv_I8 or ILOp.Conv_R4
+                    or ILOp.Conv_R8 or ILOp.Conv_U1 or ILOp.Conv_U2 or ILOp.Conv_U4 or ILOp.Conv_U8
+                    or ILOp.Conv_I or ILOp.Conv_U or ILOp.Conv_R_Un:
+                    if (stack.Count == 0)
+                        return null;
+                    var converted = stack[^1];
+                    stack[^1] = Expression.Call(convert, Expression.Constant(instruction.Op), converted);
+                    break;
+                case ILOp.Ret:
+                    if (i != code.Length - 1)
+                        return null;
+                    var returnsValue = method.Signature.ReturnType.Kind != SigKind.Void;
+                    if (stack.Count != (returnsValue ? 1 : 0))
+                        return null;
+                    statements.Add(returnsValue ? stack[^1] : Expression.Default(typeof(StackSlot)));
+                    return Expression.Lambda<Func<Interpreter, StackSlot[], StackSlot>>(
+                        Expression.Block(statements), interpreter, arguments).Compile();
+                default:
+                    return null;
+            }
+        }
+        return null;
+    }
+
+    private static bool IsLeafType(SigType type) => type.Kind is
+        SigKind.Void or SigKind.Boolean or SigKind.Char or SigKind.I1 or SigKind.U1 or
+        SigKind.I2 or SigKind.U2 or SigKind.I4 or SigKind.U4 or SigKind.I8 or SigKind.U8 or
+        SigKind.I or SigKind.U or SigKind.R4 or SigKind.R8;
+
+    private static bool IsLeafCandidate(VmMethod method, PreparedMethod prepared,
+        DecodedInstruction[] code) =>
+        !method.Signature.HasThis && IsStraightLine(code) && prepared.LocalTypes.Length == 0 &&
+        IsLeafType(method.Signature.ReturnType) &&
+        method.Signature.ParamTypes.All(IsLeafType);
+
+    private static bool IsConstructorLeafCandidate(VmMethod method, PreparedMethod prepared,
+        DecodedInstruction[] code) =>
+        method.Name == ".ctor" && method.Signature.HasThis &&
+        method.Signature.ReturnType.Kind == SigKind.Void && prepared.LocalTypes.Length == 0 &&
+        method.Signature.ParamTypes.All(IsLeafType) && IsStraightLine(code) &&
+        code.Any(instruction => instruction.Op == ILOp.Stfld);
+
+    private static Func<Interpreter, StackSlot[], StackSlot>? TryCompileConstructorLeaf(
+        VmMethod method, DecodedInstruction[] code) {
+        var interpreter = Expression.Parameter(typeof(Interpreter), "interpreter");
+        var arguments = Expression.Parameter(typeof(StackSlot[]), "arguments");
+        var statements = new List<Expression>(code.Length + 1);
+        var stack = new List<Expression>();
+        var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var storeField = typeof(Interpreter).GetMethod(nameof(Interpreter.StoreLeafField),
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var ofInt32 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt32), [typeof(int)])!;
+        var ofInt64 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt64), [typeof(long)])!;
+        var ofFloat = typeof(StackSlot).GetMethod(nameof(StackSlot.OfFloat), [typeof(double)])!;
+
+        for (var i = 0; i < code.Length; i++) {
+            var instruction = code[i];
+            statements.Add(Expression.Call(interpreter, consume));
+            switch (instruction.Op) {
+                case ILOp.Nop or ILOp.Break:
+                    break;
+                case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
+                    stack.Add(Expression.ArrayIndex(arguments,
+                        Expression.Constant((int)(instruction.Op - ILOp.Ldarg_0))));
+                    break;
+                case ILOp.Ldarg_S or ILOp.Ldarg:
+                    stack.Add(Expression.ArrayIndex(arguments, Expression.Constant(instruction.IntOperand)));
+                    break;
+                case ILOp.Ldc_I4_M1:
+                    stack.Add(Expression.Call(ofInt32, Expression.Constant(-1)));
+                    break;
+                case >= ILOp.Ldc_I4_0 and <= ILOp.Ldc_I4_8:
+                    stack.Add(Expression.Call(ofInt32,
+                        Expression.Constant((int)(instruction.Op - ILOp.Ldc_I4_0))));
+                    break;
+                case ILOp.Ldc_I4_S or ILOp.Ldc_I4:
+                    stack.Add(Expression.Call(ofInt32, Expression.Constant(instruction.IntOperand)));
+                    break;
+                case ILOp.Ldc_I8:
+                    stack.Add(Expression.Call(ofInt64, Expression.Constant(instruction.LongOperand)));
+                    break;
+                case ILOp.Ldc_R4 or ILOp.Ldc_R8:
+                    stack.Add(Expression.Call(ofFloat, Expression.Constant(instruction.DoubleOperand)));
+                    break;
+                case ILOp.Pop:
+                    if (stack.Count == 0)
+                        return null;
+                    stack.RemoveAt(stack.Count - 1);
+                    break;
+                case ILOp.Stfld:
+                    if (stack.Count < 2)
+                        return null;
+                    var fieldValue = stack[^1];
+                    var fieldReceiver = stack[^2];
+                    stack.RemoveRange(stack.Count - 2, 2);
+                    statements.Add(Expression.Call(interpreter, storeField,
+                        Expression.Constant(method), Expression.Constant(instruction.IntOperand),
+                        fieldReceiver, fieldValue));
+                    break;
+                case ILOp.Ret:
+                    if (i != code.Length - 1 || stack.Count != 0)
+                        return null;
+                    statements.Add(Expression.Default(typeof(StackSlot)));
+                    return Expression.Lambda<Func<Interpreter, StackSlot[], StackSlot>>(
+                        Expression.Block(statements), interpreter, arguments).Compile();
+                default:
+                    return null;
+            }
+        }
+        return null;
+    }
 
     private static bool IsSupported(ILOp op) => op switch {
         ILOp.Nop or ILOp.Break or
@@ -951,6 +1276,8 @@ internal static class JitMethodCompiler {
             return Call(frame, nameof(JitFrame.LoadIndirect), Constant(op), Constant(next));
         if (IsIndirectStore(op))
             return Call(frame, nameof(JitFrame.StoreIndirect), Constant(op), Constant(next));
+        if (op == ILOp.Call && (TableKind)((uint)instruction.IntOperand >> 24) == TableKind.MethodDef)
+            return Call(frame, nameof(JitFrame.CallDirect), Constant(instruction.IntOperand), Constant(next));
         if (op is ILOp.Call or ILOp.Callvirt)
             return Call(frame, nameof(JitFrame.Call), Constant(instruction.IntOperand),
                 Constant(op == ILOp.Callvirt), Constant(next));

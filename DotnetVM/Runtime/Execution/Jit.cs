@@ -232,7 +232,7 @@ internal sealed class JitFrame {
     }
 
     public void LoadArgumentAddress(int index, int next) {
-        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(_frame.Arguments, index)));
+        _frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(_frame.Arguments, index)));
         _frame.Ip = next;
     }
 
@@ -247,7 +247,7 @@ internal sealed class JitFrame {
     }
 
     public void LoadLocalAddress(int index, int next) {
-        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(_frame.Locals, index)));
+        _frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(_frame.Locals, index)));
         _frame.Ip = next;
     }
 
@@ -376,7 +376,7 @@ internal sealed class JitFrame {
         MemoryOps.CheckArrayBounds(array, index);
         var isReadOnly = _frame.PendingReadonly;
         _frame.PendingReadonly = false;
-        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, isReadOnly)));
+        _frame.Stack.Push(StackSlot.OfByRef(VmByRef.ArrayElement(array, index, isReadOnly)));
         _frame.Ip = next;
     }
 
@@ -433,7 +433,9 @@ internal sealed class JitFrame {
     public void LoadFieldAddress(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
-        _frame.Stack.Push(objects.FieldAddress(_frame.Stack.Pop(), field));
+        var isReadOnly = _frame.PendingReadonly;
+        _frame.PendingReadonly = false;
+        _frame.Stack.Push(objects.FieldAddress(_frame.Stack.Pop(), field, isReadOnly));
         _frame.Ip = next;
     }
 
@@ -455,9 +457,11 @@ internal sealed class JitFrame {
 
     public void LoadStaticFieldAddress(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var isReadOnly = _frame.PendingReadonly;
+        _frame.PendingReadonly = false;
         _frame.Stack.Push(objects.TryGetStaticFieldRvaAddress(token) ??
             StackSlot.OfByRef(objects.StaticFieldLocation(token, _frame.Context,
-                _frame.Method.DynamicTokens)));
+                _frame.Method.DynamicTokens, isReadOnly)));
         _frame.Ip = next;
     }
 
@@ -484,7 +488,7 @@ internal sealed class JitFrame {
         } else if (address.ObjectValue is VmByRef byRef) {
             _frame.Stack.Push(SlotOps.PushCopyOfValue(byRef.Slot));
         } else {
-            throw new InvalidOperationException($"ldobj のアドレスが不正です: {SlotOps.Describe(address)}");
+            throw InvalidAddress("ldobj", address);
         }
         _frame.Ip = next;
     }
@@ -496,13 +500,13 @@ internal sealed class JitFrame {
         if (address.ObjectValue is VmNativePointer native) {
             var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
             var size = MemoryOps.SizeOfType(type);
-            EnsureNativeRange(native, size, "stobj");
+            EnsureNativeRange(native, size, "stobj", writable: true);
             var bytes = MemoryOps.BytesOfValue(value, type, size);
             Array.Copy(bytes, 0, native.Bytes, native.ByteOffset, size);
         } else if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(SlotOps.StoreCopyOfValue(value));
         } else {
-            throw new InvalidOperationException($"stobj のアドレスが不正です: {SlotOps.Describe(address)}");
+            throw InvalidAddress("stobj", address);
         }
         _frame.Ip = next;
     }
@@ -516,26 +520,26 @@ internal sealed class JitFrame {
         if (source.ObjectValue is VmNativePointer sourceNative &&
             destination.ObjectValue is VmNativePointer destinationNative) {
             EnsureNativeRange(sourceNative, size, "cpobj");
-            EnsureNativeRange(destinationNative, size, "cpobj");
+            EnsureNativeRange(destinationNative, size, "cpobj", writable: true);
             Array.Copy(sourceNative.Bytes, sourceNative.ByteOffset,
                 destinationNative.Bytes, destinationNative.ByteOffset, size);
         } else if (source.ObjectValue is VmNativePointer sourceOnly) {
             EnsureNativeRange(sourceOnly, size, "cpobj");
             if (destination.ObjectValue is not VmByRef destinationByRef)
-                throw new InvalidOperationException("cpobj の宛先が不正です。");
+                throw InvalidAddress("cpobj", destination);
             destinationByRef.Write(SlotOps.StoreCopyOfValue(MemoryOps.ValueFromBytes(
                 sourceOnly.Bytes.AsSpan(sourceOnly.ByteOffset, size).ToArray(), type, size)));
         } else if (destination.ObjectValue is VmNativePointer destinationOnly) {
-            EnsureNativeRange(destinationOnly, size, "cpobj");
+            EnsureNativeRange(destinationOnly, size, "cpobj", writable: true);
             if (source.ObjectValue is not VmByRef sourceByRef)
-                throw new InvalidOperationException("cpobj のソースが不正です。");
+                throw InvalidAddress("cpobj", source);
             var bytes = MemoryOps.BytesOfValue(sourceByRef.Read(), type, size);
             Array.Copy(bytes, 0, destinationOnly.Bytes, destinationOnly.ByteOffset, size);
         } else if (source.ObjectValue is VmByRef sourceByRef &&
                    destination.ObjectValue is VmByRef destinationByRef) {
             destinationByRef.Write(SlotOps.StoreCopyOfValue(sourceByRef.Read()));
         } else {
-            throw new InvalidOperationException("cpobj のアドレスが不正です。");
+            throw InvalidAddress("cpobj", destination);
         }
         _frame.Ip = next;
     }
@@ -546,29 +550,35 @@ internal sealed class JitFrame {
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         if (address.ObjectValue is VmNativePointer native) {
             var size = MemoryOps.SizeOfType(type);
-            EnsureNativeRange(native, size, "initobj");
+            EnsureNativeRange(native, size, "initobj", writable: true);
             Array.Clear(native.Bytes, native.ByteOffset, size);
         } else if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(_services.Objects.DefaultForType(type, _services.Loader));
         } else {
-            throw new InvalidOperationException($"initobj のアドレスが不正です: {SlotOps.Describe(address)}");
+            throw InvalidAddress("initobj", address);
         }
         _frame.Ip = next;
     }
 
-    private static void EnsureNativeRange(VmNativePointer pointer, int size, string operation) {
-        if (pointer.ByteOffset < 0 || (long)pointer.ByteOffset + size > pointer.Bytes.Length)
-            throw new InvalidOperationException($"{operation} がブロック外を参照します。");
+    private static void EnsureNativeRange(VmNativePointer pointer, int size, string operation,
+        bool writable = false) {
+        if (writable)
+            pointer.EnsureWritable();
+        pointer.EnsureBounds(size);
     }
+
+    private static UnhandledGuestException InvalidAddress(string operation, in StackSlot address) =>
+        new("System.InvalidProgramException",
+            $"{operation} のアドレスがマネージ参照または有効な unmanaged ポインタではありません: {SlotOps.Describe(address)}");
 
     public void Unbox(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
-        if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+        if (value.ObjectValue is not VmBoxedValue boxed || !TypeChecks.IsExactUnboxType(boxed.Type, target))
             throw new UnhandledGuestException("System.InvalidCastException",
                 $"{SlotOps.Describe(value)} を {target.FullName} として unbox できません。");
-        _frame.Stack.Push(StackSlot.OfByRef(new VmByRef(boxed.Fields, 0)));
+        _frame.Stack.Push(StackSlot.OfByRef(VmByRef.BoxedValue(boxed)));
         _frame.Ip = next;
     }
 
@@ -597,7 +607,7 @@ internal sealed class JitFrame {
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
         if (target.IsValueType) {
-            if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+            if (value.ObjectValue is not VmBoxedValue boxed || !TypeChecks.IsExactUnboxType(boxed.Type, target))
                 throw new UnhandledGuestException("System.InvalidCastException",
                     $"{SlotOps.Describe(value)} を {target.FullName} に unbox.any できません。");
             if (VmPrimitiveTypes.IsSlotPrimitive(target.FullName))
@@ -814,7 +824,8 @@ internal static class JitMethodCompiler {
                 if ((uint)instruction.IntOperand >= (uint)prepared.LocalTypes.Length)
                     return false;
             if (instruction.Op == ILOp.Readonly &&
-                (i + 1 >= code.Length || code[i + 1].Op != ILOp.Ldelema))
+                (i + 1 >= code.Length || code[i + 1].Op is not
+                    (ILOp.Ldelema or ILOp.Ldflda or ILOp.Ldsflda)))
                 return false;
             if (instruction.OperandKind is IlOperandKind.ShortBrTarget or IlOperandKind.BrTarget &&
                 !offsets.Contains(instruction.IntOperand))
@@ -1043,7 +1054,14 @@ internal static class JitMethodCompiler {
         or ILOp.Stelem;
 
     private static MemoryOps.ArrayElementKind ArrayKind(ILOp op) => op switch {
-        ILOp.Ldelem_I8 or ILOp.Ldelem_I or ILOp.Stelem_I8 => MemoryOps.ArrayElementKind.Int64,
+        ILOp.Ldelem_I1 or ILOp.Stelem_I1 => MemoryOps.ArrayElementKind.SignedByte,
+        ILOp.Ldelem_U1 => MemoryOps.ArrayElementKind.UnsignedByte,
+        ILOp.Ldelem_I2 or ILOp.Stelem_I2 => MemoryOps.ArrayElementKind.SignedShort,
+        ILOp.Ldelem_U2 => MemoryOps.ArrayElementKind.UnsignedShort,
+        ILOp.Ldelem_U4 => MemoryOps.ArrayElementKind.UnsignedInt32,
+        ILOp.Ldelem_I8 or ILOp.Stelem_I8 => MemoryOps.ArrayElementKind.Int64,
+        ILOp.Ldelem_I => MemoryOps.ArrayElementKind.NativeInt,
+        ILOp.Stelem_I => MemoryOps.ArrayElementKind.NativeInt,
         ILOp.Ldelem_R4 or ILOp.Ldelem_R8 or ILOp.Stelem_R4 or ILOp.Stelem_R8 => MemoryOps.ArrayElementKind.Float,
         ILOp.Ldelem_Ref or ILOp.Stelem_Ref => MemoryOps.ArrayElementKind.Object,
         _ => MemoryOps.ArrayElementKind.Int32,

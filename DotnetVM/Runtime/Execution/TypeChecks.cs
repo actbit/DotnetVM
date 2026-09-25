@@ -7,6 +7,38 @@ namespace DotnetVM.Runtime.Execution;
 /// デリゲート判定/例外ファサード判定など、型システムの面だけを見る共通判定。</summary>
 internal static class TypeChecks {
 
+    /// <summary>
+    /// boxed 値を unbox/unbox.any する際の型判定。代入可能性とは異なり、基底の
+    /// ValueType や実装インターフェースへ unbox することは許さない。CoreLib の
+    /// facade と実型が混在する場合だけ、統合済みの完全名一致を許容する。
+    /// </summary>
+    public static bool IsExactUnboxType(VmType actual, VmType target) {
+        if (ReferenceEquals(actual, target))
+            return true;
+        if (actual.FullName != target.FullName)
+            return false;
+
+        // Intrinsic types are the VM's explicit facade for a CoreLib type.  A box
+        // created through the real CoreLib TypeDef must still unbox through the
+        // corresponding facade (primitive facades are the common case).
+        if (actual is VmIntrinsicType || target is VmIntrinsicType)
+            return true;
+
+        if (actual is VmConstructedType actualConstructed &&
+            target is VmConstructedType targetConstructed)
+            return IsExactUnboxType(actualConstructed.Definition, targetConstructed.Definition) &&
+                actualConstructed.TypeArguments.Length == targetConstructed.TypeArguments.Length &&
+                actualConstructed.TypeArguments.Zip(targetConstructed.TypeArguments)
+                    .All(pair => IsExactUnboxType(pair.First, pair.Second));
+
+        // Two guest TypeDefs with the same name from different images are not the
+        // same CLR type. Use assembly identity + TypeDef RID rather than the broad
+        // FullName-based assignability rule used for facade compatibility.
+        return actual is VmClassType actualClass && target is VmClassType targetClass &&
+            actualClass.TypeDefRid == targetClass.TypeDefRid &&
+            actualClass.Image.Identity.MatchesExactly(targetClass.Image.Identity);
+    }
+
     /// <summary>VM オブジェクトがターゲット型に代入可能か (castclass/isinst/配列共変/例外 catch の共通判定)。
     /// ジェネリック型のインスタンスは実引数を記録した構築型を作って判定する (変性込み・M5)。
     /// stringType は呼出元 VM の System.String 実型 (InterpreterServices.StringType。VM 単位で

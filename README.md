@@ -112,11 +112,14 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 ### 簡易 JIT (M8)
 `VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` に加えて managed ByRef (`ldarga` / `ldloca` / `ldelema` / `ldflda` / `ldsflda`)、間接アクセス、値型コピー、`ldtoken` も VM オブジェクトモデルの操作として実行します。
 
-対象外の命令 (EH、unmanaged pointer、typed reference、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。managed ByRef は VM のスロット配列を直接指し、`readonly. ldelema` の読み取り専用制約も維持します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
+対象外の命令 (EH、unmanaged pointer、typed reference、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。managed ByRef は VM のスロット配列を直接指し、`readonly.` の制約も `ldelema` / `ldflda` / `ldsflda` から nested field へ伝播します。配列要素・ボックス・VM オブジェクトのフィールドを指す ByRef は、storage owner を保持して GC root と heap accounting を維持します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
 
 JIT のコンパイル処理自体も VM のリソースポリシーで制限されます。`MemoryPolicy.JitCompilationBudget` は式ツリー構築とデリゲート生成の作業量、`HostWorkBudget` はホスト CPU 作業、`HostTempAllocationByteLimit` はホスト側の一時メモリとして計上されます。さらに `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で VM 全体の保持数・入力サイズ・式ツリー複雑度を制限します。いずれかの上限を超えた場合は例外ではなく、そのメソッドをインタプリタで実行します。
 
 JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
+
+### Native int
+VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。
 
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
@@ -169,7 +172,7 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 | 命令 | CLR との差分 |
 |---|---|
 | `localloc` | 初期化は 0 (実 CLR は不定値)。ブロックは GC 管理 (フレーム終了で解放しない = 脱出 stackalloc も安全側に動く)。ブロック外アクセスは境界検査で拒否 (実 CLR は未定義動作 = アドレス空間破壊)。確保は `VmHeap` 会計の対象で、上限検査はホスト実確保より先に実施 |
-| `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度、ByRef 間は 8 バイト切り上げのスロット粒度 |
+| `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度。VM のスロット配置を安全に表現できない ByRef 間コピーは `InvalidProgramException` へ fail-closed |
 | `sizeof` | ゲスト値型は ClassLayout の Pack/Size と FieldLayout の明示オフセットを反映。順次配置のネスト値型の整列は近似。値型フィールド自体は VM のスロットとして保持するため、明示レイアウトの重なりアクセスは未対応 |
 | `arglist` | ハンドル生成のみ。varargs 実呼出は fail-closed (C# 産 IL では生成されない) |
 | `jmp` | 尾呼び移行として実装 (残フレームを実行せず呼出先の戻り値を引き継ぐ)。intrinsic 面への移行は拒否 |
@@ -177,7 +180,7 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 
 ### Prefix behavior
 
-`volatile.` は対応するメモリアクセス前後にメモリバリアを置きます。`unaligned.` は VM の仮想メモリがアラインメント制約を持たないため no-op です。`readonly. ldelema` は読み取り専用 ByRef を作り、書き込み命令で拒否します。`tail.` + `call`/`callvirt`/`calli` は、戻り値型が一致し、protected region 外で、呼出元の引数/ローカルへの参照を渡さない場合にフレームを置き換えます。それ以外は通常の呼出にフォールバックします。`jmp` は評価スタックを空にし、呼出元と呼出先のシグネチャが一致するゲストメソッド間でフレームを置き換えます。
+`volatile.` は対応するメモリアクセス前後にメモリバリアを置きます。`unaligned.` は VM の仮想メモリがアラインメント制約を持たないため no-op です。`readonly.` は `ldelema` / `ldflda` / `ldsflda` から作られる ByRef と nested field に伝播し、`stind` / `stobj` / `cpobj` / `initobj` などの書き込みを拒否します。`tail.` + `call`/`callvirt`/`calli` は、戻り値型が一致し、protected region 外で、呼出元の引数/ローカルへの参照を渡さない場合にフレームを置き換えます。それ以外は通常の呼出にフォールバックします。`jmp` は評価スタックを空にし、呼出元と呼出先のシグネチャが一致するゲストメソッド間でフレームを置き換えます。
 
 ### Rejected
 

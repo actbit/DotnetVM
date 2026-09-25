@@ -144,6 +144,27 @@ public class GcTests {
     }
 
     [Fact]
+    public void ByRefOwner_KeepsBoxAliveAndAccountedFor() {
+        var heap = new VmHeap(new MemoryPolicy());
+        var valueType = new VmIntrinsicType {
+            Namespace = "System", Name = "Int32", IsValue = true,
+        };
+        var box = heap.Allocate(new VmBoxedValue(valueType, [StackSlot.OfInt32(7)]));
+        var byRef = VmByRef.BoxedValue(box);
+        Func<IEnumerable<StackSlot[]>> roots = () => [[StackSlot.OfByRef(byRef)]];
+        heap.AddRootSlotSource(roots);
+
+        var before = heap.Snapshot();
+        var after = heap.Collect();
+
+        Assert.Contains(box, heap.TrackedObjects);
+        Assert.Equal(ObjectModel.EstimateSize(box), after.LiveBytes);
+        Assert.Equal(before.TotalAllocatedBytes, after.TotalAllocatedBytes);
+        byRef.Write(StackSlot.OfInt32(9));
+        Assert.Equal(9, byRef.Read().AsInt32);
+    }
+
+    [Fact]
     public void Heap_AllocateRejectsWhenLiveWouldExceedLimit() {
         var heap = new VmHeap(new MemoryPolicy {
             LiveObjectByteLimit = 200,

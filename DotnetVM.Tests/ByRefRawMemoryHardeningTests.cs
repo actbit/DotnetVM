@@ -1,6 +1,9 @@
 using DotnetVM.Host;
+using DotnetVM.IL;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
+using DotnetVM.Runtime.Heap;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 using Xunit;
 
@@ -48,11 +51,27 @@ public sealed class ByRefRawMemoryHardeningTests {
                 return values[1];
             }
 
+            // The array local disappears at the return boundary. The returned managed
+            // ByRef must retain the VmArray as its GC/accounting owner.
+            public static ref int ReturnArrayElementReference() {
+                var values = new[] { 41 };
+                return ref values[0];
+            }
+
+            public static ref int ReturnInstanceFieldReference() {
+                var holder = new Holder { Value = 43 };
+                return ref holder.Value;
+            }
+
             public static int ReadOnlyArrayElementAddress() {
                 var values = new[] { 7, 8, 9 };
                 ref readonly var element = ref values[1];
                 return element;
             }
+        }
+
+        public sealed class Holder {
+            public int Value;
         }
         """;
 
@@ -111,6 +130,58 @@ public sealed class ByRefRawMemoryHardeningTests {
         Assert.True(vm.IsJitCompiled(method));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReturnedArrayByRefKeepsArrayAliveAcrossCollection(bool enableJit) {
+        using var vm = CreateVm(enableJit);
+        var byRef = Assert.IsType<VmByRef>(vm.Invoke("Vm.Raw", "ReturnArrayElementReference"));
+        var array = Assert.IsType<VmArray>(byRef.Owner);
+        Assert.Same(array.Elements, byRef.Container);
+
+        var roots = new Func<IEnumerable<StackSlot[]>>(() => [
+            [StackSlot.OfByRef(byRef)],
+        ]);
+        vm.Heap.AddRootSlotSource(roots);
+        try {
+            vm.CollectGarbage();
+            Assert.Contains(array, vm.Heap.TrackedObjects);
+            Assert.Equal(41, byRef.Read().AsInt32);
+            byRef.Write(StackSlot.OfInt32(42));
+            Assert.Equal(42, byRef.Read().AsInt32);
+        } finally {
+            vm.Heap.RemoveRootSlotSource(roots);
+        }
+
+        if (enableJit)
+            Assert.True(vm.IsJitCompiled(vm.Loaders[0].FindTypeByFullName("Vm.Raw")!.Methods
+                .Single(method => method.Name == "ReturnArrayElementReference")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReturnedInstanceFieldByRefKeepsOwnerAliveAcrossCollection(bool enableJit) {
+        using var vm = CreateVm(enableJit);
+        var byRef = Assert.IsType<VmByRef>(vm.Invoke("Vm.Raw", "ReturnInstanceFieldReference"));
+        var owner = Assert.IsType<VmClassInstance>(byRef.Owner);
+        Assert.Same(owner.Fields, byRef.Container);
+
+        var roots = new Func<IEnumerable<StackSlot[]>>(() => [[StackSlot.OfByRef(byRef)]]);
+        vm.Heap.AddRootSlotSource(roots);
+        try {
+            vm.CollectGarbage();
+            Assert.Contains(owner, vm.Heap.TrackedObjects);
+            Assert.Equal(43, byRef.Read().AsInt32);
+        } finally {
+            vm.Heap.RemoveRootSlotSource(roots);
+        }
+
+        if (enableJit)
+            Assert.True(vm.IsJitCompiled(vm.Loaders[0].FindTypeByFullName("Vm.Raw")!.Methods
+                .Single(method => method.Name == "ReturnInstanceFieldReference")));
+    }
+
     [Fact]
     public void InvalidAndReadonlyByRefsFailClosed() {
         var readOnly = new VmByRef([StackSlot.OfInt32(1)], 0, isReadOnly: true);
@@ -118,6 +189,20 @@ public sealed class ByRefRawMemoryHardeningTests {
 
         var onePast = new VmByRef([], 0);
         Assert.Throws<UnhandledGuestException>(() => _ = onePast.Read());
+    }
+
+    [Fact]
+    public void ReadonlyNativeMemoryRejectsIndirectAndBlockWrites() {
+        var memory = new VmLocallocMemory { Bytes = new byte[8] };
+        var pointer = new VmNativePointer { Memory = memory, ByteOffset = 0, IsReadOnly = true };
+        var address = StackSlot.OfObject(pointer);
+
+        Assert.Throws<UnhandledGuestException>(() => MemoryOps.StoreIndirect(
+            ILOp.Stind_I4, address, StackSlot.OfInt32(1)));
+        Assert.Throws<UnhandledGuestException>(() => MemoryOps.CopyMemoryBlock(
+            address, StackSlot.OfObject(new VmNativePointer { Memory = memory, ByteOffset = 0 }), 4));
+        Assert.Throws<UnhandledGuestException>(() => MemoryOps.InitMemoryBlock(
+            address, StackSlot.OfInt32(0), 4));
     }
 
     [Fact]

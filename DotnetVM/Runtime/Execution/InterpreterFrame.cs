@@ -166,7 +166,10 @@ public sealed class InterpreterFrame {
             Arguments = arguments,
             Locals = locals,
             LocalTypes = localTypes,
-            Stack = new EvaluationStack(maxStack),
+            // Preparation has already checked the declared maxstack.  Keep a
+            // small runtime floor for intrinsic bridge calls whose host-side
+            // implementation can transiently retain an extra result slot.
+            Stack = new EvaluationStack(Math.Max(maxStack, 8)),
         };
     }
 
@@ -178,7 +181,7 @@ public sealed class InterpreterFrame {
             Arguments = arguments,
             Locals = (StackSlot[])prepared.InitialLocals.Clone(),
             LocalTypes = prepared.LocalTypes,
-            Stack = new EvaluationStack(maxStack),
+            Stack = new EvaluationStack(Math.Max(maxStack, 8)),
         };
 
     /// <summary>署名型に対する既定値スロット (ローカル変数のゼロ初期化)。</summary>

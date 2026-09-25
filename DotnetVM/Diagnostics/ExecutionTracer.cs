@@ -18,6 +18,7 @@ public sealed class ExecutionTracer {
     private readonly object _gate = new();
     private ExecutionTraceOptions _options = new();
     private long _droppedEventCount;
+    private long _droppedFrameCount;
     private long _sequence;
     private int _capturesInstructions;
 
@@ -29,6 +30,9 @@ public sealed class ExecutionTracer {
 
     /// <summary>Events の上限超過により保存されなかったイベント数。</summary>
     public long DroppedEventCount { get { lock (_gate) return _droppedEventCount; } }
+
+    /// <summary>Frames の上限超過により保存されなかったフレーム数。</summary>
+    public long DroppedFrameCount { get { lock (_gate) return _droppedFrameCount; } }
 
     /// <summary>命令イベントを記録中か。JIT は命令の可観測性を保つため自動的に迂回される。</summary>
     internal bool CapturesInstructions {
@@ -50,6 +54,7 @@ public sealed class ExecutionTracer {
             _frames.Clear();
             _events.Clear();
             _droppedEventCount = 0;
+            _droppedFrameCount = 0;
             _sequence = 0;
             _options = options;
             _enabled = true;
@@ -75,8 +80,13 @@ public sealed class ExecutionTracer {
     /// <summary>Interpreter がフレーム開始時に呼ぶ (internal: VM 本体からの記録のみ)。</summary>
     internal void Record(string assemblyName, string typeFullName, string methodName) {
         lock (_gate) {
-            if (_enabled)
-                _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
+            if (!_enabled)
+                return;
+            if (_frames.Count >= _options.MaxFrames) {
+                _droppedFrameCount++;
+                return;
+            }
+            _frames.Add(new ExecutionFrame(assemblyName, typeFullName, methodName));
         }
     }
 

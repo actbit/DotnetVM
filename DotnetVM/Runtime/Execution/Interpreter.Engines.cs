@@ -27,6 +27,7 @@ public sealed partial class Interpreter {
     internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
         bool enableJit = false, int jitPromotionThreshold = 1000,
         NetworkGateway? network = null, StorageGateway? storage = null, Diagnostics.ExecutionTracer? tracer = null,
+        Diagnostics.VmDebugger? debugger = null,
         VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null, VmSharedState? shared = null,
         Func<ReadOnlyMemory<byte>, TypeLoader>? loadAssemblyFromBytes = null,
         VmAssemblyLoadContext? defaultAssemblyLoadContext = null,
@@ -43,6 +44,7 @@ public sealed partial class Interpreter {
         _network = network;
         _storage = storage;
         _tracer = tracer;
+        _debugger = debugger;
         _coreLibSurfaces = coreLibSurfaces;
         _stringType = stringType;
         _shared = shared ?? new VmSharedState();

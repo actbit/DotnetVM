@@ -1,4 +1,5 @@
 using DotnetVM.Devices;
+using DotnetVM.Diagnostics;
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
@@ -37,6 +38,12 @@ public sealed class VirtualMachine : IDisposable {
     private readonly Func<IEnumerable<VmObject?>> _guestThreadRoots;
     private readonly Func<IEnumerable<StackSlot[]>> _guestTaskRoots;
     private int _disposed;
+
+    /// <summary>命令トレース。Start() で記録を有効化する。</summary>
+    public ExecutionTracer Tracer { get; } = new();
+
+    /// <summary>命令ブレークポイントとステップ実行を提供するデバッガ。</summary>
+    public VmDebugger Debugger { get; } = new();
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
@@ -515,15 +522,11 @@ public sealed class VirtualMachine : IDisposable {
             ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
                 _options.EnableJit, _options.JitPromotionThreshold,
-                _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
+                _network, _storage, Tracer, Debugger, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
                 _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
                 LoadAssemblyPathInContext);
         }
     }
-
-    /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
-    /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>
-    public Diagnostics.ExecutionTracer Tracer { get; } = new();
 
     private TypeLoader GetPrimaryLoader() {
         lock (_assemblyGate) {
@@ -723,6 +726,7 @@ public sealed class VirtualMachine : IDisposable {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            Debugger.Dispose();
             _sharedState.Dispose();
             lock (_interpreterGate) {
                 _interpreter?.Dispose();

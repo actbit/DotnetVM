@@ -39,6 +39,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly NetworkGateway? _network;
     private readonly StorageGateway? _storage;
     private readonly Diagnostics.ExecutionTracer? _tracer;
+    private readonly Diagnostics.VmDebugger? _debugger;
     private readonly VmCoreLibSurfaces? _coreLibSurfaces;
     private readonly VmType? _stringType;
     private readonly VmSharedState _shared;
@@ -73,6 +74,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
     private readonly VmExecutionCoordinator _coordinator = new();
     private long _instructionCount;
+    private long _traceSequence;
     private int _running;
     private int _disposed;
     private readonly Func<IEnumerable<StackSlot[]>> _frameRootSource;
@@ -167,6 +169,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 using var instructionLease = _coordinator.EnterInstructionInBatch();
                 ConsumeInstruction();
                 var instruction = frame.Code[frame.Ip];
+                ObserveInstruction(frame, instruction);
             var isPrefix = IsPrefix(instruction.Op);
             var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
             var readonlyAddress = frame.PendingReadonly && !isPrefix &&
@@ -968,6 +971,28 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         } finally {
             instructionBatch.Dispose();
         }
+    }
+
+    /// <summary>命令単位のトレースとデバッガ停止を同じ命令境界で実行する。</summary>
+    private void ObserveInstruction(InterpreterFrame frame, DecodedInstruction instruction) {
+        if (_tracer?.CapturesInstructions != true && _debugger?.IsActive != true)
+            return;
+
+        var trace = new Diagnostics.ExecutionTraceEvent(
+            Interlocked.Increment(ref _traceSequence),
+            DateTimeOffset.UtcNow,
+            Environment.CurrentManagedThreadId,
+            CurrentState.Frames.Count,
+            new Diagnostics.ExecutionFrame(
+                frame.Method.Loader?.Image.Name ?? "",
+                frame.Method.DeclaringType.FullName,
+                frame.Method.Name),
+            instruction.Offset,
+            instruction.Op,
+            IlOpcodeTable.Get(instruction.Op)?.Name ?? instruction.Op.ToString());
+        if (_tracer is { } tracer)
+            trace = tracer.RecordInstruction(trace);
+        _debugger?.Observe(trace);
     }
 
     private static void EnsureFieldWritable(VmField field, VmMethod method) {

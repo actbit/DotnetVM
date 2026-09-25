@@ -141,7 +141,8 @@ public sealed partial class Interpreter {
             }
             var container = byRef?.Container ?? [value];
             var index = byRef?.Index ?? 0;
-            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index))],
+            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index,
+                byRef?.IsReadOnly ?? false, byRef?.Owner))],
                 GenericContext.Of(structMachine.TypeArguments, null));
         };
         // Activator.CreateInstance 等が .ctor を実行するためのフック

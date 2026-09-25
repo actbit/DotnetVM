@@ -305,6 +305,14 @@ public sealed class VmConstructedType : VmType {
 /// intrinsic ファサードのどちらで解決されても、ストレージ表現はスロットのまま変わらない。
 /// </summary>
 public static class VmPrimitiveTypes {
+    /// <summary>
+    /// VM の native-int 表現はホスト OS に依存させず 64-bit に固定する。
+    /// これにより Ubuntu/Windows/macOS 間で conv.i、IntPtr 配列、ポインタ演算の
+    /// 意味論と heap layout が変化しない。32-bit guest ABI は現時点では提供しない。
+    /// </summary>
+    public const int NativeIntSizeBytes = 8;
+    public const int NativeIntBits = NativeIntSizeBytes * 8;
+
     /// <summary>単一スロット表現のプリミティブ完全名 (i4 統合面 + i8 + fp + native int)。</summary>
     private static readonly HashSet<string> SlotPrimitives = new(StringComparer.Ordinal) {
         "System.Boolean", "System.Char", "System.SByte", "System.Byte",

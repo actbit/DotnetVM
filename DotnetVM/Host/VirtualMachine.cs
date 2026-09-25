@@ -654,6 +654,9 @@ public sealed class VirtualMachine : IDisposable {
         StackKind.ValueType when slot.ObjectValue is VmStructValue sv && sv.StructType.FullName == "System.Decimal" =>
             DecodeDecimal(sv),
         StackKind.ValueType => slot.ObjectValue, // その他の構造体値は VM オブジェクトのまま返す
+        // ref return は VM の managed ByRef をそのまま返す。Owner を保持した ByRef を
+        // ホスト側で診断/root 登録でき、array/box の GC/accounting 回帰テストにも使える。
+        StackKind.ByRef => slot.ObjectValue,
         _ => throw new InvalidOperationException($"戻り値スロット {slot.Kind} はホスト値に変換できません。"),
     };
 

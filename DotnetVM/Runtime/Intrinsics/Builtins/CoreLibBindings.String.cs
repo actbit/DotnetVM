@@ -413,7 +413,7 @@ internal static partial class CoreLibBindings {
                 // 形 (ByRef スロット経由) もあるため展開して受ける
                 var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
                 return value.ObjectValue is VmArray array
-                     ? StackSlot.OfByRef(new VmByRef(array.Elements, 0, owner: array))
+                     ? StackSlot.OfByRef(VmByRef.ArrayElement(array, 0))
                     : throw new InvalidOperationException(
                         $"MemoryMarshal.GetArrayDataReference の引数が配列ではありません ({value.Kind})。");
             },
@@ -422,7 +422,7 @@ internal static partial class CoreLibBindings {
             static (_, a) => {
                 var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
                 return value.ObjectValue is VmArray array
-                     ? StackSlot.OfByRef(new VmByRef(array.Elements, 0, owner: array))
+                     ? StackSlot.OfByRef(VmByRef.ArrayElement(array, 0))
                     : throw new InvalidOperationException(
                         $"MemoryMarshal.GetArrayDataReference の引数が配列ではありません ({value.Kind})。");
             },

@@ -38,7 +38,23 @@ internal static class MemoryOps {
 
     // ---- 配列要素 ----
 
-    public enum ArrayElementKind { Int32, Int64, Float, Object }
+    /// <summary>
+    /// 配列命令がスタックへ返す/配列へ格納する表現。小整数は IL の signed/unsigned
+    /// 拡張幅を保持する。storage 自体は VM の正規化スロットだが、opcode ごとの拡張を
+    /// ここで明示し、Interpreter/JIT の境界で同じ結果になるようにする。
+    /// </summary>
+    public enum ArrayElementKind {
+        Int32,
+        SignedByte,
+        UnsignedByte,
+        SignedShort,
+        UnsignedShort,
+        UnsignedInt32,
+        Int64,
+        NativeInt,
+        Float,
+        Object,
+    }
 
     public static ArrayElementKind ElementKindFromType(VmType type) {
         if (type.IsValueType) {
@@ -46,7 +62,13 @@ internal static class MemoryOps {
             if (type is not VmIntrinsicType)
                 return ArrayElementKind.Object;
             return type.FullName switch {
-                "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr" => ArrayElementKind.Int64,
+                "System.SByte" => ArrayElementKind.SignedByte,
+                "System.Byte" => ArrayElementKind.UnsignedByte,
+                "System.Char" or "System.UInt16" => ArrayElementKind.UnsignedShort,
+                "System.Int16" => ArrayElementKind.SignedShort,
+                "System.UInt32" => ArrayElementKind.UnsignedInt32,
+                "System.Int64" or "System.UInt64" => ArrayElementKind.Int64,
+                "System.IntPtr" or "System.UIntPtr" => ArrayElementKind.NativeInt,
                 "System.Single" or "System.Double" => ArrayElementKind.Float,
                 _ => ArrayElementKind.Int32, // プリミティブ小整数
             };
@@ -59,7 +81,8 @@ internal static class MemoryOps {
             return array;
         if (slot.ObjectValue is null)
             throw new UnhandledGuestException("System.NullReferenceException", null);
-        throw new InvalidOperationException($"配列でないオブジェクトに配列命令を適用しました: {SlotOps.Describe(slot)}");
+        throw new UnhandledGuestException("System.InvalidProgramException",
+            $"配列でないオブジェクトに配列命令を適用しました: {SlotOps.Describe(slot)}");
     }
 
     public static void CheckArrayBounds(VmArray array, int index) {
@@ -77,7 +100,13 @@ internal static class MemoryOps {
             slot = array.Elements[index];
         return kind switch {
             ArrayElementKind.Int32 => StackSlot.OfInt32((int)slot.Int64Value),
+            ArrayElementKind.SignedByte => StackSlot.OfInt32((sbyte)slot.Int64Value),
+            ArrayElementKind.UnsignedByte => StackSlot.OfInt32((byte)slot.Int64Value),
+            ArrayElementKind.SignedShort => StackSlot.OfInt32((short)slot.Int64Value),
+            ArrayElementKind.UnsignedShort => StackSlot.OfInt32((ushort)slot.Int64Value),
+            ArrayElementKind.UnsignedInt32 => StackSlot.OfInt32(unchecked((int)(uint)slot.Int64Value)),
             ArrayElementKind.Int64 => StackSlot.OfInt64(slot.Int64Value),
+            ArrayElementKind.NativeInt => StackSlot.OfNativeInt(slot.Int64Value),
             ArrayElementKind.Float => StackSlot.OfFloat(array.ArrayType.ElementType.FullName == "System.Single"
                 ? (float)slot.DoubleValue : slot.DoubleValue),
             // 構造体要素は読み出し時にコピーする (値型コピー意味論)
@@ -99,11 +128,19 @@ internal static class MemoryOps {
 
         lock (array.Elements)
             array.Elements[index] = kind switch {
-                ArrayElementKind.Int32 => StackSlot.OfInt32((int)value.Int64Value),
+                ArrayElementKind.Int32 or ArrayElementKind.UnsignedInt32 =>
+                    StackSlot.OfInt32(unchecked((int)(uint)value.Int64Value)),
+                ArrayElementKind.SignedByte or ArrayElementKind.UnsignedByte =>
+                    StackSlot.OfInt32(unchecked((byte)value.Int64Value)),
+                ArrayElementKind.SignedShort or ArrayElementKind.UnsignedShort =>
+                    StackSlot.OfInt32(unchecked((ushort)value.Int64Value)),
                 ArrayElementKind.Int64 => StackSlot.OfInt64(value.Int64Value),
+                ArrayElementKind.NativeInt => StackSlot.OfNativeInt(value.Int64Value),
                 ArrayElementKind.Float => StackSlot.OfFloat(array.ArrayType.ElementType.FullName == "System.Single"
                     ? (float)value.DoubleValue : value.DoubleValue),
-                _ => value,
+                _ => value.ObjectValue is VmStructValue structValue
+                    ? StackSlot.OfValueType(structValue.Clone())
+                    : value,
             };
     }
 
@@ -114,7 +151,8 @@ internal static class MemoryOps {
     private static VmByRef MemoryLocation(in StackSlot slot) =>
         slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef byRef
             ? byRef
-            : throw new InvalidOperationException($"cpblk/initblk はマネージポインタ (&) を要求します: {SlotOps.Describe(slot)}");
+            : throw new UnhandledGuestException("System.InvalidProgramException",
+                $"cpblk/initblk はマネージポインタ (&) を要求します: {SlotOps.Describe(slot)}");
 
     /// <summary>cpblk: unmanaged ポインタ間だけをバイト単位で扱う。
     /// スロット配列は実バイト配置を表していないため、ByRef 間の近似コピーは拒否する。</summary>
@@ -205,7 +243,11 @@ internal static class MemoryOps {
         }
         if (offset < 0 || offset > int.MaxValue)
             throw new UnhandledGuestException("System.OverflowException", null);
-        return StackSlot.OfObject(new VmNativePointer { Memory = pointer.Memory, ByteOffset = (int)offset });
+        return StackSlot.OfObject(new VmNativePointer {
+            Memory = pointer.Memory,
+            ByteOffset = (int)offset,
+            IsReadOnly = pointer.IsReadOnly,
+        });
     }
 
     // ---- 間接アクセス (ldind / stind) ----
@@ -223,7 +265,7 @@ internal static class MemoryOps {
                 ILOp.Ldind_I8 or ILOp.Ldind_I => ReadInt64(ptr),
                 ILOp.Ldind_R4 => ReadSingle(ptr),
                 ILOp.Ldind_R8 => ReadDouble(ptr),
-                _ => throw new NotSupportedException(
+                _ => throw new UnhandledGuestException("System.InvalidProgramException",
                     "unmanaged ポインタからの参照読み出し (ldind.ref) は対応していません。"),
             };
         }
@@ -255,12 +297,14 @@ internal static class MemoryOps {
                 _ => StackSlot.OfInt32((int)slot.Int64Value), // I1〜U4 は i4 正規化スロット
             };
         }
-        throw new InvalidOperationException($"ldind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
+        throw new UnhandledGuestException("System.InvalidProgramException",
+            $"ldind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
     }
 
     /// <summary>stind: アドレスの参照先へ書き込む (LoadIndirect の書き込み版)。</summary>
     public static void StoreIndirect(ILOp op, in StackSlot address, in StackSlot value) {
         if (address.ObjectValue is VmNativePointer ptr) {
+            ptr.EnsureWritable();
             switch (op) {
                 case ILOp.Stind_I1: ptr.EnsureBounds(1); ptr.WriteInt8((int)value.Int64Value); return;
                 case ILOp.Stind_I2: ptr.EnsureBounds(2); ptr.WriteInt16((int)value.Int64Value); return;
@@ -269,7 +313,7 @@ internal static class MemoryOps {
                 case ILOp.Stind_R4: ptr.EnsureBounds(4); ptr.WriteSingle((float)value.DoubleValue); return;
                 case ILOp.Stind_R8: ptr.EnsureBounds(8); ptr.WriteDouble(value.DoubleValue); return;
                 default: // Stind_Ref / Stind_I
-                    throw new NotSupportedException(
+                    throw new UnhandledGuestException("System.InvalidProgramException",
                         "unmanaged ポインタへの参照書き込み (stind.ref) は対応していません。");
             }
         }
@@ -297,7 +341,8 @@ internal static class MemoryOps {
             });
             return;
         }
-        throw new InvalidOperationException($"stind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
+        throw new UnhandledGuestException("System.InvalidProgramException",
+            $"stind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
     }
 
     private static StackSlot ReadInt8(VmNativePointer pointer) { pointer.EnsureBounds(1); return StackSlot.OfInt32(pointer.ReadInt8()); }
@@ -324,7 +369,7 @@ internal static class MemoryOps {
                 "System.Char" or "System.Int16" or "System.UInt16" => 2,
                 "System.Int32" or "System.UInt32" or "System.Single" => 4,
                 "System.Int64" or "System.UInt64" or "System.Double"
-                    or "System.IntPtr" or "System.UIntPtr" => 8,
+                    or "System.IntPtr" or "System.UIntPtr" => VmPrimitiveTypes.NativeIntSizeBytes,
                 // 列挙ファサード等 (StringSplitOptions 等) は VM 内で i4 スロットに正規化される
                 _ => 4,
             };
@@ -339,7 +384,7 @@ internal static class MemoryOps {
                 "System.Char" or "System.Int16" or "System.UInt16" => 2,
                 "System.Int32" or "System.UInt32" or "System.Single" => 4,
                 "System.Int64" or "System.UInt64" or "System.Double"
-                    or "System.IntPtr" or "System.UIntPtr" => 8,
+                    or "System.IntPtr" or "System.UIntPtr" => VmPrimitiveTypes.NativeIntSizeBytes,
                 _ => 0,
             };
             if (primitiveSize > 0)

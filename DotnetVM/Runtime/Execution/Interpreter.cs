@@ -156,7 +156,8 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
             var instruction = frame.Code[frame.Ip];
             var isPrefix = IsPrefix(instruction.Op);
             var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
-            var readonlyArrayAddress = frame.PendingReadonly && !isPrefix && instruction.Op == ILOp.Ldelema;
+            var readonlyAddress = frame.PendingReadonly && !isPrefix &&
+                instruction.Op is (ILOp.Ldelema or ILOp.Ldflda or ILOp.Ldsflda);
             var tailCallAllowed = frame.PendingTail && !isPrefix &&
                 (instruction.Op is ILOp.Call or ILOp.Callvirt or ILOp.Calli) &&
                 frame.Ip + 1 < frame.Code.Length && frame.Code[frame.Ip + 1].Op == ILOp.Ret &&
@@ -202,7 +203,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     break;
                 case ILOp.Ldarga_S or ILOp.Ldarga:
                     CheckArgIndex(frame, instruction.IntOperand);
-                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(frame.Arguments, instruction.IntOperand)));
+                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(frame.Arguments, instruction.IntOperand)));
                     break;
                 case ILOp.Starg_S or ILOp.Starg:
                     CheckArgIndex(frame, instruction.IntOperand);
@@ -220,7 +221,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     break;
                 case ILOp.Ldloca_S or ILOp.Ldloca:
                     CheckLocalIndex(frame, instruction.IntOperand);
-                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(frame.Locals, instruction.IntOperand)));
+                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(frame.Locals, instruction.IntOperand)));
                     break;
                 case ILOp.Stloc_0 or ILOp.Stloc_1 or ILOp.Stloc_2 or ILOp.Stloc_3:
                     CheckLocalIndex(frame, instruction.Op - ILOp.Stloc_0);
@@ -387,12 +388,29 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     break;
 
                 // ---- 配列要素 ----
-                case ILOp.Ldelem_I1 or ILOp.Ldelem_U1 or ILOp.Ldelem_I2 or ILOp.Ldelem_U2
-                    or ILOp.Ldelem_I4 or ILOp.Ldelem_U4:
+                case ILOp.Ldelem_I1:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.SignedByte));
+                    break;
+                case ILOp.Ldelem_U1:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.UnsignedByte));
+                    break;
+                case ILOp.Ldelem_I2:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.SignedShort));
+                    break;
+                case ILOp.Ldelem_U2:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.UnsignedShort));
+                    break;
+                case ILOp.Ldelem_I4:
                     frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.Int32));
                     break;
-                case ILOp.Ldelem_I8 or ILOp.Ldelem_I:
+                case ILOp.Ldelem_U4:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.UnsignedInt32));
+                    break;
+                case ILOp.Ldelem_I8:
                     frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.Int64));
+                    break;
+                case ILOp.Ldelem_I:
+                    frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.NativeInt));
                     break;
                 case ILOp.Ldelem_R4 or ILOp.Ldelem_R8:
                     frame.Stack.Push(MemoryOps.ArrayLoad(frame, MemoryOps.ArrayElementKind.Float));
@@ -404,7 +422,16 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     frame.Stack.Push(MemoryOps.ArrayLoad(frame,
                         MemoryOps.ElementKindFromType(objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens))));
                     break;
-                case ILOp.Stelem_I or ILOp.Stelem_I1 or ILOp.Stelem_I2 or ILOp.Stelem_I4:
+                case ILOp.Stelem_I:
+                    MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.NativeInt);
+                    break;
+                case ILOp.Stelem_I1:
+                    MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.SignedByte);
+                    break;
+                case ILOp.Stelem_I2:
+                    MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.SignedShort);
+                    break;
+                case ILOp.Stelem_I4:
                     MemoryOps.ArrayStore(frame, MemoryOps.ArrayElementKind.Int32);
                     break;
                 case ILOp.Stelem_I8:
@@ -424,7 +451,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var index = frame.Stack.Pop().AsInt32;
                     var array = MemoryOps.GetArray(frame.Stack.Pop());
                     MemoryOps.CheckArrayBounds(array, index);
-                     frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, readonlyArrayAddress, array)));
+                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.ArrayElement(array, index, readonlyAddress)));
                     break;
                 }
 
@@ -435,7 +462,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (instruction.Op == ILOp.Ldflda) {
                         // VnString (可変 char バッファ) はバイト実体への unmanaged ポインタ、
                         // それ以外は ByRef (CoreLib IL が Unsafe.Add / Buffer.Memmove に渡す形)
-                        frame.Stack.Push(objects.FieldAddress(objSlot, field));
+                        frame.Stack.Push(objects.FieldAddress(objSlot, field, readonlyAddress));
                         break;
                     }
                     var location = objects.FieldLocation(objSlot, field);
@@ -465,7 +492,8 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (objects.TryGetStaticFieldRvaAddress(instruction.IntOperand) is { } rvaSlot)
                         frame.Stack.Push(rvaSlot);
                     else
-                        frame.Stack.Push(StackSlot.OfByRef(objects.StaticFieldLocation(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens)));
+                        frame.Stack.Push(StackSlot.OfByRef(objects.StaticFieldLocation(
+                            instruction.IntOperand, frame.Context, frame.Method.DynamicTokens, readonlyAddress)));
                     break;
                 }
                 case ILOp.Stsfld: {
@@ -548,11 +576,17 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         var value = MemoryOps.ValueFromBytes(
                             srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
-                        ((VmByRef)dst.ObjectValue!).Write(SlotOps.StoreCopyOfValue(value));
+                        if (dst.ObjectValue is not VmByRef dstManaged)
+                            throw new UnhandledGuestException("System.InvalidProgramException",
+                                "cpobj の宛先がマネージ参照ではありません。");
+                        dstManaged.Write(SlotOps.StoreCopyOfValue(value));
                         break;
                     }
                     if (dst.ObjectValue is VmNativePointer dstOnly) {
-                        var srcValue = ((VmByRef)src.ObjectValue!).Read();
+                        if (src.ObjectValue is not VmByRef srcManaged)
+                            throw new UnhandledGuestException("System.InvalidProgramException",
+                                "cpobj の送信元がマネージ参照ではありません。");
+                        var srcValue = srcManaged.Read();
                         var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
                         if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
@@ -598,10 +632,10 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 case ILOp.Unbox: {
                     var target = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
                     var value = frame.Stack.Pop();
-                    if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+                    if (value.ObjectValue is not VmBoxedValue boxed || !TypeChecks.IsExactUnboxType(boxed.Type, target))
                         throw new UnhandledGuestException("System.InvalidCastException",
                             $"{SlotOps.Describe(value)} を {target.FullName} として unbox できません。");
-                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(boxed.Fields, 0)));
+                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.BoxedValue(boxed)));
                     break;
                 }
                 case ILOp.Unbox_Any: {
@@ -609,7 +643,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var value = frame.Stack.Pop();
                     if (target.IsValueType) {
                         // 値型への unbox.any はボックス化実体からコピーを取り出す
-                        if (value.ObjectValue is not VmBoxedValue boxed || !boxed.Type.IsAssignableTo(target))
+                        if (value.ObjectValue is not VmBoxedValue boxed || !TypeChecks.IsExactUnboxType(boxed.Type, target))
                             throw new UnhandledGuestException("System.InvalidCastException",
                                 $"{SlotOps.Describe(value)} を {target.FullName} に unbox.any できません。");
                         if (VmPrimitiveTypes.IsSlotPrimitive(target.FullName)) {

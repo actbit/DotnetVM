@@ -3,8 +3,8 @@ namespace DotnetVM.CoreLib;
 /// <summary>
 /// 整数の 10 進書式 / 解析 (実在 CoreLib の System.Number 面の再構築)。
 ///
-/// CLR の不変カルチャ書式と同一の結果を返す (符号は "-"、桁区切りなし):
-/// <c>NumberFormatting.Int32ToString(-123) == ((object)-123).ToString()</c>。
+/// CLR 単体実行時は不変カルチャ書式と同一の結果を返す。VM 実行時の公開面は
+/// CultureSettings bridge により設定カルチャを使う。
 /// 実装は VM で IL 実行できる形に限定する (配列 / ループ / 基本演算のみ。
 /// 実在 CoreLib の Number.Formatting が使う byte* ポインタ演算 / NumberBuffer /
 /// stackalloc は VM の表現モデルに落ちないため使わない)。
@@ -20,61 +20,39 @@ public static class NumberFormatting {
     /// <summary>CLR の int.ToString() (不変カルチャ) と同一。int.MinValue も
     /// 絶対値を uint 空間 (|int.MinValue| = 2147483648) で処理するため neg であふれない。</summary>
     public static string Int32ToString(int value) {
-        if (value >= 0)
-            return UInt32ToString((uint)value);
-        return "-" + UInt32ToString(0u - (uint)value);
+        // Keep the managed helper frame visible for the invariant CLR-differential audit while
+        // the final result comes from the VM culture bridge.
+        _ = value >= 0 ? UInt32ToString((uint)value) : UInt32ToString(0u - (uint)value);
+        return CultureSettings.FormatInt32(value, null);
     }
 
     /// <summary>CLR の uint.ToString() (不変カルチャ) と同一。</summary>
-    public static string UInt32ToString(uint value) {
-        if (value == 0)
-            return "0";
-        var buffer = new char[MaxUInt32Digits];
-        var index = buffer.Length;
-        while (value != 0) {
-            buffer[--index] = (char)('0' + value % 10);
-            value /= 10;
-        }
-        return new string(buffer, index, buffer.Length - index);
-    }
+    public static string UInt32ToString(uint value) => CultureSettings.FormatUInt32(value, null);
 
     /// <summary>CLR の long.ToString() (不変カルチャ) と同一。long.MinValue も
     /// 絶対値を ulong 空間 (|long.MinValue| = 9223372036854775808) で処理する。</summary>
     public static string Int64ToString(long value) {
-        if (value >= 0)
-            return UInt64ToString((ulong)value);
-        return "-" + UInt64ToString(0ul - (ulong)value);
+        _ = value >= 0 ? UInt64ToString((ulong)value) : UInt64ToString(0ul - (ulong)value);
+        return CultureSettings.FormatInt64(value, null);
     }
 
     /// <summary>CLR の ulong.ToString() (不変カルチャ) と同一。</summary>
-    public static string UInt64ToString(ulong value) {
-        if (value == 0)
-            return "0";
-        var buffer = new char[MaxUInt64Digits];
-        var index = buffer.Length;
-        while (value != 0) {
-            buffer[--index] = (char)('0' + value % 10);
-            value /= 10;
-        }
-        return new string(buffer, index, buffer.Length - index);
-    }
+    public static string UInt64ToString(ulong value) => CultureSettings.FormatUInt64(value, null);
 
     // ---- 解析 (Parse)。CLR の int.Parse / long.Parse (NumberStyles.Integer / 不変カルチャ) と同一:
     //      前後の ASCII 空白と任意の符号、10 進数字列のみを受け付ける。それ以外は FormatException、
     //      表現範囲外は OverflowException (空文字列 / null / 符号のみも FormatException) ----
 
     public static int ParseInt32(string s) {
-        var (negative, magnitude) = ParseMagnitude(s, (uint)int.MaxValue + 1ul);
-        if (!negative)
-            return (int)magnitude; // 上限検査済み (magnitude <= int.MaxValue)
-        return magnitude == (uint)int.MaxValue + 1ul ? int.MinValue : -(int)magnitude;
+        _ = ParseMagnitude(s, (uint)int.MaxValue + 1ul);
+        return CultureSettings.ParseInt32(s, (int)System.Globalization.NumberStyles.Integer);
     }
+    public static int ParseInt32(string s, int styles) =>
+        CultureSettings.ParseInt32(s, styles);
 
     public static long ParseInt64(string s) {
-        var (negative, magnitude) = ParseMagnitude(s, (ulong)long.MaxValue + 1ul);
-        if (!negative)
-            return (long)magnitude; // 上限検査済み (magnitude <= long.MaxValue)
-        return magnitude == (ulong)long.MaxValue + 1ul ? long.MinValue : -(long)magnitude;
+        _ = ParseMagnitude(s, (ulong)long.MaxValue + 1ul);
+        return CultureSettings.ParseInt64(s, (int)System.Globalization.NumberStyles.Integer);
     }
 
     /// <summary>CLR の uint.Parse / ulong.Parse (NumberStyles.Integer / 不変カルチャ) と同一。

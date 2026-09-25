@@ -19,7 +19,8 @@ namespace DotnetVM.CoreLib;
 /// 引数渡しで置換。Single は double への拡大格納で扱い、bit 組立後に (float) 再丸め
 /// することで正しい値が得られる。
 ///
-/// culture は不変カルチャ固定 (NumberFormatInfo.InvariantInfo の固定値を定数として持つ)。
+/// CLR 単体実行時は不変カルチャ固定。VM 実行時の公開面は CultureSettings bridge により
+/// VmHostOptions.Culture を使う。
 /// </summary>
 public static class DoubleParsing {
     // ---- 不変カルチャ (NumberFormatInfo.InvariantInfo) の固定値 ----
@@ -52,22 +53,27 @@ public static class DoubleParsing {
 
     // ---- 公開エントリ (面ごと) ----
 
-    public static double DoubleParse(string value) => Parse(FloatTraits.Double, value, StyleNumber);
-    public static double DoubleParse(string value, int styles) => Parse(FloatTraits.Double, value, styles);
-    public static double DoubleParse(string value, object? provider) => Parse(FloatTraits.Double, value, StyleNumber);
-    public static double DoubleParse(string value, int styles, object? provider) => Parse(FloatTraits.Double, value, styles);
+    public static double DoubleParse(string value) => CultureSettings.ParseDouble(value, StyleNumber);
+    public static double DoubleParse(string value, int styles) => CultureSettings.ParseDouble(value, styles);
+    public static double DoubleParse(string value, object? provider) => CultureSettings.ParseDouble(value, StyleNumber);
+    public static double DoubleParse(string value, int styles, object? provider) => CultureSettings.ParseDouble(value, styles);
 
     // Single は float に丸めた値を double へ拡大格納して返す (本家 Single.Parse と同値)
-    public static double SingleParse(string value) => Parse(FloatTraits.Single, value, StyleNumber);
-    public static double SingleParse(string value, int styles) => Parse(FloatTraits.Single, value, styles);
-    public static double SingleParse(string value, object? provider) => Parse(FloatTraits.Single, value, StyleNumber);
-    public static double SingleParse(string value, int styles, object? provider) => Parse(FloatTraits.Single, value, styles);
+    public static double SingleParse(string value) => CultureSettings.ParseSingle(value, StyleNumber);
+    public static double SingleParse(string value, int styles) => CultureSettings.ParseSingle(value, styles);
+    public static double SingleParse(string value, object? provider) => CultureSettings.ParseSingle(value, StyleNumber);
+    public static double SingleParse(string value, int styles, object? provider) => CultureSettings.ParseSingle(value, styles);
 
-    // Convert 面 (Convert.ToDouble / ToSingle の文字列入力)
-    public static double ConvertDoubleParse(string value) => Parse(FloatTraits.Double, value, ConvertFloatingPointStyles);
-    public static double ConvertSingleParse(string value) => Parse(FloatTraits.Single, value, ConvertFloatingPointStyles);
-    public static double ConvertDoubleParse(string value, object? provider) => Parse(FloatTraits.Double, value, ConvertFloatingPointStyles);
-    public static double ConvertSingleParse(string value, object? provider) => Parse(FloatTraits.Single, value, ConvertFloatingPointStyles);
+    // Convert 面 (Convert.ToDouble / ToSingle の文字列入力)。VM 実行時は
+    // CultureSettings bridge が configured culture を渡し、CLR 単体実行時は invariant を使う。
+    public static double ConvertDoubleParse(string value) =>
+        CultureSettings.ParseDouble(value, ConvertFloatingPointStyles);
+    public static double ConvertSingleParse(string value) =>
+        CultureSettings.ParseSingle(value, ConvertFloatingPointStyles);
+    public static double ConvertDoubleParse(string value, object? provider) =>
+        CultureSettings.ParseDouble(value, ConvertFloatingPointStyles);
+    public static double ConvertSingleParse(string value, object? provider) =>
+        CultureSettings.ParseSingle(value, ConvertFloatingPointStyles);
 
     private static double Parse(FloatTraits traits, string value, int styles) {
         if (value == null) {

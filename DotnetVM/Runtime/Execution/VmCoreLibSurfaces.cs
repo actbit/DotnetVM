@@ -33,14 +33,15 @@ internal sealed class VmCoreLibSurfaces {
         ("System.UInt32", "ToString", [], "DotnetVM.CoreLib.NumberFormatting", "UInt32ToString", ["System.UInt32"]),
         ("System.UInt64", "ToString", [], "DotnetVM.CoreLib.NumberFormatting", "UInt64ToString", ["System.UInt64"]),
         // IConvertible.ToString(IFormatProvider) の暗黙実装面 (Convert.ToString(object) の
-        // 実 IL が interface ディスパッチで辿る)。provider は不変カルチャ固定で無視
+        // 実 IL が interface ディスパッチで辿る)。provider は VM 設定カルチャを使うため無視
         // (置換後の static 実装は引数 1 個のみ受け、余剰スロットは choke point が無視する)
         ("System.Int32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int32ToString", ["System.Int32"]),
         ("System.Int64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int64ToString", ["System.Int64"]),
         ("System.UInt32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt32ToString", ["System.UInt32"]),
         ("System.UInt64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt64ToString", ["System.UInt64"]),
-        // 整数 10 進解析 (NumberStyles.Integer / 不変カルチャ相当)
+        // 整数 10 進解析 (NumberStyles.Integer / VM 設定カルチャ)
         ("System.Int32", "Parse", ["System.String"], "DotnetVM.CoreLib.NumberFormatting", "ParseInt32", ["System.String"]),
+        ("System.Int32", "Parse", ["System.String", "System.Globalization.NumberStyles"], "DotnetVM.CoreLib.NumberFormatting", "ParseInt32", ["System.String", "System.Int32"]),
         ("System.Int64", "Parse", ["System.String"], "DotnetVM.CoreLib.NumberFormatting", "ParseInt64", ["System.String"]),
         // Convert 面の文字列⇔整数変換 (ボックス化 object 経由の面は載せない = legacy 経路継続)
         ("System.Convert", "ToInt32", ["System.String"], "DotnetVM.CoreLib.IntegerConvert", "ToInt32", ["System.String"]),
@@ -51,7 +52,7 @@ internal sealed class VmCoreLibSurfaces {
         // Convert の (string, IFormatProvider) 面 (C5.5 Wave 1): Convert.ToXxx(object) を
         // 実 IL 化した際に String の IConvertible EII が Convert.ToXxx(value, provider) を
         // 辿り、先の先が Number.Formatting (char* / NumberBuffer) に落ちるため
-        // 不変カルチャ解析の置換 IL へ差し替える (provider は不変カルチャ固定で無視)
+        // 設定カルチャ解析の置換 IL へ差し替える (provider は VM 設定カルチャを使うため無視)
         ("System.Convert", "ToInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt32", ["System.String"]),
         ("System.Convert", "ToInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt64", ["System.String"]),
         ("System.Convert", "ToBoolean", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToBoolean", ["System.String"]),
@@ -64,8 +65,8 @@ internal sealed class VmCoreLibSurfaces {
         // ---- C5.5 Wave 2: 整数書式 overload (標準書式 G/D/X/B/C/F/N/E/P/R + カスタム書式)。
         // 実在側は Number.Formatting (byte* 生ポインタ + NumberBuffer + stackalloc) +
         // NumberFormatInfo culture 機構で構成され VM の表現モデルに落ちないため、
-        // DotnetVM.CoreLib.FormatSpecifiers (意味論移植・不変カルチャ固定) へ差し替える。
-        // provider は不変カルチャ固定で無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // DotnetVM.CoreLib.FormatSpecifiers (意味論移植・設定カルチャ bridge) へ差し替える。
+        // provider は VM 設定カルチャを使うため無視するが 3 引数面は impl 側も 3 パラメータで受ける
         // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
         ("System.Byte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte", "System.String"]),
         ("System.SByte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte", "System.String"]),
@@ -104,9 +105,9 @@ internal sealed class VmCoreLibSurfaces {
         // 実在側は Number.Formatting (Grisu3 / Dragon4 / byte* 生ポインタ + NumberBuffer) +
         // NumberFormatInfo culture 機構で構成され VM の表現モデルに落ちないため、
         // DotnetVM.CoreLib.DoubleFormatting (dotnet/runtime MIT ソースのポインタなし移植・
-        // 不変カルチャ固定) へ差し替える。Single の impl は float 値を double へ拡大格納して
+        // 設定カルチャ bridge) へ差し替える。Single の impl は float 値を double へ拡大格納して
         // 受ける (impl 内で (float) へ再丸めするため実型 Single の意味論を保持)。
-        // provider は不変カルチャ固定で無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // provider は VM 設定カルチャを使うため無視するが 3 引数面は impl 側も 3 パラメータで受ける
         // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
         ("System.Single", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double"]),
         ("System.Double", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double"]),
@@ -116,7 +117,7 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Double", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double", "System.String", "System.Object"]),
         ("System.Single", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double", "System.Object"]),
         ("System.Double", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double", "System.Object"]),
-        // 浮動小数点 10 進解析 (NumberStyles / 不変カルチャ相当。Impl は styles を Int32 受け)
+        // 浮動小数点 10 進解析 (NumberStyles / VM 設定カルチャ。Impl は styles を Int32 受け)
         ("System.Single", "Parse", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String"]),
         ("System.Double", "Parse", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "DoubleParse", ["System.String"]),
         ("System.Single", "Parse", ["System.String", "System.Globalization.NumberStyles"], "DotnetVM.CoreLib.DoubleParsing", "SingleParse", ["System.String", "System.Int32"]),
@@ -136,7 +137,7 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Decimal", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String"]),
         ("System.Convert", "ToString", ["System.Decimal"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
         // Convert の文字列⇔浮動小数点変換 (Convert.ToDouble/ToSingle(string[, provider]) は
-        // NumberStyles.Float | AllowThousands の不変カルチャ解析。ToString(Double/Single) は
+        // NumberStyles.Float | AllowThousands の設定カルチャ解析。ToString(Double/Single) は
         // 実 IL が value.ToString(provider) を直接呼ぶが、面自体も置換面で受ける
         ("System.Convert", "ToDouble", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "ConvertDoubleParse", ["System.String"]),
         ("System.Convert", "ToSingle", ["System.String"], "DotnetVM.CoreLib.DoubleParsing", "ConvertSingleParse", ["System.String"]),
@@ -174,7 +175,7 @@ internal sealed class VmCoreLibSurfaces {
         // 本家 AppendFormatHelper (StringBuilder チャンク + Span 解析) の正確な移植で、
         // index / width の上限や異常書式の FormatException 分類まで CLR 同一。
         // 書式付き要素は IFormattable ディスパッチで整数 / 浮動小数点の既存置換面
-        // (FormatSpecifiers / DoubleFormatting) を辿る。provider は不変カルチャ固定で無視
+        // (FormatSpecifiers / DoubleFormatting) を辿る。provider は VM 設定カルチャを使うため無視
         ("System.String", "Format", ["System.String", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format2", ["System.String", "System.Object"]),
         ("System.String", "Format", ["System.String", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format3", ["System.String", "System.Object", "System.Object"]),
         ("System.String", "Format", ["System.String", "System.Object", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format4", ["System.String", "System.Object", "System.Object", "System.Object"]),

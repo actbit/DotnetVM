@@ -46,6 +46,11 @@ public sealed partial class TypeLoader {
     /// ファイル名照合でなく参照同一性による trusted marker)。</summary>
     public bool IsTrustedCoreLib { get; internal set; }
 
+    /// <summary>VM が同梱する DotnetVM.CoreLib の実装画像か。
+    /// CultureSettings のような VM 専用の host bridge を解決するための marker であり、
+    /// guest がロードした同名画像には付与しない。</summary>
+    public bool IsTrustedVmCoreLib { get; internal set; }
+
     public TypeLoader(AssemblyImage image) {
         _image = image;
         InitializeIntrinsicTypes();

@@ -987,7 +987,7 @@ internal static partial class CoreLibBindings {
             } catch (UnhandledGuestException) {
                 registration.Cancel();
                 throw;
-            } catch (VmGuestThrow guest) {
+            } catch (VmGuestThrow) {
                 registration.Cancel();
                 throw;
             }

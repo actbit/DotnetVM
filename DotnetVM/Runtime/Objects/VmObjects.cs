@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Types;
 
@@ -739,6 +740,9 @@ public sealed class VmNativePointer : VmObject {
 
     public int ByteOffset { get; init; }
 
+    /// <summary>FieldRVA/readonly span 由来のポインタは書き込み不可。</summary>
+    public bool IsReadOnly { get; init; }
+
     public byte[] Bytes => Memory.Bytes;
 
     public override VmType Type => PointerType;
@@ -746,9 +750,27 @@ public sealed class VmNativePointer : VmObject {
     // ---- バイト読み書き (境界検査付き) ----
 
     private void CheckBounds(int byteCount) {
+        if (byteCount < 0)
+            throw new InvalidOperationException("ポインタのアクセス幅が負です。");
         if (ByteOffset < 0 || (long)ByteOffset + byteCount > Bytes.Length)
             throw new InvalidOperationException(
                 $"unmanaged ポインタがブロック外を参照します (offset={ByteOffset}, 要求 {byteCount} バイト, ブロック {Bytes.Length} バイト)。");
+    }
+
+    /// <summary>guest 命令経路用の境界検査。公開した低レベル API の従来例外型は維持しつつ、
+    /// ゲストへはホスト例外を漏らさない。</summary>
+    public void EnsureBounds(int byteCount) {
+        try {
+            CheckBounds(byteCount);
+        } catch (InvalidOperationException ex) {
+            throw new UnhandledGuestException("System.IndexOutOfRangeException", ex.Message);
+        }
+    }
+
+    public void EnsureWritable() {
+        if (IsReadOnly)
+            throw new UnhandledGuestException("System.InvalidProgramException",
+                "読み取り専用の仮想メモリへ書き込めません。");
     }
 
     public int ReadInt8() {
@@ -792,31 +814,37 @@ public sealed class VmNativePointer : VmObject {
     }
 
     public void WriteInt8(int value) {
+        EnsureWritable();
         CheckBounds(1);
         Bytes[ByteOffset] = (byte)value;
     }
 
     public void WriteInt16(int value) {
+        EnsureWritable();
         CheckBounds(2);
         System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2), (short)value);
     }
 
     public void WriteInt32(int value) {
+        EnsureWritable();
         CheckBounds(4);
         System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
 
     public void WriteInt64(long value) {
+        EnsureWritable();
         CheckBounds(8);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteDouble(double value) {
+        EnsureWritable();
         CheckBounds(8);
         System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteSingle(float value) {
+        EnsureWritable();
         CheckBounds(4);
         System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }

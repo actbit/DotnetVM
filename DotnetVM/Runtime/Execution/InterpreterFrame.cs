@@ -1,6 +1,7 @@
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -13,23 +14,40 @@ namespace DotnetVM.Runtime.Execution;
 public sealed class VmByRef {
     public readonly StackSlot[] Container;
     public readonly int Index;
+    /// <summary>配列/オブジェクトの storage owner。ByRef 自体が GC root になった場合も所有物を保持する。</summary>
+    public readonly VmObject? Owner;
 
-    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false) {
+    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false, VmObject? owner = null) {
+        ArgumentNullException.ThrowIfNull(container);
+        if ((uint)index > (uint)container.Length)
+            throw new ArgumentOutOfRangeException(nameof(index));
         Container = container;
         Index = index;
         IsReadOnly = isReadOnly;
+        Owner = owner;
     }
 
     public bool IsReadOnly { get; }
-    public ref StackSlot Slot => ref Container[Index];
+    /// <summary>空コンテナの index 0 は null/one-past 参照の表現として許可する。</summary>
+    public bool IsNullOrOnePast => Index == Container.Length;
+
+    /// <summary>参照先スロット。読み書きの境界を必ず VM 例外へ正規化する。</summary>
+    public ref StackSlot Slot {
+        get {
+            EnsureInBounds();
+            return ref Container[Index];
+        }
+    }
 
     public StackSlot Read() {
+        EnsureInBounds();
         lock (Container)
             return Container[Index];
     }
 
     public void Write(in StackSlot value) {
         EnsureWritable();
+        EnsureInBounds();
         lock (Container)
             Container[Index] = value;
     }
@@ -38,6 +56,15 @@ public sealed class VmByRef {
         if (IsReadOnly)
             throw new UnhandledGuestException("System.InvalidProgramException",
                 "readonly. で作られたマネージ参照には書き込めません。");
+    }
+
+    public void EnsureInBounds() {
+        if ((uint)Index >= (uint)Container.Length)
+            throw new UnhandledGuestException(
+                Container.Length == 0
+                    ? "System.NullReferenceException"
+                    : "System.IndexOutOfRangeException",
+                "マネージ参照が有効なスロットを指していません。");
     }
 }
 

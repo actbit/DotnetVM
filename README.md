@@ -118,6 +118,40 @@ JIT のコンパイル処理自体も VM のリソースポリシーで制限さ
 
 JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
 
+### JIT の速度比較
+
+`DotnetVM.BenchmarkGuest` の同じ Release ビルド済みゲストアセンブリを、次の 3 通りで比較します。
+
+1. **CoreCLR** — ゲストメソッドを CoreCLR 上で型付き delegate から直接実行 (通常の CoreCLR JIT)
+2. **VM interpreter** — `EnableJit = false`
+3. **VM JIT** — `EnableJit = true`, `JitPromotionThreshold = 1`
+
+ワークロードは算術、分岐、配列アクセス、メソッド呼出、オブジェクト確保の 5 パターンです。
+各パターンは CLR 実行結果を期待値として VM の結果を検証します。ロード・JIT コンパイル・
+ウォームアップを計測から除外し、9 サンプル (各 5 回実行) の中央値を表示します。
+
+```bash
+dotnet build DotnetVM.slnx --configuration Release
+dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
+```
+
+2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で
+実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+
+| パターン (入力) | CoreCLR (ms) | VM interpreter (ms) | VM JIT (ms) | interpreter / CoreCLR | JIT / CoreCLR | interpreter / JIT |
+|---|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.836 | 2,122.945 | 2,056.153 | 2,538.8x | 2,458.9x | 1.03x |
+| Branches (100,000) | 2.014 | 1,982.856 | 1,894.130 | 984.3x | 940.2x | 1.05x |
+| Array access (10,000) | 0.118 | 317.975 | 300.199 | 2,683.3x | 2,533.3x | 1.06x |
+| Method calls (100,000) | 0.521 | 2,261.004 | 2,139.330 | 4,335.6x | 4,102.3x | 1.06x |
+| Object allocation (10,000) | 0.246 | 2,827.280 | 2,797.550 | 11,479.0x | 11,358.3x | 1.01x |
+
+この測定では VM JIT は interpreter より 1.01〜1.06 倍高速でした。一方、CoreCLR は
+ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
+フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
+CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で
+変動するため、ベンチマークを追加・変更した場合は上記コマンドで README の実測値も更新してください。
+
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。
 

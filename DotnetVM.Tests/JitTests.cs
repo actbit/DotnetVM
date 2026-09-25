@@ -72,6 +72,53 @@ public sealed class JitTests {
             public static int IsString(object value) => value is string ? 1 : 0;
             public static int CallVirt(string value) => value.Length;
             public static int StaticField() => StaticValue;
+            public static int RefLocal(int value) {
+                var local = value;
+                Increment(ref local);
+                return local;
+            }
+            public static int RefValueArgument(int value) {
+                Increment(ref value);
+                return value;
+            }
+            public static int RefArray(int value) {
+                var values = new int[1];
+                values[0] = value;
+                Increment(ref values[0]);
+                return values[0];
+            }
+            public static int RefField(int value) {
+                var holder = new Holder(value);
+                Increment(ref holder.Value);
+                return holder.Value;
+            }
+            public static int RefStatic() {
+                Increment(ref StaticValue);
+                return StaticValue;
+            }
+            public static int ReadonlyArray(int value) {
+                var values = new int[1];
+                values[0] = value;
+                ref readonly var item = ref values[0];
+                return item;
+            }
+            public static int StructLdobj(int value) {
+                var pair = new Pair { Left = value, Right = 2 };
+                return ReadPair(ref pair).Left;
+            }
+            public static int StructInitobj() {
+                ClearPair(out var pair);
+                return pair.Left + pair.Right;
+            }
+            public static int StructStobj(int value) {
+                var pair = new Pair { Left = 0, Right = 0 };
+                var replacement = new Pair { Left = value, Right = 3 };
+                WritePair(ref pair, replacement);
+                return pair.Left + pair.Right;
+            }
+            public static string TokenTypeName() => typeof(Calc).Name;
+            public static string TokenMethodName() =>
+                System.Reflection.MethodBase.GetCurrentMethod()!.Name;
             public static void ThrowFromJit() => throw new System.InvalidOperationException("jit");
             public static int SizeOfInt() => sizeof(int);
             public static int Infinite() {
@@ -79,10 +126,21 @@ public sealed class JitTests {
                 while (true) i++;
             }
             private static int StaticValue;
+            private static int Increment(ref int value) {
+                value += 1;
+                return value;
+            }
+            private static Pair ReadPair(ref Pair value) => value;
+            private static void ClearPair(out Pair value) => value = default;
+            private static void WritePair(ref Pair target, Pair value) => target = value;
         }
         public sealed class Holder {
             public int Value;
             public Holder(int value) => Value = value;
+        }
+        public struct Pair {
+            public int Left;
+            public int Right;
         }
         """;
 
@@ -224,6 +282,39 @@ public sealed class JitTests {
     }
 
     [Fact]
+    public void JitSupportsManagedByRefsAndLdtoken() {
+        using var vm = CreateVm();
+
+        Assert.Equal(8, vm.Invoke("Vm.Calc", "RefLocal", 7));
+        Assert.Equal(8, vm.Invoke("Vm.Calc", "RefValueArgument", 7));
+        Assert.Equal(8, vm.Invoke("Vm.Calc", "RefArray", 7));
+        Assert.Equal(8, vm.Invoke("Vm.Calc", "RefField", 7));
+        Assert.Equal(1, vm.Invoke("Vm.Calc", "RefStatic"));
+        Assert.Equal(7, vm.Invoke("Vm.Calc", "ReadonlyArray", 7));
+        Assert.Equal(7, vm.Invoke("Vm.Calc", "StructLdobj", 7));
+        Assert.Equal(0, vm.Invoke("Vm.Calc", "StructInitobj"));
+        Assert.Equal(10, vm.Invoke("Vm.Calc", "StructStobj", 7));
+        Assert.Equal("Calc", vm.Invoke("Vm.Calc", "TokenTypeName"));
+        Assert.Equal("TokenMethodName", vm.Invoke("Vm.Calc", "TokenMethodName"));
+
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.RefLocal))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.RefValueArgument))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.RefArray))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.RefField))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.RefStatic))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.ReadonlyArray))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.StructLdobj))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.StructInitobj))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.StructStobj))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.ReadPair))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.ClearPair))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.WritePair))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.TokenTypeName))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.TokenMethodName))));
+        Assert.True(vm.IsJitCompiled(Method(vm, nameof(CalcNames.Increment))));
+    }
+
+    [Fact]
     public void CompilationResourceLimitsFallBackToInterpreter() {
         foreach (var memory in new[] {
             new MemoryPolicy { InstructionQuota = 100_000, JitCompilationBudget = 0 },
@@ -311,6 +402,21 @@ public sealed class JitTests {
         public const string IsString = "IsString";
         public const string CallVirt = "CallVirt";
         public const string StaticField = "StaticField";
+        public const string RefLocal = "RefLocal";
+        public const string RefValueArgument = "RefValueArgument";
+        public const string RefArray = "RefArray";
+        public const string RefField = "RefField";
+        public const string RefStatic = "RefStatic";
+        public const string ReadonlyArray = "ReadonlyArray";
+        public const string StructLdobj = "StructLdobj";
+        public const string StructInitobj = "StructInitobj";
+        public const string StructStobj = "StructStobj";
+        public const string TokenTypeName = "TokenTypeName";
+        public const string TokenMethodName = "TokenMethodName";
+        public const string Increment = "Increment";
+        public const string ReadPair = "ReadPair";
+        public const string ClearPair = "ClearPair";
+        public const string WritePair = "WritePair";
         public const string ThrowFromJit = "ThrowFromJit";
         public const string SizeOfInt = "SizeOfInt";
         public const string Infinite = "Infinite";

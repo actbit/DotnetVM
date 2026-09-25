@@ -39,7 +39,7 @@ dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-re
 
 ### 実行方式
 - **IL インタプリタ** (主) — 事前デコードした IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
-- **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / box / cast / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、byref、ポインタ、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
+- **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / managed ByRef / box / cast / `ldtoken` / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、unmanaged pointer、typed reference、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
 - **独自オブジェクトモデル** — CLR オブジェクトを流用しない。`VmObject` / `VmClassInstance` / `VmStructValue` / `VmArray` / `VmBoxedValue` の全生成が `VmHeap.Allocate` を通るため、アロケーション計上と GC 制御が正確
 
 ### リソース制約 (クォータ + 拒否方式)
@@ -110,9 +110,9 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
 
 ### 簡易 JIT (M8)
-`VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` も VM オブジェクトモデルの操作として実行します。
+`VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` に加えて managed ByRef (`ldarga` / `ldloca` / `ldelema` / `ldflda` / `ldsflda`)、間接アクセス、値型コピー、`ldtoken` も VM オブジェクトモデルの操作として実行します。
 
-対象外の命令 (EH、byref/pointer、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
+対象外の命令 (EH、unmanaged pointer、typed reference、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。managed ByRef は VM のスロット配列を直接指し、`readonly. ldelema` の読み取り専用制約も維持します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
 
 JIT のコンパイル処理自体も VM のリソースポリシーで制限されます。`MemoryPolicy.JitCompilationBudget` は式ツリー構築とデリゲート生成の作業量、`HostWorkBudget` はホスト CPU 作業、`HostTempAllocationByteLimit` はホスト側の一時メモリとして計上されます。さらに `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で VM 全体の保持数・入力サイズ・式ツリー複雑度を制限します。いずれかの上限を超えた場合は例外ではなく、そのメソッドをインタプリタで実行します。
 

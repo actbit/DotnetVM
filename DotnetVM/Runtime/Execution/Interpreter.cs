@@ -424,7 +424,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var index = frame.Stack.Pop().AsInt32;
                     var array = MemoryOps.GetArray(frame.Stack.Pop());
                     MemoryOps.CheckArrayBounds(array, index);
-                    frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, readonlyArrayAddress)));
+                     frame.Stack.Push(StackSlot.OfByRef(new VmByRef(array.Elements, index, readonlyArrayAddress, array)));
                     break;
                 }
 
@@ -444,6 +444,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 }
                 case ILOp.Stfld: {
                     var field = objects.ResolveFieldToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
+                    EnsureFieldWritable(field, frame.Method);
                     var value = frame.Stack.Pop();
                     var objSlot = frame.Stack.Pop();
                     // VnString レシーバはバイト実体 (真実源) に直接書く
@@ -468,6 +469,8 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     break;
                 }
                 case ILOp.Stsfld: {
+                    var field = objects.ResolveFieldToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
+                    EnsureFieldWritable(field, frame.Method);
                     var value = frame.Stack.Pop();
                     objects.StaticFieldLocation(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens).Write(value);
                     break;
@@ -495,13 +498,15 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         var ldType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
                         var ldSize = MemoryOps.SizeOfType(ldType);
                         if (ldNative.ByteOffset < 0 || (long)ldNative.ByteOffset + ldSize > ldNative.Bytes.Length)
-                            throw new InvalidOperationException(
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"ldobj がブロック外を参照します (offset={ldNative.ByteOffset}, {ldSize} バイト)。");
                         frame.Stack.Push(MemoryOps.ValueFromBytes(
                             ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize).ToArray(), ldType, ldSize));
                         break;
                     }
-                    var byref = (VmByRef)address.ObjectValue!;
+                    var byref = address.ObjectValue as VmByRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException",
+                            "ldobj のアドレスがマネージ参照ではありません。");
                     frame.Stack.Push(SlotOps.PushCopyOfValue(byref.Slot));
                     break;
                 }
@@ -511,14 +516,17 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (stAddress.ObjectValue is VmNativePointer stNative) {
                         var stType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
                         var stSize = MemoryOps.SizeOfType(stType);
+                        stNative.EnsureWritable();
                         if (stNative.ByteOffset < 0 || (long)stNative.ByteOffset + stSize > stNative.Bytes.Length)
-                            throw new InvalidOperationException(
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"stobj がブロック外を参照します (offset={stNative.ByteOffset}, {stSize} バイト)。");
                         var stBytes = MemoryOps.BytesOfValue(value, stType, stSize);
                         Array.Copy(stBytes, 0, stNative.Bytes, stNative.ByteOffset, stSize);
                         break;
                     }
-                    var byref = (VmByRef)stAddress.ObjectValue!;
+                    var byref = stAddress.ObjectValue as VmByRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException",
+                            "stobj のアドレスがマネージ参照ではありません。");
                     byref.Write(SlotOps.StoreCopyOfValue(value));
                     break;
                 }
@@ -530,13 +538,14 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (src.ObjectValue is VmNativePointer srcNative && dst.ObjectValue is VmNativePointer dstNative) {
                         if ((long)srcNative.ByteOffset + cpSize > srcNative.Bytes.Length ||
                             (long)dstNative.ByteOffset + cpSize > dstNative.Bytes.Length)
-                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
+                        dstNative.EnsureWritable();
                         Array.Copy(srcNative.Bytes, srcNative.ByteOffset, dstNative.Bytes, dstNative.ByteOffset, cpSize);
                         break;
                     }
                     if (src.ObjectValue is VmNativePointer srcOnly) {
                         if (srcOnly.ByteOffset < 0 || (long)srcOnly.ByteOffset + cpSize > srcOnly.Bytes.Length)
-                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
                         var value = MemoryOps.ValueFromBytes(
                             srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize).ToArray(), cpType, cpSize);
                         ((VmByRef)dst.ObjectValue!).Write(SlotOps.StoreCopyOfValue(value));
@@ -546,12 +555,15 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         var srcValue = ((VmByRef)src.ObjectValue!).Read();
                         var dstBytes = MemoryOps.BytesOfValue(srcValue, cpType, cpSize);
                         if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
-                            throw new InvalidOperationException("cpobj がブロック外を参照します。");
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
+                        dstOnly.EnsureWritable();
                         Array.Copy(dstBytes, 0, dstOnly.Bytes, dstOnly.ByteOffset, cpSize);
                         break;
                     }
-                    var srcRef = (VmByRef)src.ObjectValue!;
-                    var dstRef = (VmByRef)dst.ObjectValue!;
+                    var srcRef = src.ObjectValue as VmByRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "cpobj の送信元がマネージ参照ではありません。");
+                    var dstRef = dst.ObjectValue as VmByRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "cpobj の宛先がマネージ参照ではありません。");
                     dstRef.Write(SlotOps.StoreCopyOfValue(srcRef.Read()));
                     break;
                 }
@@ -560,12 +572,14 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (initAddress.ObjectValue is VmNativePointer initNative) {
                         var initType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
                         var initSize = MemoryOps.SizeOfType(initType);
+                        initNative.EnsureWritable();
                         if (initNative.ByteOffset < 0 || (long)initNative.ByteOffset + initSize > initNative.Bytes.Length)
-                            throw new InvalidOperationException("initobj がブロック外を参照します。");
+                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "initobj がブロック外を参照します。");
                         Array.Clear(initNative.Bytes, initNative.ByteOffset, initSize);
                         break;
                     }
-                    var byref = (VmByRef)initAddress.ObjectValue!;
+                    var byref = initAddress.ObjectValue as VmByRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "initobj のアドレスがマネージ参照ではありません。");
                     byref.Write(engines.Services.Objects.DefaultForType(
                         objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens), loader));
                     break;
@@ -798,9 +812,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
                 // ---- 生メモリ系 ----
                 case ILOp.Localloc: {
-                    var bytes = frame.Stack.Pop().AsInt32;
-                    if (bytes < 0)
-                        throw new UnhandledGuestException("System.OverflowException", null);
+                    var bytes = MemoryOps.ByteCount(frame.Stack.Pop(), "localloc");
                     // VM 内表現: 実バイト列の仮想メモリブロック (ヒープ確保・実バイト数を計上) を作り、
                     // 先頭バイトへの unmanaged ポインタを返す。実 CLR と異なり初期化は 0 (安全側の
                     // 上限動作)、フレーム終了でも解放されない (GC 管理) = 脱出 stackalloc も安全側に動く
@@ -814,14 +826,14 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 }
                 case ILOp.Cpblk: {
                     // スタック: dst, src, size (逆順に pop)
-                    var size = frame.Stack.Pop().AsInt32;
+                    var size = MemoryOps.ByteCount(frame.Stack.Pop(), "cpblk");
                     var src = frame.Stack.Pop();
                     var dst = frame.Stack.Pop();
                     MemoryOps.CopyMemoryBlock(dst, src, size);
                     break;
                 }
                 case ILOp.Initblk: {
-                    var size = frame.Stack.Pop().AsInt32;
+                    var size = MemoryOps.ByteCount(frame.Stack.Pop(), "initblk");
                     var value = frame.Stack.Pop();
                     var dst = frame.Stack.Pop();
                     MemoryOps.InitMemoryBlock(dst, value, size);
@@ -863,7 +875,17 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             var rva = loader.Image.GetFieldRva(tokenRid);
                             if (rva == 0)
                                 throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
-                            var handle = _services.Heap.Allocate(new VmFieldRvaData { Data = loader.Image.GetRvaDataToEnd(rva) });
+                            var field = objects.ResolveFieldToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
+                            var fieldType = field.FieldType
+                                ?? throw new BadImageFormatException($"FieldRVA {field} の型を解決できません。");
+                            var fieldSize = MemoryOps.SizeOfType(fieldType);
+                            var imageData = loader.Image.GetRvaDataToEnd(rva);
+                            if (fieldSize > imageData.Length)
+                                throw new BadImageFormatException(
+                                    $"FieldRVA {field} のデータ長 {imageData.Length} が型サイズ {fieldSize} 未満です。");
+                            var handle = _services.Heap.Allocate(new VmFieldRvaData {
+                                Data = imageData[..fieldSize].ToArray(),
+                            });
                             frame.Stack.Push(StackSlot.OfObject(handle));
                             break;
                         }
@@ -894,6 +916,15 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 Thread.MemoryBarrier();
             frame.Ip++;
         }
+    }
+
+    private static void EnsureFieldWritable(VmField field, VmMethod method) {
+        if (!field.IsInitOnly)
+            return;
+        var allowed = field.IsStatic ? method.Name == ".cctor" : method.Name == ".ctor";
+        if (!allowed)
+            throw new UnhandledGuestException("System.FieldAccessException",
+                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
     }
 
     private static bool IsPrefix(ILOp op) =>

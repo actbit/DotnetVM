@@ -261,7 +261,7 @@ internal sealed class JitFrame {
     }
 
     public void Duplicate(int next) {
-        _frame.Stack.Push(_frame.Stack.Peek());
+        _frame.Stack.Push(SlotOps.PushCopyOfValue(_frame.Stack.Peek()));
         _frame.Ip = next;
     }
 
@@ -396,6 +396,7 @@ internal sealed class JitFrame {
     public void StoreField(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        EnsureFieldWritable(field);
         var value = _frame.Stack.Pop();
         var receiver = _frame.Stack.Pop();
         if (!objects.TryStoreStringField(receiver, field, value))
@@ -412,9 +413,20 @@ internal sealed class JitFrame {
 
     public void StoreStaticField(int token, int next) {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        EnsureFieldWritable(field);
         objects.StaticFieldLocation(token, _frame.Context, _frame.Method.DynamicTokens)
             .Write(_frame.Stack.Pop());
         _frame.Ip = next;
+    }
+
+    private void EnsureFieldWritable(VmField field) {
+        if (!field.IsInitOnly)
+            return;
+        var allowed = field.IsStatic ? _frame.Method.Name == ".cctor" : _frame.Method.Name == ".ctor";
+        if (!allowed)
+            throw new UnhandledGuestException("System.FieldAccessException",
+                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
     }
 
     public void Box(int token, int next) {

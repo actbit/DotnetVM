@@ -38,29 +38,28 @@ internal static partial class CoreLibBindings {
         // パラメータ型名は VM 表現と CoreLib 署名の実型 (統合後) 完全名で鍵化する。
         // i4 統合面 (byte/sbyte/short/ushort/bool/char/int が i4 スロットに載る) は 1 面で受け、
         // i8 / float / double / nint / nuint は別キーで鍵化
-        static string[] I(string t) => [t];
-        const string I4 = "System.Int32", I8 = "System.Int64", R4 = "System.Single", R8 = "System.Double";
+        const string I4 = "System.Int32", I8 = "System.Int64";
         const string Ref1 = "&";
-        void InstanceFace(string name, string[] paramTypes, IntrinsicImpl impl) =>
-            r.RegisterBinding(BindingKey.StaticWithReturn(T, name, paramTypes[0].TrimEnd('&'), paramTypes), impl, BindingOrigin.InternalCall);
 
         // Increment(ref T) / Decrement(ref T): (ref int,int) と (ref long,long) の両面.
         foreach (var (ty, tyName) in new[] { (I4, "System.Int32"), (I8, "System.Int64") }) {
             var vt = tyName;
             r.RegisterBinding(BindingKey.StaticWithReturn(T, "Increment", vt, [vt + Ref1]), static (_, a) => {
                 var loc = Location(a[0], "Increment");
-                var updated = loc.Slot.Kind == StackKind.Int64
-                    ? StackSlot.OfInt64(loc.Slot.Int64Value + 1)
-                    : StackSlot.OfInt32((int)loc.Slot.Int64Value + 1);
-                loc.Slot = updated;
+                var original = loc.Read();
+                var updated = original.Kind == StackKind.Int64
+                    ? StackSlot.OfInt64(original.Int64Value + 1)
+                    : StackSlot.OfInt32((int)original.Int64Value + 1);
+                loc.Write(updated);
                 return updated;
             }, BindingOrigin.InternalCall);
             r.RegisterBinding(BindingKey.StaticWithReturn(T, "Decrement", vt, [vt + Ref1]), static (_, a) => {
                 var loc = Location(a[0], "Decrement");
-                var updated = loc.Slot.Kind == StackKind.Int64
-                    ? StackSlot.OfInt64(loc.Slot.Int64Value - 1)
-                    : StackSlot.OfInt32((int)loc.Slot.Int64Value - 1);
-                loc.Slot = updated;
+                var original = loc.Read();
+                var updated = original.Kind == StackKind.Int64
+                    ? StackSlot.OfInt64(original.Int64Value - 1)
+                    : StackSlot.OfInt32((int)original.Int64Value - 1);
+                loc.Write(updated);
                 return updated;
             }, BindingOrigin.InternalCall);
         }
@@ -99,16 +98,16 @@ internal static partial class CoreLibBindings {
         }
         var exchangeImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "Exchange");
-            var original = loc.Slot;
-            loc.Slot = a[1];
+            var original = loc.Read();
+            loc.Write(a[1]);
             return original;
         });
         var compareExchange = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "CompareExchange");
-            var original = loc.Slot;
+            var original = loc.Read();
             var equal = SlotEquals(original, a[2]);
             if (equal)
-                loc.Slot = a[1];
+                loc.Write(a[1]);
             if (a.Length >= 4 && a[3].ObjectValue is VmByRef succeeded)
                 succeeded.Write(StackSlot.OfInt32(equal ? 1 : 0));
             return original;
@@ -116,15 +115,16 @@ internal static partial class CoreLibBindings {
         var addImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "Add");
             StackSlot updated;
-            if (loc.Slot.Kind == StackKind.Int64) {
-                updated = StackSlot.OfInt64(loc.Slot.Int64Value + a[1].Int64Value);
+            var original = loc.Read();
+            if (original.Kind == StackKind.Int64) {
+                updated = StackSlot.OfInt64(original.Int64Value + a[1].Int64Value);
             } else {
                 int sum;
-                try { sum = checked((int)loc.Slot.Int64Value + a[1].AsInt32); }
+                try { sum = checked((int)original.Int64Value + a[1].AsInt32); }
                 catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
                 updated = StackSlot.OfInt32(sum);
             }
-            loc.Slot = updated;
+            loc.Write(updated);
             return updated;
         });
         RegExchangeFamily(r, T, exchangeImpl, compareExchange, addImpl);
@@ -153,18 +153,18 @@ internal static partial class CoreLibBindings {
         }
         var andImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "And");
-            var original = loc.Slot;
-            loc.Slot = original.Kind == StackKind.Int64
+            var original = loc.Read();
+            loc.Write(original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value & a[1].Int64Value)
-                : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32);
+                : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32));
             return original;
         });
         var orImpl = (IntrinsicImpl)((_, a) => {
             var loc = Location(a[0], "Or");
-            var original = loc.Slot;
-            loc.Slot = original.Kind == StackKind.Int64
+            var original = loc.Read();
+            loc.Write(original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value | a[1].Int64Value)
-                : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32);
+                : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32));
             return original;
         });
         RegAndOrFamily(r, T, "And", andImpl);

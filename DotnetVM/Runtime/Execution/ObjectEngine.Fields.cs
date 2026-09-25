@@ -25,9 +25,18 @@ internal sealed partial class ObjectEngine {
         if (rva == 0)
             return null;
         if (!_rvaFieldAddresses.TryGetValue(token, out var pointer)) {
+            var field = ResolveFieldToken(token);
+            var fieldType = field.FieldType
+                ?? throw new BadImageFormatException($"FieldRVA {field} の型を解決できません。");
+            var fieldSize = MemoryOps.SizeOfType(fieldType);
+            var imageData = _loader.Image.GetRvaDataToEnd(rva);
+            if (fieldSize < 0 || fieldSize > imageData.Length)
+                throw new BadImageFormatException(
+                    $"FieldRVA {field} のデータ長 {imageData.Length} が型サイズ {fieldSize} 未満です。");
             pointer = new VmNativePointer {
-                Memory = new VmLocallocMemory { Bytes = _loader.Image.GetRvaDataToEnd(rva).ToArray() },
+                Memory = new VmLocallocMemory { Bytes = imageData[..fieldSize].ToArray() },
                 ByteOffset = 0,
+                IsReadOnly = true,
             };
             _rvaFieldAddresses[token] = pointer;
         }
@@ -145,12 +154,12 @@ internal sealed partial class ObjectEngine {
                 str.SyncFieldSlotsFromBytes();
                 return new VmByRef(str.FieldSlots, stringFieldOffset == 0 ? 0 : 1);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
-                return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field));
+                return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field), owner: instance);
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed: {
                 // ボックス化ジェネリック構造体 (構築型) は定義型に解いてレイアウトを取る
                 var bt = DefinitionOf(boxed.Type);
                 return bt is not null
-                    ? new VmByRef(boxed.Fields, GetInstanceFieldIndex(bt, field))
+                    ? new VmByRef(boxed.Fields, GetInstanceFieldIndex(bt, field), owner: boxed)
                     : new VmByRef(boxed.Fields, 0);
             }
             case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
@@ -158,9 +167,9 @@ internal sealed partial class ObjectEngine {
                 var target = outer.Read();
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
                     DefinitionOf(sv.StructType) is VmClassType st)
-                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field), outer.IsReadOnly);
+                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field), outer.IsReadOnly, outer.Owner);
                 if (target.ObjectValue is VmClassInstance nested)
-                    return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field), outer.IsReadOnly);
+                    return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field), outer.IsReadOnly, nested);
                 break;
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&

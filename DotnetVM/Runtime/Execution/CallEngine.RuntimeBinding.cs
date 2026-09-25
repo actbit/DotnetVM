@@ -208,7 +208,8 @@ internal sealed partial class CallEngine {
         // 戻り型名をキーに含める (op_Implicit / op_Explicit 群のように同一パラメータ列で
         // 戻り型のみ異なる面を区別する)。既存の全登録面は戻り型ワイルドカードなので、
         // 実引数キー (精密) → 戻り型ワイルドカードキーの順に照合して後方互換を保つ
-        var returnName = DescribeBindingType(method.Signature.ReturnType, methodArgs, classArgs, method.Loader) ?? "";
+        var returnName = DescribeBindingType(method.Signature.ReturnType, methodArgs, classArgs,
+            method.Loader ?? _loader) ?? "";
         var key = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(declaringName, method.Name, returnName, names)
             : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);

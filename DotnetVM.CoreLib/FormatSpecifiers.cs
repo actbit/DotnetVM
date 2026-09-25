@@ -10,9 +10,8 @@ namespace DotnetVM.CoreLib;
 /// 限定して移植したもの (byte* ポインタ / stackalloc / ValueListBuilder / Span を
 /// char[] + インデックス + 手書きバッファに置換。Array.Copy 等の依存面も使わない)。
 ///
-/// culture は不変カルチャ固定 (NumberFormatInfo.Invariant の固定値を定数として持つ:
-/// 負号 "-"、小数点 "."、桁区切り ","、通貨記号 "¤"、パーセント "%"、既定小数桁数 2、
-/// 区切り桁数 [3]、負数パターン -n / (¤n) / -n %)。
+/// CLR 単体実行時は不変カルチャ固定。VM 実行時の公開面は CultureSettings bridge により
+/// VmHostOptions.Culture を使う。
 /// CLR の不変カルチャ書式と同一の結果を返す (VmCoreLibClrTests の全面グリッドで突合)。
 /// </summary>
 public static class FormatSpecifiers {
@@ -38,28 +37,28 @@ public static class FormatSpecifiers {
     /// <summary>数値バッファのサイズ (ulong 20 桁 + 丸め余裕)。</summary>
     private const int DigitBufferSize = 24;
 
-    // ---- 公開エントリ (面ごと)。provider は不変カルチャ固定で無視 ----
+    // ---- 公開エントリ (面ごと)。provider は VM 設定カルチャを使うため bridge では無視 ----
 
-    public static string SByteToString(sbyte value) => FormatSigned(value, 0xFF, null);
-    public static string SByteToString(sbyte value, string? format) => FormatSigned(value, 0xFF, format);
-    public static string SByteToString(sbyte value, string? format, object? provider) => FormatSigned(value, 0xFF, format);
-    public static string ByteToString(byte value) => FormatUnsigned(value, null);
-    public static string ByteToString(byte value, string? format) => FormatUnsigned(value, format);
-    public static string ByteToString(byte value, string? format, object? provider) => FormatUnsigned(value, format);
-    public static string Int16ToString(short value) => FormatSigned(value, 0xFFFF, null);
-    public static string Int16ToString(short value, string? format) => FormatSigned(value, 0xFFFF, format);
-    public static string Int16ToString(short value, string? format, object? provider) => FormatSigned(value, 0xFFFF, format);
-    public static string UInt16ToString(ushort value) => FormatUnsigned(value, null);
-    public static string UInt16ToString(ushort value, string? format) => FormatUnsigned(value, format);
-    public static string UInt16ToString(ushort value, string? format, object? provider) => FormatUnsigned(value, format);
-    public static string Int32ToString(int value, string? format) => FormatSigned(value, 0xFFFFFFFF, format);
-    public static string Int32ToString(int value, string? format, object? provider) => FormatSigned(value, 0xFFFFFFFF, format);
-    public static string UInt32ToString(uint value, string? format) => FormatUnsigned(value, format);
-    public static string UInt32ToString(uint value, string? format, object? provider) => FormatUnsigned(value, format);
-    public static string Int64ToString(long value, string? format) => FormatSignedLong(value, 0xFFFFFFFFFFFFFFFF, format);
-    public static string Int64ToString(long value, string? format, object? provider) => FormatSignedLong(value, 0xFFFFFFFFFFFFFFFF, format);
-    public static string UInt64ToString(ulong value, string? format) => FormatUnsigned(value, format);
-    public static string UInt64ToString(ulong value, string? format, object? provider) => FormatUnsigned(value, format);
+    public static string SByteToString(sbyte value) => CultureSettings.FormatSByte(value, null);
+    public static string SByteToString(sbyte value, string? format) => CultureSettings.FormatSByte(value, format);
+    public static string SByteToString(sbyte value, string? format, object? provider) => CultureSettings.FormatSByte(value, format);
+    public static string ByteToString(byte value) => CultureSettings.FormatByte(value, null);
+    public static string ByteToString(byte value, string? format) => CultureSettings.FormatByte(value, format);
+    public static string ByteToString(byte value, string? format, object? provider) => CultureSettings.FormatByte(value, format);
+    public static string Int16ToString(short value) => CultureSettings.FormatInt16(value, null);
+    public static string Int16ToString(short value, string? format) => CultureSettings.FormatInt16(value, format);
+    public static string Int16ToString(short value, string? format, object? provider) => CultureSettings.FormatInt16(value, format);
+    public static string UInt16ToString(ushort value) => CultureSettings.FormatUInt16(value, null);
+    public static string UInt16ToString(ushort value, string? format) => CultureSettings.FormatUInt16(value, format);
+    public static string UInt16ToString(ushort value, string? format, object? provider) => CultureSettings.FormatUInt16(value, format);
+    public static string Int32ToString(int value, string? format) => CultureSettings.FormatInt32(value, format);
+    public static string Int32ToString(int value, string? format, object? provider) => CultureSettings.FormatInt32(value, format);
+    public static string UInt32ToString(uint value, string? format) => CultureSettings.FormatUInt32(value, format);
+    public static string UInt32ToString(uint value, string? format, object? provider) => CultureSettings.FormatUInt32(value, format);
+    public static string Int64ToString(long value, string? format) => CultureSettings.FormatInt64(value, format);
+    public static string Int64ToString(long value, string? format, object? provider) => CultureSettings.FormatInt64(value, format);
+    public static string UInt64ToString(ulong value, string? format) => CultureSettings.FormatUInt64(value, format);
+    public static string UInt64ToString(ulong value, string? format, object? provider) => CultureSettings.FormatUInt64(value, format);
 
     public static string BooleanToString(bool value) => value ? "True" : "False";
     public static string BooleanToString(bool value, object? provider) => value ? "True" : "False";

@@ -21,9 +21,10 @@ namespace DotnetVM.CoreLib;
 ///   整数の D/X/B は高速経路で先に処理されるため case 自体が無い)
 /// - 値 0 でも小数桁 (Scale) を保持する (Scale = 桁数 - decScale。例: 0.000m → "0.000")
 ///
-/// culture は不変カルチャ固定 (FormatSpecifiers と同じ固定値: 負号 "-"、小数点 "."、
-/// 桁区切り ","、通貨記号 "¤" 等)。96 ビット分解 (lo/mid/hi/flags) は実在 CoreLib の
-/// System.Decimal.GetBits (managed IL: private プロパティ経由) を VM の IL 実行で辿る。
+/// CLR 単体実行時は不変カルチャ固定。VM 実行時の公開面は CultureSettings bridge により
+/// VmHostOptions.Culture を使う (内部の互換計算核は不変値のまま)。96 ビット分解
+/// (lo/mid/hi/flags) は実在 CoreLib の System.Decimal.GetBits
+/// (managed IL: private プロパティ経由) を VM の IL 実行で辿る。
 /// CLR の不変カルチャ書式と同一の結果を返す (VmCoreLibClrTests のグリッドで突合)。
 /// </summary>
 public static class DecimalFormatting {
@@ -37,9 +38,9 @@ public static class DecimalFormatting {
     /// 一致する (ulong 空間に昇格させると lo &lt; div*1e9 のとき 2^64 ラップして破綻)。</summary>
     private const uint TenToPowerNine = 1000000000;
 
-    public static string DecimalToString(decimal value) => Format(value, null);
+    public static string DecimalToString(decimal value) => CultureSettings.FormatDecimal(value, null);
 
-    public static string DecimalToString(decimal value, string? format) => Format(value, format);
+    public static string DecimalToString(decimal value, string? format) => CultureSettings.FormatDecimal(value, format);
 
     /// <summary>本家 FormatDecimal の構成 (ParseFormatSpecifier → DecimalToNumber →
     /// NumberToString / NumberToStringFormat)。</summary>

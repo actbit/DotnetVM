@@ -37,6 +37,7 @@ internal static partial class CoreLibBindings {
         RegisterCancellationAndSynchronization(r);
         RegisterTaskBindings(r);
         RegisterComparableInterfaces(r);
+        RegisterVmCoreLibCultureSettings(r);
         RegisterPrimitiveToString(r);
         RegisterDecimalBindings(r);
         RegisterTimeCultureFaces(r);

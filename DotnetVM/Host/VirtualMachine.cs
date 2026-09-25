@@ -133,6 +133,7 @@ public sealed class VirtualMachine : IDisposable {
         TypeLoader vmCoreLibLoader;
         lock (_assemblyGate)
             vmCoreLibLoader = _loaders[^1];
+        vmCoreLibLoader.IsTrustedVmCoreLib = true;
         var surfaces = VmCoreLibSurfaces.Create(vmCoreLibLoader);
         surfaces.MarkTrustedCoreLib(coreLibLoader);
         _coreLibSurfaces = surfaces;

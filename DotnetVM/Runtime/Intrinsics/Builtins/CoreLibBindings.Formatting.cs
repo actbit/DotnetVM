@@ -19,6 +19,7 @@ internal static partial class CoreLibBindings {
     /// (DotnetVM.CoreLib FormatSpecifiers / DoubleFormatting の managed IL) に置換したため、
     /// ここには載せない (載せると ① が ②'/置換面を塞いでしまう)。</summary>
     private static void RegisterPrimitiveToString(IntrinsicRegistry r) {
+        RegisterCultureLegacyNumericFaces(r);
     }
 
     // ---- 構築ジェネリック インターフェース (プリミティブ実体化面) ----

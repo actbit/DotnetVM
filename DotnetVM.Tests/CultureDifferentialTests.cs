@@ -28,6 +28,13 @@ public sealed class CultureDifferentialTests {
                 public static decimal ParseDecimal(string value) => decimal.Parse(value);
                 public static string ParseTime(string value) => TimeSpan.Parse(value).ToString();
                 public static decimal ParseCommaDecimal() => decimal.Parse("1,5");
+                public static string NumericCulture() =>
+                    12345.67.ToString("N2") + "|" + int.Parse("1.234", NumberStyles.Number).ToString("N0") +
+                    "|" + string.Format("{0:N2}", 12345.67);
+                public static string NumericDoubleParse() =>
+                    double.Parse("1.234,5", NumberStyles.Number).ToString("N1");
+                public static string NumericConvert() =>
+                    Convert.ToDouble("1.234,5").ToString("N1");
                 public static decimal TaskWorkerCulture() =>
                     Task.Run(ParseCommaDecimal).GetAwaiter().GetResult();
                 public static decimal ThreadWorkerCulture() {
@@ -52,10 +59,11 @@ public sealed class CultureDifferentialTests {
         return (Assembly.Load(bytes), bytes);
     });
 
-    private static VirtualMachine CreateVm(CultureInfo culture, MemoryPolicy? memory = null) {
+    private static VirtualMachine CreateVm(CultureInfo culture, MemoryPolicy? memory = null,
+        bool loadHostCoreLib = true) {
         var vm = new VirtualMachine(new VmHostOptions {
             Culture = culture,
-            LoadHostCoreLib = true,
+            LoadHostCoreLib = loadHostCoreLib,
             Memory = memory ?? new MemoryPolicy { InstructionQuota = 100_000_000 },
         });
         using var stream = new MemoryStream(Compiled.Value.Bytes);
@@ -101,6 +109,20 @@ public sealed class CultureDifferentialTests {
         AssertMatchesClr(culture, "ParseDate", "31.12.2024");
         AssertMatchesClr(culture, "ParseDecimal", "1.234,50");
         AssertMatchesClr(culture, "ParseTime", "1:02:03,5");
+    }
+
+    [Fact]
+    public void NumericFormattingAndParsing_UseConfiguredCultureWithOrWithoutHostCoreLib() {
+        var culture = CultureInfo.GetCultureInfo("de-DE");
+        var expected = RunClr(culture, "NumericCulture");
+        foreach (var loadHostCoreLib in new[] { true, false }) {
+            using var vm = CreateVm(culture, loadHostCoreLib: loadHostCoreLib);
+            Assert.Equal(expected, vm.Invoke("Vm.CultureChecks.Ops", "NumericCulture"));
+            Assert.Equal(RunClr(culture, "NumericDoubleParse"),
+                vm.Invoke("Vm.CultureChecks.Ops", "NumericDoubleParse"));
+            Assert.Equal(RunClr(culture, "NumericConvert"),
+                vm.Invoke("Vm.CultureChecks.Ops", "NumericConvert"));
+        }
     }
 
     [Fact]

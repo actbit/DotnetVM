@@ -16,7 +16,8 @@ namespace DotnetVM.CoreLib;
 /// FloatTraits (参照型) の引数渡しで置換。Single は double への拡大格納で扱い、bit 分解
 /// 時に (float) 再丸めすることで正しい bit 列が得られる。
 ///
-/// culture は不変カルチャ固定 (NumberFormatInfo.InvariantInfo の固定値を定数として持つ)。
+/// CLR 単体実行時は不変カルチャ固定。VM 実行時の公開面は CultureSettings bridge により
+/// VmHostOptions.Culture を使う。
 /// </summary>
 public static class DoubleFormatting {
     // ---- 不変カルチャ (NumberFormatInfo.InvariantInfo) の固定値 ----
@@ -44,18 +45,18 @@ public static class DoubleFormatting {
     private const string PercentPositivePattern = "_ p";   // invariant PercentPositivePattern=0 → "n %"
     private const string PercentNegativePattern = "n_ p";  // invariant PercentNegativePattern=0 → "-n %"
 
-    // ---- 公開エントリ (面ごと)。provider は不変カルチャ固定で無視 ----
+    // ---- 公開エントリ (面ごと)。provider は VM 設定カルチャを使うため bridge では無視 ----
 
-    public static string DoubleToString(double value) => FormatFloat(FloatTraits.Double, value, null);
-    public static string DoubleToString(double value, string? format) => FormatFloat(FloatTraits.Double, value, format);
-    public static string DoubleToString(double value, string? format, object? provider) => FormatFloat(FloatTraits.Double, value, format);
-    public static string DoubleToString(double value, object? provider) => FormatFloat(FloatTraits.Double, value, null);
+    public static string DoubleToString(double value) => CultureSettings.FormatDouble(value, null);
+    public static string DoubleToString(double value, string? format) => CultureSettings.FormatDouble(value, format);
+    public static string DoubleToString(double value, string? format, object? provider) => CultureSettings.FormatDouble(value, format);
+    public static string DoubleToString(double value, object? provider) => CultureSettings.FormatDouble(value, null);
 
     // Single は double に拡大格納して渡る (impl は SingleTraits で処理)。
-    public static string SingleToString(double value) => FormatFloat(FloatTraits.Single, value, null);
-    public static string SingleToString(double value, string? format) => FormatFloat(FloatTraits.Single, value, format);
-    public static string SingleToString(double value, string? format, object? provider) => FormatFloat(FloatTraits.Single, value, format);
-    public static string SingleToString(double value, object? provider) => FormatFloat(FloatTraits.Single, value, null);
+    public static string SingleToString(double value) => CultureSettings.FormatSingle(value, null);
+    public static string SingleToString(double value, string? format) => CultureSettings.FormatSingle(value, format);
+    public static string SingleToString(double value, string? format, object? provider) => CultureSettings.FormatSingle(value, format);
+    public static string SingleToString(double value, object? provider) => CultureSettings.FormatSingle(value, null);
 
     // ---- 本家 FormatFloat の移植 ----
 

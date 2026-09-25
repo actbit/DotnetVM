@@ -87,8 +87,8 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 ### VM CoreLib (DotnetVM.CoreLib) による置換面
 実在 CoreLib の一部の面は、その managed IL が VM の表現モデルに落ちません (`Number.Formatting` の byte* 生ポインタ演算 / NumberBuffer / culture 機構の静的キャッシュ等)。これらは自前の互換ライブラリ **DotnetVM.CoreLib** の managed IL に差し替えて実行します (`VmCoreLibSurfaces` の監査可能な対応表)。
 
-- DotnetVM.CoreLib は外部依存ゼロの普通の .NET クラスライブラリでもあり、**CLR 上でそのまま動作**します (不変カルチャで `int.ToString()` / `int.Parse` / `Convert` 系と同一結果)。CLR 差分テストで正当性を担保してから VM に配線します
-- 差し替えは `Interpreter.Invoke` (唯一の IL 実行入口) で行われるため、MemberRef 解決でも CoreLib IL 内の仮想呼出 (box 済み int の `callvirt ToString` 等) でも同一の面に置換されます。数値の書式・解析や `String.Format` の互換置換面は、現在も不変カルチャ規約 (符号 "-" / 桁区切りなし) です
+- DotnetVM.CoreLib は外部依存ゼロの普通の .NET クラスライブラリでもあり、**CLR 上でそのまま動作**します (単体実行時は不変カルチャで `int.ToString()` / `int.Parse` / `Convert` 系と同一結果)。CLR 差分テストで正当性を担保してから VM に配線します
+- 差し替えは `Interpreter.Invoke` (唯一の IL 実行入口) で行われるため、MemberRef 解決でも CoreLib IL 内の仮想呼出 (box 済み int の `callvirt ToString` 等) でも同一の面に置換されます。置換 IL の数値書式・解析は `CultureSettings` bridge を通じて `VmHostOptions.Culture` を使い、CoreLib 未ロード時の legacy 面も同じカルチャに揃えます
 - IL 実行されるため ExecutionTracer には `DotnetVM.CoreLib` フレームとして記録され、legacy intrinsic 委譲と区別できます
 - 対応表に載っていない面 (ボックス化 `object` 経由の `Convert.ToInt32(object)` 等は従来どおり legacy intrinsic 委譲) を含む全委譲面の分類は、次節の監査表 (`CoreLibSurfaceAudit`) が唯一の真実源です
 
@@ -104,7 +104,7 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 `CoreLibSurfaceAuditTests` が双方向 (順方向: 全登録キーが監査表に載っている / 逆方向: 監査表エントリに実体登録がある) とシャドウ禁止 (置換面にバインドを登録する退行の検出) を常時検査します。
 
-ロケールは `VmHostOptions.Culture` に `CultureInfo` を指定できます (既定は `InvariantCulture`)。例: `new VmHostOptions { Culture = CultureInfo.GetCultureInfo("ja-JP") }`。VM は各外側 guest 呼出の間だけ `CurrentCulture` と `CurrentUICulture` に反映し、終了時にホスト thread の値を復元します。文字列比較・大文字小文字変換、DateTime / TimeSpan の Parse・ToString、および decimal.Parse はこの設定を使います。`CultureInfo` オブジェクト自体の guest 面は未実装です。また DotnetVM.CoreLib の数値書式・整数 Parse や `String.Format` 置換面は不変カルチャ規約を維持します。ordinal で意味論確定の面 (CompareOrdinal / IndexOf(char) / Contains / Replace / Split 全 overload) は DotnetVM.CoreLib 置換面 (`StringOrdinalOps`) が CLR と同じ結果を提供します。
+ロケールは `VmHostOptions.Culture` に `CultureInfo` を指定できます (既定は `InvariantCulture`)。例: `new VmHostOptions { Culture = CultureInfo.GetCultureInfo("ja-JP") }`。VM は各外側 guest 呼出の間だけ `CurrentCulture` と `CurrentUICulture` に反映し、終了時にホスト thread の値を復元します。文字列比較・大文字小文字変換、数値の書式・Parse、DateTime / TimeSpan の Parse・ToString、および decimal.Parse はこの設定を使います。置換 IL の culture bridge は VM 内部専用で、guest が同名 assembly を持ち込んでも利用できません。`CultureInfo` オブジェクト自体の guest 面は未実装です。ordinal で意味論確定の面 (CompareOrdinal / IndexOf(char) / Contains / Replace / Split 全 overload) は DotnetVM.CoreLib 置換面 (`StringOrdinalOps`) が CLR と同じ結果を提供します。
 
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。

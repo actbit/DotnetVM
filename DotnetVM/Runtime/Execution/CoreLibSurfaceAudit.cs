@@ -85,6 +85,30 @@ internal static class CoreLibSurfaceAudit {
 
         var integer4 = new[] { "System.Int32", "System.UInt32", "System.Int64", "System.UInt64" };
 
+        // ---- CultureSettings bridge / no-CoreLib fallback ----
+        var cultureBridgeJ = CultureOutOfScope +
+            "。VM CoreLib の置換 IL からは専用 bridge を通じて VmHostOptions.Culture を適用し、" +
+            "CoreLib 未ロード時の数値面は同じ host BCL 委譲へ直接フォールバックする";
+        foreach (var method in new[] {
+            "FormatByte", "FormatSByte", "FormatInt16", "FormatUInt16", "FormatInt32",
+            "FormatUInt32", "FormatInt64", "FormatUInt64", "FormatSingle", "FormatDouble",
+            "FormatDecimal", "ParseInt32", "ParseInt64", "ParseSingle", "ParseDouble",
+        })
+            Add("DotnetVM.CoreLib.CultureSettings", method, CoreLibSurfaceKind.RuntimeInternal,
+                cultureBridgeJ, hasThis: false, paramCount: 2);
+        var legacyNumericJ = CultureOutOfScope +
+            "。CoreLib 未ロード時の数値書式 / 解析を VM 設定カルチャで host BCL 委譲する legacy fallback";
+        foreach (var type in new[] {
+            "System.Byte", "System.SByte", "System.Int16", "System.UInt16", "System.Int32",
+            "System.UInt32", "System.Int64", "System.UInt64", "System.Single", "System.Double",
+        })
+            Add(type, "ToString", CoreLibSurfaceKind.RuntimeInternal, legacyNumericJ,
+                hasThis: true, paramCount: 1);
+        Add("System.Int32", "Parse", CoreLibSurfaceKind.RuntimeInternal, legacyNumericJ,
+            hasThis: false, paramCount: 2);
+        Add("System.Double", "Parse", CoreLibSurfaceKind.RuntimeInternal, legacyNumericJ,
+            hasThis: false, paramCount: 2);
+
         // ---- CoreLibBindings: 書式付きプリミティブ ToString (culture 書式面) ----
         // C5.5 Wave 2 で整数 8 型 + Boolean/Char、Wave 3 で Single/Double の全 ToString 面
         // (無引数 / format / format+IFormatProvider / IFormatProvider) を Faces 置換面 (b) へ

@@ -18,7 +18,6 @@ internal static partial class CoreLibBindings {
     /// 一般経路 (② IL 実行 / ③ legacy) のまま。</summary>
     private static void RegisterMathBindings(IntrinsicRegistry r) {
         const string T = "System.Math";
-        const string Double = "System.Double";
         const string Midpoint = "System.MidpointRounding";
 
         // ModF(double, out double&): 丸め核 (RoundNumber 内部 IL が呼ぶ InternalCall 面)。

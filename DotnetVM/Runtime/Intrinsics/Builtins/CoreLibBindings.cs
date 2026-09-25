@@ -68,5 +68,5 @@ internal static partial class CoreLibBindings {
     // 重いホスト演算 (CompareInfo / TextInfo / Number.Formatting) を HostWorkBudget
     // (VmHeap.ChargeHostWork) に計上する (符号の作業量を文字数近似での計上)。
     // charge を 1 箇所で集中管理し、従来「intrinsic 毎に Sculptor」だった経路を統一。
-    private static long HostWorkChars(string? a, string? b) => (long)a?.Length + b?.Length ?? 0;
+    private static long HostWorkChars(string? a, string? b) => (long)(a?.Length ?? 0) + (b?.Length ?? 0);
 }

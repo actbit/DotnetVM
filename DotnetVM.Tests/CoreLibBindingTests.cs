@@ -1,5 +1,3 @@
-using System.Reflection;
-using DotnetVM.Host;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Intrinsics;
 using Xunit;
@@ -78,21 +76,14 @@ public class CoreLibBindingTests {
         }
         """;
 
-    private static readonly Lazy<(Assembly Clr, byte[] Bytes)> Compiled = new(() => {
-        var bytes = TestAssemblyCompiler.CompileToBytes(Source, "C4Asm");
-        return (Assembly.Load(bytes), bytes);
-    });
+    private static readonly Lazy<CompiledTestAssembly> Compiled = new(() =>
+        new CompiledTestAssembly(Source, "C4Asm"));
 
     private static object? RunClr(string method) =>
-        Compiled.Value.Clr.GetType("Vm.C4.Entry")!.GetMethod(method, BindingFlags.Public | BindingFlags.Static)!
-            .Invoke(null, null);
+        Compiled.Value.InvokeClr("Vm.C4.Entry", method);
 
-    private static VirtualMachine CreateVm(bool loadCoreLib) {
-        var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = loadCoreLib });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
-        return vm;
-    }
+    private static DotnetVM.Host.VirtualMachine CreateVm(bool loadCoreLib) =>
+        Compiled.Value.CreateVm(loadCoreLib);
 
     /// <summary>CoreLib あり/なしの両 VM と CLR の 3 方突合 (解決経路が変わっても結果が不変なこと)。</summary>
     private static void AssertSameEverywhere(string method) {

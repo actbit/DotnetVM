@@ -20,7 +20,8 @@ internal static partial class CoreLibBindings {
     private static void RegisterTimeCultureFaces(IntrinsicRegistry r) {
         // VM System.TimeSpan 構造体値の構築 (ホスト TimeSpan.Ticks → CoreLib TimeSpan._ticks)
         static StackSlot MakeTimeSpanStruct(IntrinsicContext ctx, TimeSpan ts) {
-            var cls = FindCoreLibType(ctx, "System.TimeSpan");
+            var cls = FindCoreLibType(ctx, "System.TimeSpan")
+                ?? throw new InvalidOperationException("System.TimeSpan の CoreLib 型が見つかりません。");
             var fields = new StackSlot[InstanceFieldCount(cls)];
             var index = 0;
             foreach (var field in cls.Fields) {
@@ -35,7 +36,8 @@ internal static partial class CoreLibBindings {
         }
         // VM System.DateTime 構造体値の構築 (_dateData = ticks | kind<<62 本家レイアウト)
         static StackSlot MakeDateTimeStruct(IntrinsicContext ctx, DateTime dt) {
-            var cls = FindCoreLibType(ctx, "System.DateTime");
+            var cls = FindCoreLibType(ctx, "System.DateTime")
+                ?? throw new InvalidOperationException("System.DateTime の CoreLib 型が見つかりません。");
             var fields = new StackSlot[InstanceFieldCount(cls)];
             var index = 0;
             var kindBits = dt.Kind switch {
@@ -76,7 +78,6 @@ internal static partial class CoreLibBindings {
             return new DateTime(ticks, kind);
         }
         static string? S(in StackSlot slot) => (slot.ObjectValue as VmString)?.Value;
-        static VmString? ResultString(IntrinsicContext ctx, string value) => ctx.MakeString(value);
 
         var timeSpanT = "System.TimeSpan";
         // TimeSpan.ToString (無引数 / format / format,provider): 本家 IL は Span 解析 + culture 機構

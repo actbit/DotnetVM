@@ -632,6 +632,8 @@ public sealed class VirtualMachine : IDisposable {
         }
         if (declared is not null && slot.Kind == StackKind.Int64 && declared.Kind == SigKind.U8)
             return (ulong)slot.Int64Value;
+        if (declared is not null && slot.Kind == StackKind.Float && declared.Kind == SigKind.R4)
+            return (float)slot.DoubleValue;
         return FromSlotCore(slot);
     }
 

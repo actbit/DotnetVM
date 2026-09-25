@@ -401,7 +401,7 @@ internal static class SlotOps {
             case ILOp.Conv_R8: return StackSlot.OfFloat(isFloatSrc ? f : i);
             case ILOp.Conv_R_Un:
                 if (isFloatSrc) return StackSlot.OfFloat(f);
-                return value.Kind == StackKind.Int64
+                return value.Kind is StackKind.Int64 or StackKind.NativeInt
                     ? StackSlot.OfFloat((double)(ulong)value.Int64Value)
                     : StackSlot.OfFloat((double)(uint)value.Int64Value);
 

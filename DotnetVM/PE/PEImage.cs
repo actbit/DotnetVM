@@ -22,7 +22,7 @@ public sealed class PEImage {
         if (span.Length < 0x40 || span[0] != (byte)'M' || span[1] != (byte)'Z')
             throw new BadImageFormatException("DOS ヘッダ ('MZ') が見つかりません。");
         var peHeaderOffset = BinaryPrimitives.ReadInt32LittleEndian(span[0x3C..]);
-        if (peHeaderOffset < 0 || peHeaderOffset + 24 > span.Length)
+        if (peHeaderOffset < 0 || peHeaderOffset > span.Length - 24)
             throw new BadImageFormatException("PE ヘッダのオフセットが不正です。");
 
         // PE シグネチャ 'PE\0\0' + COFF ヘッダ (20バイト)
@@ -33,7 +33,7 @@ public sealed class PEImage {
         var sectionCount = BinaryPrimitives.ReadUInt16LittleEndian(span[(coffHeader + 2)..]);
         var optionalHeaderSize = BinaryPrimitives.ReadUInt16LittleEndian(span[(coffHeader + 16)..]);
         var optionalHeader = coffHeader + 20;
-        if (optionalHeader + optionalHeaderSize > span.Length)
+        if (optionalHeader > span.Length || optionalHeaderSize > span.Length - optionalHeader || optionalHeaderSize < 2)
             throw new BadImageFormatException("オプションヘッダが範囲外です。");
 
         // オプションヘッダ: Magic 0x10B = PE32, 0x20B = PE32+
@@ -44,12 +44,16 @@ public sealed class PEImage {
             _ => throw new BadImageFormatException($"未知のオプションヘッダ Magic: 0x{magic:X}"),
         };
         const int CorDataDirectoryIndex = 14;   // CLR Runtime Header
-        var corHeaderRva = BinaryPrimitives.ReadInt32LittleEndian(span[(dataDirectoryOffset + CorDataDirectoryIndex * 8)..]);
+        var corDirectoryOffset = checked(dataDirectoryOffset + CorDataDirectoryIndex * 8);
+        if (corDirectoryOffset < optionalHeader || corDirectoryOffset > optionalHeader + optionalHeaderSize - 8 ||
+            corDirectoryOffset > span.Length - 8)
+            throw new BadImageFormatException("CLI データディレクトリがオプションヘッダの範囲外です。");
+        var corHeaderRva = BinaryPrimitives.ReadInt32LittleEndian(span[corDirectoryOffset..]);
         if (corHeaderRva == 0)
             throw new BadImageFormatException("CLR ランタイムヘッダ (データディレクトリ 14) が空です。CLI アセンブリではありません。");
 
         var sectionTableOffset = optionalHeader + optionalHeaderSize;
-        if (sectionTableOffset + sectionCount * 40 > span.Length)
+        if (sectionTableOffset > span.Length || sectionCount > (span.Length - sectionTableOffset) / 40)
             throw new BadImageFormatException("セクションテーブルが範囲外です。");
 
         return new PEImage(image, corHeaderRva, new RvaMap(span, sectionCount, sectionTableOffset));
@@ -62,7 +66,7 @@ public sealed class PEImage {
     public ReadOnlySpan<byte> GetSegment(int rva, int size) {
         var offset = GetOffset(rva);
         var span = _image.Span;
-        if (offset + size > span.Length)
+        if (size < 0 || offset < 0 || offset > span.Length - size)
             throw new BadImageFormatException($"RVA 0x{rva:X} のセグメント (size={size}) がファイル末尾を超えます。");
         return span.Slice(offset, size);
     }

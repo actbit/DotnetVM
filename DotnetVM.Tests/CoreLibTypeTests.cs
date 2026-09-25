@@ -1,5 +1,3 @@
-using System.Reflection;
-using DotnetVM.Host;
 using DotnetVM.Runtime.Types;
 using Xunit;
 
@@ -42,21 +40,14 @@ public class CoreLibTypeTests {
         }
         """;
 
-    private static readonly Lazy<(Assembly Clr, byte[] Bytes)> Compiled = new(() => {
-        var bytes = TestAssemblyCompiler.CompileToBytes(Source, "C2Asm");
-        return (Assembly.Load(bytes), bytes);
-    });
+    private static readonly Lazy<CompiledTestAssembly> Compiled = new(() =>
+        new CompiledTestAssembly(Source, "C2Asm"));
 
     private static object? RunClr(string method) =>
-        Compiled.Value.Clr.GetType("Vm.C2.Entry")!.GetMethod(method, BindingFlags.Public | BindingFlags.Static)!
-            .Invoke(null, null);
+        Compiled.Value.InvokeClr("Vm.C2.Entry", method);
 
-    private static VirtualMachine CreateVm(bool loadCoreLib) {
-        var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = loadCoreLib });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
-        return vm;
-    }
+    private static DotnetVM.Host.VirtualMachine CreateVm(bool loadCoreLib) =>
+        Compiled.Value.CreateVm(loadCoreLib);
 
     /// <summary>CoreLib あり/なしの両 VM と CLR の 3 方突合 (実型化しても結果が変わらないこと)。</summary>
     private static void AssertSameEverywhere(string method) {

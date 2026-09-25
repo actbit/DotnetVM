@@ -90,7 +90,7 @@ public sealed partial class Interpreter {
                 // guest instruction.  Do not perform it after the guest has
                 // already exhausted its instruction budget; the first
                 // interpreter instruction will report the normal quota error.
-                var compiled = HasInstructionBudget
+                var compiled = CanUseJit
                     ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
                     : null;
                 return compiled is null
@@ -101,6 +101,7 @@ public sealed partial class Interpreter {
                     lock (state.Gate)
                         state.Frames.Remove(frame);
                 }
+                _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
             }
         } finally {
             state.Depth--;
@@ -119,6 +120,8 @@ public sealed partial class Interpreter {
     internal bool TryInvokeCompiled(VmMethod method, StackSlot[] arguments,
         GenericContext? context, out StackSlot result) {
         result = default;
+        if (!CanUseJit)
+            return false;
         var engines = EnginesFor(method);
         var compiled = engines.Jit.GetCompiled(method);
         if (compiled is null)
@@ -156,6 +159,7 @@ public sealed partial class Interpreter {
             } finally {
                 lock (state.Gate)
                     state.Frames.Remove(frame);
+                _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
             }
         } finally {
             state.Depth--;
@@ -173,6 +177,10 @@ public sealed partial class Interpreter {
         if (!objects.TryStoreStringField(receiver, field, value))
             objects.WriteField(receiver, field, value);
     }
+
+    /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>
+    private bool CanUseJit => HasInstructionBudget &&
+        _tracer?.CapturesInstructions != true && _debugger?.IsActive != true;
 
     /// <summary>外側の guest 呼出の間だけ、ホスト thread の ambient culture を VM 設定に合わせる。</summary>
     private sealed class GuestCultureScope : IDisposable {

@@ -246,7 +246,7 @@ VirtualMachine (Host/)          組み込みファサード
  ├─ Policy/                     クォータ定義 + ゲートウェイ + ブリッジ I/F
  ├─ Devices/VmConsole           仮想コンソールデバイス
  ├─ Intrinsics/                 最小 BCL 面 (起動時登録のみ)
- └─ Diagnostics/IlDisassembler  IL 逆アセンブル (デバッグ/検証)
+ └─ Diagnostics/                 IL 逆アセンブル + 実行トレース/デバッガ
 ```
 
 依存方向は `Diagnostics/Host → Execution → Types/Objects/Heap → Metadata → PE → Binary` の一方向。
@@ -276,8 +276,10 @@ dotnet test DotnetVM.Tests
 - [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
 - [x] C6.1: Task / ValueTask / async-await (Task / Task<T>、ValueTask / ValueTask<T>、Delay / Run / FromResult、各 awaiter、ConfigureAwait、async state machine)
 - [x] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
-- [ ] M9: デバッガ / 実行トレース
+- [x] M9: デバッガ / 実行トレース (命令イベント、IL ブレークポイント、継続、ステップ実行)
 
 C6.1 は `Task` / `Task<T>` と `ValueTask` / `ValueTask<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` / `ValueTask.FromResult`、`ConfigureAwait(bool)` に対応する。`IValueTaskSource` / `IValueTaskSource<T>`、`OnCompleted` / `UnsafeOnCompleted` を使う独自 awaiter、キャンセル token、`Task.WhenAll` / `WhenAny` / `WaitAll`、および `SynchronizationContext` の捕捉・`ConfigureAwait(false)` にも対応する。guest Thread と Task worker は `VmHostOptions` の個別上限と VM 全体の上限で制御されます (既定はいずれも最大 64 worker、`Task.Delay` の未完了 Timer は最大 1024)。
+
+M9 の `VirtualMachine.Tracer` は `Start()` 後に命令ごとの `ExecutionTraceEvent` を `Events` に記録します。`ExecutionTraceOptions.MaxEvents` で記録量を制限でき、上限超過分は `DroppedEventCount` で確認できます。`VirtualMachine.Debugger` では `AddBreakpoint(type, method, ilOffset, assembly)`、`Continue()`、`StepInto()`、`StepOver()`、`StepOut()`、`Pause()` を利用でき、停止通知 (`Stopped`) からホスト UI が実行を制御できます。トレース/デバッグ中は命令可観測性を優先して該当メソッドをインタプリタで実行します。
 
 プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。同梱の DotnetVM.CoreLib も依存ゼロのクラスライブラリで、VM の置換面として DotnetVM.dll と同じディレクトリに配置される。

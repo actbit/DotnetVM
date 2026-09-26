@@ -8,6 +8,7 @@ public sealed class PEImage {
 
     public int CorHeaderRva { get; }
     public RvaMap RvaMap { get; }
+    public int ByteLength => _image.Length;
 
     private PEImage(ReadOnlyMemory<byte> image, int corHeaderRva, RvaMap rvaMap) {
         _image = image;

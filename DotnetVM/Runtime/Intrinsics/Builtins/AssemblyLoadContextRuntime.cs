@@ -236,6 +236,7 @@ internal static class AssemblyLoadContextRuntime {
         };
 
     private static VmAssemblyLoadContext RequireActive(StackSlot slot) {
+        VmLifetime.EnsureLiveForGuest(slot);
         var loadContext = Require(slot);
         if (loadContext.IsUnloaded)
             throw new UnhandledGuestException("System.ObjectDisposedException", "AssemblyLoadContext はアンロード済みです。");
@@ -272,9 +273,10 @@ internal static class AssemblyLoadContextRuntime {
             ?? throw new UnhandledGuestException("System.NotSupportedException", "VM では MemoryStream のみ AssemblyLoadContext に渡せます。");
         var remaining = stream.Bytes.Length - stream.Position;
         CheckAssemblySize(ctx, remaining);
-        // MemoryStream の backing array は構築時に host buffer quota へ計上済み。
-        // stream 部分を ReadOnlyMemory として直接渡し、上限検査前の全量コピーを作らない。
-        var bytes = stream.Bytes.AsMemory(stream.Position, remaining);
+        // PEImage retains its input memory. Copy only the unread slice so a
+        // tiny assembly loaded from the tail of a large MemoryStream does not
+        // keep the entire guest-provided backing array alive.
+        var bytes = stream.Bytes.AsSpan(stream.Position, remaining).ToArray();
         var loader = ctx.LoadAssemblyInContext?.Invoke(loadContext, bytes)
             ?? throw new OperationNotAllowedException("AssemblyLoadContext の動的ローダーは VM ホストから利用できません。");
         stream.Position = stream.Bytes.Length;
@@ -323,37 +325,43 @@ internal static class AssemblyLoadContextRuntime {
     }
 
     private static StackSlot Assemblies(IntrinsicContext ctx, VmAssemblyLoadContext loadContext) {
-        var assemblyType = (VmType?)ctx.Types.FindTypeByFullName("System.Reflection.Assembly")
-            ?? VmAssemblyObject.AssemblyFacade;
-        var elements = loadContext.Context.Loaders
-            .Select(loader => StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader })))
-            .ToArray();
-        return StackSlot.OfObject(ctx.Heap.Allocate(new VmArray(
-            new VmArrayType { ElementType = assemblyType }, elements)));
+        lock (loadContext.LifetimeGate) {
+            VmLifetime.EnsureLiveForGuest(loadContext);
+            var assemblyType = (VmType?)ctx.Types.FindTypeByFullName("System.Reflection.Assembly")
+                ?? VmAssemblyObject.AssemblyFacade;
+            var elements = loadContext.Context.Loaders
+                .Select(loader => StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader })))
+                .ToArray();
+            return StackSlot.OfObject(ctx.Heap.Allocate(new VmArray(
+                new VmArrayType { ElementType = assemblyType }, elements)));
+        }
     }
 
     private static StackSlot LoadByName(IntrinsicContext ctx, VmAssemblyLoadContext loadContext, StackSlot slot) {
-        var fullName = slot.ObjectValue switch {
-            VmAssemblyNameObject assemblyName => assemblyName.FullName,
-            VmString text => text.Value,
-            _ => throw new UnhandledGuestException("System.ArgumentNullException", null),
-        };
-        TypeLoader? loader;
-        if (fullName.Contains(',')) {
-            AssemblyIdentity identity;
-            try {
-                identity = AssemblyIdentity.ParseFullName(fullName);
-            } catch (Exception ex) when (ex is ArgumentException or FileLoadException) {
-                throw new UnhandledGuestException("System.ArgumentException", ex.Message);
+        lock (loadContext.LifetimeGate) {
+            VmLifetime.EnsureLiveForGuest(loadContext);
+            var fullName = slot.ObjectValue switch {
+                VmAssemblyNameObject assemblyName => assemblyName.FullName,
+                VmString text => text.Value,
+                _ => throw new UnhandledGuestException("System.ArgumentNullException", null),
+            };
+            TypeLoader? loader;
+            if (fullName.Contains(',')) {
+                AssemblyIdentity identity;
+                try {
+                    identity = AssemblyIdentity.ParseFullName(fullName);
+                } catch (Exception ex) when (ex is ArgumentException or FileLoadException) {
+                    throw new UnhandledGuestException("System.ArgumentException", ex.Message);
+                }
+                loader = loadContext.Context.FindByIdentity(identity);
+            } else {
+                loader = loadContext.Context.FindBySimpleName(SimpleName(fullName));
             }
-            loader = loadContext.Context.FindByIdentity(identity);
-        } else {
-            loader = loadContext.Context.FindBySimpleName(SimpleName(fullName));
+            if (loader is null)
+                throw new UnhandledGuestException("System.IO.FileNotFoundException",
+                    $"アセンブリ '{fullName}' が見つかりません。");
+            return Assembly(ctx, loader);
         }
-        if (loader is null)
-            throw new UnhandledGuestException("System.IO.FileNotFoundException",
-                $"アセンブリ '{fullName}' が見つかりません。");
-        return Assembly(ctx, loader);
     }
 
     private static int CheckAssemblyByteArray(IntrinsicContext ctx, in StackSlot slot) {

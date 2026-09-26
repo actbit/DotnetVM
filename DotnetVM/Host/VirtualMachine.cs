@@ -24,6 +24,10 @@ public sealed class VirtualMachine : IDisposable {
     private readonly NetworkGateway _network;
     private readonly StorageGateway _storage;
     private readonly List<TypeLoader> _loaders = [];
+    // Keep charges until VM disposal: stale guest/host handles can still retain
+    // an unloaded TypeLoader and therefore its PE image backing memory.
+    private readonly HashSet<TypeLoader> _hostImageChargedLoaders = [];
+    private readonly HashSet<VmAssemblyContext> _assemblyContexts = [];
     private readonly object _assemblyGate = new();
     private readonly VmAssemblyContext _context;
     private readonly VmAssemblyLoadContext _defaultAssemblyLoadContext;
@@ -40,11 +44,14 @@ public sealed class VirtualMachine : IDisposable {
     private int _disposed;
 
     /// <summary>命令ブレークポイントとステップ実行を提供するデバッガ。</summary>
-    public VmDebugger Debugger { get; } = new();
+    public VmDebugger Debugger { get; }
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
         _options.Memory.Validate();
+        if (_options.MaxBreakpoints < 1)
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxBreakpoints は 1 以上である必要があります。");
+        Debugger = new VmDebugger(_options.MaxBreakpoints);
         if (_options.EnableJit && _options.JitPromotionThreshold < 1)
             throw new ArgumentOutOfRangeException(nameof(options), "JitPromotionThreshold は 1 以上である必要があります。");
         if (_options.MaxGuestThreads < 1)
@@ -84,6 +91,7 @@ public sealed class VirtualMachine : IDisposable {
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
         Tracer = new Diagnostics.ExecutionTracer(_options.Memory.MaxTraceEvents);
         _context = new VmAssemblyContext(LoadDependencyAssembly);
+        _assemblyContexts.Add(_context);
         _defaultAssemblyLoadContext = new VmAssemblyLoadContext {
             Context = _context,
             Name = "Default",
@@ -160,6 +168,7 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>ゲスト AssemblyLoadContext 用の名前付き VM ローダーを生成する。</summary>
     private VmAssemblyLoadContext CreateAssemblyLoadContext(string? name, bool isCollectible) {
+        ThrowIfDisposed();
         VmAssemblyContext? context = null;
         context = new VmAssemblyContext(
             path => LoadDependencyAssemblyFromStorage(path, context!),
@@ -172,6 +181,13 @@ public sealed class VirtualMachine : IDisposable {
             IsDefault = false,
             UnloadAction = () => UnloadAssemblyLoadContext(context),
         };
+        lock (_assemblyGate) {
+            if (_disposed != 0) {
+                context.Retire();
+                throw new ObjectDisposedException(nameof(VirtualMachine));
+            }
+            _assemblyContexts.Add(context);
+        }
         return loadContext;
     }
 
@@ -184,7 +200,7 @@ public sealed class VirtualMachine : IDisposable {
         _heap.ChargeHostBuffer(bytes.Length);
         var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
         image.SourcePath = Path.GetFullPath(path);
-        return RegisterAssemblyImage(image, context);
+        return RegisterChargedAssemblyImage(image, context);
     }
 
     /// <summary>ゲスト ALC に byte[] を VM アセンブリとして解析・登録する。入力コピーの quota は intrinsic 側で事前計上済み。</summary>
@@ -197,7 +213,7 @@ public sealed class VirtualMachine : IDisposable {
                 throw new OperationNotAllowedException(
                     $"AssemblyLoadContext の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
             var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
-            return RegisterAssemblyImage(image, loadContext.Context);
+            return RegisterChargedAssemblyImage(image, loadContext.Context);
         }
     }
 
@@ -218,7 +234,7 @@ public sealed class VirtualMachine : IDisposable {
             _heap.ChargeHostBuffer(bytes.Length);
             var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
             image.SourcePath = fullPath;
-            return RegisterAssemblyImage(image, loadContext.Context);
+            return RegisterChargedAssemblyImage(image, loadContext.Context);
         }
     }
 
@@ -233,6 +249,7 @@ public sealed class VirtualMachine : IDisposable {
                 _loaders.Remove(loader);
             foreach (var loader in loaders)
                 context.Unregister(loader);
+            _assemblyContexts.Remove(context);
         }
     }
 
@@ -328,9 +345,14 @@ public sealed class VirtualMachine : IDisposable {
                     $"LoadAssembly の入力が上限を超えています (上限 {maxBytes:N0} バイト。読込途中で打ち切りました)。");
             buffered.Write(copyBuffer, 0, n);
         }
-        var image = AssemblyImage.Parse(buffered.ToArray(), limits: _options.Memory);
+        var imageBytes = buffered.ToArray();
+        // AssemblyImage/PEImage retain the input memory for the lifetime of the
+        // loader.  Stream loading used to bypass host-memory accounting, so a
+        // guest-controlled sequence of one-shot loads could retain uncharged
+        // PE images even though every individual image was size limited.
+        var image = AssemblyImage.Parse(imageBytes, limits: _options.Memory);
         image.SourcePath = sourcePath;
-        return RegisterAssemblyImage(image, context);
+        return RegisterChargedAssemblyImage(image, context);
     }
 
     /// <summary>Assembly.Load(byte[]) 用の画像登録。入力コピーの quota は intrinsic 側で事前計上し、ここでは VM loader で解析する。</summary>
@@ -340,7 +362,24 @@ public sealed class VirtualMachine : IDisposable {
             throw new OperationNotAllowedException(
                 $"Assembly.Load の入力が上限を超えています (上限 {_options.Memory.MaxAssemblyBytes:N0} バイト)。");
         var image = AssemblyImage.Parse(bytes, limits: _options.Memory);
-        return RegisterAssemblyImage(image, _context);
+        return RegisterChargedAssemblyImage(image, _context);
+    }
+
+    private TypeLoader RegisterChargedAssemblyImage(AssemblyImage image, VmAssemblyContext? context = null) {
+        _heap.ChargeHostBytes(image.ByteLength);
+        try {
+            // Keep registration and the charged-loader set atomic with respect
+            // to Dispose/unload.  Otherwise a concurrent Dispose could remove
+            // the loader between the two bookkeeping operations.
+            lock (_assemblyGate) {
+                var loader = RegisterAssemblyImage(image, context);
+                _hostImageChargedLoaders.Add(loader);
+                return loader;
+            }
+        } catch {
+            _heap.ReleaseHostBytes(image.ByteLength);
+            throw;
+        }
     }
 
     private TypeLoader RegisterAssemblyImage(AssemblyImage image, VmAssemblyContext? context = null) {
@@ -728,21 +767,33 @@ public sealed class VirtualMachine : IDisposable {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            VmAssemblyContext[] contexts;
+            lock (_assemblyGate)
+                contexts = _assemblyContexts.ToArray();
+            foreach (var context in contexts)
+                context.Retire();
             Debugger.Dispose();
             _sharedState.Dispose();
             lock (_interpreterGate) {
                 _interpreter?.Dispose();
                 _interpreter = null;
             }
+            _handles.InvalidateAll();
             _heap.RemoveRootObjectSource(_handleRoots);
             _heap.RemoveRootObjectSource(_typeFacadeRoots);
             _heap.RemoveRootObjectSource(_guestThreadRoots);
             _heap.RemoveRootSlotSource(_guestTaskRoots);
+            TypeLoader[] chargedLoaders;
             lock (_assemblyGate) {
                 foreach (var loader in _loaders.ToArray())
-                    _context.Unregister(loader);
+                    loader.Context?.Unregister(loader);
+                chargedLoaders = _hostImageChargedLoaders.ToArray();
+                _hostImageChargedLoaders.Clear();
                 _loaders.Clear();
+                _assemblyContexts.Clear();
             }
+            foreach (var loader in chargedLoaders)
+                _heap.ReleaseHostBytes(loader.Image.ByteLength);
         }
     }
 

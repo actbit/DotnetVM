@@ -63,6 +63,12 @@ public sealed class MemoryPolicy {
     /// </summary>
     public int MaxPreparedMethods { get; init; } = 4096;
 
+    /// <summary>
+    /// 1 loader が prepared method cache に保持できる概算 host representation の合計バイト数。
+    /// 命令列、offset map、ローカル既定値、EH 解決結果を含む。0 は prepared cache を無効化する。
+    /// </summary>
+    public long MaxPreparedMethodBytes { get; init; } = 64L * 1024 * 1024;
+
     /// <summary>1 メソッドを式ツリーへ変換する際に許す概算ノード数。</summary>
     public int MaxJitExpressionNodes { get; init; } = 32_768;
 
@@ -72,6 +78,10 @@ public sealed class MemoryPolicy {
     /// <summary>ロード検証 phase の入力上限 (loader hardening):
     /// Assembly バイト総量 > MaxAssemblyBytes はロード拒否。</summary>
     public long MaxAssemblyBytes { get; init; } = 64 * 1024 * 1024;
+
+    /// <summary>VM の生存中にロード済み PE image が保持する host memory の上限。
+    /// collectible unload 後も stale handle が画像を保持し得るため、上限の返却は VM Dispose 時に行う。</summary>
+    public long LoadedAssemblyHostByteLimit { get; init; } = long.MaxValue;
 
     /// <summary>メタデータ行 (TypeDef / MethodDef / MemberRef 等) の合計上限。
     /// hostile 画像が ソート不可の数値でメタデータを肥大させるのを防ぐ。</summary>
@@ -105,9 +115,11 @@ public sealed class MemoryPolicy {
         if (MaxJitCompiledMethods < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCompiledMethods));
         if (MaxJitCacheEntries < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCacheEntries));
         if (MaxPreparedMethods < 0) throw new ArgumentOutOfRangeException(nameof(MaxPreparedMethods));
+        if (MaxPreparedMethodBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxPreparedMethodBytes));
         if (MaxJitExpressionNodes < 1) throw new ArgumentOutOfRangeException(nameof(MaxJitExpressionNodes));
         if (MaxJitMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitMethodBodyBytes));
         if (MaxAssemblyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxAssemblyBytes));
+        if (LoadedAssemblyHostByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(LoadedAssemblyHostByteLimit));
         if (MaxMetadataRows < 0) throw new ArgumentOutOfRangeException(nameof(MaxMetadataRows));
         if (MaxMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxMethodBodyBytes));
         if (MaxSignatureDepth < 0) throw new ArgumentOutOfRangeException(nameof(MaxSignatureDepth));
@@ -202,4 +214,7 @@ public sealed class VmHostOptions {
     /// cancellation/interrupt で速やかに終了する。
     /// </summary>
     public int ShutdownTimeoutMilliseconds { get; init; } = 5_000;
+
+    /// <summary>デバッガが保持できる命令ブレークポイント数。</summary>
+    public int MaxBreakpoints { get; init; } = 4096;
 }

@@ -42,6 +42,15 @@ public sealed class GcHandleTable {
 
     public int Count { get { lock (_gate) return _handles.Count; } }
 
+    /// <summary>
+    /// VM Dispose 時に全ハンドルを無効化する。個別 Free と異なり、既にホストが保持している
+    /// GcHandle 値もすべて stale になるため、破棄済み VM のオブジェクトを再び root 化できない。
+    /// </summary>
+    internal void InvalidateAll() {
+        lock (_gate)
+            _handles.Clear();
+    }
+
     /// <summary>生存ハンドルの参照先を列挙する (GC ルート用)。</summary>
     public IEnumerable<VmObject> EnumerateRoots() {
         lock (_gate)

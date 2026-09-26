@@ -49,7 +49,6 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly Func<VmAssemblyLoadContext, ReadOnlyMemory<byte>, TypeLoader>? _loadAssemblyInContext;
     private readonly Func<VmAssemblyLoadContext, string, TypeLoader>? _loadAssemblyFromPath;
     private readonly InterpreterServices _services;
-    private readonly MethodPreparer _preparer;
     private readonly ObjectEngine _objectEngine;
     private readonly CallEngine _callEngine;
     private readonly ExceptionDispatcher _exceptionDispatcher;
@@ -778,7 +777,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var signature = calls.DecodeStandAloneSignature(instruction.IntOperand);
                     var argCount = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
                     var fnptr = frame.Stack.Pop();
-                    VmLifetime.EnsureLive(fnptr);
+                    VmLifetime.EnsureLiveForGuest(fnptr);
                     var args = new StackSlot[argCount];
                     for (var i = argCount - 1; i >= 0; i--)
                         args[i] = frame.Stack.Pop();

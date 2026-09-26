@@ -576,6 +576,22 @@ internal sealed class GuestTaskRuntime(
             foreach (var type in _completedSentinels.Keys.ToArray())
                 if (context.OwnsType(type))
                     _completedSentinels.Remove(type);
+            // Continuation roots are deliberately inspected as well. A
+            // collectible delegate may otherwise remain runnable after the
+            // completed-task cache has been cleared.
+            foreach (var (id, roots) in _continuationRoots.ToArray()) {
+                if (roots.Any(IsStaleRoot))
+                    _continuationRoots.TryRemove(id, out _);
+            }
+        }
+
+        static bool IsStaleRoot(StackSlot root) {
+            try {
+                VmLifetime.EnsureLive(root);
+                return false;
+            } catch (ObjectDisposedException) {
+                return true;
+            }
         }
     }
 
@@ -600,6 +616,7 @@ internal sealed class GuestTaskRuntime(
             StartWorker(null, [StackSlot.OfObject(awaited), value], () => {
                 awaited.Wait(_shutdownToken);
                 _shutdownToken.ThrowIfCancellationRequested();
+                VmLifetime.EnsureLive(value);
                 invoke(value);
                 return default;
             }, onSuccess: null, onError: _ => { },

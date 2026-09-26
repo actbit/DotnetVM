@@ -40,12 +40,16 @@ public static class IlDecoder {
             var result = instructions.ToArray();
             ValidateBranchTargets(result, il.Length);
             return result;
+        } catch (BadImageFormatException) {
+            throw;
         } catch (EndOfStreamException ex) {
             throw new BadImageFormatException("IL オペランドが途中で終わっています。", ex);
         } catch (ArgumentOutOfRangeException ex) {
             throw new BadImageFormatException("IL オペランドの範囲が不正です。", ex);
         } catch (OverflowException ex) {
             throw new BadImageFormatException("IL オペランドのサイズがオーバーフローしました。", ex);
+        } catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) {
+            throw new BadImageFormatException("IL の命令形式が不正です。", ex);
         }
     }
 

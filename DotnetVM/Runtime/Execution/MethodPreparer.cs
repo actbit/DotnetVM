@@ -7,38 +7,62 @@ namespace DotnetVM.Runtime.Execution;
 
 /// <summary>メソッドの事前準備キャッシュ: ローカル変数署名のデコード結果と、IL オフセット基準の
 /// EH 句を命令インデックス基準に解決した結果をメソッドごとに 1 回だけ計算して保持する。</summary>
-internal sealed class MethodPreparer(TypeLoader loader) {
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<VmMethod, PreparedMethod> _prepared = new();
+internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) {
+    private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
+    private readonly Queue<VmMethod> _order = [];
+    private readonly object _gate = new();
 
-    public PreparedMethod Prepare(VmMethod method) =>
-        _prepared.GetOrAdd(method, static (candidate, preparer) => preparer.PrepareCore(candidate), this);
+    internal int Count { get { lock (_gate) return _prepared.Count; } }
+
+    public PreparedMethod Prepare(VmMethod method) {
+        lock (_gate)
+            return PrepareCore(method);
+    }
 
     private PreparedMethod PrepareCore(VmMethod method) {
         if (_prepared.TryGetValue(method, out var cached))
             return cached;
 
-        var code = method.DecodeIl();
+        var code = method.Body is null ? [] : DecodeIl(method);
         SigType[] localTypes = method.Body?.DynamicLocalTypes ?? [];
         if (method.Body is { } body && body.DynamicLocalTypes is null && body.LocalVarSigToken != 0) {
             var table = (TableKind)(body.LocalVarSigToken >> 24);
             var rid = (int)(body.LocalVarSigToken & 0xFFFFFF);
             if (table != TableKind.StandAloneSig)
                 throw new BadImageFormatException($"ローカル変数署名トークン 0x{body.LocalVarSigToken:X8} が不正です。");
-            localTypes = SignatureDecoder.DecodeLocalsSignature(
-                loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)),
-                loader.Image.Limits?.MaxSignatureDepth ?? 64,
-                loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+            try {
+                localTypes = SignatureDecoder.DecodeLocalsSignature(
+                    loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)).ToArray(),
+                    loader.Image.Limits?.MaxSignatureDepth ?? 64,
+                    loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+            } catch (BadImageFormatException) {
+                throw;
+            } catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) {
+                throw new BadImageFormatException(
+                    $"ローカル変数署名 0x{body.LocalVarSigToken:X8} の構造が不正です。", ex);
+            }
         }
 
         var prepared = new PreparedMethod(localTypes, code) {
             Clauses = ResolveExceptionClauses(method, code),
         };
+        if (method.Body is not null)
+            IlVerifier.Verify(loader, method, code, localTypes, prepared.Clauses);
         _ = IlStackVerifier.Verify(method, loader, localTypes, code, prepared.Clauses);
-        // Keep the declared capacity after verification.  Some intrinsic
+        // Keep the declared capacity after verification. Some intrinsic
         // surfaces expose a host implementation whose runtime stack shape is
-        // wider than the metadata signature even though the guest IL is
-        // structurally valid; the declared maxstack remains the hard cap.
+        // wider than the metadata signature; the declared maxstack remains the hard cap.
         prepared.MaxStack = method.Body?.MaxStack ?? 0;
+        if (maxPreparedMethods > 0) {
+            _prepared[method] = prepared;
+            _order.Enqueue(method);
+            while (_prepared.Count > maxPreparedMethods) {
+                var oldest = _order.Dequeue();
+                // The dictionary is only populated once per method while the
+                // gate is held, so a FIFO eviction is deterministic and bounded.
+                _prepared.Remove(oldest);
+            }
+        }
         return prepared;
     }
 
@@ -65,34 +89,64 @@ internal sealed class MethodPreparer(TypeLoader loader) {
         var clauses = new PreparedClause[raw.Length];
         for (var i = 0; i < raw.Length; i++) {
             var clause = raw[i];
+            if (clause.Kind is not (ExceptionClauseKind.Catch or ExceptionClauseKind.Filter or
+                ExceptionClauseKind.Finally or ExceptionClauseKind.Fault) ||
+                clause.TryLength <= 0 || clause.HandlerLength <= 0 ||
+                clause.TryOffset < 0 || clause.HandlerOffset < 0)
+                throw new BadImageFormatException($"EH 句 {i} の種別または長さが不正です。");
             if (!offsetToIndex.TryGetValue(clause.TryOffset, out var tryStart) ||
                 !offsetToIndex.TryGetValue(clause.HandlerOffset, out var handlerStart))
                 throw new BadImageFormatException(
                     $"EH 句 {i} (try IL_{clause.TryOffset:X4}, handler IL_{clause.HandlerOffset:X4}) が命令境界上にありません。");
+            var tryEndOffset = CheckedEnd(clause.TryOffset, clause.TryLength, code, i, "try");
+            var handlerEndOffset = CheckedEnd(clause.HandlerOffset, clause.HandlerLength, code, i, "handler");
             clauses[i] = new PreparedClause {
                 Kind = clause.Kind,
                 TryStart = tryStart,
-                TryEnd = IndexAfter(code, clause.TryOffset + clause.TryLength, tryStart),
+                TryEnd = BoundaryIndex(code, tryEndOffset, i, "try 終端"),
                 HandlerStart = handlerStart,
-                HandlerEnd = IndexAfter(code, clause.HandlerOffset + clause.HandlerLength, handlerStart),
+                HandlerEnd = BoundaryIndex(code, handlerEndOffset, i, "handler 終端"),
                 FilterStart = clause.Kind == ExceptionClauseKind.Filter
                     ? (offsetToIndex.TryGetValue(clause.ClassTokenOrFilterOffset, out var filterStart)
                         ? filterStart
                         : throw new BadImageFormatException(
                             $"フィルタ先 IL_{clause.ClassTokenOrFilterOffset:X4} が命令境界上にありません。"))
-                    : -1,
-                ClassToken = clause.ClassTokenOrFilterOffset,
+                        : -1,
+                ClassToken = clause.Kind == ExceptionClauseKind.Catch
+                    ? clause.ClassTokenOrFilterOffset : 0,
             };
+            if (clauses[i].Kind == ExceptionClauseKind.Filter &&
+                (clauses[i].FilterStart < 0 || clauses[i].FilterStart >= clauses[i].HandlerStart))
+                throw new BadImageFormatException($"EH 句 {i} のフィルタ終端が不正です。");
         }
         return clauses;
     }
 
-    /// <summary>指定 IL オフセット以上で最初の命令のインデックス (末尾到達なら code.Length)。</summary>
-    private static int IndexAfter(DecodedInstruction[] code, int ilOffset, int fallback) {
-        for (var i = fallback; i < code.Length; i++)
-            if (code[i].Offset >= ilOffset)
+    private static DecodedInstruction[] DecodeIl(VmMethod method) {
+        try {
+            return method.DecodeIl();
+        } catch (BadImageFormatException) {
+            throw;
+        } catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) {
+            throw new BadImageFormatException($"メソッド {method} の IL が不正です。", ex);
+        }
+    }
+
+    private static int CheckedEnd(int offset, int length, DecodedInstruction[] code, int clauseIndex, string name) {
+        long end = (long)offset + length;
+        var ilLength = code.Length == 0 ? 0 : code[^1].Offset + code[^1].Size;
+        if (end > ilLength)
+            throw new BadImageFormatException($"EH 句 {clauseIndex} の {name} 範囲がメソッド本体を超えています。");
+        return (int)end;
+    }
+
+    private static int BoundaryIndex(DecodedInstruction[] code, int ilOffset, int clauseIndex, string name) {
+        if (code.Length > 0 && ilOffset == code[^1].Offset + code[^1].Size)
+            return code.Length;
+        for (var i = 0; i < code.Length; i++)
+            if (code[i].Offset == ilOffset)
                 return i;
-        return code.Length;
+        throw new BadImageFormatException($"EH 句 {clauseIndex} の {name} IL_{ilOffset:X4} が命令境界上にありません。");
     }
 }
 

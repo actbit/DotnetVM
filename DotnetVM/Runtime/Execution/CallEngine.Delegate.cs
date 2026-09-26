@@ -17,6 +17,9 @@ internal sealed partial class CallEngine {
     /// マルチキャストは全エントリを順に実行し、最後の戻り値を返す (CLR 規約)。
     /// 各呼出は通常の Invoke ゲート経由 (クォータ/セーフポイント/EH 機構を共有)。</summary>
     public StackSlot? InvokeDelegate(VmDelegate @delegate, StackSlot[] args) {
+        VmLifetime.EnsureLive(@delegate);
+        foreach (var argument in args)
+            VmLifetime.EnsureLive(argument);
         if (@delegate.HostCallback is { } hostCallback)
             return hostCallback(args);
 

@@ -126,13 +126,15 @@ public class MetadataParsingTests {
                 Assert.Null(vmBody); // abstract/pinvoke
                 continue;
             }
-            Assert.NotNull(vmBody);
-            var oracleBody = peReader.GetMethodBody(md.RelativeVirtualAddress);
-            Assert.Equal(oracleBody.GetILBytes().Length, vmBody.IlCode.Length);
+            var body = vmBody ?? throw new Xunit.Sdk.XunitException($"MethodDef rid={rid} の本体がありません。");
+            var oracleBody = peReader.GetMethodBody(md.RelativeVirtualAddress)!;
+            var oracleIl = oracleBody.GetILBytes()
+                ?? throw new Xunit.Sdk.XunitException($"MethodDef rid={rid} のoracle IL本体がありません。");
+            Assert.Equal(oracleIl.Length, body.IlCode.Length);
             // IL 本体のバイト一致
-            Assert.True(oracleBody.GetILBytes().AsSpan().SequenceEqual(vmBody.IlCode.ToArray()),
+            Assert.True(oracleIl.AsSpan().SequenceEqual(body.IlCode.ToArray()),
                 $"MethodDef rid={rid} の IL 本体が不一致");
-            Assert.Equal(oracleBody.ExceptionRegions.Length, vmBody.ExceptionClauses?.Length ?? 0);
+            Assert.Equal(oracleBody.ExceptionRegions.Length, body.ExceptionClauses?.Length ?? 0);
         }
     }
 

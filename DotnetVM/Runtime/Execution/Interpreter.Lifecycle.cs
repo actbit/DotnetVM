@@ -19,7 +19,7 @@ public sealed partial class Interpreter {
         // Unload は guest 命令中の intrinsic から再入できる。実行中に engine の
         // root source を外すと、同じ frame の後続 call が辞書から消えた engine を
         // 参照するため、loader のスナップショットを取って安全な命令境界まで遅延する。
-        var loaders = context.Loaders.ToArray();
+        var loaders = context.SnapshotLoaders();
         lock (_cacheRemovalGate)
             _pendingCacheRemovals[context] = loaders;
         FlushPendingAssemblyContextCaches();

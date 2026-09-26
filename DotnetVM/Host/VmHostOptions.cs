@@ -44,6 +44,9 @@ public sealed class MemoryPolicy {
     /// を intrinsic 毎に定数で保持する (全量計上ではなく実コスト近似)。</summary>
     public long HostWorkBudget { get; init; } = 10_000_000;
 
+    /// <summary>診断トレーサが保持する最大イベント数。古いイベントから破棄する。</summary>
+    public int MaxTraceEvents { get; init; } = 100_000;
+
     /// <summary>JIT 式ツリー構築と CLR デリゲート生成専用の VM-wide 作業予算。</summary>
     public long JitCompilationBudget { get; init; } = 1_000_000;
 
@@ -52,6 +55,13 @@ public sealed class MemoryPolicy {
 
     /// <summary>VM 全体の JIT cache entry (昇格拒否済みを含む) の上限。</summary>
     public int MaxJitCacheEntries { get; init; } = 4096;
+
+    /// <summary>
+    /// 1 loader が保持する prepared method (デコード済み IL / locals / EH) の上限。
+    /// 一度しか実行されないメソッドを大量に受け取る VM で host representation が
+    /// 無制限に蓄積しないようにする。0 はキャッシュを無効化する。
+    /// </summary>
+    public int MaxPreparedMethods { get; init; } = 4096;
 
     /// <summary>1 メソッドを式ツリーへ変換する際に許す概算ノード数。</summary>
     public int MaxJitExpressionNodes { get; init; } = 32_768;
@@ -90,9 +100,11 @@ public sealed class MemoryPolicy {
         if (GcTriggerAllocationInterval < 1) throw new ArgumentOutOfRangeException(nameof(GcTriggerAllocationInterval));
         if (HostTempAllocationByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(HostTempAllocationByteLimit));
         if (HostWorkBudget < 0) throw new ArgumentOutOfRangeException(nameof(HostWorkBudget));
+        if (MaxTraceEvents < 1) throw new ArgumentOutOfRangeException(nameof(MaxTraceEvents));
         if (JitCompilationBudget < 0) throw new ArgumentOutOfRangeException(nameof(JitCompilationBudget));
         if (MaxJitCompiledMethods < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCompiledMethods));
         if (MaxJitCacheEntries < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitCacheEntries));
+        if (MaxPreparedMethods < 0) throw new ArgumentOutOfRangeException(nameof(MaxPreparedMethods));
         if (MaxJitExpressionNodes < 1) throw new ArgumentOutOfRangeException(nameof(MaxJitExpressionNodes));
         if (MaxJitMethodBodyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxJitMethodBodyBytes));
         if (MaxAssemblyBytes < 0) throw new ArgumentOutOfRangeException(nameof(MaxAssemblyBytes));

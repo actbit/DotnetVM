@@ -39,9 +39,6 @@ public sealed class VirtualMachine : IDisposable {
     private readonly Func<IEnumerable<StackSlot[]>> _guestTaskRoots;
     private int _disposed;
 
-    /// <summary>命令トレース。Start() で記録を有効化する。</summary>
-    public ExecutionTracer Tracer { get; } = new();
-
     /// <summary>命令ブレークポイントとステップ実行を提供するデバッガ。</summary>
     public VmDebugger Debugger { get; } = new();
 
@@ -85,6 +82,7 @@ public sealed class VirtualMachine : IDisposable {
         _heap.AddRootSlotSource(_guestTaskRoots);
         _network = new NetworkGateway(_options.Network, _options.NetworkBridge);
         _storage = new StorageGateway(_options.Storage, _options.StorageBridge);
+        Tracer = new Diagnostics.ExecutionTracer(_options.Memory.MaxTraceEvents);
         _context = new VmAssemblyContext(LoadDependencyAssembly);
         _defaultAssemblyLoadContext = new VmAssemblyLoadContext {
             Context = _context,
@@ -229,10 +227,11 @@ public sealed class VirtualMachine : IDisposable {
         _sharedState.RemoveAssemblyContextCaches(context);
         lock (_interpreterGate)
             _interpreter?.RemoveAssemblyContextCaches(context);
+        var loaders = context.SnapshotLoaders();
         lock (_assemblyGate) {
-            foreach (var loader in context.Loaders)
+            foreach (var loader in loaders)
                 _loaders.Remove(loader);
-            foreach (var loader in context.Loaders)
+            foreach (var loader in loaders)
                 context.Unregister(loader);
         }
     }
@@ -528,6 +527,9 @@ public sealed class VirtualMachine : IDisposable {
         }
     }
 
+    /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
+    /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>
+    public Diagnostics.ExecutionTracer Tracer { get; }
     private TypeLoader GetPrimaryLoader() {
         lock (_assemblyGate) {
             if (_loaders.Count == 0)

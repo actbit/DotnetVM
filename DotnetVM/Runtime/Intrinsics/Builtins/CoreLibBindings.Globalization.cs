@@ -78,7 +78,6 @@ internal static partial class CoreLibBindings {
             return new DateTime(ticks, kind);
         }
         static string? S(in StackSlot slot) => (slot.ObjectValue as VmString)?.Value;
-
         var timeSpanT = "System.TimeSpan";
         // TimeSpan.ToString (無引数 / format / format,provider): 本家 IL は Span 解析 + culture 機構
         // (TimeSpanFormat / TimeSpanParse は Number.Formatting 系 + IFormatProvider) で構成され、

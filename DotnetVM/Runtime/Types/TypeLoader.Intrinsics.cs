@@ -104,7 +104,7 @@ public sealed partial class TypeLoader {
         });
         // 頻出 BCL 列挙型のファサード (署名上の TypeRef 解決に必要。値は i4 スロットとして扱う)
         foreach (var name in new[] { "StringSplitOptions", "StringComparison" })
-            Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = true, Parent = valueType });
+            Add(new VmIntrinsicType { Namespace = "System", Name = name, IsValue = true, Parent = @enum });
 
         // デリゲート機構のファサード。Delegate/MulticastDelegate は継承判定の根で、
         // Action/Func/Predicate 等はそれらの派生として合成する (newobj デリゲート生成と
@@ -117,8 +117,8 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ParameterizedThreadStart", IsValue = false, Parent = multicastDelegate });
         Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Thread", IsValue = false, Parent = @object });
         Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Monitor", IsValue = false });
-        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadState", IsValue = true, Parent = valueType });
-        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadPriority", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadState", IsValue = true, Parent = @enum });
+        Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "ThreadPriority", IsValue = true, Parent = @enum });
         Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "SynchronizationLockException", IsValue = false, Parent = systemException });
         Add(new VmIntrinsicType { Namespace = "System.Threading", Name = "Interlocked", IsValue = false });
         var task = new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "Task", IsValue = false, Parent = @object };
@@ -133,8 +133,8 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks", Name = "ValueTask`1", IsValue = true, Parent = valueTask }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "IValueTaskSource", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "IValueTaskSource`1", IsValue = false }, [0u]);
-        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceStatus", IsValue = true, Parent = valueType });
-        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceOnCompletedFlags", IsValue = true, Parent = valueType });
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceStatus", IsValue = true, Parent = @enum });
+        Add(new VmIntrinsicType { Namespace = "System.Threading.Tasks.Sources", Name = "ValueTaskSourceOnCompletedFlags", IsValue = true, Parent = @enum });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Span`1", IsValue = true, Parent = valueType }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System", Name = "ReadOnlySpan`1", IsValue = true, Parent = valueType }, [0u]);
         Add(new VmIntrinsicType { Namespace = "System.Runtime.CompilerServices", Name = "TaskAwaiter", IsValue = true, Parent = valueType });

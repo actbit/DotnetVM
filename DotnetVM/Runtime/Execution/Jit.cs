@@ -736,8 +736,17 @@ internal struct JitFrame {
                 var rva = loader.Image.GetFieldRva(tokenRid);
                 if (rva == 0)
                     throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
+                var field = _interpreter.JitObjectsFor(_frame.Method).ResolveFieldToken(
+                    token, _frame.Context, _frame.Method.DynamicTokens);
+                var fieldType = field.FieldType
+                    ?? throw new BadImageFormatException($"FieldRVA {field} の型を解決できません。");
+                var fieldSize = MemoryOps.SizeOfType(fieldType);
+                var imageData = loader.Image.GetRvaDataToEnd(rva);
+                if (fieldSize > imageData.Length)
+                    throw new BadImageFormatException(
+                        $"FieldRVA {field} のデータ長 {imageData.Length} が型サイズ {fieldSize} 未満です。");
                 var handle = _services.Heap.Allocate(new VmFieldRvaData {
-                    Data = loader.Image.GetRvaDataToEnd(rva),
+                    Data = imageData[..fieldSize].ToArray(), OwnerLoader = loader,
                 });
                 _frame.Stack.Push(StackSlot.OfObject(handle));
                 break;

@@ -77,9 +77,7 @@ public sealed partial class Interpreter {
     /// <summary>指定 loader のエンジンセットを取得 (無ければ遅延生成して GC ルート源も登録する)。</summary>
     private LoaderEngines EnginesFor(VmMethod method) {
         var loader = method.Loader;
-        if (loader is not null && loader.Context is null && !ReferenceEquals(loader, _services.Loader))
-            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext),
-                $"メソッド {method} のアセンブリロードコンテキストは既にアンロードされています。");
+        loader?.EnsureLive();
         lock (_enginesGate) {
             if (loader is null || ReferenceEquals(loader, _services.Loader))
                 return _engines[_services.Loader];
@@ -111,7 +109,7 @@ public sealed partial class Interpreter {
             // VmString の型同一性を接続する System.String 実型 (VM 単位。LoadHostCoreLib = true 時のみ非 null)
             StringType = _stringType,
         };
-        var preparer = new MethodPreparer(loader);
+        var preparer = new MethodPreparer(loader, _memory.MaxPreparedMethods);
         var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage, _shared.TypeInitialization);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);

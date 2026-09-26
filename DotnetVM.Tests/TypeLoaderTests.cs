@@ -143,7 +143,7 @@ public class TypeLoaderTests {
         var getValue = derived.FindMethod("GetValue")!;
         Assert.True(getValue.IsVirtual);
         Assert.False(getValue.IsStatic);
-        Assert.Equal(0, getValue.Signature.ParamTypes.Length);
+        Assert.Empty(getValue.Signature.ParamTypes);
         Assert.Equal("System.Int32", NameOf(getValue.Signature.ReturnType));
 
         var labelField = derived.FindField("Label")!;

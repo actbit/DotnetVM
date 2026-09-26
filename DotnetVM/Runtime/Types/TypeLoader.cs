@@ -1,4 +1,5 @@
 using DotnetVM.Metadata;
+using DotnetVM.Runtime.Objects;
 
 namespace DotnetVM.Runtime.Types;
 
@@ -26,6 +27,13 @@ public sealed partial class TypeLoader {
 
     /// <summary>最後に登録されたロードコンテキストの識別子。Unregister 後も型の由来判定に使う。</summary>
     internal Guid? LoadContextIdentity { get; set; }
+
+    /// <summary>この loader の画像が所属する collectible context がまだ生きているか確認する。</summary>
+    internal void EnsureLive() {
+        if (Context?.IsRetired == true || (Context is null && LoadContextIdentity is not null))
+            throw new ObjectDisposedException(nameof(VmAssemblyLoadContext),
+                $"アセンブリ {Image.Name} のロードコンテキストは既にアンロードされています。");
+    }
 
     private readonly Dictionary<int, VmClassType> _typeDefs = [];
     private readonly Dictionary<string, VmIntrinsicType> _intrinsicTypes = [];

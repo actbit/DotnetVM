@@ -369,11 +369,12 @@ public class VmCoreLibClrTests {
             //      ホストに Split(string[]) / Split(string[], int) は存在しないため
             //      options 付き overload 経由のみで突合する ----
             foreach (var sa in strArrs) {
+                var hostSeparators = sa.Select(static value => value!).ToArray();
                 foreach (var o in optionsList)
-                    Assert.Equal(v.Split(sa, o), StringOrdinalOps.SplitStringsOptions(v, sa, o));
+                    Assert.Equal(v.Split(hostSeparators, o), StringOrdinalOps.SplitStringsOptions(v, sa, o));
                 foreach (var count in counts) {
                     foreach (var o in optionsList)
-                        Assert.Equal(v.Split(sa, count, o), StringOrdinalOps.SplitStringsFull(v, sa, count, o));
+                        Assert.Equal(v.Split(hostSeparators, count, o), StringOrdinalOps.SplitStringsFull(v, sa, count, o));
                 }
             }
         }
@@ -419,9 +420,9 @@ public class VmCoreLibClrTests {
                      Outcome(() => StringOrdinalOps.SplitStringOptions("a,b", ",", (StringSplitOptions)99)));
         Assert.Equal(Outcome(() => "a,b".Split(",", -1, StringSplitOptions.None)),
                      Outcome(() => StringOrdinalOps.SplitStringFull("a,b", ",", -1, StringSplitOptions.None)));
-        Assert.Equal(Outcome(() => "a,b".Split(new string?[] { "," }, (StringSplitOptions)99)),
+        Assert.Equal(Outcome(() => "a,b".Split(new[] { "," }, (StringSplitOptions)99)),
                      Outcome(() => StringOrdinalOps.SplitStringsOptions("a,b", [","], (StringSplitOptions)99)));
-        Assert.Equal(Outcome(() => "a,b".Split(new string?[] { "," }, -1, StringSplitOptions.None)),
+        Assert.Equal(Outcome(() => "a,b".Split(new[] { "," }, -1, StringSplitOptions.None)),
                      Outcome(() => StringOrdinalOps.SplitStringsFull("a,b", [","], -1, StringSplitOptions.None)));
     }
 
@@ -493,9 +494,9 @@ public class VmCoreLibClrTests {
         // format null → ArgumentNullException("format") / args null も本家どおり ANE
         Assert.Equal(Outcome(() => string.Format(null!, [42])),
                      Outcome(() => StringFormatting.FormatArray(null, [42])));
-        Assert.ThrowsAny<ArgumentNullException>(() => string.Format("x", (object[]?)null));
-        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray("x", null));
-        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray(null, null));
+        Assert.ThrowsAny<ArgumentNullException>(() => string.Format("x", null!));
+        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray("x", (object[]?)null));
+        Assert.ThrowsAny<ArgumentNullException>(() => StringFormatting.FormatArray(null, (object[]?)null));
     }
 
     [Fact]

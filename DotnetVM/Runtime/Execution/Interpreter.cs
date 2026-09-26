@@ -778,6 +778,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var signature = calls.DecodeStandAloneSignature(instruction.IntOperand);
                     var argCount = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
                     var fnptr = frame.Stack.Pop();
+                    VmLifetime.EnsureLive(fnptr);
                     var args = new StackSlot[argCount];
                     for (var i = argCount - 1; i >= 0; i--)
                         args[i] = frame.Stack.Pop();
@@ -937,6 +938,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                                     $"FieldRVA {field} のデータ長 {imageData.Length} が型サイズ {fieldSize} 未満です。");
                             var handle = _services.Heap.Allocate(new VmFieldRvaData {
                                 Data = imageData[..fieldSize].ToArray(),
+                                OwnerLoader = loader,
                             });
                             frame.Stack.Push(StackSlot.OfObject(handle));
                             break;

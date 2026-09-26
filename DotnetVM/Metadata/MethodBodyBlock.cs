@@ -60,6 +60,8 @@ public sealed class MethodBodyBlock {
                 if (maxMethodBodyBytes.HasValue && codeSize > maxMethodBodyBytes.Value)
                     throw new BadImageFormatException(
                         $"メソッド本体 (tiny) のサイズ {codeSize:N0} が上限 {maxMethodBodyBytes.Value:N0} を超えています。");
+                if (codeSize > span.Length - 1)
+                    throw new BadImageFormatException("tiny メソッド本体が範囲外です。");
                 return new MethodBodyBlock {
                     MaxStack = 8,
                     LocalVarSigToken = 0,
@@ -74,9 +76,13 @@ public sealed class MethodBodyBlock {
                 const int CorILMethodMoreSects = 0x08;
                 var headerDwords = (flagsAndSize >> 12) & 0xF;
                 var headerSize = headerDwords * 4;
+                if (headerDwords < 3)
+                    throw new BadImageFormatException("fat メソッドヘッダのサイズが不正です。");
                 var maxStack = (ushort)(span[2] | (span[3] << 8));
                 var codeSize = (int)(uint)(span[4] | (span[5] << 8) | (span[6] << 16) | (span[7] << 24));
                 var localVarSigToken = (int)(uint)(span[8] | (span[9] << 8) | (span[10] << 16) | (span[11] << 24));
+                if (codeSize < 0)
+                    throw new BadImageFormatException("fat メソッド本体のサイズが符号付き整数の範囲外です。");
                 if (maxMethodBodyBytes.HasValue && codeSize > maxMethodBodyBytes.Value)
                     throw new BadImageFormatException(
                         $"メソッド本体 (fat) のサイズ {codeSize:N0} が上限 {maxMethodBodyBytes.Value:N0} を超えています。");
@@ -86,7 +92,7 @@ public sealed class MethodBodyBlock {
                 ExceptionClause[]? clauses = null;
                 if ((flagsAndSize & CorILMethodMoreSects) != 0) {
                     var sectionOffset = Align(headerSize + codeSize, 4);
-                    clauses = ParseExceptionSections(span, sectionOffset);
+                    clauses = ParseExceptionSections(span, sectionOffset, codeSize);
                 }
 
                 return new MethodBodyBlock {
@@ -106,8 +112,8 @@ public sealed class MethodBodyBlock {
     /// 種別バイト: 種別ビット 0x01 = EHTable (他に 0x02 = OptILTable 等)、
     /// 形式フラグ 0x40 = FatFormat、0x80 = MoreSects。small EH = 0x01、fat EH = 0x41。
     /// </summary>
-    private static ExceptionClause[] ParseExceptionSections(ReadOnlySpan<byte> image, int sectionOffset) {
-        if (sectionOffset >= image.Length)
+    private static ExceptionClause[] ParseExceptionSections(ReadOnlySpan<byte> image, int sectionOffset, int codeSize) {
+        if (sectionOffset < 0 || sectionOffset > image.Length - 4)
             throw new BadImageFormatException("EH セクションが範囲外です。");
 
         var kindByte = image[sectionOffset];
@@ -127,8 +133,10 @@ public sealed class MethodBodyBlock {
             clauseSize = 24;
             clausesOffset = sectionOffset + 4;
         }
+        if (dataSize < 4 || (dataSize - 4) % clauseSize != 0 || dataSize > image.Length - sectionOffset)
+            throw new BadImageFormatException("EH セクションのサイズが不正です。");
         var clauseCount = (dataSize - 4) / clauseSize;
-        if (clausesOffset + clauseCount * clauseSize > image.Length)
+        if (clausesOffset > image.Length || clauseCount > (image.Length - clausesOffset) / clauseSize)
             throw new BadImageFormatException("EH 句が範囲外です。");
 
         var clauses = new ExceptionClause[clauseCount];
@@ -156,6 +164,11 @@ public sealed class MethodBodyBlock {
                 tokenOrFilter = (int)U32(image, p, 20);
             }
 
+            if (tryOffset < 0 || tryLength < 0 || handlerOffset < 0 || handlerLength < 0 ||
+                tryOffset > codeSize || tryLength > codeSize - tryOffset ||
+                handlerOffset > codeSize || handlerLength > codeSize - handlerOffset)
+                throw new BadImageFormatException("EH 句の try/handler 範囲が IL 本体外です。");
+
             // COR_ILEXCEPTION_CLAUSE_FILTER = 0x0001, FINALLY = 0x0002, FAULT = 0x0004
             var (kind, classTokenOrFilter) = (flags & 0x0002) != 0 ? (ExceptionClauseKind.Finally, 0)
                 : (flags & 0x0004) != 0 ? (ExceptionClauseKind.Fault, 0)
@@ -171,5 +184,5 @@ public sealed class MethodBodyBlock {
         (uint)(data[baseOffset + relative] | (data[baseOffset + relative + 1] << 8)
                | (data[baseOffset + relative + 2] << 16) | (data[baseOffset + relative + 3] << 24));
 
-    private static int Align(int value, int alignment) => (value + alignment - 1) & ~(alignment - 1);
+    private static int Align(int value, int alignment) => checked((value + alignment - 1) & ~(alignment - 1));
 }

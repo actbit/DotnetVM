@@ -86,8 +86,11 @@ public static class ObjectGraphWalker {
                     visit(referenced);
                 break;
             case StackKind.ByRef:
-                if (slot.ObjectValue is VmByRef byRef)
+                if (slot.ObjectValue is VmByRef byRef) {
+                    if (byRef.Owner is not null)
+                        visit(byRef.Owner);
                     CollectFromSlots(byRef.Container, visit); // 参照先コンテナ (ローカル/フィールド) を展開
+                }
                 break;
             case StackKind.ValueType:
                 if (slot.ObjectValue is VmStructValue structValue)

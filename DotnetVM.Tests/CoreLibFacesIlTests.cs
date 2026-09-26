@@ -1,5 +1,3 @@
-using System.Reflection;
-using DotnetVM.Host;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -296,19 +294,14 @@ public class CoreLibFacesIlTests {
         }
         """;
 
-    private static readonly Lazy<(Assembly Clr, byte[] Bytes)> Compiled = new(() => {
-        var bytes = TestAssemblyCompiler.CompileToBytes(Source, "C5FacesAsm");
-        return (Assembly.Load(bytes), bytes);
-    });
+    private static readonly Lazy<CompiledTestAssembly> Compiled = new(() =>
+        new CompiledTestAssembly(Source, "C5FacesAsm"));
 
     private static object? InvokeClr(string method, params object?[] args) =>
-        Compiled.Value.Clr.GetType("Vm.C5.FaceOps")!.GetMethod(method, BindingFlags.Public | BindingFlags.Static)!
-            .Invoke(null, args);
+        Compiled.Value.InvokeClr("Vm.C5.FaceOps", method, args);
 
     private static object? InvokeVm(string method, params object?[] args) {
-        using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
+        using var vm = Compiled.Value.CreateVm();
         return vm.Invoke("Vm.C5.FaceOps", method, args);
     }
 
@@ -355,9 +348,7 @@ public class CoreLibFacesIlTests {
 
     private static void AssertRunFrames(string assemblyName, string method, object?[] args,
         (string type, string name)[] frames, string hint) {
-        using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
-        using var stream = new MemoryStream(Compiled.Value.Bytes);
-        vm.LoadAssembly(stream);
+        using var vm = Compiled.Value.CreateVm();
         var tracer = vm.Tracer;
         tracer.Start();
         try {

@@ -1,5 +1,7 @@
 <Solution>
   <Project Path="DotnetVM.CoreLib/DotnetVM.CoreLib.csproj" />
   <Project Path="DotnetVM/DotnetVM.csproj" />
+  <Project Path="DotnetVM.BenchmarkGuest/DotnetVM.BenchmarkGuest.csproj" />
+  <Project Path="DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj" />
   <Project Path="DotnetVM.Tests/DotnetVM.Tests.csproj" />
 </Solution>

@@ -76,8 +76,9 @@ public sealed class AuditHardeningTests {
         tracer.Record("A", "T", "three");
 
         Assert.Equal(2, tracer.Frames.Count);
-        Assert.Equal("two", tracer.Frames[0].MethodName);
-        Assert.Equal("three", tracer.Frames[1].MethodName);
+        Assert.Equal("one", tracer.Frames[0].MethodName);
+        Assert.Equal("two", tracer.Frames[1].MethodName);
+        Assert.Equal(1, tracer.DroppedFrameCount);
     }
 
     private static VirtualMachine NewVm() => new();

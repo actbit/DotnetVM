@@ -38,9 +38,17 @@ dotnet test DotnetVM.Tests/DotnetVM.Tests.csproj --configuration Release --no-re
 ## 特徴
 
 ### 実行方式
-- **IL インタプリタ** (主) — 事前デコードした IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
-- **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / box / cast / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、byref、ポインタ、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
+- **IL インタプリタ** (主) — メソッド単位でキャッシュしたデコード済み IL を命令境界ごとに実行。命令クォータとセーフポイント (GC 掛かり口) をここで強制
+- **簡易 JIT** (任意) — `EnableJit = true` で、ホットメソッドの非 EH IL (ローカル / 算術 / 比較 / 分岐 / 変換 / 呼出 / 配列 / フィールド / managed ByRef / box / cast / `ldtoken` / `ldstr`) を式ツリーからデリゲートへ昇格。未対応命令、unmanaged pointer、typed reference、tail/constrained prefix はインタプリタへフォールバックし、JIT 命令も同じクォータ・セーフポイント・GC ルートを通る
 - **独自オブジェクトモデル** — CLR オブジェクトを流用しない。`VmObject` / `VmClassInstance` / `VmStructValue` / `VmArray` / `VmBoxedValue` の全生成が `VmHeap.Allocate` を通るため、アロケーション計上と GC 制御が正確
+
+### 実行ホットパスの最適化
+- デコード済み IL、分岐オフセット、ローカル初期値などの不変メタデータをメソッド/loader 単位で共有し、呼出しごとの再デコード・再構築を避けます
+- 命令実行の read lease と JIT フレームを値型化し、命令ごとの lease/closure/frame オブジェクト割り当てをなくします。実行状態の GC ルート登録もホスト thread ごとに一度だけ行います
+- メタデータ署名解析は `ReadOnlySpan<byte>` を直接受け取り、native memory の `ldobj` / `stobj` / `cpobj` / `cpblk` / `initblk` は `Span<byte>`、`stackalloc`、`BinaryPrimitives` を使います
+- `MethodDef` の不変呼出ターゲット、評価スタックの小さい操作、配列境界確認は通常の全ゲスト経路でキャッシュ/インライン化します
+- `VmHeap.Allocate` はクラス実体、配列、ボックス、intrinsic 実体の共通型についてサイズ判定の再ディスパッチを避けます。クォータ検査、会計、GC 用ヒープ登録は同じ経路に残ります
+- これらはベンチマーク専用の分岐ではありません。命令クォータ、セーフポイント、GC ルート、ByRef 所有権、loader アンロード、境界検査は変更せず、managed ByRef を CLR の生バイト列として再解釈することもありません
 
 ### リソース制約 (クォータ + 拒否方式)
 超過は `ResourceExhaustedException` 系の**管理例外**として拒否され、ゲストの `catch` には握りつぶされません。
@@ -108,15 +116,61 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
+`ExecutionTraceOptions.MaxEvents` に加えて `MaxFrames` で保持数を制限でき、超過分は `DroppedEventCount` / `DroppedFrameCount` に計上されます。診断機能がゲストのリソース上限を迂回しないよう、既定値にも上限があります。
+
+IL メソッドは実行前に評価スタック verifier を通過します。スタック underflow/overflow、分岐 merge の高さ不一致、`ret` / `call` の形状不一致、引数・ローカル範囲外、prefix の誤配置は `BadImageFormatException` として fail-closed になります。
 
 ### 簡易 JIT (M8)
-`VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` も VM オブジェクトモデルの操作として実行します。
+`VmHostOptions.EnableJit` を有効にすると、`JitPromotionThreshold` 回呼び出されたメソッドを `System.Linq.Expressions` の式ツリーから VM 内部デリゲートへコンパイルします。キャッシュは VM と loader ごとに分離され、アンロード時に破棄されます。生成コードは CLR の値やオブジェクトを直接扱わず、既存の `StackSlot` / `SlotOps` と VM フレームを利用します。`call` / `callvirt` は通常の VM 呼出ゲートを再利用し、配列・フィールド・box・cast・`newobj` に加えて managed ByRef (`ldarga` / `ldloca` / `ldelema` / `ldflda` / `ldsflda`)、間接アクセス、値型コピー、`ldtoken` も VM オブジェクトモデルの操作として実行します。
 
-対象外の命令 (EH、byref/pointer、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
+対象外の命令 (EH、unmanaged pointer、typed reference、`tail.` / `constrained.` など) を含むメソッドは昇格せず、既存インタプリタで実行します。managed ByRef は VM のスロット配列を直接指し、`readonly.` の制約も `ldelema` / `ldflda` / `ldsflda` から nested field へ伝播します。配列要素・ボックス・VM オブジェクトのフィールドを指す ByRef は、storage owner を保持して GC root と heap accounting を維持します。JIT 実行中も命令ごとに命令クォータ、セーフポイント、実行フレームの GC ルート登録を行うため、JIT の有効化でリソース制約を迂回できません。loader のアンロードとコンパイルが競合した場合は生成 delegate を破棄し、アンロード済み画像のコードを実行しません。
 
 JIT のコンパイル処理自体も VM のリソースポリシーで制限されます。`MemoryPolicy.JitCompilationBudget` は式ツリー構築とデリゲート生成の作業量、`HostWorkBudget` はホスト CPU 作業、`HostTempAllocationByteLimit` はホスト側の一時メモリとして計上されます。さらに `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で VM 全体の保持数・入力サイズ・式ツリー複雑度を制限します。いずれかの上限を超えた場合は例外ではなく、そのメソッドをインタプリタで実行します。
 
 JIT はゲストに CLR の動的コード生成 API を公開する機能ではありません。式ツリーとデリゲートは VM が固定の命令変換から生成し、生成コードは VM の `StackSlot` と実行フレームだけを操作します。ただし `System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装そのものは VM の TCB に含まれる信頼済みホストコードです。最小の TCB を優先する運用では `EnableJit = false`（既定値）のまま使用してください。
+
+### JIT の速度比較
+
+`DotnetVM.BenchmarkGuest` の同じ Release ビルド済みゲストアセンブリを、次の 3 通りで比較します。
+
+1. **CoreCLR** — ゲストメソッドを CoreCLR 上で型付き delegate から直接実行 (通常の CoreCLR JIT)
+2. **VM interpreter** — `EnableJit = false`
+3. **VM JIT** — `EnableJit = true`, `JitPromotionThreshold = 1`
+
+ワークロードは算術、分岐、配列アクセス、メソッド呼出、オブジェクト確保の 5 パターンです。
+各パターンは CLR 実行結果を期待値として VM の結果を検証します。ロード・JIT コンパイル・
+ウォームアップを計測から除外し、9 サンプル (各 5 回実行) の中央値を表示します。
+
+```bash
+dotnet build DotnetVM.slnx --configuration Release
+dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
+```
+
+2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
+最適化後のコードを実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+
+| パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.805 | 1,944.108 | 1,063.670 | 45.3% | 1,837.696 | 955.202 | 48.0% | 1.11x |
+| Branches (100,000) | 1.843 | 2,098.228 | 1,006.932 | 52.0% | 1,978.085 | 898.421 | 54.6% | 1.12x |
+| Array access (10,000) | 0.106 | 297.485 | 163.757 | 45.0% | 279.503 | 144.034 | 48.5% | 1.14x |
+| Method calls (100,000) | 0.520 | 2,119.416 | 986.856 | 53.4% | 1,975.761 | 571.500 | 71.1% | 1.73x |
+| Object allocation (10,000) | 0.228 | 2,307.112 | 2,070.939 | 10.2% | 2,307.804 | 2,033.294 | 11.9% | 1.02x |
+
+`master interp/JIT` は変更前の `origin/master` (`1897c72`) を同じ条件で測定した値、
+改善率は `1 - current / master` です。この測定では interpreter は 10.2〜53.4%、
+JIT は 11.9〜71.1% 高速化し、VM JIT は interpreter より 1.02〜1.73 倍高速でした。一方、CoreCLR は
+ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
+フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
+CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で
+変動するため、ベンチマークを追加・変更した場合は上記コマンドで README の実測値も更新してください。
+
+今回の `VmHeap.Allocate` の型別サイズ経路は、クォータと GC の意味論を変えずに共通型の型判定を省くものです。
+標準ベンチマークでは Object allocation の変化は計測誤差の範囲に留まったため、次の調査対象は
+`newobj` の型/constructor 解決、インスタンスストレージ生成、constructor 実行フレームです。
+
+### Native int
+VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。
 
 ### 仮想コンソールデバイス
 ゲストの `Console` 入出力はすべて VM 内部の `VmConsole` デバイスに集約されます。ホスト物理 I/O を VM は知りません。
@@ -169,7 +223,7 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 | 命令 | CLR との差分 |
 |---|---|
 | `localloc` | 初期化は 0 (実 CLR は不定値)。ブロックは GC 管理 (フレーム終了で解放しない = 脱出 stackalloc も安全側に動く)。ブロック外アクセスは境界検査で拒否 (実 CLR は未定義動作 = アドレス空間破壊)。確保は `VmHeap` 会計の対象で、上限検査はホスト実確保より先に実施 |
-| `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度、ByRef 間は 8 バイト切り上げのスロット粒度 |
+| `cpblk` / `initblk` | unmanaged ポインタ間はバイト粒度。VM のスロット配置を安全に表現できない ByRef 間コピーは `InvalidProgramException` へ fail-closed |
 | `sizeof` | ゲスト値型は ClassLayout の Pack/Size と FieldLayout の明示オフセットを反映。順次配置のネスト値型の整列は近似。値型フィールド自体は VM のスロットとして保持するため、明示レイアウトの重なりアクセスは未対応 |
 | `arglist` | ハンドル生成のみ。varargs 実呼出は fail-closed (C# 産 IL では生成されない) |
 | `jmp` | 尾呼び移行として実装 (残フレームを実行せず呼出先の戻り値を引き継ぐ)。intrinsic 面への移行は拒否 |
@@ -177,7 +231,7 @@ ECMA-335 の 218 opcode (1 バイト命令 + `0xFE` 2 バイト命令) は**す�
 
 ### Prefix behavior
 
-`volatile.` は対応するメモリアクセス前後にメモリバリアを置きます。`unaligned.` は VM の仮想メモリがアラインメント制約を持たないため no-op です。`readonly. ldelema` は読み取り専用 ByRef を作り、書き込み命令で拒否します。`tail.` + `call`/`callvirt`/`calli` は、戻り値型が一致し、protected region 外で、呼出元の引数/ローカルへの参照を渡さない場合にフレームを置き換えます。それ以外は通常の呼出にフォールバックします。`jmp` は評価スタックを空にし、呼出元と呼出先のシグネチャが一致するゲストメソッド間でフレームを置き換えます。
+`volatile.` は対応するメモリアクセス前後にメモリバリアを置きます。`unaligned.` は VM の仮想メモリがアラインメント制約を持たないため no-op です。`readonly.` は `ldelema` / `ldflda` / `ldsflda` から作られる ByRef と nested field に伝播し、`stind` / `stobj` / `cpobj` / `initobj` などの書き込みを拒否します。`tail.` + `call`/`callvirt`/`calli` は、戻り値型が一致し、protected region 外で、呼出元の引数/ローカルへの参照を渡さない場合にフレームを置き換えます。それ以外は通常の呼出にフォールバックします。`jmp` は評価スタックを空にし、呼出元と呼出先のシグネチャが一致するゲストメソッド間でフレームを置き換えます。
 
 ### Rejected
 
@@ -195,7 +249,7 @@ VirtualMachine (Host/)          組み込みファサード
  ├─ Policy/                     クォータ定義 + ゲートウェイ + ブリッジ I/F
  ├─ Devices/VmConsole           仮想コンソールデバイス
  ├─ Intrinsics/                 最小 BCL 面 (起動時登録のみ)
- └─ Diagnostics/IlDisassembler  IL 逆アセンブル (デバッグ/検証)
+ └─ Diagnostics/                 IL 逆アセンブル + 実行トレース/デバッガ
 ```
 
 依存方向は `Diagnostics/Host → Execution → Types/Objects/Heap → Metadata → PE → Binary` の一方向。
@@ -225,8 +279,10 @@ dotnet test DotnetVM.Tests
 - [x] C6: ゲストスレッド / 並行実行対応 (guest Thread、Monitor の競合・待機、並列ホスト呼出、スレッド別 interpreter frame、stop-the-world GC)
 - [x] C6.1: Task / ValueTask / async-await (Task / Task<T>、ValueTask / ValueTask<T>、Delay / Run / FromResult、各 awaiter、ConfigureAwait、async state machine)
 - [x] M8: 簡易 JIT (IL → 式ツリー → デリゲート昇格、ホットメソッド自動昇格)
-- [ ] M9: デバッガ / 実行トレース
+- [x] M9: デバッガ / 実行トレース (命令イベント、IL ブレークポイント、継続、ステップ実行)
 
 C6.1 は `Task` / `Task<T>` と `ValueTask` / `ValueTask<T>` の基本 await、`Task.Delay`、`Task.Run`、`Task.FromResult` / `ValueTask.FromResult`、`ConfigureAwait(bool)` に対応する。`IValueTaskSource` / `IValueTaskSource<T>`、`OnCompleted` / `UnsafeOnCompleted` を使う独自 awaiter、キャンセル token、`Task.WhenAll` / `WhenAny` / `WaitAll`、および `SynchronizationContext` の捕捉・`ConfigureAwait(false)` にも対応する。guest Thread と Task worker は `VmHostOptions` の個別上限と VM 全体の上限で制御されます (既定はいずれも最大 64 worker、`Task.Delay` の未完了 Timer は最大 1024)。
+
+M9 の `VirtualMachine.Tracer` は `Start()` 後に命令ごとの `ExecutionTraceEvent` を `Events` に記録します。`ExecutionTraceOptions.MaxEvents` で記録量を制限でき、上限超過分は `DroppedEventCount` で確認できます。`VirtualMachine.Debugger` では `AddBreakpoint(type, method, ilOffset, assembly)`、`Continue()`、`StepInto()`、`StepOver()`、`StepOut()`、`Pause()` を利用でき、停止通知 (`Stopped`) からホスト UI が実行を制御できます。トレース/デバッグ中は命令可観測性を優先して該当メソッドをインタプリタで実行します。
 
 プロダクト本体は依存ゼロ (`Microsoft.CodeAnalysis.CSharp` / `xunit` はテストプロジェクトのみ)。同梱の DotnetVM.CoreLib も依存ゼロのクラスライブラリで、VM の置換面として DotnetVM.dll と同じディレクトリに配置される。

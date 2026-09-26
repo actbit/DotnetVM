@@ -413,7 +413,7 @@ internal static partial class CoreLibBindings {
                 // 形 (ByRef スロット経由) もあるため展開して受ける
                 var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
                 return value.ObjectValue is VmArray array
-                    ? StackSlot.OfByRef(new VmByRef(array.Elements, 0))
+                     ? StackSlot.OfByRef(VmByRef.ArrayElement(array, 0))
                     : throw new InvalidOperationException(
                         $"MemoryMarshal.GetArrayDataReference の引数が配列ではありません ({value.Kind})。");
             },
@@ -422,7 +422,7 @@ internal static partial class CoreLibBindings {
             static (_, a) => {
                 var value = a[0].Kind == StackKind.ByRef && a[0].ObjectValue is VmByRef byRef ? byRef.Slot : a[0];
                 return value.ObjectValue is VmArray array
-                    ? StackSlot.OfByRef(new VmByRef(array.Elements, 0))
+                     ? StackSlot.OfByRef(VmByRef.ArrayElement(array, 0))
                     : throw new InvalidOperationException(
                         $"MemoryMarshal.GetArrayDataReference の引数が配列ではありません ({value.Kind})。");
             },
@@ -479,11 +479,12 @@ internal static partial class CoreLibBindings {
             if (slotRef.Index < 0 || slotRef.Index >= slotRef.Container.Length)
                 throw new InvalidOperationException(
                     $"Unsafe.WriteUnaligned がスロット列の範囲外を参照します (index={slotRef.Index}, 要素数 {slotRef.Container.Length})。");
-            slotRef.Container[slotRef.Index] = a[1];
+            slotRef.Write(a[1]);
             return null;
         }
-        if ((long)native!.ByteOffset + stride > native.Bytes.Length)
-            throw new InvalidOperationException(
+        native!.EnsureWritable();
+        if (native.ByteOffset < 0 || (long)native.ByteOffset + stride > native.Bytes.Length)
+            throw new UnhandledGuestException("System.IndexOutOfRangeException",
                 $"Unsafe.WriteUnaligned がブロック外を参照します (offset={native.ByteOffset}, {stride} バイト, ブロック {native.Bytes.Length} バイト)。");
         WriteNativeElement(native, native.ByteOffset, a[1], elementName);
         return null;
@@ -495,12 +496,12 @@ internal static partial class CoreLibBindings {
         var (native, slotRef) = ResolvePointerBase(a[0], "Unsafe.ReadUnaligned");
         if (slotRef is not null) {
             if (slotRef.Index < 0 || slotRef.Index >= slotRef.Container.Length)
-                throw new InvalidOperationException(
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Unsafe.ReadUnaligned がスロット列の範囲外を参照します (index={slotRef.Index}, 要素数 {slotRef.Container.Length})。");
             return slotRef.Container[slotRef.Index];
         }
-        if ((long)native!.ByteOffset + stride > native.Bytes.Length)
-            throw new InvalidOperationException(
+        if (native!.ByteOffset < 0 || (long)native.ByteOffset + stride > native.Bytes.Length)
+            throw new UnhandledGuestException("System.IndexOutOfRangeException",
                 $"Unsafe.ReadUnaligned がブロック外を参照します (offset={native.ByteOffset}, {stride} バイト, ブロック {native.Bytes.Length} バイト)。");
         return ReadNativeElement(native, native.ByteOffset, elementName);
     }
@@ -517,9 +518,17 @@ internal static partial class CoreLibBindings {
         if (slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef outer) {
             var target = outer.Read(); // 指し先スロットの値
             if (target.Kind == StackKind.ByRef && target.ObjectValue is VmByRef inner)
-                return (null, inner); // ② アドレス先スロットに格納された byref 値
+                return (null, outer.IsReadOnly
+                    ? new VmByRef(inner.Container, inner.Index, isReadOnly: true, owner: inner.Owner)
+                    : inner); // ② アドレス先スロットに格納された byref 値
             if (target.Kind == StackKind.Object && target.ObjectValue is VmNativePointer innerNative)
-                return (innerNative, null); // ② アドレス先スロットに格納されたネイティブポインタ
+                return (outer.IsReadOnly
+                    ? new VmNativePointer {
+                        Memory = innerNative.Memory,
+                        ByteOffset = innerNative.ByteOffset,
+                        IsReadOnly = true,
+                    }
+                    : innerNative, null); // ② アドレス先スロットに格納されたネイティブポインタ
             return (null, outer); // ① byref 値そのもの (外側の参照 = ポインタ)
         }
         throw new InvalidOperationException($"面 {face} の参照引数をポインタとして解釈できませんでした: {slot.Kind}");
@@ -583,15 +592,14 @@ internal static partial class CoreLibBindings {
         var stride = strideOverride ?? SlotStride(ctx.ParamAt(0));
         var (dstNative, dstRef) = ResolvePointerBase(a[0], "Buffer.Memmove");
         var (srcNative, srcRef) = ResolvePointerBase(a[1], "Buffer.Memmove");
-        var count = a[2].Kind == StackKind.Int64 ? a[2].Int64Value : a[2].AsInt32;
-        if (count < 0)
-            throw new InvalidOperationException("Buffer.Memmove の要素数が負です。");
+        var count = ReadElementCount(ctx, a[2]);
         // スロット列 ↔ スロット列 (Span._reference がローカル/配列スロットを指す形):
         // 1 要素 = 1 スロットとして要素ごとにコピーする
         if (dstRef is not null && srcRef is not null) {
-            if (dstRef.Index + count > dstRef.Container.Length ||
-                srcRef.Index + count > srcRef.Container.Length)
-                throw new InvalidOperationException(
+            dstRef.EnsureWritable();
+            if ((long)dstRef.Index + count > dstRef.Container.Length ||
+                (long)srcRef.Index + count > srcRef.Container.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Buffer.Memmove がスロット列の範囲外を参照します (dst index={dstRef.Index}, src index={srcRef.Index}, {count} 要素)。" +
                     $"ブロック {dstRef.Container.Length} / {srcRef.Container.Length} スロット。");
             // memmove 意味論 (重なりがあっても正しく) のため送信側を退避してから書く
@@ -607,49 +615,71 @@ internal static partial class CoreLibBindings {
         if (dstRef is not null || srcRef is not null) {
             var elementName = ctx.ParamAt(0).EndsWith("&", StringComparison.Ordinal)
                 ? ctx.ParamAt(0)[..^1] : ctx.ParamAt(0);
-            if (srcRef is not null && srcRef.Index + count > srcRef.Container.Length)
-                throw new InvalidOperationException(
+            if (srcRef is not null && (long)srcRef.Index + count > srcRef.Container.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Buffer.Memmove がスロット列の範囲外を参照します (src index={srcRef.Index}, {count} 要素, ブロック {srcRef.Container.Length} スロット)。");
-            if (dstRef is not null && dstRef.Index + count > dstRef.Container.Length)
-                throw new InvalidOperationException(
+            if (dstRef is not null) dstRef.EnsureWritable();
+            if (dstRef is not null && (long)dstRef.Index + count > dstRef.Container.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Buffer.Memmove がスロット列の範囲外を参照します (dst index={dstRef.Index}, {count} 要素, ブロック {dstRef.Container.Length} スロット)。");
-            if (srcNative is not null && (long)srcNative.ByteOffset + count * stride > srcNative.Bytes.Length)
-                throw new InvalidOperationException(
-                    $"Buffer.Memmove がブロック外を参照します (src offset={srcNative.ByteOffset}, {count * stride} バイト, ブロック {srcNative.Bytes.Length} バイト)。");
-            if (dstNative is not null && (long)dstNative.ByteOffset + count * stride > dstNative.Bytes.Length)
-                throw new InvalidOperationException(
-                    $"Buffer.Memmove がブロック外を参照します (dst offset={dstNative.ByteOffset}, {count * stride} バイト, ブロック {dstNative.Bytes.Length} バイト)。");
+            var mixedByteCount = checked((long)count * stride);
+            if (srcNative is { } source && (source.ByteOffset < 0 ||
+                (long)source.ByteOffset + mixedByteCount > source.Bytes.Length))
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                    $"Buffer.Memmove がブロック外を参照します (src offset={source.ByteOffset}, {mixedByteCount} バイト, ブロック {source.Bytes.Length} バイト)。");
+            if (dstNative is { } destination) destination.EnsureWritable();
+            if (dstNative is { } destinationPointer && (destinationPointer.ByteOffset < 0 ||
+                (long)destinationPointer.ByteOffset + mixedByteCount > destinationPointer.Bytes.Length))
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                    $"Buffer.Memmove がブロック外を参照します (dst offset={destinationPointer.ByteOffset}, {mixedByteCount} バイト, ブロック {destinationPointer.Bytes.Length} バイト)。");
             for (var i = 0; i < count; i++) {
                 if (dstRef is not null) {
-                    var sourceNative = srcNative ?? throw new InvalidOperationException(
-                        "Buffer.Memmove のバイト入力がありません。");
                     // バイト実体 → スロット列
+                    var sourcePointer = srcNative
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "Buffer.Memmove の送信元が不正です。");
                     dstRef.Container[dstRef.Index + i] =
-                        ReadNativeElement(sourceNative, sourceNative.ByteOffset + i * stride, elementName);
+                        ReadNativeElement(sourcePointer, sourcePointer.ByteOffset + i * stride, elementName);
                 } else {
-                    var destinationNative = dstNative ?? throw new InvalidOperationException(
-                        "Buffer.Memmove のバイト出力がありません。");
-                    var sourceRef = srcRef ?? throw new InvalidOperationException(
-                        "Buffer.Memmove のスロット入力がありません。");
                     // スロット列 → バイト実体
+                    var destinationNative = dstNative
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "Buffer.Memmove の宛先が不正です。");
+                    var sourceRef = srcRef
+                        ?? throw new UnhandledGuestException("System.InvalidProgramException", "Buffer.Memmove の送信元が不正です。");
                     WriteNativeElement(destinationNative, destinationNative.ByteOffset + i * stride,
                         sourceRef.Container[sourceRef.Index + i], elementName);
                 }
             }
             return null;
         }
-        var byteCount = count * stride;
-        var destination = dstNative ?? throw new InvalidOperationException("Buffer.Memmove の出力がありません。");
-        var source = srcNative ?? throw new InvalidOperationException("Buffer.Memmove の入力がありません。");
+        var byteCount = checked((long)count * stride);
         // 境界検査: 実 CLR では未定義動作になる参照先の越境は VM では拒否する
-        if ((long)destination.ByteOffset + byteCount > destination.Bytes.Length ||
-            (long)source.ByteOffset + byteCount > source.Bytes.Length)
-            throw new InvalidOperationException(
-                $"Buffer.Memmove がブロック外を参照します (dst offset={destination.ByteOffset}, src offset={source.ByteOffset}, " +
-                $"{byteCount} バイト, ブロック {destination.Bytes.Length} / {source.Bytes.Length} バイト)。");
+        var destinationMemory = dstNative
+            ?? throw new UnhandledGuestException("System.InvalidProgramException", "Buffer.Memmove の宛先が不正です。");
+        var sourceMemory = srcNative
+            ?? throw new UnhandledGuestException("System.InvalidProgramException", "Buffer.Memmove の送信元が不正です。");
+        destinationMemory.EnsureWritable();
+        if (destinationMemory.ByteOffset < 0 || sourceMemory.ByteOffset < 0 ||
+            (long)destinationMemory.ByteOffset + byteCount > destinationMemory.Bytes.Length ||
+            (long)sourceMemory.ByteOffset + byteCount > sourceMemory.Bytes.Length)
+            throw new UnhandledGuestException("System.IndexOutOfRangeException",
+                $"Buffer.Memmove がブロック外を参照します (dst offset={destinationMemory.ByteOffset}, src offset={sourceMemory.ByteOffset}, " +
+                $"{byteCount} バイト, ブロック {destinationMemory.Bytes.Length} / {sourceMemory.Bytes.Length} バイト)。");
         // Array.Copy は同一配列内の重なりを memmove と同じく正しく扱う
-        Array.Copy(source.Bytes, source.ByteOffset, destination.Bytes, destination.ByteOffset, byteCount);
+        Array.Copy(sourceMemory.Bytes, sourceMemory.ByteOffset, destinationMemory.Bytes, destinationMemory.ByteOffset, (int)byteCount);
         return null;
+    }
+
+    private static int ReadElementCount(IntrinsicContext ctx, in StackSlot value) {
+        ulong count = ctx.ParamAt(2) switch {
+            "System.UInt32" when value.Kind == StackKind.Int32 => unchecked((uint)value.Int64Value),
+            _ when value.Kind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt
+                && value.Int64Value >= 0 => (ulong)value.Int64Value,
+            _ => throw new UnhandledGuestException("System.OverflowException", "バイトコピーの要素数が不正です。"),
+        };
+        if (count > int.MaxValue)
+            throw new UnhandledGuestException("System.OverflowException",
+                "バイトコピーの要素数が VM の上限を超えています。");
+        return (int)count;
     }
 
     /// <summary>バイト実体から 1 要素分のスロット値を読む (LE)。</summary>
@@ -725,7 +755,10 @@ internal static partial class CoreLibBindings {
 
     private static StackSlot AddImpl(IntrinsicContext ctx, StackSlot[] a, bool elementStride) {
         var (native, slotRef) = ResolvePointerBase(a[0], elementStride ? "Unsafe.Add" : "Unsafe.AddByteOffset");
-        var offset = a[1].Kind == StackKind.Int64 ? a[1].Int64Value : a[1].AsInt32;
+        if (a[1].Kind is not (StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt))
+            throw new UnhandledGuestException("System.InvalidProgramException",
+                "Unsafe.Add のオフセットが整数型ではありません。");
+        var offset = a[1].Int64Value;
         // スロット列ベース (VmArray.Elements 等の配列データ面): 要素加算はスロット
         // インデックスの移動として表現する (1 要素 = 1 スロット)。バイトオフセット面
         // (AddByteOffset) はスロット列では表現できないため fail-closed
@@ -733,21 +766,33 @@ internal static partial class CoreLibBindings {
             if (!elementStride)
                 throw new InvalidOperationException(
                     "Unsafe.AddByteOffset はバイト実体を持たないスロット列参照には対応していません。");
-            var target = slotRef.Index + (int)offset;
+            long target;
+            try {
+                target = checked((long)slotRef.Index + offset);
+            } catch (OverflowException) {
+                throw new UnhandledGuestException("System.OverflowException", null);
+            }
             // Unsafe.Add の pointer arithmetic では、ループ終端の比較用に配列末尾の 1 つ先を
             // 作ることがある。形成だけ許可し、実アクセス時の範囲検査は読み書き面に委ねる。
             if (target < 0 || target > slotRef.Container.Length) {
-                System.IO.File.AppendAllText(@"C:\Users\Binary_number\AppData\Local\Temp\opencode\frames.log",
-                    $"ADDBOOM base0kind={slotRef.Container[0].Kind} baselen={slotRef.Container.Length} index={slotRef.Index} offset={offset} p0={ctx.ParamAt(0)}\n");
-                throw new InvalidOperationException(
+                throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Unsafe.Add の結果がスロット列の範囲外です (index {target}, 要素数 {slotRef.Container.Length})。");
             }
-            return StackSlot.OfByRef(new VmByRef(slotRef.Container, target));
+            return StackSlot.OfByRef(new VmByRef(slotRef.Container, (int)target, slotRef.IsReadOnly, slotRef.Owner));
         }
         var stride = elementStride ? SlotStride(ctx.ParamAt(0)) : 1;
+        long byteOffset;
+        try {
+            byteOffset = checked((long)native!.ByteOffset + checked(offset * stride));
+        } catch (OverflowException) {
+            throw new UnhandledGuestException("System.OverflowException", null);
+        }
+        if (byteOffset < 0 || byteOffset > int.MaxValue)
+            throw new UnhandledGuestException("System.OverflowException", null);
         return StackSlot.OfObject(new VmNativePointer {
             Memory = native!.Memory,
-            ByteOffset = native.ByteOffset + (int)(offset * stride),
+            ByteOffset = (int)byteOffset,
+            IsReadOnly = native.IsReadOnly,
         });
     }
 

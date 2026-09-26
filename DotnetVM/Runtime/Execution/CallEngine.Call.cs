@@ -243,6 +243,9 @@ internal sealed partial class CallEngine {
         var context2 = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
         if (tailCallAllowed && invoker.TryCreateTailCall(caller, method, args, context2, out tailCallRequest))
             return null;
+        if (invoker is Interpreter interpreter &&
+            interpreter.TryInvokeCompiled(method, args, context2, out var compiledResult))
+            return SlotOps.SignatureReturnsValue(method.Signature) ? compiledResult : null;
         var ret = invoker.Invoke(method, args, context2);
         return SlotOps.SignatureReturnsValue(method.Signature) ? ret : null;
     }

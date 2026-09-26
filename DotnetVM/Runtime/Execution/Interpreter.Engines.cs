@@ -27,6 +27,7 @@ public sealed partial class Interpreter {
     internal Interpreter(TypeLoader loader, IntrinsicRegistry intrinsics, VmConsole console, MemoryPolicy memory, VmHeap heap,
         bool enableJit = false, int jitPromotionThreshold = 1000,
         NetworkGateway? network = null, StorageGateway? storage = null, Diagnostics.ExecutionTracer? tracer = null,
+        Diagnostics.VmDebugger? debugger = null,
         VmCoreLibSurfaces? coreLibSurfaces = null, VmType? stringType = null, VmSharedState? shared = null,
         Func<ReadOnlyMemory<byte>, TypeLoader>? loadAssemblyFromBytes = null,
         VmAssemblyLoadContext? defaultAssemblyLoadContext = null,
@@ -43,6 +44,7 @@ public sealed partial class Interpreter {
         _network = network;
         _storage = storage;
         _tracer = tracer;
+        _debugger = debugger;
         _coreLibSurfaces = coreLibSurfaces;
         _stringType = stringType;
         _shared = shared ?? new VmSharedState();
@@ -51,6 +53,14 @@ public sealed partial class Interpreter {
         _createAssemblyLoadContext = createAssemblyLoadContext;
         _loadAssemblyInContext = loadAssemblyInContext;
         _loadAssemblyFromPath = loadAssemblyFromPath;
+        // Register each host thread's execution state exactly once when its
+        // ThreadLocal value is first materialized, rather than touching the
+        // concurrent root registry for every guest instruction.
+        _currentExecution = new ThreadLocal<ExecutionState>(() => {
+            var state = new ExecutionState();
+            _executionStates.TryAdd(state, 0);
+            return state;
+        });
         var strings = new VmStringPool(heap);
         var primary = CreateEngines(loader, strings);
         _services = primary.Services;
@@ -139,7 +149,8 @@ public sealed partial class Interpreter {
             }
             var container = byRef?.Container ?? [value];
             var index = byRef?.Index ?? 0;
-            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index))],
+            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index,
+                byRef?.IsReadOnly ?? false, byRef?.Owner))],
                 GenericContext.Of(structMachine.TypeArguments, null));
         };
         // Activator.CreateInstance 等が .ctor を実行するためのフック

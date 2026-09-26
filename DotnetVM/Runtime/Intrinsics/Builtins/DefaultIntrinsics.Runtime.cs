@@ -74,18 +74,18 @@ public static partial class DefaultIntrinsics {
         // CompareExchange<T>(ref T, T, T) → 旧値
         registry.Register(IntrinsicKey.Static(T, "CompareExchange", 3), static (_, a) => {
             var loc = Location(a[0], "CompareExchange");
-            var original = loc.Slot;
+            var original = loc.Read();
             if (SlotEquals(original, a[2]))
-                loc.Slot = a[1];
+                loc.Write(a[1]);
             return original;
         });
         // CompareExchange<T>(ref T, T, T, out bool succeeded) → 旧値
         registry.Register(IntrinsicKey.Static(T, "CompareExchange", 4), static (_, a) => {
             var loc = Location(a[0], "CompareExchange");
-            var original = loc.Slot;
+            var original = loc.Read();
             var equal = SlotEquals(original, a[2]);
             if (equal)
-                loc.Slot = a[1];
+                loc.Write(a[1]);
             if (a[3].ObjectValue is VmByRef succeeded)
                 succeeded.Write(StackSlot.OfInt32(equal ? 1 : 0));
             return original;
@@ -93,56 +93,59 @@ public static partial class DefaultIntrinsics {
         // Exchange<T>(ref T, T) → 旧値
         registry.Register(IntrinsicKey.Static(T, "Exchange", 2), static (_, a) => {
             var loc = Location(a[0], "Exchange");
-            var original = loc.Slot;
-            loc.Slot = a[1];
+            var original = loc.Read();
+            loc.Write(a[1]);
             return original;
         });
         // Add(ref int/long, n) → 新値
         registry.Register(IntrinsicKey.Static(T, "Add", 2), static (_, a) => {
             var loc = Location(a[0], "Add");
             StackSlot updated;
-            if (loc.Slot.Kind == StackKind.Int64) {
-                updated = StackSlot.OfInt64(loc.Slot.Int64Value + a[1].Int64Value);
+            var original = loc.Read();
+            if (original.Kind == StackKind.Int64) {
+                updated = StackSlot.OfInt64(original.Int64Value + a[1].Int64Value);
             } else {
                 int sum;
-                try { sum = checked((int)loc.Slot.Int64Value + a[1].AsInt32); }
+                try { sum = checked((int)original.Int64Value + a[1].AsInt32); }
                 catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
                 updated = StackSlot.OfInt32(sum);
             }
-            loc.Slot = updated;
+            loc.Write(updated);
             return updated;
         });
         registry.Register(IntrinsicKey.Static(T, "Increment", 1), static (_, a) => {
             var loc = Location(a[0], "Increment");
-            var updated = loc.Slot.Kind == StackKind.Int64
-                ? StackSlot.OfInt64(loc.Slot.Int64Value + 1)
-                : StackSlot.OfInt32((int)loc.Slot.Int64Value + 1);
-            loc.Slot = updated;
+            var original = loc.Read();
+            var updated = original.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(original.Int64Value + 1)
+                : StackSlot.OfInt32((int)original.Int64Value + 1);
+            loc.Write(updated);
             return updated;
         });
         registry.Register(IntrinsicKey.Static(T, "Decrement", 1), static (_, a) => {
             var loc = Location(a[0], "Decrement");
-            var updated = loc.Slot.Kind == StackKind.Int64
-                ? StackSlot.OfInt64(loc.Slot.Int64Value - 1)
-                : StackSlot.OfInt32((int)loc.Slot.Int64Value - 1);
-            loc.Slot = updated;
+            var original = loc.Read();
+            var updated = original.Kind == StackKind.Int64
+                ? StackSlot.OfInt64(original.Int64Value - 1)
+                : StackSlot.OfInt32((int)original.Int64Value - 1);
+            loc.Write(updated);
             return updated;
         });
         // And/Or (ref int/long, n) → 旧値
         registry.Register(IntrinsicKey.Static(T, "And", 2), static (_, a) => {
             var loc = Location(a[0], "And");
-            var original = loc.Slot;
-            loc.Slot = original.Kind == StackKind.Int64
+            var original = loc.Read();
+            loc.Write(original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value & a[1].Int64Value)
-                : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32);
+                : StackSlot.OfInt32((int)original.Int64Value & a[1].AsInt32));
             return original;
         });
         registry.Register(IntrinsicKey.Static(T, "Or", 2), static (_, a) => {
             var loc = Location(a[0], "Or");
-            var original = loc.Slot;
-            loc.Slot = original.Kind == StackKind.Int64
+            var original = loc.Read();
+            loc.Write(original.Kind == StackKind.Int64
                 ? StackSlot.OfInt64(original.Int64Value | a[1].Int64Value)
-                : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32);
+                : StackSlot.OfInt32((int)original.Int64Value | a[1].AsInt32));
             return original;
         });
         registry.Register(IntrinsicKey.Static(T, "MemoryBarrier", 0), static (_, _) => { Thread.MemoryBarrier(); return null; });

@@ -25,9 +25,18 @@ internal sealed partial class ObjectEngine {
         if (rva == 0)
             return null;
         if (!_rvaFieldAddresses.TryGetValue(token, out var pointer)) {
+            var field = ResolveFieldToken(token);
+            var fieldType = field.FieldType
+                ?? throw new BadImageFormatException($"FieldRVA {field} の型を解決できません。");
+            var fieldSize = MemoryOps.SizeOfType(fieldType);
+            var imageData = _loader.Image.GetRvaDataToEnd(rva);
+            if (fieldSize < 0 || fieldSize > imageData.Length)
+                throw new BadImageFormatException(
+                    $"FieldRVA {field} のデータ長 {imageData.Length} が型サイズ {fieldSize} 未満です。");
             pointer = new VmNativePointer {
-                Memory = new VmLocallocMemory { Bytes = _loader.Image.GetRvaDataToEnd(rva).ToArray() },
+                Memory = new VmLocallocMemory { Bytes = imageData[..fieldSize].ToArray() },
                 ByteOffset = 0,
+                IsReadOnly = true,
             };
             _rvaFieldAddresses[token] = pointer;
         }
@@ -53,14 +62,15 @@ internal sealed partial class ObjectEngine {
     /// <summary>ldflda 用のアドレス解決。VnString (可変 char バッファ) はバイト実体への
     /// unmanaged ポインタを返し (CoreLib IL が Unsafe.Add / Buffer.Memmove に渡す形)、
     /// それ以外は ByRef を返す。</summary>
-    public StackSlot FieldAddress(in StackSlot objSlot, VmField field) {
+    public StackSlot FieldAddress(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
         if (objSlot.Kind == StackKind.Object && objSlot.ObjectValue is VmString str &&
             TryGetStringFieldOffset(field.Name, out var offset))
             return StackSlot.OfObject(new VmNativePointer {
                 Memory = str.PointerMemory,
                 ByteOffset = offset,
+                IsReadOnly = isReadOnly,
             });
-        return StackSlot.OfByRef(FieldLocation(objSlot, field));
+        return StackSlot.OfByRef(FieldLocation(objSlot, field, isReadOnly));
     }
 
     /// <summary>stfld の文字列実体への書込。VnString レシーバでなければ false (通常経路へ)。</summary>
@@ -83,6 +93,13 @@ internal sealed partial class ObjectEngine {
             return dynamicField;
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
+        if (table == TableKind.Field && context is null && dynamicTokens is null) {
+            if (_fieldTokens.TryGetValue(token, out var cachedField))
+                return cachedField;
+            var resolvedField = _loader.GetFieldByToken((uint)token)
+                ?? throw new BadImageFormatException($"Field トークン 0x{token:X8} を解決できません。");
+            return _fieldTokens.GetOrAdd(token, resolvedField);
+        }
         switch (table) {
             case TableKind.Field:
                 return _loader.GetFieldByToken((uint)token)
@@ -132,9 +149,64 @@ internal sealed partial class ObjectEngine {
         }
     }
 
+    /// <summary>ldfld の読み出し専用経路。通常のクラス/ボックス/構造体は
+    /// ByRef オブジェクトを一時生成せず、フィールド配列から直接読む。</summary>
+    public StackSlot ReadField(in StackSlot objSlot, VmField field) {
+        switch (objSlot.Kind) {
+            case StackKind.Object when objSlot.ObjectValue is null:
+                throw new UnhandledGuestException("System.NullReferenceException", null);
+            case StackKind.Object when objSlot.ObjectValue is VmString str &&
+                TryGetStringFieldOffset(field.Name, out _):
+                str.SyncFieldSlotsFromBytes();
+                return str.FieldSlots[field.Name is "_stringLength" or "m_stringLength" ? 0 : 1];
+            case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
+                return instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)];
+            case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
+                if (DefinitionOf(boxed.Type) is VmClassType boxedType)
+                    return boxed.Fields[GetInstanceFieldIndex(boxedType, field)];
+                return boxed.Fields[0];
+            case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer:
+                return ReadField(outer.Read(), field);
+            case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct:
+                if (DefinitionOf(direct.StructType) is VmClassType directType)
+                    return direct.Fields[GetInstanceFieldIndex(directType, field)];
+                break;
+        }
+        return FieldLocation(objSlot, field).Read();
+    }
+
+    /// <summary>stfld の通常クラス/ボックス/構造体向け直接書込経路。
+    /// ByRef ラッパーを作らず、所有済みのフィールド配列へ値コピーを行う。</summary>
+    public void WriteField(in StackSlot objSlot, VmField field, in StackSlot value) {
+        switch (objSlot.Kind) {
+            case StackKind.Object when objSlot.ObjectValue is null:
+                throw new UnhandledGuestException("System.NullReferenceException", null);
+            case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
+                instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)] = SlotOps.StoreCopyOfValue(value);
+                return;
+            case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
+                if (DefinitionOf(boxed.Type) is VmClassType boxedType) {
+                    boxed.Fields[GetInstanceFieldIndex(boxedType, field)] = SlotOps.StoreCopyOfValue(value);
+                    return;
+                }
+                boxed.Fields[0] = SlotOps.StoreCopyOfValue(value);
+                return;
+            case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer:
+                WriteField(outer.Read(), field, value);
+                return;
+            case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct:
+                if (DefinitionOf(direct.StructType) is VmClassType directType) {
+                    direct.Fields[GetInstanceFieldIndex(directType, field)] = SlotOps.StoreCopyOfValue(value);
+                    return;
+                }
+                break;
+        }
+        FieldLocation(objSlot, field).Write(SlotOps.StoreCopyOfValue(value));
+    }
+
     /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。
     /// 構築ジェネリック型は定義に解いてレイアウトを取る (VmClassInstance/ボックス/構造体の全経路)。</summary>
-    public VmByRef FieldLocation(in StackSlot objSlot, VmField field) {
+    public VmByRef FieldLocation(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
         switch (objSlot.Kind) {
             case StackKind.Object when objSlot.ObjectValue is null:
                 throw new UnhandledGuestException("System.NullReferenceException", null);
@@ -143,29 +215,32 @@ internal sealed partial class ObjectEngine {
                 // CoreLib String の実体フィールド。バイト実体が真実源のため、読み出しのたびに
                 // 合成スロットへ同期してから返す (直近のポインタ書込が反映される)
                 str.SyncFieldSlotsFromBytes();
-                return new VmByRef(str.FieldSlots, stringFieldOffset == 0 ? 0 : 1);
+                return VmByRef.Frame(str.FieldSlots, stringFieldOffset == 0 ? 0 : 1, isReadOnly);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
-                return new VmByRef(instance.Fields, GetInstanceFieldIndex(instance.ClassType, field));
+                return VmByRef.OwnedStorage(instance, instance.Fields,
+                    GetInstanceFieldIndex(instance.ClassType, field), isReadOnly);
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed: {
                 // ボックス化ジェネリック構造体 (構築型) は定義型に解いてレイアウトを取る
                 var bt = DefinitionOf(boxed.Type);
                 return bt is not null
-                    ? new VmByRef(boxed.Fields, GetInstanceFieldIndex(bt, field))
-                    : new VmByRef(boxed.Fields, 0);
+                    ? VmByRef.OwnedStorage(boxed, boxed.Fields, GetInstanceFieldIndex(bt, field), isReadOnly)
+                    : VmByRef.BoxedValue(boxed, isReadOnly: isReadOnly);
             }
             case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
                 // 構造体ローカル/引数へのフィールド書込 (ldloca → ldfld/stfld)
                 var target = outer.Read();
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
                     DefinitionOf(sv.StructType) is VmClassType st)
-                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field), outer.IsReadOnly);
+                    return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field),
+                        isReadOnly || outer.IsReadOnly, outer.Owner);
                 if (target.ObjectValue is VmClassInstance nested)
-                    return new VmByRef(nested.Fields, GetInstanceFieldIndex(nested.ClassType, field), outer.IsReadOnly);
+                    return VmByRef.OwnedStorage(nested, nested.Fields,
+                        GetInstanceFieldIndex(nested.ClassType, field), isReadOnly || outer.IsReadOnly);
                 break;
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&
                 DefinitionOf(direct.StructType) is VmClassType dt:
-                return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field));
+                return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field), isReadOnly);
         }
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }
@@ -192,13 +267,13 @@ internal sealed partial class ObjectEngine {
 
     /// <summary>静的フィールドの位置を解決する (.cctor 起動を含む)。intrinsic 型 (TypeRef 親) の静的フィールドも解決する。</summary>
     public VmByRef StaticFieldLocation(int token, GenericContext? context = null,
-        IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        IReadOnlyDictionary<uint, object>? dynamicTokens = null, bool isReadOnly = false) {
         if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmField dynamicField) {
             if (!dynamicField.IsStatic)
                 throw new UnhandledGuestException("System.FieldAccessException",
                     $"{dynamicField.DeclaringType.FullName}::{dynamicField.Name} は静的フィールドではありません。");
-            return StaticFieldLocationForField(token, dynamicField, context);
+            return StaticFieldLocationForField(token, dynamicField, context, isReadOnly);
         }
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
@@ -212,7 +287,7 @@ internal sealed partial class ObjectEngine {
                         storage = [value(_intrinsicContext)];
                         _intrinsicStaticFields[token] = storage;
                     }
-                    return new VmByRef(storage, 0);
+                    return VmByRef.Frame(storage, 0, isReadOnly);
                 }
                 // intrinsic 静的フィールド未登録の TypeRef 親は実 TypeDef に解決できる場合、
                 // 共通の静的ストレージ経路 (直下の ResolveFieldToken フロー) へ流す
@@ -229,15 +304,16 @@ internal sealed partial class ObjectEngine {
                 var storage = _objects.GetOrCreateStaticStorage(constructed.FullName, definition, _loader,
                     new GenericContext { ClassArgs = constructed.TypeArguments }, _unifiedStaticStorage,
                     constructed.TypeArguments);
-                return new VmByRef(storage, ObjectModel.StaticFieldIndex(definition,
-                    ResolveFieldToken(token, context)));
+                return VmByRef.Frame(storage, ObjectModel.StaticFieldIndex(definition,
+                    ResolveFieldToken(token, context)), isReadOnly);
             }
         }
         var field = ResolveFieldToken(token, context, dynamicTokens);
-        return StaticFieldLocationForField(token, field, context);
+        return StaticFieldLocationForField(token, field, context, isReadOnly);
     }
 
-    private VmByRef StaticFieldLocationForField(int token, VmField field, GenericContext? context) {
+    private VmByRef StaticFieldLocationForField(int token, VmField field, GenericContext? context,
+        bool isReadOnly) {
         var owner = (VmClassType)field.DeclaringType;
         // 本家 CoreLib の IL 内からの ldsfld / stsfld (Field token 直接)。実 CLR では
         // ランタイムが値を設定する静的フィールド (String.Empty 等) は IL に初期化子が
@@ -249,7 +325,7 @@ internal sealed partial class ObjectEngine {
                 storage = [intrinsicValue(_intrinsicContext)];
                 _intrinsicStaticFields[token] = storage;
             }
-            return new VmByRef(storage, 0);
+            return VmByRef.Frame(storage, 0, isReadOnly);
         }
         // ジェネリック定義の静的フィールドを Field トークン直接で触る場合
         // (.cctor / get_Default 等の自型内アクセス)、呼出元文脈の型引数が個数一致すれば
@@ -262,10 +338,10 @@ internal sealed partial class ObjectEngine {
             EnsureConstructedInitialized(constructed);
             var constructedStorage = _objects.GetOrCreateStaticStorage(constructed.FullName, owner, _loader,
                 new GenericContext { ClassArgs = classArgs }, _unifiedStaticStorage, classArgs);
-            return new VmByRef(constructedStorage, ObjectModel.StaticFieldIndex(owner, field));
+            return VmByRef.Frame(constructedStorage, ObjectModel.StaticFieldIndex(owner, field), isReadOnly);
         }
         EnsureInitialized(owner);
         var staticStorage = _objects.GetOrCreateStaticStorage(owner.FullName, owner, _loader, null, _unifiedStaticStorage, null);
-        return new VmByRef(staticStorage, ObjectModel.StaticFieldIndex(owner, field));
+        return VmByRef.Frame(staticStorage, ObjectModel.StaticFieldIndex(owner, field), isReadOnly);
     }
 }

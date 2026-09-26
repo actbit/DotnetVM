@@ -20,7 +20,7 @@ internal sealed partial class CallEngine {
         if (table != TableKind.StandAloneSig)
             throw new BadImageFormatException($"calli のオペランド 0x{token:X8} は StandAloneSig ではありません。");
         return SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetBlob(_loader.Image.Tables.GetRowIndex(TableKind.StandAloneSig, rid, 0)).ToArray(),
+            _loader.Image.GetBlob(_loader.Image.Tables.GetRowIndex(TableKind.StandAloneSig, rid, 0)),
             _loader.Image.Limits?.MaxSignatureDepth ?? 64,
             _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
     }
@@ -44,20 +44,23 @@ internal sealed partial class CallEngine {
         var rid = (int)(token & 0xFFFFFF);
         switch (table) {
             case TableKind.MethodDef: {
+                if (_methodDefTargets.TryGetValue(token, out var cached))
+                    return cached;
                 var method = _loader.GetMethodByToken((uint)token)
                     ?? throw new BadImageFormatException($"MethodDef トークン 0x{token:X8} を解決できません。");
-                return new CallTarget {
+                var target = new CallTarget {
                     Arity = method.Signature.ParamTypes.Length + (method.Signature.HasThis ? 1 : 0),
                     Method = method,
                     Name = method.Name,
                     ParamCount = method.Signature.ParamTypes.Length,
                     HasThis = method.Signature.HasThis,
                 };
+                return _methodDefTargets.GetOrAdd(token, target);
             }
             case TableKind.MemberRef: {
                 // MemberRef 署名から hasThis/引数個数を得る
                 var signature = SignatureDecoder.DecodeMethodSignature(
-                    _loader.Image.GetMemberRefSignature(rid).ToArray(),
+                    _loader.Image.GetMemberRefSignature(rid),
                     _loader.Image.Limits?.MaxSignatureDepth ?? 64,
                     _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
                 var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
@@ -299,7 +302,7 @@ internal sealed partial class CallEngine {
             TableKind.MethodSpec, methodSpecRid, 0, CodedIndexKind.MethodDefOrRef);
         var instantiationBlobIndex = _loader.Image.Tables.GetRowIndex(TableKind.MethodSpec, methodSpecRid, 1);
         var methodArgs = SignatureDecoder.DecodeMethodSpecInstantiation(
-            _loader.Image.GetBlob(instantiationBlobIndex).ToArray(),
+            _loader.Image.GetBlob(instantiationBlobIndex),
             _loader.Image.Limits?.MaxSignatureDepth ?? 64,
             _loader.Image.Limits?.MaxGenericNestingDepth ?? 64)
             .Select(t => _loader.ResolveToken(t, context))
@@ -323,7 +326,7 @@ internal sealed partial class CallEngine {
         if (underlying.Table == TableKind.MemberRef) {
             var memberRefRid = underlying.Rid;
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+                _loader.Image.GetMemberRefSignature(memberRefRid),
                 _loader.Image.Limits?.MaxSignatureDepth ?? 64,
                 _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var name = _loader.GetMemberRefName(memberRefRid);

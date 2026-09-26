@@ -9,7 +9,7 @@ public sealed partial class TypeLoader {
     /// provenance 検査で、解決後の facade だけでなく元の TypeRef scope も確認するために使う。</summary>
     internal uint GetTypeSpecDefinitionToken(int typeSpecRid) {
         var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
-        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob.ToArray(),
+        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob,
             _image.Limits?.MaxSignatureDepth ?? 64,
             _image.Limits?.MaxGenericNestingDepth ?? 64).Type;
         if (sigType.Kind != SigKind.GenericInst)

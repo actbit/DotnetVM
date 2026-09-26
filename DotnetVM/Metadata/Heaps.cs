@@ -36,9 +36,16 @@ public sealed class UserStringHeap {
         if (offset < 1 || offset >= span.Length)
             throw new BadImageFormatException($"#US オフセット 0x{offset:X} が範囲外です。");
         var reader = new SpanReader(span[offset..]);
-        var byteCount = (int)reader.ReadCompressedUInt32();
+        var rawByteCount = reader.ReadCompressedUInt32();
+        if (rawByteCount > int.MaxValue)
+            throw new BadImageFormatException($"#US エントリの長さ {rawByteCount:N0} が大きすぎます。");
+        var byteCount = (int)rawByteCount;
+        if (byteCount < 1 || byteCount > reader.Remaining)
+            throw new BadImageFormatException("#US エントリの長さがヒープ末尾を超えています。");
         var payload = reader.ReadBytes(byteCount);
         // 末尾 1 バイトはフラグ (0/1 = ASCII 安全, それ以外 = 特殊文字を含む) なので除く
+        if ((payload.Length - 1) % 2 != 0)
+            throw new BadImageFormatException("#US エントリの UTF-16 ペイロード長が奇数です。");
         return Encoding.Unicode.GetString(payload[..^1]);
     }
 }
@@ -57,7 +64,12 @@ public sealed class BlobHeap {
         if (offset < 0 || offset >= span.Length)
             throw new BadImageFormatException($"#Blob オフセット 0x{offset:X} が範囲外です。");
         var reader = new SpanReader(span[offset..]);
-        var length = (int)reader.ReadCompressedUInt32();
+        var rawLength = reader.ReadCompressedUInt32();
+        if (rawLength > int.MaxValue)
+            throw new BadImageFormatException($"#Blob エントリの長さ {rawLength:N0} が大きすぎます。");
+        var length = (int)rawLength;
+        if (length > reader.Remaining)
+            throw new BadImageFormatException("#Blob エントリの長さがヒープ末尾を超えています。");
         return reader.ReadBytes(length);
     }
 }
@@ -72,9 +84,9 @@ public sealed class GuidHeap {
     public Guid GetGuid(int index) {
         if (index <= 0)
             return default;
-        var offset = (index - 1) * 16;
-        if (offset + 16 > _data.Length)
+        var offset = (long)(index - 1) * 16;
+        if (offset < 0 || offset > _data.Length - 16)
             throw new BadImageFormatException($"#GUID インデックス {index} が範囲外です。");
-        return new Guid(_data.Span.Slice(offset, 16).ToArray());
+        return new Guid(_data.Span.Slice((int)offset, 16));
     }
 }

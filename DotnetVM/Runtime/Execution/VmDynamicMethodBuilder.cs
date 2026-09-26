@@ -337,7 +337,7 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
                 code.AsSpan(position, sizeof(int)), target - basePosition);
         }
         ValidateDynamicCode(code);
-        return _method = new VmMethod {
+        var method = new VmMethod {
             DeclaringType = DynamicMethodType,
             MethodDefRid = 0,
             Name = Name,
@@ -349,6 +349,11 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
             DynamicTokens = _references.ToDictionary(pair => pair.Key, pair => pair.Value),
             Loader = Loader,
         };
+        // DynamicMethod has no metadata preparation cache, so run the same
+        // fail-closed stack verifier before publishing the method.
+        var decoded = method.DecodeIl();
+        _ = IlStackVerifier.Verify(method, Loader, _locals.ToArray(), decoded, clauses: null);
+        return _method = method;
     }
 
     /// <summary>生成 IL を実行可能にする前に命令境界・分岐・引数/ローカル・token をまとめて検証する。</summary>

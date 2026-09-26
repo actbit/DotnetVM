@@ -48,6 +48,11 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) 
         };
         if (method.Body is not null)
             IlVerifier.Verify(loader, method, code, localTypes, prepared.Clauses);
+        _ = IlStackVerifier.Verify(method, loader, localTypes, code, prepared.Clauses);
+        // Keep the declared capacity after verification. Some intrinsic
+        // surfaces expose a host implementation whose runtime stack shape is
+        // wider than the metadata signature; the declared maxstack remains the hard cap.
+        prepared.MaxStack = method.Body?.MaxStack ?? 0;
         if (maxPreparedMethods > 0) {
             _prepared[method] = prepared;
             _order.Enqueue(method);
@@ -146,10 +151,25 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) 
 }
 
 /// <summary>メソッドの事前準備結果 (ローカル型 + 解決済み EH 句)。</summary>
-internal sealed class PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
-    public readonly SigType[] LocalTypes = localTypes;
-    /// <summary>検証済みの命令列。デコードと検証はメソッドごとに一度だけ行う。</summary>
-    public readonly DecodedInstruction[] Code = code;
+internal sealed class PreparedMethod {
+    public readonly SigType[] LocalTypes;
+    public readonly DecodedInstruction[] Code;
+    public readonly Dictionary<int, int> OffsetMap;
+    public readonly StackSlot[] InitialLocals;
+    /// <summary>検証済みメソッドに対する実行時評価スタックの宣言容量。</summary>
+    public int MaxStack { get; set; }
+
+    public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
+        LocalTypes = localTypes;
+        Code = code;
+        OffsetMap = new Dictionary<int, int>(code.Length * 2);
+        for (var i = 0; i < code.Length; i++)
+            OffsetMap[code[i].Offset] = i;
+
+        InitialLocals = new StackSlot[localTypes.Length];
+        for (var i = 0; i < localTypes.Length; i++)
+            InitialLocals[i] = InterpreterFrame.DefaultValue(localTypes[i]);
+    }
 
     /// <summary>解決済み EH 句 (命令インデックス基準)。EH の無いメソッドは null。</summary>
     public PreparedClause[]? Clauses;

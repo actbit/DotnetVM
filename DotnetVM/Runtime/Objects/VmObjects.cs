@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Types;
 
@@ -752,6 +753,9 @@ public sealed class VmNativePointer : VmObject {
 
     public int ByteOffset { get; init; }
 
+    /// <summary>FieldRVA/readonly span 由来のポインタは書き込み不可。</summary>
+    public bool IsReadOnly { get; init; }
+
     public byte[] Bytes => Memory.Bytes;
 
     public override VmType Type => PointerType;
@@ -759,9 +763,27 @@ public sealed class VmNativePointer : VmObject {
     // ---- バイト読み書き (境界検査付き) ----
 
     private void CheckBounds(int byteCount) {
+        if (byteCount < 0)
+            throw new InvalidOperationException("ポインタのアクセス幅が負です。");
         if (ByteOffset < 0 || (long)ByteOffset + byteCount > Bytes.Length)
             throw new InvalidOperationException(
                 $"unmanaged ポインタがブロック外を参照します (offset={ByteOffset}, 要求 {byteCount} バイト, ブロック {Bytes.Length} バイト)。");
+    }
+
+    /// <summary>guest 命令経路用の境界検査。公開した低レベル API の従来例外型は維持しつつ、
+    /// ゲストへはホスト例外を漏らさない。</summary>
+    public void EnsureBounds(int byteCount) {
+        try {
+            CheckBounds(byteCount);
+        } catch (InvalidOperationException ex) {
+            throw new UnhandledGuestException("System.IndexOutOfRangeException", ex.Message);
+        }
+    }
+
+    public void EnsureWritable() {
+        if (IsReadOnly)
+            throw new UnhandledGuestException("System.InvalidProgramException",
+                "読み取り専用の仮想メモリへ書き込めません。");
     }
 
     public int ReadInt8() {
@@ -805,31 +827,37 @@ public sealed class VmNativePointer : VmObject {
     }
 
     public void WriteInt8(int value) {
+        EnsureWritable();
         CheckBounds(1);
         Bytes[ByteOffset] = (byte)value;
     }
 
     public void WriteInt16(int value) {
+        EnsureWritable();
         CheckBounds(2);
         System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2), (short)value);
     }
 
     public void WriteInt32(int value) {
+        EnsureWritable();
         CheckBounds(4);
         System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
 
     public void WriteInt64(long value) {
+        EnsureWritable();
         CheckBounds(8);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteDouble(double value) {
+        EnsureWritable();
         CheckBounds(8);
         System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteSingle(float value) {
+        EnsureWritable();
         CheckBounds(4);
         System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
@@ -846,6 +874,7 @@ public sealed class VmNativePointer : VmObject {
 /// </remarks>
 public sealed class ObjectModel {
     private readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
+    private readonly ConditionalWeakTable<VmClassType, InstanceDefaults> _instanceDefaults = new();
     private readonly object _gate = new();
     // 静的ストレージは「正準型キー (構築型なら FullName)」で保持する。CLR と同じく
     // 構築ジェネリック型 (C<int> と C<string> 等) は静的フィールドを共有しない。
@@ -855,8 +884,10 @@ public sealed class ObjectModel {
     /// <summary>インスタンスフィールドのスロット配置 (基底型のフィールドが先頭、同一型内は宣言順)。
     /// 基底が構築ジェネリック型 (例: Sub`1 : Base`1&lt;!0&gt;) の場合は定義型に解いて収集する。</summary>
     public Dictionary<VmField, int> GetLayout(VmClassType type) {
-        lock (_gate) {
         if (Layouts.TryGetValue(type, out var cached))
+            return cached;
+        lock (_gate) {
+        if (Layouts.TryGetValue(type, out cached))
             return cached;
         var layout = new Dictionary<VmField, int>();
         var index = 0;
@@ -885,10 +916,39 @@ public sealed class ObjectModel {
     /// <summary>インスタンスフィールド既定値のストレージを生成する (ジェネリック型は型引数でフィールド型を解決)。</summary>
     public StackSlot[] CreateInstanceStorage(VmClassType type, TypeLoader loader, GenericContext? context) {
         var layout = GetLayout(type);
-        var fields = new StackSlot[layout.Values.Count == 0 ? 0 : layout.Values.Max() + 1];
+        if (context is null) {
+            if (!_instanceDefaults.TryGetValue(type, out var defaults)) {
+                lock (_gate) {
+                    if (!_instanceDefaults.TryGetValue(type, out defaults)) {
+                        defaults = BuildInstanceDefaults(type, loader, layout);
+                        _instanceDefaults.Add(type, defaults);
+                    }
+                }
+            }
+            if (defaults.Template is { } template)
+                return template.Length == 0 ? Array.Empty<StackSlot>() : (StackSlot[])template.Clone();
+        }
+        var fields = new StackSlot[layout.Count];
         foreach (var (field, index) in layout)
             fields[index] = DefaultForType(GenericSubstitutor.Substitute(field.FieldType!, context), loader);
         return fields;
+    }
+
+    private InstanceDefaults BuildInstanceDefaults(VmClassType type, TypeLoader loader,
+        Dictionary<VmField, int> layout) {
+        var template = new StackSlot[layout.Count];
+        foreach (var (field, index) in layout) {
+            var value = DefaultForType(field.FieldType, loader);
+            if (value.Kind is StackKind.ValueType or StackKind.ByRef ||
+                (value.Kind == StackKind.Object && value.ObjectValue is not null))
+                return new InstanceDefaults(null);
+            template[index] = value;
+        }
+        return new InstanceDefaults(template);
+    }
+
+    private sealed class InstanceDefaults(StackSlot[]? template) {
+        public StackSlot[]? Template { get; } = template;
     }
 
     /// <summary>静的フィールドのストレージ。world を渡すと VM 単位の共有テーブル

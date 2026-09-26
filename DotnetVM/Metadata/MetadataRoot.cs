@@ -29,9 +29,11 @@ public sealed class MetadataRoot {
             throw new BadImageFormatException("メタデータルートのシグネチャ ('BSJB') が不正です。");
 
         var versionLength = BinaryPrimitives.ReadInt32LittleEndian(root[12..]);
-        var versionEnd = 16 + versionLength;
-        if (versionLength < 0 || versionLength % 4 != 0 || versionEnd + 4 > root.Length)
+        var versionEndLong = 16L + versionLength;
+        if (versionLength < 0 || versionLength % 4 != 0 ||
+            versionEndLong < 16 || versionEndLong > root.Length - 4)
             throw new BadImageFormatException("メタデータルートのバージョン文字列長が不正です。");
+        var versionEnd = (int)versionEndLong;
 
         var versionString = System.Text.Encoding.ASCII.GetString(root.Slice(16, versionLength).TrimEnd((byte)0));
         BinaryPrimitives.ReadUInt16LittleEndian(root[versionEnd..]);      // Flags (未使用)
@@ -55,11 +57,16 @@ public sealed class MetadataRoot {
             var nameStart = p;
             while (p < root.Length && root[p] != 0)
                 p++;
+            if (p >= root.Length)
+                throw new BadImageFormatException("メタデータストリーム名が null 終端されていません。");
             var name = System.Text.Encoding.ASCII.GetString(root.Slice(nameStart, p - nameStart));
             p++;                       // null 終端
-            p = (p + 3) & ~3;          // 4 バイト整列
+            p = checked((p + 3) & ~3);  // 4 バイト整列
+            if (p > root.Length)
+                throw new BadImageFormatException("メタデータストリームヘッダの整列位置が範囲外です。");
 
-            if (streamOffset < 0 || streamOffset + streamSize > root.Length)
+            if (streamOffset < 0 || streamSize < 0 || streamOffset > root.Length ||
+                streamSize > root.Length - streamOffset)
                 throw new BadImageFormatException($"ストリーム '{name}' がメタデータ領域を超えています。");
             if (limits is not null && streamSize > limits.MaxMetadataStreamBytes)
                 throw new BadImageFormatException(

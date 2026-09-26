@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace DotnetVM.Runtime.Execution;
 
 /// <summary>評価スタックのスロット型 (ECMA-335 III.1.1 の検証可能スタック型に対応)。</summary>
@@ -36,12 +38,19 @@ public struct StackSlot {
     public double DoubleValue;
     public object? ObjectValue;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfInt32(int value) => new() { Kind = StackKind.Int32, Int64Value = value };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfInt64(long value) => new() { Kind = StackKind.Int64, Int64Value = value };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfNativeInt(long value) => new() { Kind = StackKind.NativeInt, Int64Value = value };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfFloat(double value) => new() { Kind = StackKind.Float, DoubleValue = value };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfObject(object? value) => new() { Kind = StackKind.Object, ObjectValue = value };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfByRef(object reference) => new() { Kind = StackKind.ByRef, ObjectValue = reference };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfValueType(object structValue) => new() { Kind = StackKind.ValueType, ObjectValue = structValue };
     public static StackSlot Null => new() { Kind = StackKind.Object, ObjectValue = null };
 
@@ -70,35 +79,44 @@ public sealed class EvaluationStack {
     public readonly int MaxStack;
 
     public EvaluationStack(int maxStack) {
-        MaxStack = Math.Max(maxStack, 8);
+        if (maxStack < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxStack));
+        // The verifier proves the required depth before a frame is created.
+        // Keep the actual capacity equal to that proof instead of silently
+        // rounding hostile metadata up to eight slots.
+        MaxStack = maxStack;
         _slots = new StackSlot[this.MaxStack];
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Push(in StackSlot slot) {
         if (Count == _slots.Length)
-            throw new InvalidOperationException("評価スタックがオーバーフローしました (maxstack 超過)。");
+            throw new BadImageFormatException(
+                $"評価スタックがオーバーフローしました (Count={Count}, MaxStack={MaxStack})。");
         _slots[Count++] = slot;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public StackSlot Pop() {
         if (Count == 0)
-            throw new InvalidOperationException("評価スタックが空です (pop できません)。");
+            throw new BadImageFormatException("評価スタックが空です (pop できません)。");
         var slot = _slots[--Count];
         _slots[Count] = default;
         return slot;
     }
 
     /// <summary>peek (取り出さない)。</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref StackSlot Peek() {
         if (Count == 0)
-            throw new InvalidOperationException("評価スタックが空です (peek できません)。");
+            throw new BadImageFormatException("評価スタックが空です (peek できません)。");
         return ref _slots[Count - 1];
     }
 
     /// <summary>上から depth 番目を参照 (dup や二項演算の両辺参照用)。</summary>
     public ref StackSlot PeekAt(int depth) {
         if (depth < 0 || depth >= Count)
-            throw new InvalidOperationException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
+            throw new BadImageFormatException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
         return ref _slots[Count - 1 - depth];
     }
 

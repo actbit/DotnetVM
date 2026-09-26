@@ -79,7 +79,7 @@ public sealed partial class Interpreter {
                 var engines = EnginesFor(method);
                 CloneStructArgs(method, arguments);
                 var prepared = engines.Preparer.Prepare(method);
-                var frame = InterpreterFrame.Create(method, arguments, prepared.LocalTypes, method.Body.MaxStack, prepared.Code);
+                var frame = InterpreterFrame.Create(method, arguments, prepared, prepared.MaxStack);
                 frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
                 using (_coordinator.EnterRead()) {
                     lock (state.Gate)
@@ -96,7 +96,7 @@ public sealed partial class Interpreter {
                     // guest instruction.  Do not perform it after the guest has
                     // already exhausted its instruction budget; the first
                     // interpreter instruction will report the normal quota error.
-                    var compiled = HasInstructionBudget
+                    var compiled = CanUseJit
                         ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
                         : null;
                     return compiled is null
@@ -107,6 +107,7 @@ public sealed partial class Interpreter {
                         lock (state.Gate)
                             state.Frames.Remove(frame);
                     }
+                    _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
                 }
             } finally {
                 state.Depth--;
@@ -130,6 +131,77 @@ public sealed partial class Interpreter {
 
     }
 
+    /// <summary>
+    /// Execute an already promoted guest method without repeating the public
+    /// invocation plumbing on every nested call. This is only a fast path for
+    /// a delegate already present in the loader-local JIT cache; unpromoted
+    /// methods continue through the normal Invoke path.
+    /// </summary>
+    internal bool TryInvokeCompiled(VmMethod method, StackSlot[] arguments,
+        GenericContext? context, out StackSlot result) {
+        result = default;
+        if (!CanUseJit)
+            return false;
+        var engines = EnginesFor(method);
+        var compiled = engines.Jit.GetCompiled(method);
+        if (compiled is null)
+            return false;
+
+        var preparedMethod = PrepareInvocation(method, arguments, context);
+        if (!ReferenceEquals(preparedMethod, method) || method.Body is null)
+            return false;
+        var state = CurrentState;
+        if (state.Depth >= _memory.MaxRecursionDepth)
+            throw new UnhandledGuestException("System.StackOverflowException",
+                $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
+
+        state.Depth++;
+        try {
+            CloneStructArgs(method, arguments);
+            if (context is null && compiled.HasLeaf) {
+                if (_tracer is { } leafTracer)
+                    leafTracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                compiled.TryInvokeLeaf(this, arguments, out result);
+                return true;
+            }
+            var frame = InterpreterFrame.Create(method, arguments, compiled.Prepared, compiled.Prepared.MaxStack);
+            frame.Context = context;
+            // The caller is executing under an instruction-batch read lease,
+            // so a collector cannot observe this half-registered frame.
+            lock (state.Gate)
+                state.Frames.Add(frame);
+            if (_tracer is { } tracer)
+                tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+            try {
+                FixupStructLocals(frame);
+                result = compiled.Invoke(this, engines.Services, frame);
+                return true;
+            } finally {
+                lock (state.Gate)
+                    state.Frames.Remove(frame);
+                _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
+            }
+        } finally {
+            state.Depth--;
+            if (state.Depth == 0)
+                FlushPendingAssemblyContextCaches();
+        }
+    }
+
+    internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
+        var objects = JitObjectsFor(method);
+        var field = objects.ResolveFieldToken(token, null, method.DynamicTokens);
+        if (field.IsInitOnly && method.Name is not (".ctor" or ".cctor"))
+            throw new UnhandledGuestException("System.FieldAccessException",
+                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
+        if (!objects.TryStoreStringField(receiver, field, value))
+            objects.WriteField(receiver, field, value);
+    }
+
+    /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>
+    private bool CanUseJit => HasInstructionBudget &&
+        _tracer?.CapturesInstructions != true && _debugger?.IsActive != true;
+
     /// <summary>外側の guest 呼出の間だけ、ホスト thread の ambient culture を VM 設定に合わせる。</summary>
     private sealed class GuestCultureScope : IDisposable {
         private readonly CultureInfo _previousCulture = CultureInfo.CurrentCulture;
@@ -147,7 +219,6 @@ public sealed partial class Interpreter {
     }
 
     private VmMethod PrepareInvocation(VmMethod method, StackSlot[] arguments, GenericContext? context) {
-        EnsureStaticMethodTypeInitialized(method, context);
         if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
             // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する
             if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)
@@ -158,6 +229,12 @@ public sealed partial class Interpreter {
                 };
             method = substituted;
         }
+        // Validate guest IL before running a static constructor. Otherwise a
+        // malformed method could initialize guest state before fail-closed
+        // preparation has a chance to reject it.
+        if (method.Body is not null)
+            EnginesFor(method).Preparer.Prepare(method);
+        EnsureStaticMethodTypeInitialized(method, context);
         return method;
     }
 
@@ -179,7 +256,7 @@ public sealed partial class Interpreter {
                     CloneStructArgs(method, request.Arguments);
                     var nextPrepared = engines.Preparer.Prepare(method);
                     var nextFrame = InterpreterFrame.Create(method, request.Arguments,
-                        nextPrepared.LocalTypes, method.Body.MaxStack, nextPrepared.Code);
+                        nextPrepared, nextPrepared.MaxStack);
                     nextFrame.Context = request.Context;
 
                     using (_coordinator.EnterRead()) {

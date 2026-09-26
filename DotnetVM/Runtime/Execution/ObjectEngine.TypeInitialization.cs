@@ -8,10 +8,12 @@ internal sealed partial class ObjectEngine {
 
     /// <summary>型初期化子 (.cctor) の起動規約: 静的フィールド初回アクセス/newobj 前に 1 回だけ実行。</summary>
     public void EnsureInitialized(VmClassType type) {
+        if (_typeInitialization.IsCompleted(type))
+            return;
         EnsureInitializationOutsideExecutionLease(() => _typeInitialization.Ensure(type, () => {
             var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
-                invoker.Invoke(cctor, [], null);
+                InvokeGuest(cctor, []);
         }));
     }
 
@@ -22,7 +24,7 @@ internal sealed partial class ObjectEngine {
             var definition = (VmClassType)type.Definition;
             var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
-                invoker.Invoke(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
+                InvokeGuest(cctor, [], new GenericContext { ClassArgs = type.TypeArguments });
         }));
     }
 
@@ -56,7 +58,7 @@ internal sealed partial class ObjectEngine {
         args[0] = StackSlot.OfObject(instance);
         ctorArgs.CopyTo(args, 1);
         if (ctor.Body is not null)
-            invoker.Invoke(ctor, args, effectiveContext);
+            InvokeGuest(ctor, args, effectiveContext);
         return instance;
     }
 }

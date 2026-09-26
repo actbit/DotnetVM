@@ -81,9 +81,9 @@ internal static partial class CoreLibBindings {
         // VM では box / インスタンスの先頭フィールドへの ByRef、文字列はバイト実体で提供する
         r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "GetRawData", "System.Object"),
             static (_, a) => a[0].ObjectValue switch {
-                VmBoxedValue box => StackSlot.OfByRef(new VmByRef(box.Fields, 0)),
+                VmBoxedValue box => StackSlot.OfByRef(VmByRef.BoxedValue(box)),
                 VmClassInstance instance when instance.Fields.Length > 0 =>
-                    StackSlot.OfByRef(new VmByRef(instance.Fields, 0)),
+                    StackSlot.OfByRef(VmByRef.OwnedStorage(instance, instance.Fields, 0)),
                 VmString str => StackSlot.OfObject(new VmNativePointer {
                     Memory = str.PointerMemory,
                     ByteOffset = VmString.CharDataByteOffset,

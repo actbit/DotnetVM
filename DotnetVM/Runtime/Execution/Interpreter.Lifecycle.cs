@@ -131,6 +131,7 @@ public sealed partial class Interpreter {
         // 解放できないので、lock を破棄せず root だけ外し、残りの lease に任せる。
         if (_coordinator.IsExecutingOnCurrentThread) {
             _heap.RemoveRootSlotSource(_frameRootSource);
+            _executionStates.Clear();
             return;
         }
         using (_coordinator.StopTheWorld())
@@ -140,6 +141,8 @@ public sealed partial class Interpreter {
                 engines.Jit.Clear();
             _engines.Clear();
         }
+        _executionStates.Clear();
+        _currentExecution.Dispose();
         _coordinator.Dispose();
     }
 }

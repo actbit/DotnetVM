@@ -42,8 +42,13 @@ public sealed class MetadataTables {
         // 行数テーブル: Valid ビットが立っているテーブル順
         var rowCounts = new int[64];
         for (var t = 0; t < 64; t++) {
-            if ((validMask & (1UL << t)) != 0)
-                rowCounts[t] = (int)reader.ReadUInt32();
+            if ((validMask & (1UL << t)) != 0) {
+                var rawCount = reader.ReadUInt32();
+                if (rawCount > int.MaxValue)
+                    throw new BadImageFormatException(
+                        $"メタデータテーブル {t} の行数 {rawCount:N0} はサポート範囲外です。");
+                rowCounts[t] = (int)rawCount;
+            }
         }
 
         // 各テーブルの列幅を計算
@@ -58,7 +63,7 @@ public sealed class MetadataTables {
             };
             for (var c = 0; c < columns.Count; c++)
                 layout.ColumnWidths[c] = GetColumnWidth(columns[c], rowCounts);
-            layout.RowSize = layout.ColumnWidths.Sum();
+            layout.RowSize = checked(layout.ColumnWidths.Sum());
             layout.ColumnOffsets = PrefixSums(layout.ColumnWidths);
             _layouts[t] = layout;
         }
@@ -68,7 +73,11 @@ public sealed class MetadataTables {
         for (var t = 0; t < 64; t++) {
             if (_layouts[t] is { RowCount: > 0 } layout) {
                 layout.FirstRowOffset = cursor;
-                cursor += layout.RowCount * layout.RowSize;
+                var bytes = (long)layout.RowCount * layout.RowSize;
+                if (bytes > _data.Length - cursor)
+                    throw new BadImageFormatException(
+                        $"メタデータテーブル {t} が #~ ストリームを超えています。");
+                cursor += (int)bytes;
             }
         }
         if (cursor > _data.Length)
@@ -108,7 +117,7 @@ public sealed class MetadataTables {
         var sum = 0;
         for (var i = 0; i < widths.Length; i++) {
             offsets[i] = sum;
-            sum += widths[i];
+            sum = checked(sum + widths[i]);
         }
         return offsets;
     }
@@ -121,7 +130,9 @@ public sealed class MetadataTables {
         var layout = _layouts[(int)table] ?? throw new ArgumentOutOfRangeException($"テーブル {table} は存在しません。");
         if (rid < 1 || rid > layout.RowCount)
             throw new ArgumentOutOfRangeException($"テーブル {table} の rid {rid} は範囲外です (行数 {layout.RowCount})。");
-        var offset = layout.FirstRowOffset + (rid - 1) * layout.RowSize + layout.ColumnOffsets[column];
+        if (column < 0 || column >= layout.ColumnWidths.Length)
+            throw new ArgumentOutOfRangeException(nameof(column));
+        var offset = checked(layout.FirstRowOffset + checked((rid - 1) * layout.RowSize) + layout.ColumnOffsets[column]);
         var span = _data.Span;
         return layout.ColumnWidths[column] switch {
             1 => span[offset],

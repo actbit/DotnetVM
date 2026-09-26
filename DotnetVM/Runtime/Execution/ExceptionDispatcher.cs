@@ -38,6 +38,12 @@ internal sealed class ExceptionDispatcher(
         } catch (UnhandledGuestException uge) {
             // VM 内部例外 (ゼロ除算/境界外/null 参照等) を例外オブジェクトに実体化してゲスト EH へ
             return UnwindAndContinue(frame, SynthesizeCarrier(uge));
+        } catch (InvalidOperationException invalid) {
+            // A malformed stack value must not cross the VM boundary as a
+            // host implementation exception.  The verifier catches normal
+            // cases; this remains a defensive normalization for handles and
+            // other guest-controlled values introduced by host APIs.
+            return UnwindAndContinue(frame, SynthesizeCarrier(InvalidProgram(invalid)));
         }
     }
 
@@ -52,9 +58,14 @@ internal sealed class ExceptionDispatcher(
                 current = next; // handler/filter/finally 内での新たな例外
             } catch (UnhandledGuestException uge) {
                 current = SynthesizeCarrier(uge);
+            } catch (InvalidOperationException invalid) {
+                current = SynthesizeCarrier(InvalidProgram(invalid));
             }
         }
     }
+
+    private static UnhandledGuestException InvalidProgram(InvalidOperationException exception) =>
+        new("System.InvalidProgramException", $"ゲスト実行状態が不正です: {exception.Message}");
 
     /// <summary>VM 内部例外を例外ファサード型のインスタンスとしてヒープに実体化する。</summary>
     private VmGuestThrow SynthesizeCarrier(UnhandledGuestException uge) {
@@ -138,8 +149,11 @@ internal sealed class ExceptionDispatcher(
             VmClassInstance ci => (VmType)ci.ClassType,
             VmArray arr => (VmType)arr.ArrayType,
             VmBoxedValue boxed => boxed.Type,
-            _ => throw new InvalidOperationException($"throw できない VM オブジェクトです: {vmObject.GetType().Name}"),
+            _ => null,
         };
+        if (runtimeType is null)
+            return SynthesizeCarrier(new UnhandledGuestException("System.InvalidCastException",
+                $"{SlotOps.Describe(value)} は System.Exception を派生していないため throw できません。"));
         // CLR 互換: Exception 派生でないオブジェクトの throw は InvalidCastException
         var exceptionType = _loader.FindIntrinsicType("System.Exception")!;
         if (!runtimeType.IsAssignableTo(exceptionType))

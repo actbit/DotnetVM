@@ -42,6 +42,12 @@ public static class IlDecoder {
             return result;
         } catch (BadImageFormatException) {
             throw;
+        } catch (EndOfStreamException ex) {
+            throw new BadImageFormatException("IL オペランドが途中で終わっています。", ex);
+        } catch (ArgumentOutOfRangeException ex) {
+            throw new BadImageFormatException("IL オペランドの範囲が不正です。", ex);
+        } catch (OverflowException ex) {
+            throw new BadImageFormatException("IL オペランドのサイズがオーバーフローしました。", ex);
         } catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) {
             throw new BadImageFormatException("IL の命令形式が不正です。", ex);
         }
@@ -91,12 +97,17 @@ public static class IlDecoder {
             }
             case IlOperandKind.Switch: {
                 var count = reader.ReadUInt32();
-                var targets = new int[count];
-                var baseOffset = offset + 5 + 4 * (int)count;
-                for (var i = 0; i < count; i++)
+                if (count > int.MaxValue || count > (uint)(reader.Remaining / 4))
+                    throw new BadImageFormatException(
+                        $"switch のターゲット数 {count:N0} が IL の残りサイズに対して不正です。");
+                var countInt = (int)count;
+                var size = checked(5 + 4 * countInt);
+                var targets = new int[countInt];
+                var baseOffset = checked(offset + size);
+                for (var i = 0; i < countInt; i++)
                     targets[i] = baseOffset + reader.ReadInt32();
                 return new DecodedInstruction(offset, op, info.Operand,
-                    5 + 4 * (int)count, targets.Length, 0, 0, targets);
+                    size, targets.Length, 0, 0, targets);
             }
             case IlOperandKind.Method:
             case IlOperandKind.Signature:

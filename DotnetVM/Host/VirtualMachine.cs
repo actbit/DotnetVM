@@ -1,4 +1,5 @@
 using DotnetVM.Devices;
+using DotnetVM.Diagnostics;
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
@@ -37,6 +38,9 @@ public sealed class VirtualMachine : IDisposable {
     private readonly Func<IEnumerable<VmObject?>> _guestThreadRoots;
     private readonly Func<IEnumerable<StackSlot[]>> _guestTaskRoots;
     private int _disposed;
+
+    /// <summary>命令ブレークポイントとステップ実行を提供するデバッガ。</summary>
+    public VmDebugger Debugger { get; } = new();
 
     public VirtualMachine(VmHostOptions? options = null) {
         _options = options ?? new VmHostOptions();
@@ -517,7 +521,7 @@ public sealed class VirtualMachine : IDisposable {
             ThrowIfDisposed();
             return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
                 _options.EnableJit, _options.JitPromotionThreshold,
-                _network, _storage, Tracer, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
+                _network, _storage, Tracer, Debugger, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
                 _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
                 LoadAssemblyPathInContext);
         }
@@ -526,7 +530,6 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>実行トレース (どのアセンブリ/メソッドの IL フレームが実行されたか)。
     /// Tracer.Start() で記録を有効化してから Invoke する (常時記録はしない)。</summary>
     public Diagnostics.ExecutionTracer Tracer { get; }
-
     private TypeLoader GetPrimaryLoader() {
         lock (_assemblyGate) {
             if (_loaders.Count == 0)
@@ -634,6 +637,8 @@ public sealed class VirtualMachine : IDisposable {
         }
         if (declared is not null && slot.Kind == StackKind.Int64 && declared.Kind == SigKind.U8)
             return (ulong)slot.Int64Value;
+        if (declared is not null && slot.Kind == StackKind.Float && declared.Kind == SigKind.R4)
+            return (float)slot.DoubleValue;
         return FromSlotCore(slot);
     }
 
@@ -654,6 +659,9 @@ public sealed class VirtualMachine : IDisposable {
         StackKind.ValueType when slot.ObjectValue is VmStructValue sv && sv.StructType.FullName == "System.Decimal" =>
             DecodeDecimal(sv),
         StackKind.ValueType => slot.ObjectValue, // その他の構造体値は VM オブジェクトのまま返す
+        // ref return は VM の managed ByRef をそのまま返す。Owner を保持した ByRef を
+        // ホスト側で診断/root 登録でき、array/box の GC/accounting 回帰テストにも使える。
+        StackKind.ByRef => slot.ObjectValue,
         _ => throw new InvalidOperationException($"戻り値スロット {slot.Kind} はホスト値に変換できません。"),
     };
 
@@ -720,6 +728,7 @@ public sealed class VirtualMachine : IDisposable {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            Debugger.Dispose();
             _sharedState.Dispose();
             lock (_interpreterGate) {
                 _interpreter?.Dispose();

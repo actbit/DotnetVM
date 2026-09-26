@@ -239,8 +239,11 @@ internal sealed partial class ObjectEngine {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         if (table == TableKind.MethodDef) {
-            ctor = _loader.GetMethodByToken((uint)token)
-                ?? throw new BadImageFormatException($"newobj トークン 0x{token:X8} を解決できません。");
+            if (!_methodDefConstructors.TryGetValue(token, out ctor!)) {
+                ctor = _loader.GetMethodByToken((uint)token)
+                    ?? throw new BadImageFormatException($"newobj トークン 0x{token:X8} を解決できません。");
+                ctor = _methodDefConstructors.GetOrAdd(token, ctor);
+            }
             if (ctor.DeclaringType.FullName == "System.Reflection.Emit.DynamicMethod" && ctor.Name == ".ctor")
                 return NewDynamicMethodInstance(ctor.Signature.ParamTypes.Length, caller);
         } else if (table == TableKind.MemberRef) {
@@ -248,7 +251,7 @@ internal sealed partial class ObjectEngine {
             if (parent.Table == TableKind.TypeSpec)
                 return NewConstructedObject(token, rid, parent.Rid, caller);
             var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(rid).ToArray(),
+                _loader.Image.GetMemberRefSignature(rid),
                 _loader.Image.Limits?.MaxSignatureDepth ?? 64,
                 _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             var facadeParamCount = signature.ParamTypes.Length;
@@ -372,7 +375,7 @@ internal sealed partial class ObjectEngine {
             var thisStorage = new[] { StackSlot.OfValueType(_objects.DefaultStruct(owner, _loader)) };
             args[0] = StackSlot.OfByRef(new VmByRef(thisStorage, 0));
             if (ctor.Body is not null)
-                invoker.Invoke(ctor, args, null);
+                InvokeGuest(ctor, args);
             return thisStorage[0].Kind == StackKind.ValueType
                 ? thisStorage[0]
                 : StackSlot.OfValueType(thisStorage[0]);
@@ -381,7 +384,7 @@ internal sealed partial class ObjectEngine {
         var instance = _heap.Allocate(new VmClassInstance(owner, _objects.CreateInstanceStorage(owner, _loader)));
         args[0] = StackSlot.OfObject(instance);
         if (ctor.Body is not null)
-            invoker.Invoke(ctor, args, null);
+            InvokeGuest(ctor, args);
         return StackSlot.OfObject(instance);
     }
 
@@ -394,14 +397,14 @@ internal sealed partial class ObjectEngine {
             var callArgs = new StackSlot[values.Length + 1];
             callArgs[0] = StackSlot.OfByRef(new VmByRef(storage, 0));
             Array.Copy(values, 0, callArgs, 1, values.Length);
-            invoker.Invoke(ctor, callArgs, null);
+            InvokeGuest(ctor, callArgs);
             return storage[0].Kind == StackKind.ValueType ? storage[0] : StackSlot.OfValueType(storage[0]);
         }
         var instance = _heap.Allocate(new VmClassInstance(owner, _objects.CreateInstanceStorage(owner, _loader)));
         var args = new StackSlot[values.Length + 1];
         args[0] = StackSlot.OfObject(instance);
         Array.Copy(values, 0, args, 1, values.Length);
-        invoker.Invoke(ctor, args, null);
+        InvokeGuest(ctor, args);
         return StackSlot.OfObject(instance);
     }
 
@@ -429,7 +432,7 @@ internal sealed partial class ObjectEngine {
     private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
         var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
         var signature = SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetMemberRefSignature(memberRefRid).ToArray(),
+            _loader.Image.GetMemberRefSignature(memberRefRid),
             _loader.Image.Limits?.MaxSignatureDepth ?? 64,
             _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
         var paramCount = signature.ParamTypes.Length;
@@ -489,7 +492,7 @@ internal sealed partial class ObjectEngine {
             var thisStorage = new[] { StackSlot.OfValueType(_objects.DefaultStruct(definition, _loader, context, constructed.TypeArguments)) };
             args[0] = StackSlot.OfByRef(new VmByRef(thisStorage, 0));
             if (ctor?.Body is not null)
-                invoker.Invoke(ctor, args, context);
+                InvokeGuest(ctor, args, context);
             return thisStorage[0].Kind == StackKind.ValueType
                 ? thisStorage[0]
                 : StackSlot.OfValueType(thisStorage[0]);
@@ -499,7 +502,7 @@ internal sealed partial class ObjectEngine {
             _objects.CreateInstanceStorage(definition, _loader, context), constructed.TypeArguments));
         args[0] = StackSlot.OfObject(instance);
         if (ctor?.Body is not null)
-            invoker.Invoke(ctor, args, context);
+            InvokeGuest(ctor, args, context);
         return StackSlot.OfObject(instance);
     }
 }

@@ -14,6 +14,9 @@ public delegate void VmRandomFill(Span<byte> buffer);
 /// 超過は ResourceExhaustedException 系で拒否され、ゲストの catch には渡らない。
 /// </summary>
 public sealed class MemoryPolicy {
+    /// <summary>ホストスタックを危険な深さまで消費させないための絶対上限。</summary>
+    public const int MaxAllowedRecursionDepth = 4096;
+
     /// <summary>命令数クォータ (停止性保証)。既定 = 実用上ほぼ無制限。</summary>
     public long InstructionQuota { get; init; } = 1_000_000_000;
 
@@ -89,7 +92,9 @@ public sealed class MemoryPolicy {
     /// <summary>ポリシー値の符号と、実行に必要な最小値を検証する。</summary>
     internal void Validate() {
         if (InstructionQuota < 0) throw new ArgumentOutOfRangeException(nameof(InstructionQuota));
-        if (MaxRecursionDepth < 1) throw new ArgumentOutOfRangeException(nameof(MaxRecursionDepth));
+        if (MaxRecursionDepth < 1 || MaxRecursionDepth > MaxAllowedRecursionDepth)
+            throw new ArgumentOutOfRangeException(nameof(MaxRecursionDepth),
+                $"MaxRecursionDepth は 1..{MaxAllowedRecursionDepth} の範囲で指定してください。");
         if (TotalAllocationByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(TotalAllocationByteLimit));
         if (LiveObjectByteLimit < 0) throw new ArgumentOutOfRangeException(nameof(LiveObjectByteLimit));
         if (GcTriggerAllocationInterval < 1) throw new ArgumentOutOfRangeException(nameof(GcTriggerAllocationInterval));

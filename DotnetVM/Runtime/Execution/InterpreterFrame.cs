@@ -1,35 +1,73 @@
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
 
 /// <summary>
-/// マネージ参照 (ldarga/ldloca/ldelema 結果)。参照先を StackSlot 配列 + インデックスで表す。
+/// マネージ参照 (ldarga/ldloca/ldelema 等の結果)。参照先を StackSlot 配列 + インデックスで表す。
 /// ローカル/引数配列を直接指すことで stind 等が正しいスロットに書き込む。
-/// フィールド/配列要素への参照はオブジェクトモデル (M3) で拡張する。
+/// VM ヒープ上の storage を指す参照は、参照自身が root になったときにも storage owner を
+/// 生存させるため <see cref="Owner"/> を必ず保持する。
 /// </summary>
 public sealed class VmByRef {
     public readonly StackSlot[] Container;
     public readonly int Index;
+    /// <summary>配列/オブジェクトの storage owner。ByRef 自体が GC root になった場合も所有物を保持する。</summary>
+    public readonly VmObject? Owner;
 
-    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false) {
+    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false, VmObject? owner = null) {
+        ArgumentNullException.ThrowIfNull(container);
+        if ((uint)index > (uint)container.Length)
+            throw new ArgumentOutOfRangeException(nameof(index));
         Container = container;
         Index = index;
         IsReadOnly = isReadOnly;
+        Owner = owner;
     }
 
+    /// <summary>フレームの引数/ローカル storage への参照を作る。</summary>
+    public static VmByRef Frame(StackSlot[] container, int index, bool isReadOnly = false) =>
+        new(container, index, isReadOnly);
+
+    /// <summary>
+    /// 配列要素への参照を作る。配列要素の storage は必ず配列本体と同じ寿命を持つため、
+    /// owner 付き生成をこの factory に集約する。
+    /// </summary>
+    public static VmByRef ArrayElement(VmArray array, int index, bool isReadOnly = false) =>
+        new(array.Elements, index, isReadOnly, array);
+
+    /// <summary>ボックス化値の fields への参照を作る。</summary>
+    public static VmByRef BoxedValue(VmBoxedValue boxed, int index = 0, bool isReadOnly = false) =>
+        new(boxed.Fields, index, isReadOnly, boxed);
+
+    /// <summary>VmObject が所有する任意の field/state storage への参照を作る。</summary>
+    public static VmByRef OwnedStorage(VmObject owner, StackSlot[] container, int index,
+        bool isReadOnly = false) => new(container, index, isReadOnly, owner);
+
     public bool IsReadOnly { get; }
-    public ref StackSlot Slot => ref Container[Index];
+    /// <summary>空コンテナの index 0 は null/one-past 参照の表現として許可する。</summary>
+    public bool IsNullOrOnePast => Index == Container.Length;
+
+    /// <summary>参照先スロット。読み書きの境界を必ず VM 例外へ正規化する。</summary>
+    public ref StackSlot Slot {
+        get {
+            EnsureInBounds();
+            return ref Container[Index];
+        }
+    }
 
     public StackSlot Read() {
+        EnsureInBounds();
         lock (Container)
             return Container[Index];
     }
 
     public void Write(in StackSlot value) {
         EnsureWritable();
+        EnsureInBounds();
         lock (Container)
             Container[Index] = value;
     }
@@ -38,6 +76,15 @@ public sealed class VmByRef {
         if (IsReadOnly)
             throw new UnhandledGuestException("System.InvalidProgramException",
                 "readonly. で作られたマネージ参照には書き込めません。");
+    }
+
+    public void EnsureInBounds() {
+        if ((uint)Index >= (uint)Container.Length)
+            throw new UnhandledGuestException(
+                Container.Length == 0
+                    ? "System.NullReferenceException"
+                    : "System.IndexOutOfRangeException",
+                "マネージ参照が有効なスロットを指していません。");
     }
 }
 
@@ -120,9 +167,23 @@ public sealed class InterpreterFrame {
             Arguments = arguments,
             Locals = locals,
             LocalTypes = localTypes,
-            Stack = new EvaluationStack(maxStack),
+            // Preparation has already checked the declared maxstack.  Keep a
+            // small runtime floor for intrinsic bridge calls whose host-side
+            // implementation can transiently retain an extra result slot.
+            Stack = new EvaluationStack(Math.Max(maxStack, 8)),
         };
     }
+
+    internal static InterpreterFrame Create(VmMethod method, StackSlot[] arguments,
+        PreparedMethod prepared, int maxStack) => new() {
+            Method = method,
+            Code = prepared.Code,
+            OffsetMap = prepared.OffsetMap,
+            Arguments = arguments,
+            Locals = (StackSlot[])prepared.InitialLocals.Clone(),
+            LocalTypes = prepared.LocalTypes,
+            Stack = new EvaluationStack(Math.Max(maxStack, 8)),
+        };
 
     /// <summary>署名型に対する既定値スロット (ローカル変数のゼロ初期化)。</summary>
     public static StackSlot DefaultValue(SigType type) => type.Kind switch {

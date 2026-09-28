@@ -20,8 +20,6 @@ public sealed class VmMethod {
     internal IReadOnlyDictionary<uint, object>? DynamicTokens { get; init; }
 
     private string? _slotKey;
-    private DecodedInstruction[]? _decodedIl;
-
     /// <summary>ディスパッチ用スロットキー (名前 + パラメータ型の正規化形、成功時のみキャッシュ)。
     /// 署名解決が失敗した場合は都度 null を返す (呼出側はパラメータ数照合にフォールバックする)。</summary>
     internal string? SlotKey {
@@ -43,17 +41,11 @@ public sealed class VmMethod {
 
     /// <summary>IL を事前デコードする (Body が無い場合は例外)。</summary>
     public DecodedInstruction[] DecodeIl() {
-        // Method bodies are immutable after loading.  Decoding once is important
-        // for both the interpreter and JIT: a hot method otherwise paid for a
-        // complete IL decode on every invocation (and the frame rebuilt its
-        // offset map as well).
-        if (Volatile.Read(ref _decodedIl) is { } cached)
-            return cached;
-
+        // MethodPreparer is the bounded owner of decoded representations. Do not
+        // put another unbounded decoded-IL cache on every loader-owned method.
         var body = Body ?? throw new InvalidOperationException(
             $"メソッド {DeclaringType.FullName}::{Name} には本体がありません。");
-        var decoded = IlDecoder.Decode(body.IlCode);
-        return Interlocked.CompareExchange(ref _decodedIl, decoded, null) ?? decoded;
+        return IlDecoder.Decode(body.IlCode);
     }
 
     public override string ToString() => $"{DeclaringType.FullName}::{Name}";

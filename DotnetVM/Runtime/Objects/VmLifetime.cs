@@ -1,5 +1,6 @@
 using DotnetVM.Runtime.Types;
 using DotnetVM.Runtime.Execution;
+using DotnetVM.Policy;
 
 namespace DotnetVM.Runtime.Objects;
 
@@ -16,6 +17,12 @@ internal static class VmLifetime {
 
     public static void EnsureLive(object value) {
         switch (value) {
+            case VmByRef byRef:
+                if (byRef.Owner is { } owner)
+                    EnsureLive(owner);
+                if (!byRef.IsNullOrOnePast)
+                    EnsureLive(byRef.Read());
+                break;
             case VmAssemblyLoadContext context:
                 context.EnsureLive();
                 break;
@@ -67,6 +74,24 @@ internal static class VmLifetime {
             case VmField field:
                 EnsureLive(field.DeclaringType);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Guest call boundary 用の stale handle 検査。内部の loader/context は CLR の
+    /// ObjectDisposedException を使うが、それをそのまま投げると host exception が guest
+    /// 実行から漏れるため、常に VM の guest exception carrier に変換する。
+    /// </summary>
+    public static void EnsureLiveForGuest(in StackSlot slot) {
+        if (slot.ObjectValue is { } value)
+            EnsureLiveForGuest(value);
+    }
+
+    public static void EnsureLiveForGuest(object value) {
+        try {
+            EnsureLive(value);
+        } catch (ObjectDisposedException ex) {
+            throw new UnhandledGuestException("System.ObjectDisposedException", ex.Message);
         }
     }
 

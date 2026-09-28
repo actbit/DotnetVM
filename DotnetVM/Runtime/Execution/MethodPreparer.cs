@@ -7,12 +7,15 @@ namespace DotnetVM.Runtime.Execution;
 
 /// <summary>メソッドの事前準備キャッシュ: ローカル変数署名のデコード結果と、IL オフセット基準の
 /// EH 句を命令インデックス基準に解決した結果をメソッドごとに 1 回だけ計算して保持する。</summary>
-internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) {
+internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, long maxPreparedBytes) {
     private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
     private readonly Queue<VmMethod> _order = [];
     private readonly object _gate = new();
+    private long _preparedBytes;
 
     internal int Count { get { lock (_gate) return _prepared.Count; } }
+    internal long PreparedBytes { get { lock (_gate) return _preparedBytes; } }
+    internal bool IsCached(VmMethod method) { lock (_gate) return _prepared.ContainsKey(method); }
 
     public PreparedMethod Prepare(VmMethod method) {
         lock (_gate)
@@ -46,6 +49,7 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) 
         var prepared = new PreparedMethod(localTypes, code) {
             Clauses = ResolveExceptionClauses(method, code),
         };
+        prepared.SetEstimatedBytes(prepared.Clauses);
         if (method.Body is not null)
             IlVerifier.Verify(loader, method, code, localTypes, prepared.Clauses);
         _ = IlStackVerifier.Verify(method, loader, localTypes, code, prepared.Clauses);
@@ -53,14 +57,17 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods) 
         // surfaces expose a host implementation whose runtime stack shape is
         // wider than the metadata signature; the declared maxstack remains the hard cap.
         prepared.MaxStack = method.Body?.MaxStack ?? 0;
-        if (maxPreparedMethods > 0) {
+        if (maxPreparedMethods > 0 && maxPreparedBytes > 0 &&
+            prepared.EstimatedBytes <= maxPreparedBytes) {
             _prepared[method] = prepared;
             _order.Enqueue(method);
-            while (_prepared.Count > maxPreparedMethods) {
+            _preparedBytes = checked(_preparedBytes + prepared.EstimatedBytes);
+            while (_prepared.Count > maxPreparedMethods || _preparedBytes > maxPreparedBytes) {
                 var oldest = _order.Dequeue();
                 // The dictionary is only populated once per method while the
                 // gate is held, so a FIFO eviction is deterministic and bounded.
-                _prepared.Remove(oldest);
+                if (_prepared.Remove(oldest, out var removed))
+                    _preparedBytes -= removed.EstimatedBytes;
             }
         }
         return prepared;
@@ -158,6 +165,8 @@ internal sealed class PreparedMethod {
     public readonly StackSlot[] InitialLocals;
     /// <summary>検証済みメソッドに対する実行時評価スタックの宣言容量。</summary>
     public int MaxStack { get; set; }
+    /// <summary>prepared cache budget に使う保守的な host representation の概算サイズ。</summary>
+    public long EstimatedBytes { get; private set; }
 
     public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
         LocalTypes = localTypes;
@@ -169,6 +178,39 @@ internal sealed class PreparedMethod {
         InitialLocals = new StackSlot[localTypes.Length];
         for (var i = 0; i < localTypes.Length; i++)
             InitialLocals[i] = InterpreterFrame.DefaultValue(localTypes[i]);
+
+        EstimatedBytes = EstimateBytes(localTypes, code, OffsetMap, InitialLocals, null);
+    }
+
+    internal void SetEstimatedBytes(PreparedClause[]? clauses) {
+        EstimatedBytes = EstimateBytes(LocalTypes, Code, OffsetMap, InitialLocals, clauses);
+    }
+
+    private static long EstimateBytes(SigType[] localTypes, DecodedInstruction[] code,
+        Dictionary<int, int> offsetMap, StackSlot[] initialLocals, PreparedClause[]? clauses) {
+        long bytes = 256; // object headers and small fields
+        bytes = checked(bytes + code.LongLength * 64);
+        bytes = checked(bytes + localTypes.LongLength * 48);
+        bytes = checked(bytes + offsetMap.Count * 48L);
+        bytes = checked(bytes + initialLocals.LongLength * 32);
+        bytes = checked(bytes + (clauses?.LongLength ?? 0) * 96L);
+        foreach (var localType in localTypes)
+            bytes = checked(bytes + EstimateSigType(localType));
+        foreach (var instruction in code)
+            bytes = checked(bytes + (instruction.SwitchTargets?.LongLength ?? 0) * sizeof(int));
+        return bytes;
+    }
+
+    private static long EstimateSigType(SigType type) {
+        long bytes = 64; // node and record fields
+        if (type.Inner is { } inner)
+            bytes = checked(bytes + EstimateSigType(inner));
+        if (type.Args is { } args) {
+            bytes = checked(bytes + 24 + args.LongLength * 8);
+            foreach (var argument in args)
+                bytes = checked(bytes + EstimateSigType(argument));
+        }
+        return bytes;
     }
 
     /// <summary>解決済み EH 句 (命令インデックス基準)。EH の無いメソッドは null。</summary>

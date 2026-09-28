@@ -17,7 +17,7 @@ internal sealed partial class CallEngine {
         bool tailCallAllowed, out TailCallRequest? tailCallRequest) {
         tailCallRequest = null;
         foreach (var argument in caller.Stack.CopySlots())
-            VmLifetime.EnsureLive(argument);
+            VmLifetime.EnsureLiveForGuest(argument);
         // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
         // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
         var target = caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&

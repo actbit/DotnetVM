@@ -9,6 +9,8 @@ namespace DotnetVM.Metadata;
 /// </summary>
 public sealed class AssemblyImage {
     public PEImage PE { get; }
+    /// <summary>入力画像の保持バイト数 (PEImage が参照する backing memory の長さ)。</summary>
+    public int ByteLength => PE.ByteLength;
     public CliHeader Cli { get; }
     public MetadataRoot Root { get; }
     public MetadataTables Tables { get; }

@@ -64,7 +64,6 @@ public sealed partial class Interpreter {
         var strings = new VmStringPool(heap);
         var primary = CreateEngines(loader, strings);
         _services = primary.Services;
-        _preparer = primary.Preparer;
         _objectEngine = primary.Objects;
         _callEngine = primary.Calls;
         _exceptionDispatcher = primary.Exceptions;
@@ -77,14 +76,24 @@ public sealed partial class Interpreter {
     /// <summary>指定 loader のエンジンセットを取得 (無ければ遅延生成して GC ルート源も登録する)。</summary>
     private LoaderEngines EnginesFor(VmMethod method) {
         var loader = method.Loader;
-        loader?.EnsureLive();
-        lock (_enginesGate) {
-            if (loader is null || ReferenceEquals(loader, _services.Loader))
-                return _engines[_services.Loader];
-            return _engines.TryGetValue(loader, out var engines)
-                ? engines
-                : _engines[loader] = CreateEngines(loader, _services.Strings);
+        VmLifetime.EnsureLiveForGuest(method);
+        if (loader?.Context is { } context) {
+            lock (context.LifetimeGate) {
+                VmLifetime.EnsureLiveForGuest(method);
+                lock (_enginesGate)
+                    return GetOrCreateEngines(loader);
+            }
         }
+        lock (_enginesGate)
+            return GetOrCreateEngines(loader);
+    }
+
+    private LoaderEngines GetOrCreateEngines(TypeLoader? loader) {
+        if (loader is null || ReferenceEquals(loader, _services.Loader))
+            return _engines[_services.Loader];
+        return _engines.TryGetValue(loader, out var engines)
+            ? engines
+            : _engines[loader] = CreateEngines(loader, _services.Strings);
     }
 
     /// <summary>loader のエンジンセットを構築する (文字列プール・静的ストレージは VM 単位で共有)。</summary>
@@ -109,7 +118,7 @@ public sealed partial class Interpreter {
             // VmString の型同一性を接続する System.String 実型 (VM 単位。LoadHostCoreLib = true 時のみ非 null)
             StringType = _stringType,
         };
-        var preparer = new MethodPreparer(loader, _memory.MaxPreparedMethods);
+        var preparer = new MethodPreparer(loader, _memory.MaxPreparedMethods, _memory.MaxPreparedMethodBytes);
         var objects = new ObjectEngine(services, this, this, _unifiedStaticStorage, _shared.TypeInitialization);
         var calls = new CallEngine(services, this, this, objects);
         var exceptions = new ExceptionDispatcher(services, preparer, objects, this);

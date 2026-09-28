@@ -26,6 +26,8 @@ public sealed class VmHeap {
     private long _totalAllocated;
     /// <summary>ホスト側の一時アロケーション (ヒープ管理外) の累計 (HostTemp quota)。</summary>
     private long _hostTempAllocated;
+    /// <summary>ロード済み PE image の host memory 累計。</summary>
+    private long _loadedAssemblyBytes;
     /// <summary>ホスト側 CPU コストの消費 (HostWorkBudget)。</summary>
     private long _hostWorkSpent;
     /// <summary>JIT コンパイル専用の VM-wide 作業予算の消費。</summary>
@@ -189,17 +191,46 @@ public sealed class VmHeap {
     public void ChargeHostBuffer(int charCount) {
         if (charCount < 0)
             throw new ArgumentOutOfRangeException(nameof(charCount));
+        ChargeHostAllocation(24 + 2L * charCount, "buffers", includeVmAllocation: true,
+            _memory.HostTempAllocationByteLimit, ref _hostTempAllocated);
+    }
+
+    /// <summary>
+    /// ホスト側で保持される raw byte buffer を会計する。文字列用の
+    /// <see cref="ChargeHostBuffer"/> と分け、byte は 1 バイトとして計上する。
+    /// </summary>
+    public void ChargeHostBytes(long byteCount) {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        // A retained PE image is host memory, not a guest object. Keep it out
+        // of TotalAllocation/LiveObject accounting so existing guest heap
+        // budgets do not make the VM unable to load even a small program.
+        ChargeHostAllocation(24 + byteCount, "byte buffers", includeVmAllocation: false,
+            _memory.LoadedAssemblyHostByteLimit, ref _loadedAssemblyBytes);
+    }
+
+    /// <summary>Collectible context の unload で不要になった PE image 保持分を返す。</summary>
+    internal void ReleaseHostBytes(long byteCount) {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount));
+        var size = checked(24 + byteCount);
+        lock (_gate)
+            _loadedAssemblyBytes = Math.Max(0, _loadedAssemblyBytes - size);
+    }
+
+    private void ChargeHostAllocation(long size, string description, bool includeVmAllocation,
+        long hostLimit, ref long hostSpent) {
         lock (_gate) {
-        var size = 24 + 2L * charCount;
-        // HostTemp quota (ゲスト操作の結果で VM ヒープ外に生じるホスト確保分)
-        if (size > _memory.HostTempAllocationByteLimit - _hostTempAllocated)
+        if (size > hostLimit - hostSpent)
             throw new MemoryQuotaExceededException(
-                $"ホスト側一時アロケーション上限 {_memory.HostTempAllocationByteLimit:N0} バイトを超過しました (buffers " +
-                $"(+{size:N0}) 内 {charCount:N0} 文字)。\n残 {_hostTempAllocated:N0} / 上限 {_memory.HostTempAllocationByteLimit:N0}。");
+                $"ホスト側アロケーション上限 {hostLimit:N0} バイトを超過しました (" +
+                $"(+{size:N0}) {description})。\n残 {hostSpent:N0} / 上限 {hostLimit:N0}。");
         // CheckQuota は失敗する可能性があるため、すべての検査が通るまで会計を変更しない。
-        CheckQuota(size);
-        _hostTempAllocated += size;
-        _totalAllocated += size;
+        if (includeVmAllocation)
+            CheckQuota(size);
+        hostSpent += size;
+        if (includeVmAllocation)
+            _totalAllocated += size;
         }
     }
 
@@ -342,6 +373,14 @@ public sealed class VmHeap {
     public GcStatistics Snapshot() {
         lock (_gate)
             return new GcStatistics(_totalAllocated, _liveBytes, _collectionCount);
+    }
+
+    internal long HostTempAllocatedBytes {
+        get { lock (_gate) return _hostTempAllocated; }
+    }
+
+    internal long LoadedAssemblyBytes {
+        get { lock (_gate) return _loadedAssemblyBytes; }
     }
 
     /// <summary>ヒープ登録解除 (テスト補助。通常は Collect が担当)。</summary>

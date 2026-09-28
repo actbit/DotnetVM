@@ -57,9 +57,9 @@ public sealed partial class Interpreter {
     /// <summary>メソッドを実行し戻り値を得る (void は Kind=Empty)。context は呼出元のジェネリック実引数。</summary>
     public StackSlot Invoke(VmMethod method, StackSlot[] arguments, GenericContext? context) {
         _shared.ThrowIfDisposed();
-        VmLifetime.EnsureLive(method);
+        VmLifetime.EnsureLiveForGuest(method);
         foreach (var argument in arguments)
-            VmLifetime.EnsureLive(argument);
+            VmLifetime.EnsureLiveForGuest(argument);
         var state = CurrentState;
         using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared.Culture) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
@@ -96,7 +96,7 @@ public sealed partial class Interpreter {
                     // guest instruction.  Do not perform it after the guest has
                     // already exhausted its instruction budget; the first
                     // interpreter instruction will report the normal quota error.
-                    var compiled = CanUseJit
+                    var compiled = CanUseJit && engines.Preparer.IsCached(method)
                         ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
                         : null;
                     return compiled is null
@@ -140,6 +140,9 @@ public sealed partial class Interpreter {
     internal bool TryInvokeCompiled(VmMethod method, StackSlot[] arguments,
         GenericContext? context, out StackSlot result) {
         result = default;
+        VmLifetime.EnsureLiveForGuest(method);
+        foreach (var argument in arguments)
+            VmLifetime.EnsureLiveForGuest(argument);
         if (!CanUseJit)
             return false;
         var engines = EnginesFor(method);

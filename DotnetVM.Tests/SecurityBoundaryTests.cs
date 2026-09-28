@@ -29,6 +29,15 @@ public sealed class SecurityBoundaryTests {
         Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
             Memory = new MemoryPolicy { MaxMetadataStreamBytes = -1 },
         }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
+            Memory = new MemoryPolicy { MaxPreparedMethodBytes = -1 },
+        }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
+            Memory = new MemoryPolicy { LoadedAssemblyHostByteLimit = -1 },
+        }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
+            MaxBreakpoints = 0,
+        }));
     }
 
     [Fact]
@@ -63,6 +72,45 @@ public sealed class SecurityBoundaryTests {
         heap.ChargeHostBuffer(0);
 
         Assert.Equal(24, heap.Snapshot().TotalAllocatedBytes);
+    }
+
+    [Fact]
+    public void VmHeap_RawHostBytesUseByteAccurateAccounting() {
+        var heap = new VmHeap(new MemoryPolicy { LoadedAssemblyHostByteLimit = 32 });
+
+        heap.ChargeHostBytes(8);
+
+        Assert.Equal(32, heap.LoadedAssemblyBytes);
+        Assert.Throws<MemoryQuotaExceededException>(() => heap.ChargeHostBytes(1));
+    }
+
+    [Fact]
+    public void StreamAssemblyLoadChargesRetainedImageBytes() {
+        var bytes = TestAssemblyCompiler.CompileToBytes(
+            "public static class Input { public static int Run() => 0; }", "StreamAccountingInput");
+        using var vm = new VirtualMachine(new VmHostOptions {
+            Memory = new MemoryPolicy { LoadedAssemblyHostByteLimit = 24 + bytes.LongLength },
+        });
+
+        vm.LoadAssembly(new MemoryStream(bytes));
+
+        Assert.Equal(24 + bytes.LongLength, vm.Heap.LoadedAssemblyBytes);
+    }
+
+    [Fact]
+    public void DisposeReleasesLoadedImageBudgetAndInvalidatesGcHandles() {
+        var bytes = TestAssemblyCompiler.CompileToBytes(
+            "public static class Input { public static int Run() => 0; }", "DisposeAccountingInput");
+        var vm = new VirtualMachine();
+        vm.LoadAssembly(new MemoryStream(bytes));
+        var handle = vm.Handles.Register(new VmFieldRvaData { Data = ReadOnlyMemory<byte>.Empty });
+        Assert.True(vm.Heap.LoadedAssemblyBytes > 0);
+
+        vm.Dispose();
+
+        Assert.Equal(0, vm.Heap.LoadedAssemblyBytes);
+        Assert.Equal(0, vm.Handles.Count);
+        Assert.Null(vm.Handles.GetTarget(handle));
     }
 
     [Fact]

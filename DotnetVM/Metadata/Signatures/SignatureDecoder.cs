@@ -23,6 +23,10 @@ public sealed record TypeSpecSignature(SigType Type);
 /// トークンから実際の型への解決は行わない (型システムの担当)。
 /// </summary>
 public static class SignatureDecoder {
+    // Keep count-prefixed signature arrays bounded before allocating their
+    // managed representation. The metadata row limits do not protect a
+    // single hostile blob's generic/local/parameter array.
+    private const int MaxSignatureSequenceElements = 65_536;
     /// <summary>MethodDef/MethodRef/StandAloneSig のメソッド署名をデコードする。
     /// maxSignatureDepth は署名再帰の深さ上限、maxGenericNestingDepth は GenericInst の
     /// ネスト上限 (hostile 署名の再帰でホストスタックを枯渇させない)。</summary>
@@ -171,9 +175,10 @@ public static class SignatureDecoder {
 
     private static int ReadCount(ref SpanReader reader, string kind, bool requireOneBytePerItem) {
         var raw = reader.ReadCompressedUInt32();
-        if (raw > int.MaxValue || requireOneBytePerItem && raw > (uint)reader.Remaining)
+        if (raw > MaxSignatureSequenceElements ||
+            requireOneBytePerItem && raw > (uint)reader.Remaining)
             throw new BadImageFormatException(
-                $"署名の {kind} 数 {raw:N0} は blob の残りサイズに対して不正です。");
+                $"署名の {kind} 数 {raw:N0} は許容範囲または blob の残りサイズを超えています。");
         return (int)raw;
     }
 

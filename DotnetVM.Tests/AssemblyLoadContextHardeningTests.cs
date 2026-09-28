@@ -117,6 +117,34 @@ public sealed class AssemblyLoadContextHardeningTests {
     }
 
     [Fact]
+    public void DisposeRetiresNamedContextsAndReleasesLoadedImageBudget() {
+        var input = TestAssemblyCompiler.CompileToBytes(
+            "public static class Input { public static int Run() => 0; }", "DisposeNamedInput");
+        using var vm = new VirtualMachine();
+        using var driver = new MemoryStream(TestAssemblyCompiler.CompileToBytes("""
+            using System.IO;
+            using System.Runtime.Loader;
+            public static class Ops {
+                public static void Load(byte[] input) {
+                    var alc = new AssemblyLoadContext("dispose", true);
+                    _ = alc.LoadFromStream(new MemoryStream(input));
+                }
+            }
+            """, "DisposeNamedDriver"));
+        vm.LoadAssembly(driver);
+
+        vm.Invoke("Ops", "Load", input);
+
+        Assert.True(vm.Loaders.Count >= 2);
+        Assert.True(vm.Heap.LoadedAssemblyBytes > 0);
+
+        vm.Dispose();
+
+        Assert.Empty(vm.Loaders);
+        Assert.Equal(0, vm.Heap.LoadedAssemblyBytes);
+    }
+
+    [Fact]
     public void CollectibleUnload_RemovesTypeInitializationAndStaticRoots() {
         var image = AssemblyImage.Parse(TestAssemblyCompiler.CompileToBytes("""
             namespace Vm.AlcCache {

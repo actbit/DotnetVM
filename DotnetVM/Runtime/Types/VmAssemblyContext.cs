@@ -24,6 +24,7 @@ public sealed class VmAssemblyContext(
 
     /// <summary>Unload 開始後は新しい解決/登録を一切許可しない。</summary>
     internal bool IsRetired => Volatile.Read(ref _retired) != 0;
+    internal object LifetimeGate => _gate;
 
     internal void Retire() {
         lock (_gate)

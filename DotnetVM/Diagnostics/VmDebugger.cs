@@ -1,4 +1,5 @@
 using DotnetVM.IL;
+using DotnetVM.Policy;
 
 namespace DotnetVM.Diagnostics;
 
@@ -42,6 +43,7 @@ public sealed class DebuggerStoppedEventArgs(DebuggerStop stop) : EventArgs {
 public sealed class VmDebugger : IDisposable {
     private readonly object _gate = new();
     private readonly List<DebuggerBreakpoint> _breakpoints = [];
+    private readonly int _maxBreakpoints;
     private int _nextBreakpointId;
     private bool _pauseRequested;
     private bool _paused;
@@ -50,6 +52,12 @@ public sealed class VmDebugger : IDisposable {
     private DebuggerStop? _currentStop;
     private StepPlan _stepPlan;
     private int _active;
+
+    public VmDebugger(int maxBreakpoints = 4096) {
+        if (maxBreakpoints < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxBreakpoints));
+        _maxBreakpoints = maxBreakpoints;
+    }
 
     private enum StepKind {
         None,
@@ -94,6 +102,9 @@ public sealed class VmDebugger : IDisposable {
 
         lock (_gate) {
             ThrowIfDisposed();
+            if (_breakpoints.Count >= _maxBreakpoints)
+                throw new OperationNotAllowedException(
+                    $"デバッガのブレークポイント上限 {_maxBreakpoints:N0} を超えました。");
             var id = ++_nextBreakpointId;
             _breakpoints.Add(new DebuggerBreakpoint(id, assemblyName, typeFullName, methodName, ilOffset));
             RefreshActive();

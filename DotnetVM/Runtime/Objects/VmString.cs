@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using System.Runtime.InteropServices;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Heap;
 
@@ -34,7 +35,10 @@ public sealed class VmString {
         ArgumentNullException.ThrowIfNull(value);
         _bytes = new byte[BufferByteCount(value.Length)];
         BinaryPrimitives.WriteInt32LittleEndian(_bytes, value.Length);
-        Encoding.Unicode.GetBytes(value, 0, value.Length, _bytes, CharDataByteOffset);
+        if (BitConverter.IsLittleEndian)
+            MemoryMarshal.AsBytes(value.AsSpan()).CopyTo(_bytes.AsSpan(CharDataByteOffset));
+        else
+            for (var i = 0; i < value.Length; i++) BinaryPrimitives.WriteUInt16LittleEndian(_bytes.AsSpan(CharDataByteOffset + i * 2), value[i]);
         _cachedForLength = value.Length;
         _cachedValue = value;
     }
@@ -65,11 +69,18 @@ public sealed class VmString {
             var len = Length;
             if (_cachedValue is { } cached && _cachedForLength == len)
                 return cached;
-            var decoded = Encoding.Unicode.GetString(_bytes, CharDataByteOffset, len * 2);
+            var decoded = DecodeUtf16(_bytes.AsSpan(CharDataByteOffset, len * 2));
             _cachedForLength = len;
             _cachedValue = decoded;
             return decoded;
         }
+    }
+
+    internal static string DecodeUtf16(ReadOnlySpan<byte> bytes) {
+        if (BitConverter.IsLittleEndian) return new string(MemoryMarshal.Cast<byte, char>(bytes));
+        var chars = new char[bytes.Length / 2];
+        for (var i = 0; i < chars.Length; i++) chars[i] = (char)BinaryPrimitives.ReadUInt16LittleEndian(bytes[(i * 2)..]);
+        return new string(chars);
     }
 
     /// <summary>生バッファ (Buffer.Memmove / Unsafe.* / GetRawStringData の参照先)。</summary>

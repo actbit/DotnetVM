@@ -23,6 +23,31 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System", Name = "Console", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Math", IsValue = false });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Convert", IsValue = false });
+        var cultureInfo = new VmIntrinsicType { Namespace = "System.Globalization", Name = "CultureInfo", IsValue = false, Parent = @object };
+        Add(cultureInfo);
+        foreach (var name in new[] { "NumberFormatInfo", "DateTimeFormatInfo", "TextInfo", "CompareInfo" })
+            Add(new VmIntrinsicType { Namespace = "System.Globalization", Name = name, IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Globalization", Name = "NumberStyles", IsValue = true, Parent = @enum });
+        var encoding = new VmIntrinsicType { Namespace = "System.Text", Name = "Encoding", IsValue = false, Parent = @object };
+        Add(encoding);
+        Add(new VmIntrinsicType { Namespace = "System.Text", Name = "Encoder", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Text", Name = "Decoder", IsValue = false, Parent = @object });
+        Add(new VmIntrinsicType { Namespace = "System.Text", Name = "UTF8Encoding", IsValue = false, Parent = encoding });
+        foreach (var (ns, name) in new[] {
+            ("System.Text.RegularExpressions", "Regex"), ("System.Text.RegularExpressions", "Match"),
+            ("System.Text.RegularExpressions", "Group"), ("System.Text.RegularExpressions", "GroupCollection"),
+            ("System.Net.Http", "HttpClient"), ("System.Net.Http", "HttpResponseMessage"),
+            ("System.Net.Http", "HttpContent"), ("System.Net.Http", "StringContent"), ("System.Net.Http", "ByteArrayContent"),
+            ("System.Security.Cryptography", "SHA256"), ("System.Security.Cryptography", "SHA384"),
+            ("System.Security.Cryptography", "SHA512"), ("System.Security.Cryptography", "HMACSHA256"),
+            ("System.Security.Cryptography", "CryptographicOperations"), ("System.Security.Cryptography", "RandomNumberGenerator"),
+        }) Add(new VmIntrinsicType { Namespace = ns, Name = name, IsValue = false, Parent = @object });
+        foreach (var (ns, name) in new[] { ("System.Text.RegularExpressions", "RegexOptions"), ("System.IO.Compression", "CompressionMode"), ("System.IO.Compression", "CompressionLevel") })
+            Add(new VmIntrinsicType { Namespace = ns, Name = name, IsValue = true, Parent = @enum });
+        var symmetric = new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "SymmetricAlgorithm", IsValue = false, Parent = @object };
+        Add(symmetric);
+        Add(new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "Aes", IsValue = false, Parent = symmetric });
+        foreach (var name in new[] { "PaddingMode", "CipherMode" }) Add(new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = name, IsValue = true, Parent = @enum });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Array", IsValue = false, Parent = @object });
         Add(new VmIntrinsicType { Namespace = "System", Name = "Type", IsValue = false, Parent = @object });
         var memberInfo = new VmIntrinsicType { Namespace = "System.Reflection", Name = "MemberInfo", IsValue = false, Parent = @object };
@@ -38,6 +63,8 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System.Runtime.Loader", Name = "AssemblyLoadContext", IsValue = false, Parent = @object });
         var stream = new VmIntrinsicType { Namespace = "System.IO", Name = "Stream", IsValue = false, Parent = @object };
         Add(stream);
+        foreach (var name in new[] { "GZipStream", "DeflateStream", "BrotliStream", "ZLibStream" })
+            Add(new VmIntrinsicType { Namespace = "System.IO.Compression", Name = name, IsValue = false, Parent = stream });
         Add(new VmIntrinsicType { Namespace = "System.IO", Name = "MemoryStream", IsValue = false, Parent = stream });
         var expression = new VmIntrinsicType { Namespace = "System.Linq.Expressions", Name = "Expression", IsValue = false, Parent = @object };
         Add(expression);
@@ -63,6 +90,9 @@ public sealed partial class TypeLoader {
         Add(argumentException);
         Add(new VmIntrinsicType { Namespace = "System", Name = "ArgumentOutOfRangeException", IsValue = false, Parent = argumentException });
         Add(new VmIntrinsicType { Namespace = "System", Name = "ArgumentNullException", IsValue = false, Parent = argumentException });
+        Add(new VmIntrinsicType { Namespace = "System.Globalization", Name = "CultureNotFoundException", IsValue = false, Parent = argumentException });
+        foreach (var name in new[] { "EncoderFallbackException", "DecoderFallbackException" })
+            Add(new VmIntrinsicType { Namespace = "System.Text", Name = name, IsValue = false, Parent = argumentException });
         Add(new VmIntrinsicType { Namespace = "System", Name = "ApplicationException", IsValue = false, Parent = _intrinsicTypes["System.Exception"] });
         foreach (var name in new[] {
             "NullReferenceException", "IndexOutOfRangeException", "DivideByZeroException",
@@ -80,6 +110,10 @@ public sealed partial class TypeLoader {
         Add(missingMember);
         Add(new VmIntrinsicType { Namespace = "System", Name = "MissingMethodException", IsValue = false, Parent = missingMember });
         Add(new VmIntrinsicType { Namespace = "System", Name = "ObjectDisposedException", IsValue = false, Parent = _intrinsicTypes["System.InvalidOperationException"] });
+        Add(new VmIntrinsicType { Namespace = "System.Text.RegularExpressions", Name = "RegexMatchTimeoutException", IsValue = false, Parent = _intrinsicTypes["System.TimeoutException"] });
+        Add(new VmIntrinsicType { Namespace = "System.Text.RegularExpressions", Name = "RegexParseException", IsValue = false, Parent = argumentException });
+        Add(new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "CryptographicException", IsValue = false, Parent = systemException });
+        Add(new VmIntrinsicType { Namespace = "System.Net.Http", Name = "HttpRequestException", IsValue = false, Parent = _intrinsicTypes["System.Exception"] });
 
         // プリミティブはすべて ValueType の派生
         foreach (var (name, isValue) in new[] {

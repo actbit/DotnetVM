@@ -586,9 +586,7 @@ internal static class IlVerifier {
                 case ILOp.Box: {
                     var type = GetTypeKind(instruction.IntOperand, "box 型");
                     var value = Pop(state, instruction);
-                    if (type is IlAbstractType.Object or IlAbstractType.ByRef or IlAbstractType.NativeInt or
-                        IlAbstractType.TypedByRef)
-                        FailAt(instruction, "box の対象型が値型ではありません。");
+                    RequireBoxableValueType(type, instruction, "box");
                     RequireAssignable(value, type, instruction, "box の値");
                     Push(state, IlAbstractType.Object, instruction);
                     FallThrough(index, state);
@@ -605,7 +603,10 @@ internal static class IlVerifier {
                 case ILOp.Unbox_Any: {
                     RequireObjectLike(Pop(state, instruction), instruction, "unbox.any の対象");
                     var type = GetTypeKind(instruction.IntOperand, "unbox.any 型");
-                    RequireBoxableValueType(type, instruction, "unbox.any");
+                    // ECMA-335: reference targets perform castclass semantics. Generic
+                    // numeric conversion IL includes these in branches guarded by typeof.
+                    if (type != IlAbstractType.Object)
+                        RequireBoxableValueType(type, instruction, "unbox.any");
                     Push(state, type, instruction);
                     FallThrough(index, state);
                     return;
@@ -1141,7 +1142,14 @@ internal static class IlVerifier {
         }
 
         private void RequireBoxableValueType(IlAbstractType type, DecodedInstruction instruction, string operation) {
-            if (type is IlAbstractType.Object or IlAbstractType.ByRef or IlAbstractType.NativeInt or
+            if (type == IlAbstractType.NativeInt) {
+                var token = unchecked((uint)instruction.IntOperand);
+                var target = TryGetDynamicToken(token, null, out var dynamicReference) ? dynamicReference as VmType
+                    : _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: token));
+                if (target?.FullName is not ("System.IntPtr" or "System.UIntPtr"))
+                    FailAt(instruction, $"{operation} の対象型が値型ではありません。");
+            }
+            if (type is IlAbstractType.Object or IlAbstractType.ByRef or
                 IlAbstractType.TypedByRef)
                 FailAt(instruction, $"{operation} の対象型が値型ではありません。");
         }

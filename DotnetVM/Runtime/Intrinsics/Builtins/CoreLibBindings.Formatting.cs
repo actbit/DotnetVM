@@ -86,7 +86,7 @@ internal static partial class CoreLibBindings {
     /// <summary>ISpanFormattable.TryFormat(span, out int, format, provider) の同等意味論。
     /// string.JoinCore 等が要素書式に辿る。本家 IL は Number.TryFormat* (char* / culture 機構)
     /// のため VM 表現境界。ホストの不変カルチャ書式で文字列化し、出力 span へ書き込む。
-    /// provider は不変カルチャ規約で無視する (全書式面と同一方針)。長さ不足は false
+    /// provider は指定された CultureInfo / NumberFormatInfo を使う。長さ不足は false
     /// (例外なし。Try パターン規約)。不正書式は CLR どおり FormatException。
     /// 整数 4 型 + 浮動小数点 2 型を列挙する (他は fail-closed のまま)。</summary>
     private static void RegisterSpanFormattable(IntrinsicRegistry r) {
@@ -94,31 +94,26 @@ internal static partial class CoreLibBindings {
         const string ReadOnlySpanChar = "System.ReadOnlySpan`1<System.Char>";
         const string OutInt = "System.Int32&";
         const string Provider = "System.IFormatProvider";
-        static void Face(IntrinsicRegistry reg, string type, Func<StackSlot, string?, string> format) =>
+        static void Face(IntrinsicRegistry reg, string type, Func<StackSlot, string?, IFormatProvider, string> format) =>
             reg.RegisterBinding(
                 BindingKey.Instance(type, "TryFormat", SpanChar, OutInt, ReadOnlySpanChar, Provider),
                 (ctx, a) => TryFormatImpl(ctx, a, format),
                 BindingOrigin.Managed);
-        static string Inv(int v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        static string Unv(uint v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        static string Lng(long v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        static string Ulng(ulong v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        static string Flt(float v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        static string Dbl(double v, string? f) => v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
-        Face(r, "System.Int32", static (v, f) => Inv((int)v.Int64Value, f));
-        Face(r, "System.UInt32", static (v, f) => Unv((uint)v.Int64Value, f));
-        Face(r, "System.Int64", static (v, f) => Lng(v.Int64Value, f));
-        Face(r, "System.UInt64", static (v, f) => Ulng((ulong)v.Int64Value, f));
-        Face(r, "System.Single", static (v, f) => Flt((float)v.DoubleValue, f));
-        Face(r, "System.Double", static (v, f) => Dbl(v.DoubleValue, f));
+        Face(r, "System.Int32", static (v, f, p) => ((int)v.Int64Value).ToString(f, p));
+        Face(r, "System.UInt32", static (v, f, p) => ((uint)v.Int64Value).ToString(f, p));
+        Face(r, "System.Int64", static (v, f, p) => v.Int64Value.ToString(f, p));
+        Face(r, "System.UInt64", static (v, f, p) => ((ulong)v.Int64Value).ToString(f, p));
+        Face(r, "System.Single", static (v, f, p) => ((float)v.DoubleValue).ToString(f, p));
+        Face(r, "System.Double", static (v, f, p) => v.DoubleValue.ToString(f, p));
     }
 
-    private static StackSlot? TryFormatImpl(IntrinsicContext ctx, StackSlot[] a, Func<StackSlot, string?, string> format) {
+    private static StackSlot? TryFormatImpl(IntrinsicContext ctx, StackSlot[] a, Func<StackSlot, string?, IFormatProvider, string> format) {
         // 書式 span (空 = null 書式相当)
         var formatText = ReadCharSpanOrEmpty(a[3]);
         string text;
         try {
-            text = format(a[0], formatText);
+            ctx.Heap.ChargeHostWork(formatText.Length + 32);
+            text = format(PrimitiveValue(a[0]), formatText, GuestProvider(ctx, a[4]));
         } catch (FormatException) {
             throw new UnhandledGuestException("System.FormatException", null);
         }
@@ -145,7 +140,15 @@ internal static partial class CoreLibBindings {
         return new string(chars);
     }
 
+    internal static StackSlot MakeStringFromCharSpan(IntrinsicContext ctx, in StackSlot span) {
+        var length = ReadSpanParts(span).Length;
+        ctx.Heap.ChargeHostBuffer(length); ctx.Heap.ChargeHostWork(length);
+        return StackSlot.OfObject(ctx.MakeString(ReadCharSpanOrEmpty(span)));
+    }
+
     private static (StackSlot Reference, int Length) ReadSpanParts(in StackSlot span) {
+        if (span.ObjectValue is VmByRef byRef)
+            return ReadSpanParts(byRef.Read());
         if (span.ObjectValue is not VmStructValue sv)
             throw new InvalidOperationException($"span ではありません ({span.Kind})。");
         var definition = sv.StructType is VmConstructedType constructed
@@ -186,7 +189,9 @@ internal static partial class CoreLibBindings {
     }
 
     private static void WriteChars(in StackSlot reference, string text) {
+        if (text.Length == 0) return;
         if (reference.Kind == StackKind.ByRef && reference.ObjectValue is VmByRef byRef) {
+            byRef.EnsureWritable();
             if (byRef.Index + text.Length > byRef.Container.Length)
                 throw new InvalidOperationException("span の範囲外に書きます。");
             for (var i = 0; i < text.Length; i++)
@@ -194,6 +199,7 @@ internal static partial class CoreLibBindings {
             return;
         }
         if (reference.ObjectValue is VmNativePointer native) {
+            native.EnsureWritable();
             if ((long)native.ByteOffset + text.Length * 2 > native.Bytes.Length)
                 throw new InvalidOperationException("span の範囲外に書きます。");
             for (var i = 0; i < text.Length; i++)

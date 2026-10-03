@@ -158,6 +158,18 @@ public sealed class VirtualMachine : IDisposable {
             .Select(l => l.FindTypeByFullName("System.String"))
             .OfType<VmClassType>()
             .FirstOrDefault();
+        foreach (var assembly in new[] {
+            typeof(System.Text.RegularExpressions.Regex).Assembly,
+            typeof(System.Net.Http.HttpClient).Assembly,
+            typeof(System.IO.Compression.GZipStream).Assembly,
+            typeof(System.IO.Compression.BrotliStream).Assembly,
+            typeof(System.Security.Cryptography.SHA256).Assembly,
+            typeof(System.Text.Encodings.Web.JavaScriptEncoder).Assembly,
+        }.Distinct()) {
+            LoadAssembly(assembly.Location);
+            lock (_assemblyGate)
+                _loaders.Single(l => l.Image.Identity.Name == assembly.GetName().Name).IsTrustedBcl = true;
+        }
     }
 
     /// <summary>VmAssemblyContext が依存アセンブリの同一ディレクトリ探索で見つけた DLL をロードする。</summary>

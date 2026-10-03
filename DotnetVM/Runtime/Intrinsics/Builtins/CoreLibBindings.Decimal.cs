@@ -33,7 +33,7 @@ internal static partial class CoreLibBindings {
             try {
                 return StackSlot.OfValueType(MakeDecimalStruct(ctx,
                     decimal.Parse(S(a, 0) ?? "", (System.Globalization.NumberStyles)styles,
-                        System.Globalization.CultureInfo.CurrentCulture)));
+                        InvocationProvider(ctx, a))));
             } catch (FormatException) {
                 throw new UnhandledGuestException("System.FormatException", null);
             } catch (OverflowException) {
@@ -58,7 +58,7 @@ internal static partial class CoreLibBindings {
                 decimal value = 0m;
                 bool ok;
                 try {
-                    value = decimal.Parse(S(a, 0) ?? "", System.Globalization.CultureInfo.CurrentCulture);
+                    value = decimal.Parse(S(a, 0) ?? "", InvocationProvider(ctx, a));
                     ok = true;
                 } catch (FormatException) {
                     ok = false;
@@ -204,7 +204,7 @@ internal static partial class CoreLibBindings {
         try {
             return StackSlot.OfValueType(MakeDecimalStruct(ctx,
                 decimal.Parse(s ?? "", (System.Globalization.NumberStyles)styles,
-                    System.Globalization.CultureInfo.CurrentCulture)));
+                    ctx.Shared.CurrentCulture)));
         } catch (FormatException) {
             throw new UnhandledGuestException("System.FormatException", null);
         } catch (OverflowException) {

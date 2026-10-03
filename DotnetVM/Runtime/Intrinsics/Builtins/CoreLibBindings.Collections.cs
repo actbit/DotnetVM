@@ -19,6 +19,22 @@ internal static partial class CoreLibBindings {
     /// IComparer がある面はゲスト委譲機構が無いため fail-closed (ホスト例外)。
     /// 多次元配列は RankException (SZArray のみ対応)。</summary>
     private static void RegisterArrayBindings(IntrinsicRegistry r) {
+        r.RegisterBinding(BindingKey.Instance("System.Array", "get_NativeLength"), static (_, a) => StackSlot.OfNativeInt((a[0].ObjectValue as VmArray)?.Length ?? throw new UnhandledGuestException("System.NullReferenceException", null)), BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static("System.Buffer", "BlockCopy", "System.Array", "System.Int32", "System.Array", "System.Int32", "System.Int32"), static (ctx, a) => {
+            var source = a[0].ObjectValue as VmArray ?? throw new ArgumentNullException("src");
+            var destination = a[2].ObjectValue as VmArray ?? throw new ArgumentNullException("dst");
+            if (!VmPrimitiveTypes.IsSlotPrimitive(source.ArrayType.ElementType.FullName) || !VmPrimitiveTypes.IsSlotPrimitive(destination.ArrayType.ElementType.FullName)) throw new UnhandledGuestException("System.ArgumentException", "BlockCopy requires primitive arrays.");
+            var srcStride = MemoryOps.SizeOfType(source.ArrayType.ElementType); var dstStride = MemoryOps.SizeOfType(destination.ArrayType.ElementType);
+            var srcLength = checked(source.Length * srcStride); var dstLength = checked(destination.Length * dstStride);
+            var offset = a[1].AsInt32; var destOffset = a[3].AsInt32; var count = a[4].AsInt32;
+            if (offset < 0 || destOffset < 0 || count < 0) throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
+            if (offset > srcLength - count || destOffset > dstLength - count) throw new UnhandledGuestException("System.ArgumentException", null);
+            ctx.Heap.ChargeHostBuffer(count); ctx.Heap.ChargeHostWork(count);
+            var bytes = new byte[count]; Span<byte> element = stackalloc byte[8];
+            for (var i = 0; i < count; i++) { MemoryOps.BytesOfValue(source.Elements[(offset + i) / srcStride], source.ArrayType.ElementType, srcStride, element); bytes[i] = element[(offset + i) % srcStride]; }
+            for (var i = 0; i < count; i++) { var index = (destOffset + i) / dstStride; MemoryOps.BytesOfValue(destination.Elements[index], destination.ArrayType.ElementType, dstStride, element); element[(destOffset + i) % dstStride] = bytes[i]; destination.Elements[index] = MemoryOps.ValueFromBytes(element, destination.ArrayType.ElementType, dstStride); }
+            return null;
+        }, BindingOrigin.Managed);
         const string T = "System.Array";
         r.RegisterBinding(BindingKey.Static(T, "Sort",
                 "System.Array", "System.Array", "System.Int32", "System.Int32", "System.Collections.IComparer"),

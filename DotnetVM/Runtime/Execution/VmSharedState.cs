@@ -62,6 +62,10 @@ public sealed class VmSharedState : IDisposable {
 
     /// <summary>VM 固有の読み取り専用カルチャ設定。</summary>
     public CultureInfo Culture { get; }
+    private readonly AsyncLocal<CultureInfo?> _currentCulture = new();
+    private readonly AsyncLocal<CultureInfo?> _currentUiCulture = new();
+    internal CultureInfo CurrentCulture { get => _currentCulture.Value ?? Culture; set => _currentCulture.Value = value; }
+    internal CultureInfo CurrentUICulture { get => _currentUiCulture.Value ?? Culture; set => _currentUiCulture.Value = value; }
 
     private DateTimeOffset ReadVmLocalInstant() => TimeZoneInfo.ConvertTime(_clockProvider(), _timeZone);
 

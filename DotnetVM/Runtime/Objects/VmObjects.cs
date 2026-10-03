@@ -7,10 +7,16 @@ namespace DotnetVM.Runtime.Objects;
 
 /// <summary>VM ヒープ上のオブジェクトの基底。世代別 GC 拡張用の Generation を初段から保持する。</summary>
 public abstract class VmObject {
+    internal VmObject[] BclReferences { get; set; } = [];
     /// <summary>GC 世代 (0 = 新世代)。世代別戦略 (M6 以降) で利用。</summary>
     public byte Generation { get; internal set; }
 
     public abstract VmType Type { get; }
+}
+
+/// <summary>Opaque state for explicitly registered BCL surfaces; no host object escapes to guest IL.</summary>
+internal sealed class VmBclObject(VmType type) : VmObject {
+    public override VmType Type => type;
 }
 
 /// <summary>クラスのインスタンス。フィールドは宣言順 (基底型フィールドが先頭) のスロット配列。</summary>
@@ -526,6 +532,7 @@ public sealed class VmAssemblyNameObject : VmObject {
 
 /// <summary>ゲストの MemoryStream を表す小さな VM ストリーム。AssemblyLoadContext.LoadFromStream 用。</summary>
 public sealed class VmMemoryStreamObject : VmObject {
+    internal bool IsDisposed { get; set; }
     public static readonly VmIntrinsicType MemoryStreamFacade =
         new() { Namespace = "System.IO", Name = "MemoryStream", IsValue = false };
     public static readonly VmIntrinsicType StreamFacade =
@@ -1007,6 +1014,10 @@ public sealed class ObjectModel {
         if (type is null)
             return StackSlot.Null;
         var substituted = GenericSubstitutor.Substitute(type, context);
+        if (substituted.IsEnum) {
+            var underlying = (substituted as VmClassType)?.Fields.FirstOrDefault(f => f.Name == "value__")?.FieldType;
+            return underlying is null ? StackSlot.OfInt32(0) : DefaultForType(underlying, loader, context);
+        }
         if (substituted is VmIntrinsicType intrinsic) {
             if (!intrinsic.IsValue)
                 return StackSlot.Null;

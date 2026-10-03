@@ -59,6 +59,10 @@ public sealed partial class TypeLoader {
     /// guest がロードした同名画像には付与しない。</summary>
     public bool IsTrustedVmCoreLib { get; internal set; }
 
+    // Host-selected BCL images may use explicit normalized runtime bindings, but
+    // do not receive the privileged CoreLib caller domain.
+    internal bool IsTrustedBcl { get; set; }
+
     public TypeLoader(AssemblyImage image) {
         _image = image;
         InitializeIntrinsicTypes();

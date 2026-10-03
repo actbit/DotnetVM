@@ -39,6 +39,7 @@ internal static partial class CoreLibBindings {
     /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定。
     /// 状態は ctx.Shared の VM インスタンス状態)。</summary>
     private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
+        r.RegisterBinding(BindingKey.TrustedStatic("System.Environment", "GetProcessorCount"), static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static("System.Environment", "get_CurrentManagedThreadId"),
             static (ctx, _) => StackSlot.OfInt32(ctx.Shared.GuestThreads.CurrentManagedThreadId),
             BindingOrigin.InternalCall);

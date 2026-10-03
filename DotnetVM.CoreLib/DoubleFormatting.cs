@@ -45,18 +45,18 @@ public static class DoubleFormatting {
     private const string PercentPositivePattern = "_ p";   // invariant PercentPositivePattern=0 → "n %"
     private const string PercentNegativePattern = "n_ p";  // invariant PercentNegativePattern=0 → "-n %"
 
-    // ---- 公開エントリ (面ごと)。provider は VM 設定カルチャを使うため bridge では無視 ----
+    // ---- 公開エントリ (面ごと)。provider を CultureSettings bridge に渡す ----
 
     public static string DoubleToString(double value) => CultureSettings.FormatDouble(value, null);
     public static string DoubleToString(double value, string? format) => CultureSettings.FormatDouble(value, format);
-    public static string DoubleToString(double value, string? format, object? provider) => CultureSettings.FormatDouble(value, format);
-    public static string DoubleToString(double value, object? provider) => CultureSettings.FormatDouble(value, null);
+    public static string DoubleToString(double value, string? format, object? provider) => CultureSettings.FormatDouble(value, format, provider);
+    public static string DoubleToString(double value, object? provider) => CultureSettings.FormatDouble(value, null, provider);
 
     // Single は double に拡大格納して渡る (impl は SingleTraits で処理)。
     public static string SingleToString(double value) => CultureSettings.FormatSingle(value, null);
     public static string SingleToString(double value, string? format) => CultureSettings.FormatSingle(value, format);
-    public static string SingleToString(double value, string? format, object? provider) => CultureSettings.FormatSingle(value, format);
-    public static string SingleToString(double value, object? provider) => CultureSettings.FormatSingle(value, null);
+    public static string SingleToString(double value, string? format, object? provider) => CultureSettings.FormatSingle(value, format, provider);
+    public static string SingleToString(double value, object? provider) => CultureSettings.FormatSingle(value, null, provider);
 
     // ---- 本家 FormatFloat の移植 ----
 

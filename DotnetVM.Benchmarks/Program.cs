@@ -36,6 +36,10 @@ if (legacy) {
 var mixedGuest = typeof(GuestWorkloads);
 var loopGuest = typeof(DotnetVM.BenchmarkGuest.Workloads);
 var workloads = new (string Name, Type GuestType, int Count)[] {
+    (nameof(GuestWorkloads.SpanCopies), mixedGuest, 1000),
+    (nameof(GuestWorkloads.IntegerFormatting), mixedGuest, 1000),
+    (nameof(GuestWorkloads.IntegerParsing), mixedGuest, 1000),
+    (nameof(GuestWorkloads.StringCopies), mixedGuest, 1000),
     (nameof(GuestWorkloads.Arithmetic), mixedGuest, 5000),
     (nameof(DotnetVM.BenchmarkGuest.Workloads.ArithmeticLoop), loopGuest, 100000),
     (nameof(DotnetVM.BenchmarkGuest.Workloads.BranchLoop), loopGuest, 100000),
@@ -118,7 +122,7 @@ if (output is not null) {
     File.WriteAllText(path, JsonSerializer.Serialize(new { Runtime = Environment.Version.ToString(),
         MeasuredAt = DateTimeOffset.UtcNow, OS = Environment.OSVersion.ToString(),
         HostTieredCompilation = Environment.GetEnvironmentVariable("DOTNET_TieredCompilation") ?? "default",
-        Protocol = "unified-18", LoadHostCoreLib = true, JitPromotionThreshold = 2,
+        Protocol = "unified-22", LoadHostCoreLib = true, JitPromotionThreshold = 2,
         EnableJit = enableJit, Warmups = warmups, Samples = samples, Results = results },
         new JsonSerializerOptions { WriteIndented = true }));
 }

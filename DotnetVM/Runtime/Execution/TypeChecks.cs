@@ -48,6 +48,7 @@ internal static class TypeChecks {
         VmStructValue sv => sv.RuntimeType.IsAssignableTo(target),
         VmIntrinsicInstance intrinsic => intrinsic.RuntimeType.IsAssignableTo(target),
         VmTaskObject task => task.Type.IsAssignableTo(target),
+        VmBclObject bcl => bcl.Type.IsAssignableTo(target),
         DotnetVM.Runtime.Objects.VmExceptionObject e => e.ExceptionType.IsAssignableTo(target),
         VmString => target.FullName is "System.String" or "System.Object" ||
             (stringType is { } st && st.IsAssignableTo(target)),

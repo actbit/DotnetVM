@@ -7,7 +7,7 @@ namespace DotnetVM.CoreLib;
 ///
 /// CLR execution keeps the historical invariant implementation so the replacement assembly
 /// remains self-contained and deterministic on its own. When the assembly is executed by the VM,
-/// these methods are replaced by host bindings that use the VM's configured CultureInfo. Keeping
+/// these methods are replaced by host bindings that use the guest current culture or an explicit provider. Keeping
 /// the bridge behind ordinary managed methods means the replacement faces remain traceable IL
 /// while avoiding a process-global culture cache.
 /// </summary>
@@ -34,4 +34,22 @@ public static class CultureSettings {
         float.Parse(value, (NumberStyles)styles, Invariant);
     public static double ParseDouble(string value, int styles) =>
         double.Parse(value, (NumberStyles)styles, Invariant);
+
+    // Explicit providers are forwarded to the VM bridge as opaque guest objects.
+    public static string FormatByte(byte value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatSByte(sbyte value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatInt16(short value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatUInt16(ushort value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatInt32(int value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatUInt32(uint value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatInt64(long value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatUInt64(ulong value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatDouble(double value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatDecimal(decimal value, string? format, object? provider) => value.ToString(format, provider as IFormatProvider ?? Invariant);
+    public static string FormatSingle(double value, string? format, object? provider) => ((float)value).ToString(format, provider as IFormatProvider ?? Invariant);
+    public static int ParseInt32(string value, int styles, object? provider) => int.Parse(value, (NumberStyles)styles, provider as IFormatProvider ?? Invariant);
+    public static long ParseInt64(string value, int styles, object? provider) => long.Parse(value, (NumberStyles)styles, provider as IFormatProvider ?? Invariant);
+    public static ulong ParseUInt64(string value, int styles, object? provider) => ulong.Parse(value, (NumberStyles)styles, provider as IFormatProvider ?? Invariant);
+    public static double ParseSingle(string value, int styles, object? provider) => float.Parse(value, (NumberStyles)styles, provider as IFormatProvider ?? Invariant);
+    public static double ParseDouble(string value, int styles, object? provider) => double.Parse(value, (NumberStyles)styles, provider as IFormatProvider ?? Invariant);
 }

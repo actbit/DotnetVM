@@ -86,7 +86,7 @@ internal static class AssemblyLoadContextRuntime {
         r.RegisterBinding(BindingKey.Instance(MemoryStreamType, "get_Length"), static (_, a) =>
             StackSlot.OfInt64(RequireStream(a[0]).Bytes.Length), BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(MemoryStreamType, "ToArray"), static (ctx, a) =>
-            StackSlot.OfObject(ctx.MakeByteArray(RequireStream(a[0]).Bytes)), BindingOrigin.Managed);
+            StackSlot.OfObject(ctx.MakeByteArray(RequireStream(a[0], allowClosed: true).Bytes)), BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.Instance(MemoryStreamType, "Read", "System.Byte[]", "System.Int32", "System.Int32"),
             static (ctx, a) => Read(ctx, a), BindingOrigin.Managed);
     }
@@ -196,7 +196,7 @@ internal static class AssemblyLoadContextRuntime {
         r.Register(IntrinsicKey.Instance(t, "get_Length", 0), static (_, a) =>
             StackSlot.OfInt64(RequireStream(a[0]).Bytes.Length));
         r.Register(IntrinsicKey.Instance(t, "ToArray", 0), static (ctx, a) =>
-            StackSlot.OfObject(ctx.MakeByteArray(RequireStream(a[0]).Bytes)));
+            StackSlot.OfObject(ctx.MakeByteArray(RequireStream(a[0], allowClosed: true).Bytes)));
         r.Register(IntrinsicKey.Instance(t, "Read", 3), static (ctx, a) => Read(ctx, a));
     }
 
@@ -283,9 +283,11 @@ internal static class AssemblyLoadContextRuntime {
         return Assembly(ctx, loader);
     }
 
-    private static VmMemoryStreamObject RequireStream(StackSlot slot) =>
-        slot.ObjectValue as VmMemoryStreamObject
-        ?? throw new UnhandledGuestException("System.NullReferenceException", null);
+    private static VmMemoryStreamObject RequireStream(StackSlot slot, bool allowClosed = false) {
+        var stream = slot.ObjectValue as VmMemoryStreamObject ?? throw new UnhandledGuestException("System.NullReferenceException", null);
+        if (stream.IsDisposed && !allowClosed) throw new UnhandledGuestException("System.ObjectDisposedException", "MemoryStream is closed.");
+        return stream;
+    }
 
     private static void SetStreamBytes(StackSlot[] args, byte[] bytes) {
         if (args[0].ObjectValue is not VmMemoryStreamObject stream)

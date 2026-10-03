@@ -37,28 +37,28 @@ public static class FormatSpecifiers {
     /// <summary>数値バッファのサイズ (ulong 20 桁 + 丸め余裕)。</summary>
     private const int DigitBufferSize = 24;
 
-    // ---- 公開エントリ (面ごと)。provider は VM 設定カルチャを使うため bridge では無視 ----
+    // ---- 公開エントリ (面ごと)。provider を CultureSettings bridge に渡す ----
 
     public static string SByteToString(sbyte value) => CultureSettings.FormatSByte(value, null);
     public static string SByteToString(sbyte value, string? format) => CultureSettings.FormatSByte(value, format);
-    public static string SByteToString(sbyte value, string? format, object? provider) => CultureSettings.FormatSByte(value, format);
+    public static string SByteToString(sbyte value, string? format, object? provider) => CultureSettings.FormatSByte(value, format, provider);
     public static string ByteToString(byte value) => CultureSettings.FormatByte(value, null);
     public static string ByteToString(byte value, string? format) => CultureSettings.FormatByte(value, format);
-    public static string ByteToString(byte value, string? format, object? provider) => CultureSettings.FormatByte(value, format);
+    public static string ByteToString(byte value, string? format, object? provider) => CultureSettings.FormatByte(value, format, provider);
     public static string Int16ToString(short value) => CultureSettings.FormatInt16(value, null);
     public static string Int16ToString(short value, string? format) => CultureSettings.FormatInt16(value, format);
-    public static string Int16ToString(short value, string? format, object? provider) => CultureSettings.FormatInt16(value, format);
+    public static string Int16ToString(short value, string? format, object? provider) => CultureSettings.FormatInt16(value, format, provider);
     public static string UInt16ToString(ushort value) => CultureSettings.FormatUInt16(value, null);
     public static string UInt16ToString(ushort value, string? format) => CultureSettings.FormatUInt16(value, format);
-    public static string UInt16ToString(ushort value, string? format, object? provider) => CultureSettings.FormatUInt16(value, format);
+    public static string UInt16ToString(ushort value, string? format, object? provider) => CultureSettings.FormatUInt16(value, format, provider);
     public static string Int32ToString(int value, string? format) => CultureSettings.FormatInt32(value, format);
-    public static string Int32ToString(int value, string? format, object? provider) => CultureSettings.FormatInt32(value, format);
+    public static string Int32ToString(int value, string? format, object? provider) => CultureSettings.FormatInt32(value, format, provider);
     public static string UInt32ToString(uint value, string? format) => CultureSettings.FormatUInt32(value, format);
-    public static string UInt32ToString(uint value, string? format, object? provider) => CultureSettings.FormatUInt32(value, format);
+    public static string UInt32ToString(uint value, string? format, object? provider) => CultureSettings.FormatUInt32(value, format, provider);
     public static string Int64ToString(long value, string? format) => CultureSettings.FormatInt64(value, format);
-    public static string Int64ToString(long value, string? format, object? provider) => CultureSettings.FormatInt64(value, format);
+    public static string Int64ToString(long value, string? format, object? provider) => CultureSettings.FormatInt64(value, format, provider);
     public static string UInt64ToString(ulong value, string? format) => CultureSettings.FormatUInt64(value, format);
-    public static string UInt64ToString(ulong value, string? format, object? provider) => CultureSettings.FormatUInt64(value, format);
+    public static string UInt64ToString(ulong value, string? format, object? provider) => CultureSettings.FormatUInt64(value, format, provider);
 
     public static string BooleanToString(bool value) => value ? "True" : "False";
     public static string BooleanToString(bool value, object? provider) => value ? "True" : "False";
@@ -815,4 +815,8 @@ public static class FormatSpecifiers {
         }
         return new string(buffer, 0, buffer.Length);
     }
+    public static string ByteToString(byte value, object? provider) => CultureSettings.FormatByte(value, null, provider);
+    public static string SByteToString(sbyte value, object? provider) => CultureSettings.FormatSByte(value, null, provider);
+    public static string Int16ToString(short value, object? provider) => CultureSettings.FormatInt16(value, null, provider);
+    public static string UInt16ToString(ushort value, object? provider) => CultureSettings.FormatUInt16(value, null, provider);
 }

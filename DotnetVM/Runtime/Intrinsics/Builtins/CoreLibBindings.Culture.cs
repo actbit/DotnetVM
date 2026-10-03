@@ -30,19 +30,20 @@ internal static partial class CoreLibBindings {
     }
 
     private static string FormatPrimitive(IntrinsicContext ctx, in StackSlot receiver,
-        string type, string? format) {
+        string type, string? format, IFormatProvider? provider = null) {
+        provider ??= ctx.Shared.CurrentCulture;
         var value = receiver.ObjectValue is VmBoxedValue boxed ? boxed.Fields[0] : receiver;
         return type switch {
-            "System.Byte" => ((byte)value.AsInt32).ToString(format, ctx.Shared.Culture),
-            "System.SByte" => ((sbyte)value.AsInt32).ToString(format, ctx.Shared.Culture),
-            "System.Int16" => ((short)value.AsInt32).ToString(format, ctx.Shared.Culture),
-            "System.UInt16" => ((ushort)value.AsInt32).ToString(format, ctx.Shared.Culture),
-            "System.Int32" => value.AsInt32.ToString(format, ctx.Shared.Culture),
-            "System.UInt32" => ((uint)value.AsInt32).ToString(format, ctx.Shared.Culture),
-            "System.Int64" => value.Int64Value.ToString(format, ctx.Shared.Culture),
-            "System.UInt64" => ((ulong)value.Int64Value).ToString(format, ctx.Shared.Culture),
-            "System.Single" => ((float)value.DoubleValue).ToString(format, ctx.Shared.Culture),
-            "System.Double" => value.DoubleValue.ToString(format, ctx.Shared.Culture),
+            "System.Byte" => ((byte)value.AsInt32).ToString(format, provider),
+            "System.SByte" => ((sbyte)value.AsInt32).ToString(format, provider),
+            "System.Int16" => ((short)value.AsInt32).ToString(format, provider),
+            "System.UInt16" => ((ushort)value.AsInt32).ToString(format, provider),
+            "System.Int32" => value.AsInt32.ToString(format, provider),
+            "System.UInt32" => ((uint)value.AsInt32).ToString(format, provider),
+            "System.Int64" => value.Int64Value.ToString(format, provider),
+            "System.UInt64" => ((ulong)value.Int64Value).ToString(format, provider),
+            "System.Single" => ((float)value.DoubleValue).ToString(format, provider),
+            "System.Double" => value.DoubleValue.ToString(format, provider),
             _ => throw new InvalidOperationException($"未対応の数値型です: {type}"),
         };
     }
@@ -51,14 +52,14 @@ internal static partial class CoreLibBindings {
         ?? throw new UnhandledGuestException("System.ArgumentNullException", "value");
 
     private static StackSlot ParseInt32Culture(IntrinsicContext ctx, in StackSlot value, int styles) {
-        try { return StackSlot.OfInt32(int.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+        try { return StackSlot.OfInt32(int.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
         catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
         catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
         catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }
     }
 
     private static StackSlot ParseDoubleCulture(IntrinsicContext ctx, in StackSlot value, int styles) {
-        try { return StackSlot.OfFloat(double.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+        try { return StackSlot.OfFloat(double.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
         catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
         catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
         catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }
@@ -79,18 +80,18 @@ internal static partial class CoreLibBindings {
             r.RegisterBinding(BindingKey.StaticWithReturn(T, method, "System.String", [valueType, "System.String"]),
                 (ctx, a) => FormatGuest(ctx, () => format(ctx, a)), BindingOrigin.Managed);
 
-        FormatFace("FormatByte", "System.Byte", (ctx, a) => ((byte)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatSByte", "System.SByte", (ctx, a) => ((sbyte)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatInt16", "System.Int16", (ctx, a) => ((short)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatUInt16", "System.UInt16", (ctx, a) => ((ushort)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatInt32", "System.Int32", (ctx, a) => a[0].AsInt32.ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatUInt32", "System.UInt32", (ctx, a) => ((uint)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatInt64", "System.Int64", (ctx, a) => a[0].Int64Value.ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatUInt64", "System.UInt64", (ctx, a) => ((ulong)a[0].Int64Value).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatSingle", "System.Double", (ctx, a) => ((float)a[0].DoubleValue).ToString(Format(a[1]), ctx.Shared.Culture));
-        FormatFace("FormatDouble", "System.Double", (ctx, a) => a[0].DoubleValue.ToString(Format(a[1]), ctx.Shared.Culture));
+        FormatFace("FormatByte", "System.Byte", (ctx, a) => ((byte)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatSByte", "System.SByte", (ctx, a) => ((sbyte)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatInt16", "System.Int16", (ctx, a) => ((short)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatUInt16", "System.UInt16", (ctx, a) => ((ushort)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatInt32", "System.Int32", (ctx, a) => a[0].AsInt32.ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatUInt32", "System.UInt32", (ctx, a) => ((uint)a[0].AsInt32).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatInt64", "System.Int64", (ctx, a) => a[0].Int64Value.ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatUInt64", "System.UInt64", (ctx, a) => ((ulong)a[0].Int64Value).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatSingle", "System.Double", (ctx, a) => ((float)a[0].DoubleValue).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
+        FormatFace("FormatDouble", "System.Double", (ctx, a) => a[0].DoubleValue.ToString(Format(a[1]), ctx.Shared.CurrentCulture));
         FormatFace("FormatDecimal", "System.Decimal", (ctx, a) =>
-            ToDecimalValue(a[0]).ToString(Format(a[1]), ctx.Shared.Culture));
+            ToDecimalValue(a[0]).ToString(Format(a[1]), ctx.Shared.CurrentCulture));
 
         r.RegisterBinding(BindingKey.StaticWithReturn(T, "ParseInt32", "System.Int32", ["System.String", "System.Int32"]),
             static (ctx, a) => ParseInt32(ctx, a[0], a[1].AsInt32), BindingOrigin.Managed);
@@ -102,25 +103,25 @@ internal static partial class CoreLibBindings {
             static (ctx, a) => ParseDouble(ctx, a[0], a[1].AsInt32), BindingOrigin.Managed);
 
         static StackSlot ParseInt32(IntrinsicContext ctx, in StackSlot value, int styles) {
-            try { return StackSlot.OfInt32(int.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+            try { return StackSlot.OfInt32(int.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
             catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
             catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
             catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }
         }
         static StackSlot ParseInt64(IntrinsicContext ctx, in StackSlot value, int styles) {
-            try { return StackSlot.OfInt64(long.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+            try { return StackSlot.OfInt64(long.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
             catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
             catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
             catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }
         }
         static StackSlot ParseSingle(IntrinsicContext ctx, in StackSlot value, int styles) {
-            try { return StackSlot.OfFloat(float.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+            try { return StackSlot.OfFloat(float.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
             catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
             catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
             catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }
         }
         static StackSlot ParseDouble(IntrinsicContext ctx, in StackSlot value, int styles) {
-            try { return StackSlot.OfFloat(double.Parse(Text(value), (NumberStyles)styles, ctx.Shared.Culture)); }
+            try { return StackSlot.OfFloat(double.Parse(Text(value), (NumberStyles)styles, ctx.Shared.CurrentCulture)); }
             catch (FormatException) { throw new UnhandledGuestException("System.FormatException", null); }
             catch (OverflowException) { throw new UnhandledGuestException("System.OverflowException", null); }
             catch (ArgumentException) { throw new UnhandledGuestException("System.ArgumentException", null); }

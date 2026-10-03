@@ -62,7 +62,7 @@ public sealed partial class Interpreter {
             VmLifetime.EnsureLiveForGuest(argument);
         var state = CurrentState;
         RegisterExecutionState(state);
-        using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared.Culture) : null;
+        using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
         }
@@ -261,9 +261,9 @@ public sealed partial class Interpreter {
         private readonly CultureInfo _previousCulture = CultureInfo.CurrentCulture;
         private readonly CultureInfo _previousUiCulture = CultureInfo.CurrentUICulture;
 
-        public GuestCultureScope(CultureInfo culture) {
-            CultureInfo.CurrentCulture = culture;
-            CultureInfo.CurrentUICulture = culture;
+        public GuestCultureScope(VmSharedState shared) {
+            CultureInfo.CurrentCulture = shared.CurrentCulture;
+            CultureInfo.CurrentUICulture = shared.CurrentUICulture;
         }
 
         public void Dispose() {

@@ -35,6 +35,47 @@ internal static class MemoryOps {
     }
 
     private static readonly ConditionalWeakTable<AssemblyImage, LayoutMetadata> s_layoutMetadata = new();
+    private sealed record ByteField(VmType Type, int Slot, int Offset, int Size);
+    private sealed record ByteLayout(int Size, int Alignment, ByteField[] Fields);
+    private static readonly ConditionalWeakTable<VmType, ByteLayout> s_byteLayouts = new();
+
+    private static bool IsBlittableStruct(VmType type) => type.IsValueType && !type.IsEnum &&
+        !VmPrimitiveTypes.IsSlotPrimitive(type.FullName) && type is VmClassType or VmConstructedType;
+
+    internal static int SizeOfRawType(VmType type) => IsBlittableStruct(type) ? GetByteLayout(type).Size : SizeOfType(type);
+
+    private static ByteLayout GetByteLayout(VmType type, HashSet<VmType>? active = null) {
+        if (s_byteLayouts.TryGetValue(type, out var cached)) return cached;
+        active ??= [];
+        if (active.Count >= 64 || !active.Add(type)) throw new BadImageFormatException("Recursive raw struct layout.");
+        try {
+            return s_byteLayouts.GetValue(type, _ => {
+                var constructed = type as VmConstructedType;
+                var definition = (constructed?.Definition ?? type) as VmClassType ?? throw new InvalidOperationException("Struct definition is unavailable.");
+                var metadata = s_layoutMetadata.GetValue(definition.Image, static image => LayoutMetadata.Read(image));
+                var packing = EffectivePackingSize(definition, metadata);
+                var slots = new ObjectModel().GetLayout(definition);
+                var fields = new List<ByteField>();
+                var end = 0; var alignment = 1;
+                foreach (var field in definition.Fields) {
+                    if (field.IsStatic || field.IsLiteral) continue;
+                    var fieldType = field.FieldType ?? throw new InvalidOperationException("Field type is unavailable.");
+                    if (constructed is not null) fieldType = GenericSubstitutor.Substitute(fieldType, new GenericContext { ClassArgs = constructed.TypeArguments });
+                    if (!fieldType.IsValueType || fieldType is VmByRefType) throw new UnhandledGuestException("System.ArgumentException", "Raw structs cannot contain references.");
+                    var nested = IsBlittableStruct(fieldType) ? GetByteLayout(fieldType, active) : null;
+                    var size = nested?.Size ?? SizeOfType(fieldType);
+                    var align = Math.Min(nested?.Alignment ?? size, packing);
+                    var explicitOffset = GetFieldOffset(field, metadata);
+                    if ((definition.Flags & 0x18) == 0x10 && explicitOffset is null) throw new BadImageFormatException("Explicit struct field has no offset.");
+                    var offset = explicitOffset ?? checked((end + align - 1) / align * align);
+                    fields.Add(new ByteField(fieldType, slots[field], offset, size));
+                    end = checked(Math.Max(end, offset + size)); alignment = Math.Max(alignment, align);
+                }
+                end = Math.Max(end, DeclaredClassSize(definition, metadata));
+                return new ByteLayout(Math.Max(1, checked((end + alignment - 1) / alignment * alignment)), alignment, fields.ToArray());
+            });
+        } finally { active.Remove(type); }
+    }
 
     // ---- 配列要素 ----
 
@@ -363,6 +404,8 @@ internal static class MemoryOps {
     public static int SizeOfType(VmType type) => SizeOfTypeCore(type, []);
 
     private static int SizeOfTypeCore(VmType type, HashSet<VmType> visiting) {
+        if (!type.IsValueType || type is VmByRefType)
+            return VmPrimitiveTypes.NativeIntSizeBytes;
         if (type is VmIntrinsicType intrinsic) {
             if (!intrinsic.IsValue)
                 throw new InvalidOperationException($"sizeof は値型にのみ適用できます: {type.FullName}");
@@ -401,7 +444,10 @@ internal static class MemoryOps {
                 foreach (var field in cls.Fields) {
                     if ((field.Flags & 0x0010) != 0)
                         continue; // FieldAttributes.Static
-                    var fieldSize = field.FieldType is null ? 8 : SizeOfTypeCore(field.FieldType, visiting);
+                    var fieldType = field.FieldType;
+                    if (fieldType is not null && type is VmConstructedType generic)
+                        fieldType = GenericSubstitutor.Substitute(fieldType, new GenericContext { ClassArgs = generic.TypeArguments });
+                    var fieldSize = fieldType is null ? VmPrimitiveTypes.NativeIntSizeBytes : SizeOfTypeCore(fieldType, visiting);
                     var fieldLayout = GetFieldOffset(field, layout);
                     if (fieldLayout is { } explicitOffset) {
                         size = LayoutSize(Math.Max((long)size, (long)explicitOffset + fieldSize), cls);
@@ -460,6 +506,12 @@ internal static class MemoryOps {
     /// typeof から構成を取り出し, VM 表現を使って "ldobj 型", "cpobj 型" も走る</summary>
     public static StackSlot ValueFromBytes(ReadOnlySpan<byte> bytes, VmType type, int size)
     {
+        if (IsBlittableStruct(type)) {
+            var layout = GetByteLayout(type);
+            var fields = new StackSlot[layout.Fields.Length == 0 ? 0 : layout.Fields.Max(f => f.Slot) + 1];
+            foreach (var field in layout.Fields) fields[field.Slot] = ValueFromBytes(bytes.Slice(field.Offset, field.Size), field.Type, field.Size);
+            return StackSlot.OfValueType(new VmStructValue(type, fields, (type as VmConstructedType)?.TypeArguments));
+        }
         // プリミティブ値は VM の統合スロットで表す (int/char/bool 等は i4 スロット)
         var typeName = PrimitiveStorageTypeName(type);
         if (bytes.Length == 1)
@@ -502,6 +554,14 @@ internal static class MemoryOps {
     /// <summary>VM スロット値を LE バイト列へ展開する (stobj/unmanaged ポインタ書き込み用)。</summary>
     public static void BytesOfValue(in StackSlot value, VmType type, int size, Span<byte> destination)
     {
+        if (IsBlittableStruct(type)) {
+            var layout = GetByteLayout(type);
+            var slot = value.ObjectValue is VmByRef byRef ? byRef.Read() : value;
+            var fields = slot.ObjectValue switch { VmStructValue sv => sv.Fields, VmBoxedValue box => box.Fields, _ => throw new InvalidOperationException("Expected a struct value.") };
+            destination[..layout.Size].Clear();
+            foreach (var field in layout.Fields) BytesOfValue(fields[field.Slot], field.Type, field.Size, destination.Slice(field.Offset, field.Size));
+            return;
+        }
         if (size is not (1 or 2 or 4 or 8))
             throw new InvalidOperationException($"unmanaged ポインタへの {type.FullName} (要素幅 {size} バイト) の書き込みに対応していません。");
         if ((uint)size > (uint)destination.Length)

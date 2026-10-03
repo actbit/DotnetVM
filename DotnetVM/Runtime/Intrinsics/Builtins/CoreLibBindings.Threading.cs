@@ -518,6 +518,7 @@ internal static partial class CoreLibBindings {
                         generic ? (valueTask ? ValueTaskResultType(ctx, a[0]) : ResultType(ctx, fromMethod: false)) : null,
                         a[0]));
             if (!valueTask) {
+                RegisterBinding(registry, BindingKey.Instance(typeName, "get_IsCanceled"), (ctx, a) => StackSlot.OfInt32(AsTask(ctx, a[0], generic).IsCanceled ? 1 : 0));
                 RegisterBinding(registry, BindingKey.Instance(typeName, "Wait"),
                     (ctx, a) => { SuspendHostWait(ctx, AsTask(ctx, a[0]).Wait); return null; });
                 RegisterBinding(registry, BindingKey.InstanceWithReturn(typeName, "Wait", "System.Boolean", ["System.Int32"]),

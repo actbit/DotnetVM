@@ -13,6 +13,7 @@ namespace DotnetVM.Runtime.Heap;
 public static class ObjectGraphWalker {
     /// <summary>ヒープオブジェクトから直接到達する参照を列挙する。</summary>
     public static void CollectReferences(VmObject obj, Action<VmObject> visit) {
+        foreach (var reference in obj.BclReferences) visit(reference);
         switch (obj) {
             case VmClassInstance instance:
                 CollectFromSlots(instance.Fields, visit);

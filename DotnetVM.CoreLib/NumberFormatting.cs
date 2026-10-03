@@ -19,22 +19,14 @@ public static class NumberFormatting {
 
     /// <summary>CLR の int.ToString() (不変カルチャ) と同一。int.MinValue も
     /// 絶対値を uint 空間 (|int.MinValue| = 2147483648) で処理するため neg であふれない。</summary>
-    public static string Int32ToString(int value) {
-        // Keep the managed helper frame visible for the invariant CLR-differential audit while
-        // the final result comes from the VM culture bridge.
-        _ = value >= 0 ? UInt32ToString((uint)value) : UInt32ToString(0u - (uint)value);
-        return CultureSettings.FormatInt32(value, null);
-    }
+    public static string Int32ToString(int value) => CultureSettings.FormatInt32(value, null);
 
     /// <summary>CLR の uint.ToString() (不変カルチャ) と同一。</summary>
     public static string UInt32ToString(uint value) => CultureSettings.FormatUInt32(value, null);
 
     /// <summary>CLR の long.ToString() (不変カルチャ) と同一。long.MinValue も
     /// 絶対値を ulong 空間 (|long.MinValue| = 9223372036854775808) で処理する。</summary>
-    public static string Int64ToString(long value) {
-        _ = value >= 0 ? UInt64ToString((ulong)value) : UInt64ToString(0ul - (ulong)value);
-        return CultureSettings.FormatInt64(value, null);
-    }
+    public static string Int64ToString(long value) => CultureSettings.FormatInt64(value, null);
 
     /// <summary>CLR の ulong.ToString() (不変カルチャ) と同一。</summary>
     public static string UInt64ToString(ulong value) => CultureSettings.FormatUInt64(value, null);
@@ -44,14 +36,12 @@ public static class NumberFormatting {
     //      表現範囲外は OverflowException (空文字列 / null / 符号のみも FormatException) ----
 
     public static int ParseInt32(string s) {
-        _ = ParseMagnitude(s, (uint)int.MaxValue + 1ul);
         return CultureSettings.ParseInt32(s, (int)System.Globalization.NumberStyles.Integer);
     }
     public static int ParseInt32(string s, int styles) =>
         CultureSettings.ParseInt32(s, styles);
 
     public static long ParseInt64(string s) {
-        _ = ParseMagnitude(s, (ulong)long.MaxValue + 1ul);
         return CultureSettings.ParseInt64(s, (int)System.Globalization.NumberStyles.Integer);
     }
 
@@ -136,4 +126,9 @@ public static class NumberFormatting {
     /// VM の決定論のため Unicode 面には依存しない。</summary>
     private static bool IsWhiteSpace(char c) =>
         c is ' ' or '\t' or '\n' or '\r' or '\v' or '\f';
+
+    public static string Int32ToString(int value, object? provider) => CultureSettings.FormatInt32(value, null, provider);
+    public static string Int64ToString(long value, object? provider) => CultureSettings.FormatInt64(value, null, provider);
+    public static string UInt32ToString(uint value, object? provider) => CultureSettings.FormatUInt32(value, null, provider);
+    public static string UInt64ToString(ulong value, object? provider) => CultureSettings.FormatUInt64(value, null, provider);
 }

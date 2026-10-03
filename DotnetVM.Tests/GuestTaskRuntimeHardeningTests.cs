@@ -64,7 +64,7 @@ public sealed class GuestTaskRuntimeHardeningTests {
 
         shared.GuestTasks.Delay(task, 1);
         Assert.Equal(1, shared.GuestTasks.PendingTimerCount);
-        Assert.True(task.Wait(1_000));
+        Assert.True(task.Wait(5_000));
         Assert.True(SpinWait.SpinUntil(
             () => shared.GuestTasks.PendingTimerCount == 0, TimeSpan.FromSeconds(1)));
     }

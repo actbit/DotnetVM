@@ -48,7 +48,7 @@ internal static class CoreLibSurfaceAudit {
     public const string JitIntrinsic = "jit-intrinsic: 実 CLR も JIT が IL を丸ごと置き換える面";
     public const string InternalCall = "internal-call: CoreLib 上で本体 IL が存在しない面 (InternalCall)";
     public const string RuntimeRepresentation = "runtime-representation: ランタイム内部表現依存で VM の表現モデルに落ちない面";
-    public const string CultureOutOfScope = "culture-out-of-scope: CultureInfo / CompareInfo の guest 実装が未対応のためホスト BCL へ委譲";
+    public const string CultureOutOfScope = "culture-out-of-scope: OS の globalization データは VM 内部の CultureInfo / CompareInfo bridge からホスト BCL へ委譲";
     public const string DeviceFace = "device: I/O は仮想デバイス / ゲートウェイ経由限定という VM 設計原則による面";
 
     /// <summary>登録済み全 intrinsic / バインドキーの分類表 (唯一の真実源)。</summary>
@@ -84,6 +84,80 @@ internal static class CoreLibSurfaceAudit {
         }
 
         var integer4 = new[] { "System.Int32", "System.UInt32", "System.Int64", "System.UInt64" };
+
+        // Explicit normalized BCL boundaries. These remain distinct from privileged
+        // CoreLib callers; host-selected framework loaders only authorize these keys.
+        var bclJ = RuntimeRepresentation + "。ホスト選択 BCL の状態を VM オブジェクトで保持し、結果と予算を正規化する";
+        void Bcl(string type, string[] methods, bool? hasThis = null, string? justification = null) {
+            foreach (var method in methods) Add(type, method, CoreLibSurfaceKind.RuntimeInternal, justification ?? bclJ, hasThis);
+        }
+        Bcl("System.Globalization.CultureInfo", [".cctor", ".ctor", "GetCultureInfo", "get_InvariantCulture", "get_CurrentCulture", "get_CurrentUICulture", "set_CurrentCulture", "set_CurrentUICulture", "ReadOnly", "Clone", "ToString", "Equals", "GetHashCode", "get_Name", "get_DisplayName", "get_EnglishName", "get_NativeName", "get_TwoLetterISOLanguageName", "get_ThreeLetterISOLanguageName", "get_LCID", "get_IsReadOnly", "get_IsNeutralCulture", "get_Parent", "get_NumberFormat", "get_DateTimeFormat", "get_TextInfo", "get_CompareInfo", "GetFormat"]);
+        Bcl("System.Globalization.NumberFormatInfo", [".ctor", "Clone", "get_IsReadOnly"], true);
+        foreach (var property in new[] { "NumberDecimalSeparator", "NumberGroupSeparator", "NegativeSign", "PositiveSign", "CurrencySymbol", "CurrencyDecimalSeparator", "PercentSymbol", "NaNSymbol", "PositiveInfinitySymbol", "NegativeInfinitySymbol" })
+            Bcl("System.Globalization.NumberFormatInfo", ["get_" + property, "set_" + property], true);
+        Bcl("System.Globalization.TextInfo", ["ToUpper", "ToLower"], true);
+        foreach (var method in new[] { "ToUpper", "ToLower" }) {
+            Add("System.String", method, CoreLibSurfaceKind.RuntimeInternal, bclJ, true, 1);
+            Add("System.Char", method, CoreLibSurfaceKind.RuntimeInternal, bclJ, false, 2);
+        }
+        foreach (var type in integer4.Concat(new[] { "System.Byte", "System.SByte", "System.Int16", "System.UInt16" })) {
+            Add(type, "Parse", CoreLibSurfaceKind.RuntimeInternal, bclJ, false, 2);
+            Add(type, "Parse", CoreLibSurfaceKind.RuntimeInternal, bclJ, false, 3);
+        }
+        foreach (var method in new[] { "FormatByte", "FormatSByte", "FormatInt16", "FormatUInt16", "FormatInt32", "FormatUInt32", "FormatInt64", "FormatUInt64", "FormatSingle", "FormatDouble", "FormatDecimal", "ParseInt32", "ParseInt64", "ParseUInt64", "ParseSingle", "ParseDouble" })
+            Add("DotnetVM.CoreLib.CultureSettings", method, CoreLibSurfaceKind.RuntimeInternal, bclJ, false, 3);
+        Bcl("System.Text.Encoding", ["get_UTF8"], false);
+        Bcl("System.Text.UTF8Encoding", [".ctor"], true);
+        foreach (var type in new[] { "System.Text.Encoding", "System.Text.UTF8Encoding" }) Bcl(type, ["GetEncoder", "GetDecoder"], true);
+        Bcl("System.Text.Encoder", ["Reset", "Convert", "GetByteCount", "GetBytes"], true);
+        Bcl("System.Text.Decoder", ["Reset", "Convert", "GetCharCount", "GetChars"], true);
+        foreach (var type in new[] { "System.Text.Encoding", "System.Text.UTF8Encoding" })
+            Bcl(type, ["GetPreamble", "get_WebName", "get_EncodingName", "get_CodePage", "get_IsReadOnly", "Clone", "GetMaxByteCount", "GetMaxCharCount", "GetByteCount", "GetBytes", "GetCharCount", "GetString", "GetChars"], true);
+        Bcl("System.Runtime.CompilerServices.RuntimeHelpers", ["TryGetHashCode", "ObjectHasComponentSize"], false);
+        Bcl("System.Runtime.CompilerServices.Unsafe", ["NullRef", "Subtract", "ByteOffset", "IsAddressGreaterThan", "IsAddressLessThan"], false);
+        Bcl("System.Runtime.InteropServices.MemoryMarshal", ["CreateSpan", "GetReference"], false);
+        Bcl("System.SpanHelpers", ["ClearWithoutReferences", "ClearWithReferences"], false);
+        Bcl("System.Threading.Volatile", ["Read", "Write"], false, JitIntrinsic);
+        foreach (var type in new[] { "System.Threading.Tasks.Task", "System.Threading.Tasks.Task`1" }) Bcl(type, ["get_IsCanceled"], true);
+        Bcl("System.Numerics.Vector", ["get_IsHardwareAccelerated"], false, JitIntrinsic);
+        foreach (var type in new[] { "Ssse3", "Sse41", "Avx" }) Bcl("System.Runtime.Intrinsics.X86." + type, ["get_IsSupported"], false, JitIntrinsic);
+        foreach (var width in new[] { 64, 128, 256, 512 }) {
+            var type = "System.Runtime.Intrinsics.Vector" + width;
+            Bcl(type, ["Create", "GetElement", "WithElement", "Add", "Subtract", "Multiply"], false, JitIntrinsic);
+            Bcl(type + "`1", ["get_Count", "get_IsSupported", "get_Zero", "op_Addition", "op_Subtraction", "op_Multiply"], false, JitIntrinsic);
+            Bcl(type + "`1", ["GetElement"], true, JitIntrinsic);
+        }
+        Bcl("System.Buffers.SearchValues", ["Create"], false);
+        Bcl("System.Buffers.SearchValues`1", ["IndexOfAny", "IndexOfAnyExcept"], true);
+        Bcl("System.MemoryExtensions", ["IndexOfAny", "IndexOfAnyExcept", "ContainsAny", "ContainsAnyExcept"], false);
+        Bcl("System.Buffers.Text.Utf8Parser", ["TryParse"], false);
+        Bcl("System.Text.Unicode.Utf8", ["FromUtf16", "ToUtf16"], false);
+        foreach (var type in new[] { "System.Memory`1", "System.ReadOnlyMemory`1" }) Bcl(type, ["get_Span"], true);
+        Bcl("System.Array", ["get_NativeLength"], true);
+        Bcl("System.Buffer", ["BlockCopy"], false);
+        Bcl("System.Environment", ["GetProcessorCount"], false, RuntimeRepresentation + "。VM の論理 CPU 数を 1 として提供し OS 呼出を避ける");
+        Bcl("System.Text.RegularExpressions.Regex", [".ctor", "IsMatch", "Match", "Replace", "Split"]);
+        foreach (var type in new[] { "Match", "Group" }) Bcl("System.Text.RegularExpressions." + type, ["get_Success", "get_Value", "get_Index", "get_Length"], true);
+        Bcl("System.Text.RegularExpressions.Match", ["get_Groups"], true);
+        Bcl("System.Text.RegularExpressions.Capture", ["get_Value", "get_Index", "get_Length"], true);
+        Bcl("System.Text.RegularExpressions.GroupCollection", ["get_Item"], true);
+        foreach (var algorithm in new[] { "SHA256", "SHA384", "SHA512" }) Bcl("System.Security.Cryptography." + algorithm, ["HashData", "TryHashData"], false);
+        Bcl("System.Security.Cryptography.HMACSHA256", ["HashData"], false);
+        Bcl("System.Security.Cryptography.Aes", ["Create"], false);
+        foreach (var type in new[] { "Aes", "SymmetricAlgorithm" }) Bcl("System.Security.Cryptography." + type, ["Dispose", "get_Key", "set_Key", "get_IV", "set_IV", "EncryptCbc", "DecryptCbc", "EncryptEcb", "DecryptEcb"], true);
+        Bcl("System.Security.Cryptography.CryptographicOperations", ["FixedTimeEquals", "ZeroMemory"], false);
+        Bcl("System.Security.Cryptography.RandomNumberGenerator", ["GetBytes", "Fill"], false, DeviceFace + "。VM の RandomFill を通じて乱数を供給する");
+        foreach (var type in new[] { "GZipStream", "DeflateStream", "BrotliStream", "ZLibStream" })
+            Bcl("System.IO.Compression." + type, [".ctor", "get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Read", "Dispose", "Close", "Flush", "CopyTo"], true);
+        Bcl("System.IO.MemoryStream", ["get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Dispose", "Close", "Flush", "CopyTo"], true);
+        Bcl("System.IO.Stream", ["get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Read", "Dispose", "Close", "Flush", "CopyTo"], true);
+        Bcl("System.Net.Http.HttpClient", [".ctor", "Dispose", "GetStringAsync", "GetByteArrayAsync", "GetAsync", "PostAsync"], true, DeviceFace + "。HttpPolicy 付き NetworkGateway と guest Task worker を通す");
+        Bcl("System.Net.Http.HttpMessageInvoker", ["Dispose"], true, DeviceFace + "。HttpClient の継承面を同じ guest client state で破棄");
+        Bcl("System.Net.Http.HttpResponseMessage", ["get_StatusCode", "get_IsSuccessStatusCode", "get_Content", "EnsureSuccessStatusCode", "Dispose"], true);
+        foreach (var type in new[] { "HttpContent", "StringContent", "ByteArrayContent" }) Bcl("System.Net.Http." + type, ["Dispose", "ReadAsStringAsync", "ReadAsByteArrayAsync"], true);
+        foreach (var type in new[] { "StringContent", "ByteArrayContent" }) Bcl("System.Net.Http." + type, [".ctor"], true);
+        Bcl("System.Text.Encodings.Web.JavaScriptEncoder", ["get_Default", "get_UnsafeRelaxedJsonEscaping"], false);
+        foreach (var type in new[] { "JavaScriptEncoder", "TextEncoder" }) Bcl("System.Text.Encodings.Web." + type, ["FindFirstCharacterToEncode", "FindFirstCharacterToEncodeUtf8", "EncodeUtf8", "Encode", "WillEncode"], true);
 
         // ---- CultureSettings bridge / no-CoreLib fallback ----
         var cultureBridgeJ = CultureOutOfScope +

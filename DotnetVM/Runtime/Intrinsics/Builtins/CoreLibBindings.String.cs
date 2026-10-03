@@ -380,7 +380,11 @@ internal static partial class CoreLibBindings {
                                     $"Unsafe.AsRef の引数をスロット列参照として解釈できませんでした ({a[0].Kind})。"),
                 BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(UnsafeType, "SizeOf"),
-            static (ctx, _) => StackSlot.OfInt32(SlotStride(ctx.ParamAt(0))), BindingOrigin.InternalCall);
+            static (ctx, _) => {
+                var type = ctx.MethodTypeArguments.FirstOrDefault() ?? FindAnyType(ctx, ctx.MethodTypeArgAt(0));
+                if (type is null) throw new UnhandledGuestException("System.InvalidProgramException", "SizeOf type is unavailable.");
+                return StackSlot.OfInt32(!type.IsValueType ? VmPrimitiveTypes.NativeIntSizeBytes : ContainsReferences(type) ? MemoryOps.SizeOfType(type) : MemoryOps.SizeOfRawType(type));
+            }, BindingOrigin.InternalCall);
         // static bool Unsafe.IsNullRef<T>(ref T source)
         // ([Intrinsic]: 本家 IL は AsPointer との比較で構成されるが AsPointer 自体が
         // ダミー throw のため VM では null 参照表現 (空コンテナ ByRef) の直接判定で提供する。
@@ -395,7 +399,7 @@ internal static partial class CoreLibBindings {
         // 提供する。Math.Abs(double) の IL が BitConverter.DoubleToUInt64Bits 経由で呼ぶ)。
         // ジェネリック面のため開いたキー (!!0) で登録する
         r.RegisterBinding(BindingKey.Static(UnsafeType, "BitCast", "!!0"),
-            static (ctx, a) => BitCastImpl(ctx.ParamAt(0), a[0]), BindingOrigin.InternalCall);
+            static (ctx, a) => BitCastValue(ctx, a[0]), BindingOrigin.InternalCall);
         // static void Unsafe.CopyBlockUnaligned(ref byte destination, ref byte source, uint byteCount)
         // ([Intrinsic]: 実 IL はダミー throw = JIT intrinsic。String / Span IL がバイト実体コ
         // ピーに使うため Buffer.Memmove 相当の memmove で同等意味論を提供する)。
@@ -475,8 +479,17 @@ internal static partial class CoreLibBindings {
 
     private static StackSlot? WriteUnalignedImpl(IntrinsicContext ctx, StackSlot[] a) {
         var elementName = UnalignedElementName(ctx);
-        var stride = SlotStride(elementName);
+        var elementType = ctx.MethodTypeArguments.FirstOrDefault() ?? FindAnyType(ctx, elementName) ?? throw new InvalidOperationException(elementName);
+        var stride = MemoryOps.SizeOfRawType(elementType);
         var (native, slotRef) = ResolvePointerBase(a[0], "Unsafe.WriteUnaligned");
+        if (slotRef?.Owner is VmArray { ArrayType.ElementType.FullName: "System.Byte" } || native is not null) {
+            ctx.Heap.ChargeHostWork(stride);
+            if (stride > 256) ctx.Heap.ChargeHostBuffer(stride);
+            Span<byte> bytes = stride <= 256 ? stackalloc byte[stride] : new byte[stride];
+            MemoryOps.BytesOfValue(a[1], elementType, stride, bytes);
+            WriteByteSpan(a[0], bytes);
+            return null;
+        }
         if (slotRef is not null) {
             // スロット列への T 丸ごと書込 (1 要素 = 1 スロット。Span<byte> 以外の
             // Span<T> 参照が来る形。部分重なりは単一スロット代入で正確)
@@ -496,8 +509,18 @@ internal static partial class CoreLibBindings {
 
     private static StackSlot ReadUnalignedImpl(IntrinsicContext ctx, StackSlot[] a) {
         var elementName = UnalignedElementName(ctx);
-        var stride = SlotStride(elementName);
+        var elementType = ctx.MethodTypeArguments.FirstOrDefault() ?? FindAnyType(ctx, elementName) ?? throw new InvalidOperationException(elementName);
+        var stride = MemoryOps.SizeOfRawType(elementType);
         var (native, slotRef) = ResolvePointerBase(a[0], "Unsafe.ReadUnaligned");
+        if (slotRef?.Owner is VmArray { ArrayType.ElementType.FullName: "System.Byte" } || native is not null) {
+            ctx.Heap.ChargeHostWork(stride);
+            if (native is not null) { CheckSlice(native.Bytes.Length, native.ByteOffset, stride); return MemoryOps.ValueFromBytes(native.Bytes.AsSpan(native.ByteOffset, stride), elementType, stride); }
+            CheckSlice(slotRef!.Container.Length, slotRef.Index, stride);
+            if (stride > 256) ctx.Heap.ChargeHostBuffer(stride);
+            Span<byte> bytes = stride <= 256 ? stackalloc byte[stride] : new byte[stride];
+            for (var i = 0; i < stride; i++) bytes[i] = (byte)slotRef.Container[slotRef.Index + i].AsInt32;
+            return MemoryOps.ValueFromBytes(bytes, elementType, stride);
+        }
         if (slotRef is not null) {
             if (slotRef.Index < 0 || slotRef.Index >= slotRef.Container.Length)
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
@@ -520,6 +543,7 @@ internal static partial class CoreLibBindings {
         if (slot.Kind == StackKind.Object && slot.ObjectValue is VmNativePointer directNative)
             return (directNative, null);
         if (slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef outer) {
+            if (outer.IsNullOrOnePast) return (null, outer);
             var target = outer.Read(); // 指し先スロットの値
             if (target.Kind == StackKind.ByRef && target.ObjectValue is VmByRef inner)
                 return (null, outer.IsReadOnly
@@ -549,28 +573,6 @@ internal static partial class CoreLibBindings {
             $"面 {face} の参照引数をバイト実体ポインタとして解釈できませんでした: {slot.Kind}");
     }
 
-    /// <summary>static TTo Unsafe.BitCast&lt;TFrom, TTo&gt;(TFrom from) の同等意味論。
-    /// TFrom (実引数型) のビット列をそのままのバイト幅で TTo として読み替える。スロット表現上
-    /// float32/float64 は Float スロット、8 バイト整数は Int64 スロットに正規化されるため、
-    /// TFrom 側の型名で出力スロットの種類を決める (TTo の読み手は IL 上のスロット種で解釈する)。</summary>
-    private static StackSlot BitCastImpl(string fromTypeName, in StackSlot value) {
-        // ByRef 署名 (System.Char& 等) の接尾辞と未実体化の型引数を剥がす
-        var name = fromTypeName.EndsWith("&", StringComparison.Ordinal)
-            ? fromTypeName[..^1]
-            : fromTypeName;
-        return name switch {
-            "System.Double" => StackSlot.OfInt64(BitConverter.DoubleToInt64Bits(value.DoubleValue)),
-            "System.Single" => StackSlot.OfInt32(
-                BitConverter.SingleToInt32Bits((float)value.DoubleValue)),
-            "System.Int64" or "System.UInt64" => StackSlot.OfFloat(
-                BitConverter.Int64BitsToDouble(value.Int64Value)),
-            "System.Int32" or "System.UInt32" => StackSlot.OfFloat(
-                BitConverter.Int32BitsToSingle((int)value.Int64Value)),
-            // 同一スロット表現の型 (bool/char/byte/enum 等) はビット再解釈なしで素通り
-            _ => value,
-        };
-    }
-
     /// <summary>ジェネリック型引数のスロット上の要素サイズ。未対応の型は fail-closed
     /// (スロット表現に無い参照型 T 等の memmove / ポインタ演算は実行しない)。</summary>
     private static int SlotStride(string typeName) {
@@ -593,7 +595,6 @@ internal static partial class CoreLibBindings {
         // 型名が解決できず呼出 VM 形状に乗らないものは fail-closed にする。
         // strideOverride は CopyBlockUnaligned 等の「byteCount リテラルとバイト長が一致する面」
         // (全型 1 バイト固定 stride) 用。
-        var stride = strideOverride ?? SlotStride(ctx.ParamAt(0));
         var (dstNative, dstRef) = ResolvePointerBase(a[0], "Buffer.Memmove");
         var (srcNative, srcRef) = ResolvePointerBase(a[1], "Buffer.Memmove");
         var count = ReadElementCount(ctx, a[2]);
@@ -606,14 +607,18 @@ internal static partial class CoreLibBindings {
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Buffer.Memmove がスロット列の範囲外を参照します (dst index={dstRef.Index}, src index={srcRef.Index}, {count} 要素)。" +
                     $"ブロック {dstRef.Container.Length} / {srcRef.Container.Length} スロット。");
-            // memmove 意味論 (重なりがあっても正しく) のため送信側を退避してから書く
-            var tmp = new StackSlot[count];
-            for (var i = 0; i < count; i++)
-                tmp[i] = srcRef.Container[srcRef.Index + i];
-            for (var i = 0; i < count; i++)
-                dstRef.Container[dstRef.Index + i] = tmp[i];
+            // Array.Copy preserves overlap without allocating a temporary slot array.
+            ctx.Heap.ChargeHostWork(count);
+            Array.Copy(srcRef.Container, srcRef.Index, dstRef.Container, dstRef.Index, checked((int)count));
+            var copyType = ctx.MethodTypeArgAt(0);
+            if (string.IsNullOrEmpty(copyType)) copyType = ctx.ParamAt(0).TrimEnd('&');
+            if (!VmPrimitiveTypes.IsSlotPrimitive(copyType))
+                for (var i = 0; i < count; i++)
+                    if (dstRef.Container[dstRef.Index + i].ObjectValue is VmStructValue value)
+                        dstRef.Container[dstRef.Index + i] = StackSlot.OfValueType(value.Clone());
             return null;
         }
+        var stride = strideOverride ?? SlotStride(ctx.ParamAt(0));
         // バイト実体 ↔ スロット列の混在 (Span<char> が VmString バッファとローカル char を繋ぐ形):
         // 要素をバイト列 LE とスロット値の間で変換する
         if (dstRef is not null || srcRef is not null) {
@@ -693,11 +698,14 @@ internal static partial class CoreLibBindings {
             "System.Byte" => StackSlot.OfInt32(bytes[byteOffset]),
             "System.SByte" => StackSlot.OfInt32((sbyte)bytes[byteOffset]),
             "System.Boolean" => StackSlot.OfInt32(bytes[byteOffset] != 0 ? 1 : 0),
-            "System.Char" or "System.Int16" or "System.UInt16" => StackSlot.OfInt32(
+            "System.Int16" => StackSlot.OfInt32(BinaryPrimitives.ReadInt16LittleEndian(bytes.AsSpan(byteOffset))),
+            "System.Char" or "System.UInt16" => StackSlot.OfInt32(
                 bytes[byteOffset] | bytes[byteOffset + 1] << 8),
-            "System.Int32" or "System.UInt32" or "System.Single" => StackSlot.OfInt32(
+            "System.Single" => StackSlot.OfFloat(BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(byteOffset))),
+            "System.Double" => StackSlot.OfFloat(BinaryPrimitives.ReadDoubleLittleEndian(bytes.AsSpan(byteOffset))),
+            "System.Int32" or "System.UInt32" => StackSlot.OfInt32(
                 bytes[byteOffset] | bytes[byteOffset + 1] << 8 | bytes[byteOffset + 2] << 16 | bytes[byteOffset + 3] << 24),
-            "System.Int64" or "System.UInt64" or "System.Double" => StackSlot.OfInt64(
+            "System.Int64" or "System.UInt64" => StackSlot.OfInt64(
                 BitConverter.ToInt64(bytes, byteOffset)),
             "System.IntPtr" or "System.UIntPtr" => StackSlot.OfNativeInt(BitConverter.ToInt64(bytes, byteOffset)),
             _ => throw new InvalidOperationException(
@@ -767,9 +775,11 @@ internal static partial class CoreLibBindings {
         // インデックスの移動として表現する (1 要素 = 1 スロット)。バイトオフセット面
         // (AddByteOffset) はスロット列では表現できないため fail-closed
         if (slotRef is not null) {
-            if (!elementStride)
-                throw new InvalidOperationException(
-                    "Unsafe.AddByteOffset はバイト実体を持たないスロット列参照には対応していません。");
+            if (!elementStride) {
+                var slotStride = SlotStride(ctx.MethodTypeArgAt(0));
+                if (offset % slotStride != 0) throw new UnhandledGuestException("System.NotSupportedException", "Byte offset must align with VM slot storage.");
+                offset /= slotStride;
+            }
             long target;
             try {
                 target = checked((long)slotRef.Index + offset);

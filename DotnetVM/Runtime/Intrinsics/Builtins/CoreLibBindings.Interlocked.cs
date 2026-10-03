@@ -17,6 +17,25 @@ internal static partial class CoreLibBindings {
     /// legacy intrinsic (③) は IL 本体なしの面しか受けないため、ここに ① バインドで登録する。
     /// VM の共有 atomic gate と参照スロットロックで比較と交換を原子的に行う (CLR と同じ意味論)。</summary>
     private static void RegisterInterlockedBindings(IntrinsicRegistry r) {
+        foreach (var primitive in new[] { "System.Boolean", "System.Byte", "System.SByte", "System.Int16", "System.UInt16", "System.Int32", "System.UInt32", "System.Int64", "System.UInt64", "System.Single", "System.Double", "System.IntPtr", "System.UIntPtr" }) {
+            r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Read", primitive + "&"), static (_, a) => {
+                var location = a[0].ObjectValue as VmByRef ?? throw new UnhandledGuestException("System.InvalidProgramException", "Volatile location is unavailable.");
+                lock (location.Container) return location.Read();
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Write", primitive + "&", primitive), static (_, a) => {
+                var location = a[0].ObjectValue as VmByRef ?? throw new UnhandledGuestException("System.InvalidProgramException", "Volatile location is unavailable.");
+                lock (location.Container) location.Write(a[1]); return null;
+            }, BindingOrigin.InternalCall);
+        }
+        r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Read", "!!0&"), static (_, a) => {
+            var location = a[0].ObjectValue as VmByRef ?? throw new UnhandledGuestException("System.InvalidProgramException", "Volatile location is unavailable.");
+            lock (location.Container) return location.Read();
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Write", "!!0&", "!!0"), static (_, a) => {
+            var location = a[0].ObjectValue as VmByRef ?? throw new UnhandledGuestException("System.InvalidProgramException", "Volatile location is unavailable.");
+            lock (location.Container) location.Write(a[1]);
+            return null;
+        }, BindingOrigin.InternalCall);
         const string T = "System.Threading.Interlocked";
         static VmByRef Location(StackSlot slot, string method) =>
             slot.ObjectValue as VmByRef

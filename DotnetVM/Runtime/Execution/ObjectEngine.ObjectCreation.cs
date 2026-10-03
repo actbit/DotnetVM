@@ -65,6 +65,9 @@ internal sealed partial class ObjectEngine {
         var strings = _intrinsicContext.Strings;
         switch (paramCount) {
             case 1: {
+                if (args[0].ObjectValue is VmStructValue span &&
+                    (span.StructType.FullName == "System.ReadOnlySpan`1<System.Char>" || span.StructType.FullName == "System.ReadOnlySpan`1" && span.TypeArguments.FirstOrDefault()?.FullName == "System.Char"))
+                    return CoreLibBindings.MakeStringFromCharSpan(_intrinsicContext, args[0]);
                 // string(char[] value)
                 var array = RequireCharArray(args[0]);
                 var result = strings.Allocate(array.Length);
@@ -291,6 +294,20 @@ internal sealed partial class ObjectEngine {
                     // .ctor は基底ファサード連鎖からも解決する (Exception::.ctor を派生型で使う等)
                     var hasCtorIntrinsic = TryGetIntrinsicThroughHierarchy(
                         typeName, name, facadeParamCount + 1, hasThis: true, out var intrinsicCtor);
+                    // Preserve overload identity for host-backed facade constructors.
+                    // Only a framework AssemblyRef can select a normalized binding.
+                    string[]? ctorParameterNames = null;
+                    if (parent.Table == TableKind.TypeRef && typeName is ("System.Globalization.CultureInfo" or "System.Text.UTF8Encoding" or "System.Globalization.NumberFormatInfo" or
+                        "System.Text.RegularExpressions.Regex" or "System.IO.Compression.GZipStream" or "System.IO.Compression.DeflateStream" or "System.IO.Compression.BrotliStream" or "System.IO.Compression.ZLibStream")) {
+                        var scope = _loader.Image.GetTerminalTypeRefScope(parent.Rid);
+                        if (scope.Table == TableKind.AssemblyRef && TypeLoader.IsKnownFrameworkContract(_loader.Image.GetAssemblyRefIdentity(scope.Rid))) {
+                            ctorParameterNames = signature.ParamTypes.Select(t => _loader.ResolveToken(t, caller.Context).FullName).ToArray();
+                            if (_intrinsics.TryGetBinding(BindingKey.Instance(typeName, name, ctorParameterNames), out var boundCtor, out _)) {
+                                intrinsicCtor = boundCtor;
+                                hasCtorIntrinsic = true;
+                            }
+                        }
+                    }
                     if (TypeChecks.IsExceptionFacade(facadeType)) {
                         // 例外ファサード型: VmExceptionObject として実体化 (throw 機構が依存)
                         var exception = _heap.Allocate(new VmExceptionObject(facadeType, null));
@@ -312,7 +329,12 @@ internal sealed partial class ObjectEngine {
                         ctorArgs[0] = StackSlot.OfObject(facadeInstance);
                         gate.ConsumeInstruction();
                         gate.CheckSafepoint();
-                        var intrinsicResult = intrinsicCtor(_intrinsicContext, ctorArgs);
+                        var previousParameters = _intrinsicContext.ParameterTypeNames;
+                        StackSlot? intrinsicResult;
+                        try {
+                            _intrinsicContext.ParameterTypeNames = ctorParameterNames ?? [];
+                            intrinsicResult = intrinsicCtor(_intrinsicContext, ctorArgs);
+                        } finally { _intrinsicContext.ParameterTypeNames = previousParameters; }
                         if (intrinsicResult is { Kind: StackKind.ValueType } valueTaskValue) {
                             return valueTaskValue;
                         }

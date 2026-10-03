@@ -84,24 +84,24 @@ internal static partial class CoreLibBindings {
         // Span 表現境界のため IL 実行にできない。設定カルチャでのホスト委譲で提供
         r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
                 Array.Empty<string>()),
-            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(null, System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(null, InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
                 ["System.String"]),
-            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.InstanceWithReturn(timeSpanT, "ToString", "System.String",
                 ["System.String", "System.IFormatProvider"]),
-            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(TimeSpanOf(a[0]).ToString(S(a[1]), InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         // TimeSpan.Parse (string[, provider]): 設定カルチャを使う。例外分類は本家と同じ。
         r.RegisterBinding(BindingKey.StaticWithReturn(timeSpanT, "Parse", timeSpanT, ["System.String"]),
             static (ctx, a) => {
                 try {
-                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.CurrentCulture));
+                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", InvocationProvider(ctx, a)));
                 } catch (FormatException) {
                     throw new UnhandledGuestException("System.FormatException", null);
                 } catch (OverflowException) {
@@ -113,7 +113,7 @@ internal static partial class CoreLibBindings {
                 ["System.String", "System.IFormatProvider"]),
             static (ctx, a) => {
                 try {
-                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.CurrentCulture));
+                    return MakeTimeSpanStruct(ctx, TimeSpan.Parse(S(a[0]) ?? "", InvocationProvider(ctx, a)));
                 } catch (FormatException) {
                     throw new UnhandledGuestException("System.FormatException", null);
                 } catch (OverflowException) {
@@ -141,7 +141,7 @@ internal static partial class CoreLibBindings {
         r.RegisterBinding(BindingKey.StaticWithReturn(dateTimeT, "Parse", dateTimeT, ["System.String"]),
             static (ctx, a) => {
                 try {
-                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.CurrentCulture));
+                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", InvocationProvider(ctx, a)));
                 } catch (FormatException) {
                     throw new UnhandledGuestException("System.FormatException", null);
                 } catch (Exception ex) when (ex is OverflowException or ArgumentException) {
@@ -154,7 +154,7 @@ internal static partial class CoreLibBindings {
                 ["System.String", "System.IFormatProvider"]),
             static (ctx, a) => {
                 try {
-                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", System.Globalization.CultureInfo.CurrentCulture));
+                    return MakeDateTimeStruct(ctx, DateTime.Parse(S(a[0]) ?? "", InvocationProvider(ctx, a)));
                 } catch (FormatException) {
                     throw new UnhandledGuestException("System.FormatException", null);
                 }
@@ -163,16 +163,16 @@ internal static partial class CoreLibBindings {
         // DateTime.ToString (無引数 / format / format,provider): 本家 IL は DateTimeFormatInfo 機構を辿る
         // ため culture-out-of-scope で不変カルチャ固定のホスト委譲
         r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String", Array.Empty<string>()),
-            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(null, System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(null, InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String", ["System.String"]),
-            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         r.RegisterBinding(BindingKey.InstanceWithReturn(dateTimeT, "ToString", "System.String",
                 ["System.String", "System.IFormatProvider"]),
-            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), System.Globalization.CultureInfo.CurrentCulture))
+            static (ctx, a) => ctx.MakeString(DateTimeOf(a[0]).ToString(S(a[1]), InvocationProvider(ctx, a)))
                 is { } s ? StackSlot.OfObject(s) : null,
             BindingOrigin.Managed);
         // 日付演算 (AddDays / AddYears): 本家 IL は Calendar (DaysToMonth366 FieldRVA static array +

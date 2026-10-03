@@ -34,7 +34,7 @@ public static class IntegerConvert {
 
     // ---- 文字列解析面 (Convert.ToXxx(string[, provider]) の置換先)。
     //      実在 CoreLib は X.Parse → Number.Formatting (char* / NumberBuffer) を辿るため
-    //      VM では設定カルチャ解析 (NumberFormatting) + 範囲検査に置換する。provider は無視
+    //      VM では指定 provider (null は現在のカルチャ) + 範囲検査で解析する
     //      (VM の設定カルチャを使う)。null は 0 / false (CLR 規約) ----
 
     /// <summary>CLR の Convert.ToBoolean(string) と同一 ("True" / "False" の大文字小文字を
@@ -103,4 +103,13 @@ public static class IntegerConvert {
     /// <summary>CLR の Convert.ToUInt64(string) と同一 (0..18446744073709551615。null は 0)。</summary>
     public static ulong ToUInt64(string? value) =>
         value is null ? 0 : NumberFormatting.ParseUInt64(value);
+
+    public static int ToInt32(string? value, object? provider) => value is null ? (int)0 : checked((int)CultureSettings.ParseInt32(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static long ToInt64(string? value, object? provider) => value is null ? (long)0 : checked((long)CultureSettings.ParseInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static byte ToByte(string? value, object? provider) => value is null ? (byte)0 : checked((byte)CultureSettings.ParseInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static sbyte ToSByte(string? value, object? provider) => value is null ? (sbyte)0 : checked((sbyte)CultureSettings.ParseInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static short ToInt16(string? value, object? provider) => value is null ? (short)0 : checked((short)CultureSettings.ParseInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static ushort ToUInt16(string? value, object? provider) => value is null ? (ushort)0 : checked((ushort)CultureSettings.ParseInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static uint ToUInt32(string? value, object? provider) => value is null ? (uint)0 : checked((uint)CultureSettings.ParseUInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
+    public static ulong ToUInt64(string? value, object? provider) => value is null ? (ulong)0 : checked((ulong)CultureSettings.ParseUInt64(value, (int)System.Globalization.NumberStyles.Integer, provider));
 }

@@ -76,17 +76,30 @@ internal sealed class GuestTaskRuntime(
     }
 
     public void Complete(VmTaskObject task, StackSlot result = default) {
-        task.SetResult(result);
+        ReleaseTaskTimer(task);
+        if (_shutdownToken.IsCancellationRequested)
+            task.SetHostException(new ObjectDisposedException("VirtualMachine"));
+        else
+            task.SetResult(result);
         RemoveTaskRoots(task);
     }
 
     public void CompleteGuestException(VmTaskObject task, StackSlot exception) {
-        task.SetGuestException(exception);
+        ReleaseTaskTimer(task);
+        if (_shutdownToken.IsCancellationRequested)
+            task.SetHostException(new ObjectDisposedException("VirtualMachine"));
+        else
+            task.SetGuestException(exception);
         RemoveTaskRoots(task);
     }
 
     public void CompleteHostException(VmTaskObject task, Exception exception) {
-        task.SetHostException(exception);
+        ReleaseTaskTimer(task);
+        // Shutdown can be observed inside guest execution before Dispose snapshots the
+        // active tasks. Preserve the host shutdown fault even if that path normalized
+        // an interrupted wait or a disposed loader into a guest exception.
+        task.SetHostException(_shutdownToken.IsCancellationRequested
+            ? new ObjectDisposedException("VirtualMachine") : exception);
         RemoveTaskRoots(task);
     }
 
@@ -459,6 +472,7 @@ internal sealed class GuestTaskRuntime(
     }
 
     private void Cancel(VmTaskObject task) {
+        ReleaseTaskTimer(task);
         task.SetCanceled();
         RemoveTaskRoots(task);
     }
@@ -704,6 +718,14 @@ internal sealed class GuestTaskRuntime(
 
     private void RemoveTaskRoots(VmTaskObject task) {
         _activeRoots.TryRemove(task, out _);
+        ReleaseTaskTimer(task);
+        if (_cancellationRegistrations.TryRemove(task, out var registration))
+            registration.Dispose();
+    }
+
+    // A completed task must already have released its pending-timer quota. Publishing
+    // completion first allowed a continuation to observe completion but exhaust Delay.
+    private void ReleaseTaskTimer(VmTaskObject task) {
         Timer? timer = null;
         lock (_lifetimeGate) {
             if (_timers.TryRemove(task, out timer))
@@ -711,8 +733,6 @@ internal sealed class GuestTaskRuntime(
         }
         if (timer is not null)
             timer.Dispose();
-        if (_cancellationRegistrations.TryRemove(task, out var registration))
-            registration.Dispose();
     }
 
     public void Dispose() {

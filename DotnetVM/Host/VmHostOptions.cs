@@ -14,6 +14,9 @@ public delegate void VmRandomFill(Span<byte> buffer);
 /// 超過は ResourceExhaustedException 系で拒否され、ゲストの catch には渡らない。
 /// </summary>
 public sealed class MemoryPolicy {
+    public int MaxRegexPatternLength { get; init; } = 16 * 1024;
+    public int MaxRegexInputLength { get; init; } = 1024 * 1024;
+    public int MaxRegexMatchTimeoutMilliseconds { get; init; } = 250;
     /// <summary>ホストスタックを危険な深さまで消費させないための絶対上限。</summary>
     public const int MaxAllowedRecursionDepth = 4096;
 
@@ -101,6 +104,9 @@ public sealed class MemoryPolicy {
 
     /// <summary>ポリシー値の符号と、実行に必要な最小値を検証する。</summary>
     internal void Validate() {
+        if (MaxRegexPatternLength < 0) throw new ArgumentOutOfRangeException(nameof(MaxRegexPatternLength));
+        if (MaxRegexInputLength < 0) throw new ArgumentOutOfRangeException(nameof(MaxRegexInputLength));
+        if (MaxRegexMatchTimeoutMilliseconds < 1) throw new ArgumentOutOfRangeException(nameof(MaxRegexMatchTimeoutMilliseconds));
         if (InstructionQuota < 0) throw new ArgumentOutOfRangeException(nameof(InstructionQuota));
         if (MaxRecursionDepth < 1 || MaxRecursionDepth > MaxAllowedRecursionDepth)
             throw new ArgumentOutOfRangeException(nameof(MaxRecursionDepth),

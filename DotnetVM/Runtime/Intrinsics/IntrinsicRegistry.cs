@@ -157,12 +157,21 @@ public sealed class IntrinsicContext {
 
     /// <summary>byte 配列を VM オブジェクト (VmArray) に正規化して作る (ヒープ計上済み)。</summary>
     public VmArray MakeByteArray(ReadOnlySpan<byte> data) {
+        using var reservation = Heap.ReserveArray(data.Length);
         lock (_arrayTypeGate)
             _byteArrayType ??= new VmArrayType { ElementType = Types.FindIntrinsicType("System.Byte")! };
         var elements = new StackSlot[data.Length];
         for (var i = 0; i < data.Length; i++)
             elements[i] = StackSlot.OfInt32(data[i]);
-        return Heap.Allocate(new VmArray(_byteArrayType, elements));
+        return reservation.Commit(new VmArray(_byteArrayType, elements));
+    }
+
+    public VmArray MakeCharArray(ReadOnlySpan<char> data) {
+        using var reservation = Heap.ReserveArray(data.Length);
+        var type = new VmArrayType { ElementType = Types.FindIntrinsicType("System.Char")! };
+        var elements = new StackSlot[data.Length];
+        for (var i = 0; i < elements.Length; i++) elements[i] = StackSlot.OfInt32(data[i]);
+        return reservation.Commit(new VmArray(type, elements));
     }
 
     /// <summary>string 配列を VM オブジェクトに正規化して作る (String.Split 等の戻り値用。ヒープ計上済み)。</summary>

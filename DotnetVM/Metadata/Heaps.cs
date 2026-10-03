@@ -46,7 +46,8 @@ public sealed class UserStringHeap {
         // 末尾 1 バイトはフラグ (0/1 = ASCII 安全, それ以外 = 特殊文字を含む) なので除く
         if ((payload.Length - 1) % 2 != 0)
             throw new BadImageFormatException("#US エントリの UTF-16 ペイロード長が奇数です。");
-        return Encoding.Unicode.GetString(payload[..^1]);
+        // #US stores UTF-16 code units, including unpaired surrogates.
+        return DotnetVM.Runtime.Objects.VmString.DecodeUtf16(payload[..^1]);
     }
 }
 

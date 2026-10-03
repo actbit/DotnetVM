@@ -153,7 +153,10 @@ GC ルートには、実行フレームの引数・ローカル・評価スタ�
 ### ネットワークとストレージ
 
 ホストが `INetworkBridge` / `IStorageBridge` を実装し、`VmHostOptions` に設定します。
-**接続先やパスの許可判断はブリッジが行い、VM は転送量の計上と上限の強制を担います。**
+従来のブリッジは接続先やパスの許可を判断し、VM が転送量を計上します。
+`HttpClient` には `IHttpNetworkBridge` と `NetworkPolicy.Http` を設定します。
+VM が origin・メソッド・ヘッダーと要求数・転送量・タイムアウトを検査します。
+設定例と対応 API は [BCL 互換性と HTTP 制限](docs/bcl-compatibility.md) を参照してください。
 
 ブリッジが未設定の場合、対応する `System.Net.WebClient` / `System.IO.File` のファサード型は合成しません。
 ゲストの I/O はゲートウェイを通じてホストへ委譲されます。ホスト自身による `LoadAssembly(path)` は、明示した DLL を直接ロードする API です。
@@ -224,6 +227,10 @@ CLR との差分テストで数値書式・解析・変換や文字列操作を�
 `VmHostOptions.Culture` に `CultureInfo` を指定します。既定は `InvariantCulture` です。
 VM は外側のゲスト呼び出し中に `CurrentCulture` / `CurrentUICulture` を設定し、終了時にホストスレッドの値を復元します。
 文字列比較・大文字小文字変換、数値と decimal の書式・解析、DateTime / TimeSpan の書式・解析で使用します。
+ゲストの `CultureInfo.CurrentCulture` / `CurrentUICulture` の変更は実行コンテキストに保持し、Task に引き継ぎます。
+`CultureInfo` / `NumberFormatInfo` の明示的な provider も数値の書式・解析に渡します。
+UTF8Encoding、Span / Unsafe / software vector、Regex、Compression、Crypto の対応範囲と
+実在 `System.Text.Json` の検証内容は [互換性ドキュメント](docs/bcl-compatibility.md) に記載しています。
 `CultureInfo` オブジェクト自体を扱うゲスト API は未実装です。
 
 序数比較に基づく `CompareOrdinal`、`IndexOf(char)`、`Contains`、`Replace`、`Split` の置換は `StringOrdinalOps` が担当します。

@@ -268,6 +268,13 @@ public sealed partial class TypeLoader {
             ("System.Linq", "b03f5f7f11d50a3a") or
             ("System.Collections", "b03f5f7f11d50a3a") or
             ("System.Collections.Concurrent", "b03f5f7f11d50a3a") or
+            ("System.Memory", "cc7b13ffcd2ddd51") or
+            ("System.Text.RegularExpressions", "b03f5f7f11d50a3a") or
+            ("System.Net.Http", "b03f5f7f11d50a3a") or
+            ("System.IO.Compression", "b77a5c561934e089") or
+            ("System.IO.Compression.Brotli", "b77a5c561934e089") or
+            ("System.Security.Cryptography", "b03f5f7f11d50a3a") or
+            ("System.Text.Encodings.Web", "cc7b13ffcd2ddd51") or
             ("System.Threading", "b03f5f7f11d50a3a") or
             ("System.Threading.Tasks", "b03f5f7f11d50a3a") or
             ("System.Reflection", "b03f5f7f11d50a3a") or

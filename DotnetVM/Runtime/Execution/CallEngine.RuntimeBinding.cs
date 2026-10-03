@@ -35,7 +35,7 @@ internal sealed partial class CallEngine {
     /// </summary>
     private static bool IsAllowedRuntimeBindingType(VmType? type) => type switch {
         VmIntrinsicType => true,
-        VmClassType cls => cls.Loader?.IsTrustedCoreLib == true || cls.Loader?.IsTrustedVmCoreLib == true,
+        VmClassType cls => cls.Loader?.IsTrustedCoreLib == true || cls.Loader?.IsTrustedVmCoreLib == true || cls.Loader?.IsTrustedBcl == true,
         VmConstructedType constructed => IsAllowedRuntimeBindingType(constructed.Definition),
         _ => false,
     };

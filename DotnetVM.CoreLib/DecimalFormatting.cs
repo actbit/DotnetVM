@@ -111,4 +111,6 @@ public static class DecimalFormatting {
             digits[i] = digits[index + i];
         return number;
     }
+    public static string DecimalToString(decimal value, object? provider) => CultureSettings.FormatDecimal(value, null, provider);
+    public static string DecimalToString(decimal value, string? format, object? provider) => CultureSettings.FormatDecimal(value, format, provider);
 }

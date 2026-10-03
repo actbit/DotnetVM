@@ -372,8 +372,7 @@ public class CoreLibFacesIlTests {
         // 結果の文字列化は VM CoreLib (DotnetVM.CoreLib) の managed IL に置換される
         // (String.Concat IL 内の boxed int の callvirt ToString も同一の面に置換)
         AssertRunsVmCoreLibIl("MathFaces", [-7, 12],
-            ("DotnetVM.CoreLib.NumberFormatting", "Int32ToString"),
-            ("DotnetVM.CoreLib.NumberFormatting", "UInt32ToString"));
+            ("DotnetVM.CoreLib.NumberFormatting", "Int32ToString"));
     }
 
     [Fact]
@@ -421,7 +420,6 @@ public class CoreLibFacesIlTests {
         AssertSame("ParseFaces", " 42 ");
         AssertRunsVmCoreLibIl("ParseFaces", ["42"],
             ("DotnetVM.CoreLib.NumberFormatting", "ParseInt32"),
-            ("DotnetVM.CoreLib.NumberFormatting", "ParseMagnitude"),
             ("DotnetVM.CoreLib.NumberFormatting", "Int32ToString"));
     }
 

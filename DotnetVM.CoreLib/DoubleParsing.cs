@@ -55,14 +55,14 @@ public static class DoubleParsing {
 
     public static double DoubleParse(string value) => CultureSettings.ParseDouble(value, StyleNumber);
     public static double DoubleParse(string value, int styles) => CultureSettings.ParseDouble(value, styles);
-    public static double DoubleParse(string value, object? provider) => CultureSettings.ParseDouble(value, StyleNumber);
-    public static double DoubleParse(string value, int styles, object? provider) => CultureSettings.ParseDouble(value, styles);
+    public static double DoubleParse(string value, object? provider) => CultureSettings.ParseDouble(value, StyleNumber, provider);
+    public static double DoubleParse(string value, int styles, object? provider) => CultureSettings.ParseDouble(value, styles, provider);
 
     // Single は float に丸めた値を double へ拡大格納して返す (本家 Single.Parse と同値)
     public static double SingleParse(string value) => CultureSettings.ParseSingle(value, StyleNumber);
     public static double SingleParse(string value, int styles) => CultureSettings.ParseSingle(value, styles);
-    public static double SingleParse(string value, object? provider) => CultureSettings.ParseSingle(value, StyleNumber);
-    public static double SingleParse(string value, int styles, object? provider) => CultureSettings.ParseSingle(value, styles);
+    public static double SingleParse(string value, object? provider) => CultureSettings.ParseSingle(value, StyleNumber, provider);
+    public static double SingleParse(string value, int styles, object? provider) => CultureSettings.ParseSingle(value, styles, provider);
 
     // Convert 面 (Convert.ToDouble / ToSingle の文字列入力)。VM 実行時は
     // CultureSettings bridge が configured culture を渡し、CLR 単体実行時は invariant を使う。
@@ -71,9 +71,9 @@ public static class DoubleParsing {
     public static double ConvertSingleParse(string value) =>
         CultureSettings.ParseSingle(value, ConvertFloatingPointStyles);
     public static double ConvertDoubleParse(string value, object? provider) =>
-        CultureSettings.ParseDouble(value, ConvertFloatingPointStyles);
+        CultureSettings.ParseDouble(value, ConvertFloatingPointStyles, provider);
     public static double ConvertSingleParse(string value, object? provider) =>
-        CultureSettings.ParseSingle(value, ConvertFloatingPointStyles);
+        CultureSettings.ParseSingle(value, ConvertFloatingPointStyles, provider);
 
     private static double Parse(FloatTraits traits, string value, int styles) {
         if (value == null) {

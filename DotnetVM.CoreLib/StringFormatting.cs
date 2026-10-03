@@ -12,11 +12,11 @@ namespace DotnetVM.CoreLib;
 ///
 /// - 本家の ISpanFormattable 高速経路は省略している (出力に影響しないフォールバックのみの省略:
 ///   本家も失敗時 / パディング必要時は IFormattable 経路に落ちるため結果は同一)
-/// - ICustomFormatter (provider?.GetFormat) は culture 機構のため VM では無効 (provider 無視)
+/// - ICustomFormatter のゲストコールバックは未対応。数値には CultureInfo / NumberFormatInfo を渡す
 /// - index / width の上限 (IndexLimit / WidthLimit = 1,000,000) と、異常書式の
 ///   FormatException 分類 (先頭文字非数字 / 閉じていないホール / ホール内 '{' /
 ///   インデックス範囲外) を本家どおり再現する
-/// - provider 付き overload も provider を無視して同一結果を返す (不変カルチャ規約)
+/// - provider 付き overload は指定された数値カルチャを書式設定に使う
 ///
 /// 正当性は CLR 上の差分テスト (VmCoreLibClrTests) で担保してから VmCoreLibSurfaces に配線する。
 /// </summary>
@@ -58,19 +58,19 @@ public static class StringFormatting {
 
     public static string FormatProvider3(object? provider, string? format, object? arg0) {
         var output = new FormatSpecifiers.Out();
-        AppendFormat(output, format, [arg0]);
+        AppendFormat(output, format, [arg0], provider);
         return output.Build();
     }
 
     public static string FormatProvider4(object? provider, string? format, object? arg0, object? arg1) {
         var output = new FormatSpecifiers.Out();
-        AppendFormat(output, format, [arg0, arg1]);
+        AppendFormat(output, format, [arg0, arg1], provider);
         return output.Build();
     }
 
     public static string FormatProvider5(object? provider, string? format, object? arg0, object? arg1, object? arg2) {
         var output = new FormatSpecifiers.Out();
-        AppendFormat(output, format, [arg0, arg1, arg2]);
+        AppendFormat(output, format, [arg0, arg1, arg2], provider);
         return output.Build();
     }
 
@@ -78,13 +78,13 @@ public static class StringFormatting {
         if (args is null)
             throw new ArgumentNullException(format is null ? "format" : "args");
         var output = new FormatSpecifiers.Out();
-        AppendFormat(output, format, args);
+        AppendFormat(output, format, args, provider);
         return output.Build();
     }
 
-    // ---- 本家 AppendFormatHelper の移植 (provider / ICustomFormatter 無効化のみの差分) ----
+    // ---- 本家 AppendFormatHelper の移植 (ICustomFormatter コールバックを除く) ----
 
-    private static void AppendFormat(FormatSpecifiers.Out output, string? format, object?[] args) {
+    private static void AppendFormat(FormatSpecifiers.Out output, string? format, object?[] args, object? provider = null) {
         if (format is null)
             throw new ArgumentNullException("format");
 
@@ -191,7 +191,7 @@ public static class StringFormatting {
                 var itemFormat = itemFormatStart >= 0
                     ? format.Substring(itemFormatStart, pos - 1 - itemFormatStart)
                     : null;
-                s = formattable.ToString(itemFormat, formatProvider: null);
+                s = formattable.ToString(itemFormat, formatProvider: provider as System.IFormatProvider);
             } else {
                 s = arg?.ToString();
             }

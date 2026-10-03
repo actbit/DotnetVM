@@ -1,13 +1,13 @@
 namespace DotnetVM.Policy;
 
 /// <summary>
-/// ネットワークアクセスのポリシー (バイトクォータのみ)。
-/// 「どこへの通信を許すか」は VM では判断しない — その界面 (System.Net.WebClient ファサード) を
-/// 再現するかは VmHostOptions.NetworkBridge の設定有無で決まり、ブリッジ未設定なら
-/// ファサード型自体が合成されない。許可の判断はブリッジ (ホスト実装のプロキシ) 側が行う。
-/// VM 側は通過したバイトの計上とクォータ強制だけを担う。
+/// ネットワークアクセスのポリシー。HTTP は HttpPolicy の origin / method / header と
+/// 要求数・転送量・タイムアウトを gateway で検査する。従来の INetworkBridge では
+/// ホストのプロキシが宛先の許可を判断し、VM が転送量を計上する。
 /// </summary>
 public sealed class NetworkPolicy {
+    /// <summary>HttpClient capability; null denies HTTP requests.</summary>
+    public HttpPolicy? Http { get; init; }
     /// <summary>累計転送バイト上限 (送信 + 受信の合計)。</summary>
     public long TotalTransferByteLimit { get; init; } = long.MaxValue;
 
@@ -17,6 +17,10 @@ public sealed class NetworkPolicy {
 
 /// <summary>ブリッジに渡される 1 要求。</summary>
 public sealed class NetworkRequest {
+    public string Method { get; init; } = "GET";
+    public IReadOnlyDictionary<string, string> Headers { get; init; } = new Dictionary<string, string>();
+    public CancellationToken CancellationToken { get; init; }
+    public int MaxResponseHeaderBytes { get; init; } = 16 * 1024;
     public required Uri Url { get; init; }
 
     /// <summary>送信ボディ (空 = 取得系要求)。</summary>
@@ -45,14 +49,18 @@ public interface INetworkBridge {
 }
 
 /// <summary>
-/// ネットワークゲートウェイ (純粋なプロキシ + クォータ強制点)。名前による許可判断はしない。
-/// ゲストからの全通信はここを通り、バイトが計上されてからブリッジに委譲される。
+/// ネットワークゲートウェイ。HTTP の許可条件と転送クォータを検査してから
+/// ホストブリッジへ委譲する。ゲストからの全通信はこの境界を通る。
 /// </summary>
 public sealed class NetworkGateway {
     private readonly NetworkPolicy _policy;
     private readonly INetworkBridge? _bridge;
     private readonly object _gate = new();
     private long _totalBytesTransferred;
+    private long _httpRequests;
+    private readonly HashSet<string> _origins;
+    private readonly HashSet<string> _methods;
+    private readonly HashSet<string> _headers;
 
     public NetworkGateway(NetworkPolicy policy, INetworkBridge? bridge) {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -61,6 +69,60 @@ public sealed class NetworkGateway {
         if (_policy.MaxBytesPerRequest < 0)
             throw new ArgumentOutOfRangeException(nameof(policy), "MaxBytesPerRequest は 0 以上である必要があります。");
         _bridge = bridge;
+        var http = policy.Http;
+        _origins = new((http?.AllowedOrigins ?? Array.Empty<Uri>()).Select(Origin), StringComparer.OrdinalIgnoreCase);
+        _methods = new(http?.AllowedMethods ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        _headers = new(http?.AllowedRequestHeaders ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        if (http is not null && (http.MaxRequests < 0 || http.RequestTimeout <= TimeSpan.Zero || http.RequestTimeout.TotalMilliseconds > int.MaxValue || http.MaxResponseHeaderBytes < 0 || http.MaxResponseBodyBytes < 0 || http.MaxRequestBodyBytes < 0 || http.MaxRequestHeaderBytes < 0))
+            throw new ArgumentOutOfRangeException(nameof(policy));
+    }
+
+    private static string Origin(Uri uri) {
+        if (!uri.IsAbsoluteUri || uri.Scheme is not ("https" or "http") || uri.UserInfo.Length != 0)
+            throw new OperationNotAllowedException("Only absolute HTTP(S) origins without credentials are allowed.");
+        return uri.GetLeftPart(UriPartial.Authority);
+    }
+
+    public HttpNetworkResponse TransferHttp(string method, Uri uri, ReadOnlyMemory<byte> body,
+        IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default) {
+        lock (_gate) {
+            var http = _policy.Http ?? throw new OperationNotAllowedException("HTTP capability is not configured.");
+            if (_bridge is not IHttpNetworkBridge bridge || !_origins.Contains(Origin(uri)) || !_methods.Contains(method))
+                throw new OperationNotAllowedException("HTTP destination or method is not permitted.");
+            if (uri.Fragment.Length != 0) throw new OperationNotAllowedException("HTTP URL fragments are not permitted.");
+            headers ??= new Dictionary<string, string>();
+            long requestHeaderBytes = 0;
+            foreach (var (name, value) in headers) {
+                if (!_headers.Contains(name) || name.Equals("Host", StringComparison.OrdinalIgnoreCase) || name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) || name.Contains('\r') || name.Contains('\n') || value.Contains('\r') || value.Contains('\n'))
+                    throw new OperationNotAllowedException("HTTP request header is not permitted.");
+                requestHeaderBytes += System.Text.Encoding.UTF8.GetByteCount(name) + System.Text.Encoding.UTF8.GetByteCount(value);
+            }
+            if (requestHeaderBytes > http.MaxRequestHeaderBytes) throw new NetworkQuotaExceededException("HTTP request headers exceed their byte budget.");
+            if (_httpRequests >= http.MaxRequests) throw new NetworkQuotaExceededException("HTTP request count exceeded.");
+            if (body.Length > http.MaxRequestBodyBytes || body.Length > _policy.MaxBytesPerRequest || body.Length > _policy.TotalTransferByteLimit - _totalBytesTransferred)
+                throw new NetworkQuotaExceededException("HTTP request exceeds its byte budget.");
+            cancellationToken.ThrowIfCancellationRequested();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(http.RequestTimeout);
+            _httpRequests++;
+            // Account attempted sends even if the transport subsequently fails.
+            _totalBytesTransferred += body.Length;
+            var limit = Math.Min(http.MaxResponseBodyBytes, Math.Min(_policy.MaxBytesPerRequest - body.Length, _policy.TotalTransferByteLimit - _totalBytesTransferred));
+            var response = bridge.RequestHttp(new NetworkRequest {
+                Url = uri, Method = method.ToUpperInvariant(), Body = body,
+                Headers = new Dictionary<string, string>(headers), MaxResponseBytes = limit,
+                CancellationToken = timeout.Token, MaxResponseHeaderBytes = http.MaxResponseHeaderBytes,
+            });
+            timeout.Token.ThrowIfCancellationRequested();
+            if (response?.Body is null || response.Body.LongLength > limit)
+                throw new NetworkQuotaExceededException("HTTP response exceeds its byte budget.");
+            long headerBytes = 0;
+            foreach (var (name, value) in response.Headers)
+                headerBytes += System.Text.Encoding.UTF8.GetByteCount(name) + System.Text.Encoding.UTF8.GetByteCount(value);
+            if (headerBytes > http.MaxResponseHeaderBytes) throw new NetworkQuotaExceededException("HTTP response headers exceed their byte budget.");
+            _totalBytesTransferred += response.Body.Length;
+            return response;
+        }
     }
 
     /// <summary>ブリッジが設定されているか (未設定なら通信面自体が存在しない)。</summary>
@@ -71,6 +133,10 @@ public sealed class NetworkGateway {
 
     /// <summary>要求をブリッジへ委譲し、応答ボディを返す (通過バイトを計上・クォータ強制)。</summary>
     public byte[] Transfer(string url, ReadOnlyMemory<byte> body) {
+        if (_bridge is IHttpNetworkBridge) {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) throw new NetworkQuotaExceededException("Invalid HTTP URL.");
+            return TransferHttp(body.IsEmpty ? "GET" : "POST", uri, body).Body;
+        }
         lock (_gate) {
             if (_bridge is null)
                 throw new OperationNotAllowedException(

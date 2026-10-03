@@ -180,8 +180,9 @@ TCB を最小化したい場合、または JIT の性能効果を検証して�
 
 ## 5. I/O ブリッジと fail-closed 設計
 
-ネットワークとストレージは、ブリッジを設定しない限り利用できません。未設定時は対応する
-ゲストファサード型自体を合成しないため、呼出時だけでなく型解決・ロード時点でも拒否できます。
+ネットワークとストレージは、ブリッジを設定しない限り利用できません。従来の File / WebClient は
+未設定時にゲストファサード型を合成しません。HttpClient は API を解決できても、HTTP capability が
+未設定なら gateway で要求を拒否します。
 
 ### ネットワーク
 
@@ -214,6 +215,11 @@ var options = new VmHostOptions {
 
 実際の通信を行うブリッジでは、`NetworkRequest.MaxResponseBytes` を取得前に適用し、
 ホスト側で巨大な応答を作ってから VM に拒否させる増幅を避けてください。
+
+HttpClient には `IHttpNetworkBridge` と `NetworkPolicy.Http` の両方を設定します。
+標準の `HttpNetworkBridge` は応答を上限付きで読み、自動リダイレクト・Cookie・自動展開を無効にします。
+origin / method / header の許可と要求数・通信量・タイムアウトの設定例は
+[BCL 互換性と HTTP 制限](bcl-compatibility.md) を参照してください。
 
 ### ストレージ
 

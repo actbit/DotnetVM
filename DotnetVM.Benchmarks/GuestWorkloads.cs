@@ -6,6 +6,28 @@ using System.Threading.Tasks;
 namespace DotnetVM.Benchmarks;
 
 public static class GuestWorkloads {
+    public static int SpanCopies(int count) {
+        var source = new int[256]; var target = new int[256]; source[255] = 7;
+        var total = 0;
+        for (var i = 0; i < count; i++) { new System.Span<int>(source).CopyTo(new System.Span<int>(target)); total += target[255]; }
+        return total;
+    }
+    public static int IntegerFormatting(int count) {
+        var total = 0;
+        for (var i = 0; i < count; i++) total += (-i).ToString().Length;
+        return total;
+    }
+    public static int IntegerParsing(int count) {
+        var total = 0;
+        for (var i = 0; i < count; i++) total += int.Parse("-12345");
+        return total;
+    }
+    public static int StringCopies(int count) {
+        var total = 0;
+        var chars = new[] { '日', '本', '\uD83D', '\uDE00' };
+        for (var i = 0; i < count; i++) total += new string(chars).Length;
+        return total;
+    }
     public static int Arithmetic(int count) {
         var sum = 0;
         for (var i = 0; i < count; i++) sum += (i * 3) ^ (i >> 2);

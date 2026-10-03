@@ -133,8 +133,8 @@ internal sealed class FloatNumberBuffer {
     }
 }
 
-/// <summary>bit 変換ヘルパ。VM 側は Unsafe.BitCast バインド (BitCastImpl) が
-/// TFrom 型名で解決する (Math.Abs(double) の実 CoreLib IL と同じ経路)。</summary>
+/// <summary>bit 変換ヘルパ。VM 側は Unsafe.BitCast バインドが
+/// TFrom / TTo の表現で解決する (Math.Abs(double) の実 CoreLib IL と同じ経路)。</summary>
 internal static class FloatBits {
     public static ulong Of(double value) => Unsafe.BitCast<double, ulong>(value);
     public static uint OfSingle(float value) => Unsafe.BitCast<float, uint>(value);

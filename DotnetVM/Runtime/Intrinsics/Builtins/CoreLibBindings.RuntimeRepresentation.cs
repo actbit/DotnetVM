@@ -12,6 +12,9 @@ internal static partial class CoreLibBindings {
     // ---- System.Runtime.CompilerServices.RuntimeHelpers (InternalCall 面) ----
 
     private static void RegisterRuntimeHelpers(IntrinsicRegistry r) {
+        r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "TryGetHashCode", "System.Object"), static (ctx, a) => StackSlot.OfInt32(ctx.IdentityHash(a[0].ObjectValue)), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "ObjectHasComponentSize", "System.Object"),
+            static (_, a) => StackSlot.OfInt32(a[0].ObjectValue is VmArray or VmString ? 1 : 0), BindingOrigin.Managed);
         // internal static RuntimeType GetMethodTable(object obj)
         // CoreLib 上の IL は「ldarg.0; call 自分自身; ret」のダミー自己再帰本体で、実 CLR では
         // JIT が [Intrinsic] として置き換えるため決して実行されない。VM では実行時型ファサード
@@ -34,8 +37,7 @@ internal static partial class CoreLibBindings {
             static (ctx, _) => {
                 // ジェネリック ラッパーは値パラメータ 0 個のため T はメソッド型実引数で来る
                 var name = ctx.MethodTypeArgAt(0);
-                var type = name is "" or "!!0" ? null
-                    : (VmType?)ctx.Types.FindIntrinsicType(name) ?? ctx.Types.FindTypeByFullName(name);
+                var type = ctx.MethodTypeArguments.FirstOrDefault() ?? (name is "" or "!!0" ? null : FindAnyType(ctx, name));
                 // 未解決は安全側 (参照を含む = 遅い経路を選ぶだけなので過大判定は安全)
                 return StackSlot.OfInt32(type is null || ContainsReferences(type) ? 1 : 0);
             },
@@ -105,7 +107,7 @@ internal static partial class CoreLibBindings {
             BindingOrigin.InternalCall);
     }
 
-    private static StackSlot CreateReadOnlySpanFromReference(IntrinsicContext ctx, StackSlot[] args) {
+    private static StackSlot CreateReadOnlySpanFromReference(IntrinsicContext ctx, StackSlot[] args, bool readOnly = true) {
         if (args[0].ObjectValue is not VmByRef reference)
             throw new InvalidOperationException("MemoryMarshal.CreateReadOnlySpan の参照引数が ByRef ではありません。");
         var length = args[1].AsInt32;
@@ -117,7 +119,7 @@ internal static partial class CoreLibBindings {
             throw new InvalidOperationException("MemoryMarshal.CreateReadOnlySpan の型引数 T を判別できませんでした。");
         var elementType = FindAnyType(ctx, elementName)
             ?? throw new InvalidOperationException($"span の要素型 {elementName} を解決できません。");
-        var definition = FindAnyType(ctx, "System.ReadOnlySpan`1")
+        var definition = FindAnyType(ctx, readOnly ? "System.ReadOnlySpan`1" : "System.Span`1")
             ?? throw new InvalidOperationException("System.ReadOnlySpan`1 がロードされていません。");
         var spanType = new VmConstructedType { Definition = definition, TypeArguments = [elementType] };
         return StackSlot.OfValueType(new VmStructValue(spanType,
@@ -179,6 +181,7 @@ internal static partial class CoreLibBindings {
     /// 直接観測した場合の実 x64 CLR (true) との既知差異は SIMD 表現境界として監査表に記載。</summary>
     private static void RegisterVectorIntrinsics(IntrinsicRegistry r) {
         foreach (var vectorType in new[] {
+            "System.Numerics.Vector",
             "System.Runtime.Intrinsics.Vector64",
             "System.Runtime.Intrinsics.Vector128",
             "System.Runtime.Intrinsics.Vector256",
@@ -194,6 +197,9 @@ internal static partial class CoreLibBindings {
         r.RegisterBinding(BindingKey.Static("System.Runtime.Intrinsics.X86.Sse2", "get_IsSupported"),
             static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
         foreach (var x86Type in new[] {
+            "System.Runtime.Intrinsics.X86.Ssse3",
+            "System.Runtime.Intrinsics.X86.Sse41",
+            "System.Runtime.Intrinsics.X86.Avx",
             "System.Runtime.Intrinsics.X86.Avx2",
             "System.Runtime.Intrinsics.X86.Lzcnt",
         }) {

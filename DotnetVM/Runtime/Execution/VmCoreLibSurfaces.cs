@@ -33,12 +33,12 @@ internal sealed class VmCoreLibSurfaces {
         ("System.UInt32", "ToString", [], "DotnetVM.CoreLib.NumberFormatting", "UInt32ToString", ["System.UInt32"]),
         ("System.UInt64", "ToString", [], "DotnetVM.CoreLib.NumberFormatting", "UInt64ToString", ["System.UInt64"]),
         // IConvertible.ToString(IFormatProvider) の暗黙実装面 (Convert.ToString(object) の
-        // 実 IL が interface ディスパッチで辿る)。provider は VM 設定カルチャを使うため無視
+        // 実 IL が interface ディスパッチで辿る)。provider は置換 IL から CultureSettings bridge へ渡す
         // (置換後の static 実装は引数 1 個のみ受け、余剰スロットは choke point が無視する)
-        ("System.Int32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int32ToString", ["System.Int32"]),
-        ("System.Int64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int64ToString", ["System.Int64"]),
-        ("System.UInt32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt32ToString", ["System.UInt32"]),
-        ("System.UInt64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt64ToString", ["System.UInt64"]),
+        ("System.Int32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int32ToString", ["System.Int32", "System.Object"]),
+        ("System.Int64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "Int64ToString", ["System.Int64", "System.Object"]),
+        ("System.UInt32", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt32ToString", ["System.UInt32", "System.Object"]),
+        ("System.UInt64", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.NumberFormatting", "UInt64ToString", ["System.UInt64", "System.Object"]),
         // 整数 10 進解析 (NumberStyles.Integer / VM 設定カルチャ)
         ("System.Int32", "Parse", ["System.String"], "DotnetVM.CoreLib.NumberFormatting", "ParseInt32", ["System.String"]),
         ("System.Int32", "Parse", ["System.String", "System.Globalization.NumberStyles"], "DotnetVM.CoreLib.NumberFormatting", "ParseInt32", ["System.String", "System.Int32"]),
@@ -52,21 +52,21 @@ internal sealed class VmCoreLibSurfaces {
         // Convert の (string, IFormatProvider) 面 (C5.5 Wave 1): Convert.ToXxx(object) を
         // 実 IL 化した際に String の IConvertible EII が Convert.ToXxx(value, provider) を
         // 辿り、先の先が Number.Formatting (char* / NumberBuffer) に落ちるため
-        // 設定カルチャ解析の置換 IL へ差し替える (provider は VM 設定カルチャを使うため無視)
-        ("System.Convert", "ToInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt32", ["System.String"]),
-        ("System.Convert", "ToInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt64", ["System.String"]),
+        // 設定カルチャ解析の置換 IL へ差し替える (provider は置換 IL から CultureSettings bridge へ渡す)
+        ("System.Convert", "ToInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt32", ["System.String", "System.Object"]),
+        ("System.Convert", "ToInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt64", ["System.String", "System.Object"]),
         ("System.Convert", "ToBoolean", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToBoolean", ["System.String"]),
-        ("System.Convert", "ToByte", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToByte", ["System.String"]),
-        ("System.Convert", "ToSByte", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToSByte", ["System.String"]),
-        ("System.Convert", "ToInt16", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt16", ["System.String"]),
-        ("System.Convert", "ToUInt16", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt16", ["System.String"]),
-        ("System.Convert", "ToUInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt32", ["System.String"]),
-        ("System.Convert", "ToUInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt64", ["System.String"]),
+        ("System.Convert", "ToByte", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToByte", ["System.String", "System.Object"]),
+        ("System.Convert", "ToSByte", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToSByte", ["System.String", "System.Object"]),
+        ("System.Convert", "ToInt16", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToInt16", ["System.String", "System.Object"]),
+        ("System.Convert", "ToUInt16", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt16", ["System.String", "System.Object"]),
+        ("System.Convert", "ToUInt32", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt32", ["System.String", "System.Object"]),
+        ("System.Convert", "ToUInt64", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.IntegerConvert", "ToUInt64", ["System.String", "System.Object"]),
         // ---- C5.5 Wave 2: 整数書式 overload (標準書式 G/D/X/B/C/F/N/E/P/R + カスタム書式)。
         // 実在側は Number.Formatting (byte* 生ポインタ + NumberBuffer + stackalloc) +
         // NumberFormatInfo culture 機構で構成され VM の表現モデルに落ちないため、
         // DotnetVM.CoreLib.FormatSpecifiers (意味論移植・設定カルチャ bridge) へ差し替える。
-        // provider は VM 設定カルチャを使うため無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // 3 引数面は provider を含め impl 側も 3 パラメータで受ける
         // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
         ("System.Byte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte", "System.String"]),
         ("System.SByte", "ToString", ["System.String"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte", "System.String"]),
@@ -85,15 +85,15 @@ internal sealed class VmCoreLibSurfaces {
         ("System.Int64", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int64ToString", ["System.Int64", "System.String", "System.Object"]),
         ("System.UInt64", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt64ToString", ["System.UInt64", "System.String", "System.Object"]),
         // 整数 4 小型 (Byte/SByte/Int16/UInt16) の無引数 / provider のみの面 (既存の NumberFormatting
-        // 面は Int32/64/UInt32/64 のみだった)。IFormatProvider のみの面は余剰スロット無視で 1 引数 impl へ
+        // 面は Int32/64/UInt32/64 のみだった)。IFormatProvider のみの面も provider を受け取る impl へ
         ("System.Byte", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte"]),
         ("System.SByte", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte"]),
         ("System.Int16", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16"]),
         ("System.UInt16", "ToString", [], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16"]),
-        ("System.Byte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte"]),
-        ("System.SByte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte"]),
-        ("System.Int16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16"]),
-        ("System.UInt16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16"]),
+        ("System.Byte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "ByteToString", ["System.Byte", "System.Object"]),
+        ("System.SByte", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "SByteToString", ["System.SByte", "System.Object"]),
+        ("System.Int16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "Int16ToString", ["System.Int16", "System.Object"]),
+        ("System.UInt16", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.FormatSpecifiers", "UInt16ToString", ["System.UInt16", "System.Object"]),
         // Boolean / Char の ToString 面 (実在側は culture 機構を辿る。True/False と 1 文字は
         // 不変)。Char の 1 文字生成は char.ToString() を使わない (Faces 置換の再帰になるため
         // new string(char, int) で生成する)
@@ -107,7 +107,7 @@ internal sealed class VmCoreLibSurfaces {
         // DotnetVM.CoreLib.DoubleFormatting (dotnet/runtime MIT ソースのポインタなし移植・
         // 設定カルチャ bridge) へ差し替える。Single の impl は float 値を double へ拡大格納して
         // 受ける (impl 内で (float) へ再丸めするため実型 Single の意味論を保持)。
-        // provider は VM 設定カルチャを使うため無視するが 3 引数面は impl 側も 3 パラメータで受ける
+        // 3 引数面は provider を含め impl 側も 3 パラメータで受ける
         // (余剰スロット無視は末尾切捨てのみで、位置がずれる format には使えない)
         ("System.Single", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "SingleToString", ["System.Double"]),
         ("System.Double", "ToString", [], "DotnetVM.CoreLib.DoubleFormatting", "DoubleToString", ["System.Double"]),
@@ -133,8 +133,8 @@ internal sealed class VmCoreLibSurfaces {
         // 96 ビット分解は実在 GetBits (managed IL) を VM の IL 実行で辿る
         ("System.Decimal", "ToString", [], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
         ("System.Decimal", "ToString", ["System.String"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String"]),
-        ("System.Decimal", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
-        ("System.Decimal", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String"]),
+        ("System.Decimal", "ToString", ["System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.Object"]),
+        ("System.Decimal", "ToString", ["System.String", "System.IFormatProvider"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal", "System.String", "System.Object"]),
         ("System.Convert", "ToString", ["System.Decimal"], "DotnetVM.CoreLib.DecimalFormatting", "DecimalToString", ["System.Decimal"]),
         // Convert の文字列⇔浮動小数点変換 (Convert.ToDouble/ToSingle(string[, provider]) は
         // NumberStyles.Float | AllowThousands の設定カルチャ解析。ToString(Double/Single) は
@@ -175,7 +175,7 @@ internal sealed class VmCoreLibSurfaces {
         // 本家 AppendFormatHelper (StringBuilder チャンク + Span 解析) の正確な移植で、
         // index / width の上限や異常書式の FormatException 分類まで CLR 同一。
         // 書式付き要素は IFormattable ディスパッチで整数 / 浮動小数点の既存置換面
-        // (FormatSpecifiers / DoubleFormatting) を辿る。provider は VM 設定カルチャを使うため無視
+        // (FormatSpecifiers / DoubleFormatting) を辿る。provider は置換 IL から CultureSettings bridge へ渡す
         ("System.String", "Format", ["System.String", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format2", ["System.String", "System.Object"]),
         ("System.String", "Format", ["System.String", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format3", ["System.String", "System.Object", "System.Object"]),
         ("System.String", "Format", ["System.String", "System.Object", "System.Object", "System.Object"], "DotnetVM.CoreLib.StringFormatting", "Format4", ["System.String", "System.Object", "System.Object", "System.Object"]),

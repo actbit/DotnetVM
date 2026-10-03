@@ -250,6 +250,10 @@ internal static partial class CoreLibBindings {
     /// <summary>VM 型を全ロード画像から探す (trusted 優先)。ゲスト型の比較子等、
     /// 既知型に無い型引数の解決に使う。</summary>
     private static VmType? FindAnyType(IntrinsicContext ctx, string fullName) {
+        if (fullName.EndsWith("[]", StringComparison.Ordinal)) {
+            var element = FindAnyType(ctx, fullName[..^2]);
+            return element is null ? null : new VmArrayType { ElementType = element };
+        }
         try {
             if (ctx.Types.TryResolveTrustedUnifiedType(fullName) is { } trusted)
                 return trusted;

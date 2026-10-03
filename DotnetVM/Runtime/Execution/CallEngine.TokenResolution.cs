@@ -31,6 +31,27 @@ internal sealed partial class CallEngine {
     /// Intrinsic = null の CallTarget を返す (Call 側でレシーバの仮想ディスパッチを試してから判定する)。</summary>
     public CallTarget ResolveCallTarget(int token, GenericContext? context, bool throwOnMissingIntrinsic = true,
         IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        if ((TableKind)(token >> 24) != TableKind.MemberRef || context is not null || dynamicTokens is not null ||
+            _loader.Context is not { HasParent: false } assemblyContext || !_intrinsics.IsSealed)
+            return ResolveCallTargetCore(token, context, throwOnMissingIntrinsic, dynamicTokens);
+
+        _loader.EnsureLive();
+        var version = assemblyContext.ResolutionVersion;
+        if (_memberRefIntrinsicTargets.TryGetValue(token, out var cached) &&
+            ReferenceEquals(cached.Context, assemblyContext) && cached.Version == version)
+            return cached.Target;
+
+        var target = ResolveCallTargetCore(token, context, throwOnMissingIntrinsic, dynamicTokens);
+        // Do not retain unresolved targets or guest IL methods. Provenance and
+        // caller-domain checks have already succeeded on the normal path.
+        // An assembly discovered while resolving changes the version too.
+        if (target.Intrinsic is not null && assemblyContext.ResolutionVersion == version)
+            _memberRefIntrinsicTargets[token] = new CachedIntrinsicTarget(assemblyContext, version, target);
+        return target;
+    }
+
+    private CallTarget ResolveCallTargetCore(int token, GenericContext? context, bool throwOnMissingIntrinsic,
+        IReadOnlyDictionary<uint, object>? dynamicTokens) {
         if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmMethod dynamicMethod)
             return new CallTarget {

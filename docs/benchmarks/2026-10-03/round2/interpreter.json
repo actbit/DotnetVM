@@ -1,0 +1,427 @@
+{
+  "Runtime": "10.0.12",
+  "MeasuredAt": "2026-10-03T09:36:49.3616249+00:00",
+  "OS": "Microsoft Windows NT 10.0.26200.0",
+  "HostTieredCompilation": "0",
+  "EnableJit": false,
+  "Warmups": 3,
+  "Samples": 7,
+  "Results": [
+    {
+      "Name": "Arithmetic",
+      "Count": 5000,
+      "MedianMilliseconds": 4.6936,
+      "MedianAllocatedBytes": 302568,
+      "Instructions": 85010,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        4.532,
+        4.5722,
+        4.6453,
+        4.6936,
+        4.7273,
+        4.7499,
+        4.7984
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0027601400000000003,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.002751975,
+          0.00275551,
+          0.002759465,
+          0.0027601400000000003,
+          0.0027614249999999996,
+          0.00276184,
+          0.00298534
+        ]
+      },
+      "VmToCoreClrRatio": 1700.4934532306331
+    },
+    {
+      "Name": "FieldAccess",
+      "Count": 5000,
+      "MedianMilliseconds": 6.1817,
+      "MedianAllocatedBytes": 304072,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        6.0667,
+        6.1508,
+        6.1592,
+        6.1817,
+        6.1878,
+        6.2384,
+        6.5074
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.002766165,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.002755055,
+          0.00276078,
+          0.0027641049999999998,
+          0.002766165,
+          0.002844025,
+          0.002882755,
+          0.003042955
+        ]
+      },
+      "VmToCoreClrRatio": 2234.754615144071
+    },
+    {
+      "Name": "GenericFieldAccess",
+      "Count": 5000,
+      "MedianMilliseconds": 6.7806,
+      "MedianAllocatedBytes": 304872,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        6.5521,
+        6.6043,
+        6.6134,
+        6.7806,
+        6.8623,
+        6.9448,
+        7.0028
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0027773050000000003,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.002754015,
+          0.00275881,
+          0.00276035,
+          0.0027773050000000003,
+          0.002878295,
+          0.002893295,
+          0.00290411
+        ]
+      },
+      "VmToCoreClrRatio": 2441.431531646686
+    },
+    {
+      "Name": "MethodCalls",
+      "Count": 1000,
+      "MedianMilliseconds": 2.3751,
+      "MedianAllocatedBytes": 1014568,
+      "Instructions": 16010,
+      "Expected": 500500,
+      "ElapsedMilliseconds": [
+        2.3204,
+        2.3472,
+        2.3576,
+        2.3751,
+        2.3828,
+        2.6488,
+        2.7507
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0011932697185650441,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 82790,
+        "ElapsedMilliseconds": [
+          0.001189740306800338,
+          0.001191810605145549,
+          0.0011921777992511173,
+          0.0011932697185650441,
+          0.0012227672424205821,
+          0.0012455876313564442,
+          0.0012886640898659258
+        ]
+      },
+      "VmToCoreClrRatio": 1990.4133684513133
+    },
+    {
+      "Name": "List",
+      "Count": 500,
+      "MedianMilliseconds": 11.2037,
+      "MedianAllocatedBytes": 3683032,
+      "Instructions": 61597,
+      "Expected": 125250,
+      "ElapsedMilliseconds": [
+        10.8816,
+        11.1341,
+        11.2033,
+        11.2037,
+        11.2398,
+        11.2782,
+        11.3268
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.006064545784444176,
+        "MedianAllocatedBytes": 2096,
+        "IterationsPerSample": 8267,
+        "ElapsedMilliseconds": [
+          0.005956792064836095,
+          0.005991641466069916,
+          0.005996286440062901,
+          0.006064545784444176,
+          0.006102395064715133,
+          0.00610774162332164,
+          0.006195681625740898
+        ]
+      },
+      "VmToCoreClrRatio": 1847.4095832103335
+    },
+    {
+      "Name": "ListGrowth",
+      "Count": 500,
+      "MedianMilliseconds": 6.6938,
+      "MedianAllocatedBytes": 1846656,
+      "Instructions": 40134,
+      "Expected": 124750,
+      "ElapsedMilliseconds": [
+        6.4559,
+        6.5652,
+        6.6322,
+        6.6938,
+        6.8764,
+        6.8792,
+        6.909
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0014944429480488873,
+        "MedianAllocatedBytes": 4304,
+        "IterationsPerSample": 59402,
+        "ElapsedMilliseconds": [
+          0.001395138210834652,
+          0.001396693714016363,
+          0.0014100013467560014,
+          0.0014944429480488873,
+          0.0015016581933268238,
+          0.0015443924446988317,
+          0.0015469411804316354
+        ]
+      },
+      "VmToCoreClrRatio": 4479.127161554934
+    },
+    {
+      "Name": "Linq",
+      "Count": 500,
+      "MedianMilliseconds": 16.6734,
+      "MedianAllocatedBytes": 6341944,
+      "Instructions": 43296,
+      "Expected": 186750,
+      "ElapsedMilliseconds": [
+        16.5838,
+        16.5902,
+        16.5997,
+        16.6734,
+        16.7643,
+        16.8247,
+        17.0127
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00411118,
+        "MedianAllocatedBytes": 160,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00398912,
+          0.004006805,
+          0.0040964,
+          0.00411118,
+          0.004222005,
+          0.004282905,
+          0.004662665
+        ]
+      },
+      "VmToCoreClrRatio": 4055.6239327881535
+    },
+    {
+      "Name": "DictionaryInt",
+      "Count": 200,
+      "MedianMilliseconds": 22.482,
+      "MedianAllocatedBytes": 6500224,
+      "Instructions": 91378,
+      "Expected": 59700,
+      "ElapsedMilliseconds": [
+        22.3406,
+        22.367,
+        22.4572,
+        22.482,
+        22.5772,
+        22.6691,
+        37.2545
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0035479105520614955,
+        "MedianAllocatedBytes": 4912,
+        "IterationsPerSample": 14310,
+        "ElapsedMilliseconds": [
+          0.003474136967155835,
+          0.0034742138364779874,
+          0.003540705800139762,
+          0.0035479105520614955,
+          0.003582375960866527,
+          0.0036264220824598183,
+          0.003758399720475192
+        ]
+      },
+      "VmToCoreClrRatio": 6336.687374188999
+    },
+    {
+      "Name": "DictionaryGrowth",
+      "Count": 200,
+      "MedianMilliseconds": 19.0886,
+      "MedianAllocatedBytes": 5953112,
+      "Instructions": 84974,
+      "Expected": 20100,
+      "ElapsedMilliseconds": [
+        18.9312,
+        19.036,
+        19.0755,
+        19.0886,
+        19.1549,
+        19.5785,
+        19.879
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0036654701757031895,
+        "MedianAllocatedBytes": 16064,
+        "IterationsPerSample": 26522,
+        "ElapsedMilliseconds": [
+          0.0033925495814795263,
+          0.0035977678908076316,
+          0.003623961239725511,
+          0.0036654701757031895,
+          0.0037370258653193576,
+          0.0037688975190407962,
+          0.003876996455772566
+        ]
+      },
+      "VmToCoreClrRatio": 5207.681166397163
+    },
+    {
+      "Name": "DictionaryString",
+      "Count": 200,
+      "MedianMilliseconds": 20.7036,
+      "MedianAllocatedBytes": 6265144,
+      "Instructions": 99083,
+      "Expected": 19908,
+      "ElapsedMilliseconds": [
+        20.2356,
+        20.2718,
+        20.6646,
+        20.7036,
+        20.7312,
+        20.9394,
+        21.0493
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.004990626287597858,
+        "MedianAllocatedBytes": 440,
+        "IterationsPerSample": 9708,
+        "ElapsedMilliseconds": [
+          0.0049739081170168935,
+          0.004976400906468891,
+          0.0049765142150803455,
+          0.004990626287597858,
+          0.004995199835187474,
+          0.005046384425216316,
+          0.00506394725999176
+        ]
+      },
+      "VmToCoreClrRatio": 4148.497364238684
+    },
+    {
+      "Name": "AsyncCompleted",
+      "Count": 200,
+      "MedianMilliseconds": 1.7305,
+      "MedianAllocatedBytes": 866056,
+      "Instructions": 8257,
+      "Expected": 19900,
+      "ElapsedMilliseconds": [
+        1.6036,
+        1.6162,
+        1.6488,
+        1.7305,
+        1.7716,
+        1.8705,
+        1.942
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.001263406225103706,
+        "MedianAllocatedBytes": 13824,
+        "IterationsPerSample": 72802,
+        "ElapsedMilliseconds": [
+          0.0011408697563253757,
+          0.0012030878272574928,
+          0.0012614310046427295,
+          0.001263406225103706,
+          0.0012756023186176204,
+          0.00131870278289058,
+          0.0013991456278673662
+        ]
+      },
+      "VmToCoreClrRatio": 1369.7098887239952
+    },
+    {
+      "Name": "ValueTaskCompleted",
+      "Count": 200,
+      "MedianMilliseconds": 1.8533,
+      "MedianAllocatedBytes": 1000064,
+      "Instructions": 8459,
+      "Expected": 19900,
+      "ElapsedMilliseconds": [
+        1.7509,
+        1.811,
+        1.8142,
+        1.8533,
+        1.8533,
+        1.9231,
+        2.0535
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00043933549999999996,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 200000,
+        "ElapsedMilliseconds": [
+          0.00043524650000000003,
+          0.00043644599999999995,
+          0.000438674,
+          0.00043933549999999996,
+          0.0004417945,
+          0.000450632,
+          0.000454399
+        ]
+      },
+      "VmToCoreClrRatio": 4218.416221771289
+    },
+    {
+      "Name": "AsyncWorkers",
+      "Count": 8,
+      "MedianMilliseconds": 12.9479,
+      "MedianAllocatedBytes": 493288,
+      "Instructions": 1111,
+      "Expected": 36,
+      "ElapsedMilliseconds": [
+        10.9902,
+        11.6922,
+        11.7564,
+        12.9479,
+        13.1519,
+        13.3769,
+        17.7974
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 13.691975,
+        "MedianAllocatedBytes": 5056,
+        "IterationsPerSample": 8,
+        "ElapsedMilliseconds": [
+          12.9177,
+          13.0699875,
+          13.5683625,
+          13.691975,
+          14.0132875,
+          14.7012375,
+          15.19
+        ]
+      },
+      "VmToCoreClrRatio": 0.9456561233861441
+    }
+  ]
+}

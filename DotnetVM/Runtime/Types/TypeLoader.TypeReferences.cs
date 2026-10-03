@@ -1,10 +1,16 @@
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Execution;
+using DotnetVM.Runtime.Objects;
 
 namespace DotnetVM.Runtime.Types;
 
 public sealed partial class TypeLoader {
+    private readonly MetadataResolutionCache<VmType> _resolvedTypeRefs = new();
+
+    internal void ClearTypeReferenceCache() => _resolvedTypeRefs.Clear();
+
     /// <summary>構築型 TypeSpec の GenericInst 定義トークンを取得する。runtime binding の
     /// provenance 検査で、解決後の facade だけでなく元の TypeRef scope も確認するために使う。</summary>
     internal uint GetTypeSpecDefinitionToken(int typeSpecRid) {
@@ -22,6 +28,20 @@ public sealed partial class TypeLoader {
     ///    TypeRef スコープのネスト型) → ② intrinsic ファサード → ③ ファサード無し時のネスト/自己解決 →
     ///    ④ fail-closed (AssemblyDependencyNotFoundException / NotSupportedException)。</summary>
     private VmType ResolveTypeRef(int typeRefRid) {
+        EnsureLive();
+        // Cache successful answers only. Child contexts continue consulting the
+        // parent and directory resolver on every attempt, as their contract requires.
+        var context = Context is { HasParent: false } root ? root : null;
+        if (_resolvedTypeRefs.TryGet(context, typeRefRid, null, false, out var cached, out var version)) {
+            VmLifetime.EnsureLive(cached);
+            return cached;
+        }
+        var resolved = ResolveTypeRefCore(typeRefRid);
+        _resolvedTypeRefs.Add(context, version, typeRefRid, null, false, resolved);
+        return resolved;
+    }
+
+    private VmType ResolveTypeRefCore(int typeRefRid) {
         var (ns, name, scope) = _image.GetTypeRefName(typeRefRid);
         var fullName = string.IsNullOrEmpty(ns) ? name : ns + "." + name;
         var (scopeTable, scopeRid) = scope;
@@ -146,8 +166,9 @@ public sealed partial class TypeLoader {
         var current = typeRefRid;
         var (terminalTable, terminalRid) = (TableKind.Module, 0);
         while (true) {
-            var (_, nestedName, nestedScope) = _image.GetTypeRefName(current);
-            names.Insert(0, nestedName);
+            var (nestedNamespace, nestedName, nestedScope) = _image.GetTypeRefName(current);
+            names.Insert(0, string.IsNullOrEmpty(nestedNamespace)
+                ? nestedName : nestedNamespace + "." + nestedName);
             (terminalTable, terminalRid) = nestedScope;
             if (terminalTable != TableKind.TypeRef)
                 break;
@@ -177,7 +198,7 @@ public sealed partial class TypeLoader {
         var owner = targetLoader.FindTypeByFullName(names[0]) ?? targetLoader.FindTypeByName(names[0]);
         if (owner is null) {
             // 自画像に無く BCL 統合で拾える場合 (参照アセンブリ経由の BCL ネスト型)
-            if (targetLoader == this && terminalTable == TableKind.AssemblyRef &&
+            if (terminalTable == TableKind.AssemblyRef &&
                 IsKnownFrameworkContract(_image.GetAssemblyRefIdentity(terminalRid)) &&
                 TryResolveTrustedUnifiedType(names[0]) is VmClassType unifiedClass)
                 return WalkNested(unifiedClass, names, 1);

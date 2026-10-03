@@ -39,6 +39,13 @@ internal static partial class CoreLibBindings {
     /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定。
     /// 状態は ctx.Shared の VM インスタンス状態)。</summary>
     private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
+        r.RegisterBinding(BindingKey.Static("System.Environment", "get_CurrentManagedThreadId"),
+            static (ctx, _) => StackSlot.OfInt32(ctx.Shared.GuestThreads.CurrentManagedThreadId),
+            BindingOrigin.InternalCall);
+        // Guest debugging has no native debugger attached. Task's diagnostic
+        // probe must not enter the host's P/Invoke implementation.
+        r.RegisterBinding(BindingKey.TrustedStatic("System.Diagnostics.Debugger", "IsManagedDebuggerAttached"),
+            static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
         const string MarshalType = "System.Runtime.InteropServices.Marshal";
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastSystemError", "System.Int32"),
             static (ctx, a) => {

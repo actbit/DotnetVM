@@ -19,7 +19,10 @@ public sealed partial class TypeLoader {
             return null;
         if (_methods.TryGetValue(rid, out var cached))
             return cached;
+        return FindMethodByRid(rid);
+    }
 
+    private VmMethod? FindMethodByRid(int rid) {
         // 所有型が未ロードでも解決できるよう TypeDef 全体から MethodList 範囲で探す
         var typeDefs = _image.Tables.GetRowCount(TableKind.TypeDef);
         for (var typeRid = 1; typeRid <= typeDefs; typeRid++) {

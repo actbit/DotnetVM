@@ -61,6 +61,7 @@ public sealed partial class Interpreter {
         foreach (var argument in arguments)
             VmLifetime.EnsureLiveForGuest(argument);
         var state = CurrentState;
+        RegisterExecutionState(state);
         using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared.Culture) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
@@ -119,16 +120,58 @@ public sealed partial class Interpreter {
                         // exits. Do not retain completed thread states in the
                         // VM-wide root registry for the lifetime of a long-lived VM.
                         _executionStates.TryRemove(state, out _);
+                        state.Registered = false;
                     }
                 }
             }
         } finally {
             // Preparation/type initialization can fail before Depth is entered.
             // Those failed attempts must not leave an otherwise idle state behind.
-            if (!entered && state.Depth == 0)
+            if (!entered && state.Depth == 0) {
                 _executionStates.TryRemove(state, out _);
+                state.Registered = false;
+            }
         }
 
+    }
+
+    /// <summary>Borrow caller slots for an already promoted synchronous leaf.</summary>
+    internal bool TryInvokeCompiledLeaf(VmMethod method, Span<StackSlot> arguments, out StackSlot result) {
+        result = default;
+        VmLifetime.EnsureLiveForGuest(method);
+        foreach (ref readonly var argument in arguments)
+            VmLifetime.EnsureLiveForGuest(argument);
+        if (!CanUseJit)
+            return false;
+        var compiled = EnginesFor(method).Jit.GetCompiled(method);
+        if (compiled is not { HasLeaf: true })
+            return false;
+        if (!ReferenceEquals(PrepareInvocation(method, arguments, null), method) || method.Body is null)
+            return false;
+        var state = CurrentState;
+        if (state.Depth >= _memory.MaxRecursionDepth)
+            throw new UnhandledGuestException("System.StackOverflowException",
+                $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
+        RegisterExecutionState(state);
+        state.Depth++;
+        try {
+            // Leaf parameters are primitive values; a constructor's this is
+            // retained in the caller's active stack throughout the invocation.
+            if (_tracer is { } tracer)
+                tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+            compiled.TryInvokeLeaf(this, arguments, out result);
+            return true;
+        } finally {
+            state.Depth--;
+            if (state.Depth == 0) {
+                try {
+                    FlushPendingAssemblyContextCaches();
+                } finally {
+                    _executionStates.TryRemove(state, out _);
+                    state.Registered = false;
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -158,6 +201,7 @@ public sealed partial class Interpreter {
             throw new UnhandledGuestException("System.StackOverflowException",
                 $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
 
+        RegisterExecutionState(state);
         state.Depth++;
         try {
             CloneStructArgs(method, arguments);
@@ -186,8 +230,15 @@ public sealed partial class Interpreter {
             }
         } finally {
             state.Depth--;
-            if (state.Depth == 0)
+            if (state.Depth == 0) {
                 FlushPendingAssemblyContextCaches();
+                lock (state.Gate) {
+                    if (state.Frames.Count == 0) {
+                        _executionStates.TryRemove(state, out _);
+                        state.Registered = false;
+                    }
+                }
+            }
         }
     }
 
@@ -202,7 +253,7 @@ public sealed partial class Interpreter {
     }
 
     /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>
-    private bool CanUseJit => HasInstructionBudget &&
+    private bool CanUseJit => _enableJit && HasInstructionBudget &&
         _tracer?.CapturesInstructions != true && _debugger?.IsActive != true;
 
     /// <summary>外側の guest 呼出の間だけ、ホスト thread の ambient culture を VM 設定に合わせる。</summary>
@@ -221,7 +272,7 @@ public sealed partial class Interpreter {
         }
     }
 
-    private VmMethod PrepareInvocation(VmMethod method, StackSlot[] arguments, GenericContext? context) {
+    private VmMethod PrepareInvocation(VmMethod method, Span<StackSlot> arguments, GenericContext? context) {
         if (_services.CoreLibSurfaces is { } surfaces && surfaces.Substitute(method) is { } substituted) {
             // instance 面 → static 実装への差し替えでは受信者 (this) を生スロットへ正規化する
             if (method.Signature.HasThis && !substituted.Signature.HasThis && arguments.Length > 0)

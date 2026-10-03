@@ -2,22 +2,25 @@ using DotnetVM.IL;
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Runtime.Types;
+using System.Collections.Concurrent;
 
 namespace DotnetVM.Runtime.Execution;
 
 /// <summary>メソッドの事前準備キャッシュ: ローカル変数署名のデコード結果と、IL オフセット基準の
 /// EH 句を命令インデックス基準に解決した結果をメソッドごとに 1 回だけ計算して保持する。</summary>
 internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, long maxPreparedBytes) {
-    private readonly Dictionary<VmMethod, PreparedMethod> _prepared = [];
+    private readonly ConcurrentDictionary<VmMethod, PreparedMethod> _prepared = new();
     private readonly Queue<VmMethod> _order = [];
     private readonly object _gate = new();
     private long _preparedBytes;
 
     internal int Count { get { lock (_gate) return _prepared.Count; } }
     internal long PreparedBytes { get { lock (_gate) return _preparedBytes; } }
-    internal bool IsCached(VmMethod method) { lock (_gate) return _prepared.ContainsKey(method); }
+    internal bool IsCached(VmMethod method) => _prepared.ContainsKey(method);
 
     public PreparedMethod Prepare(VmMethod method) {
+        if (_prepared.TryGetValue(method, out var cached))
+            return cached;
         lock (_gate)
             return PrepareCore(method);
     }
@@ -35,7 +38,7 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
                 throw new BadImageFormatException($"ローカル変数署名トークン 0x{body.LocalVarSigToken:X8} が不正です。");
             try {
                 localTypes = SignatureDecoder.DecodeLocalsSignature(
-                    loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)).ToArray(),
+                    loader.Image.GetBlob(loader.Image.Tables.GetRowIndex(table, rid, 0)),
                     loader.Image.Limits?.MaxSignatureDepth ?? 64,
                     loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
             } catch (BadImageFormatException) {
@@ -66,7 +69,7 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
                 var oldest = _order.Dequeue();
                 // The dictionary is only populated once per method while the
                 // gate is held, so a FIFO eviction is deterministic and bounded.
-                if (_prepared.Remove(oldest, out var removed))
+                if (_prepared.TryRemove(oldest, out var removed))
                     _preparedBytes -= removed.EstimatedBytes;
             }
         }

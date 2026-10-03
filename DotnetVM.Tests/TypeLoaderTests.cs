@@ -178,6 +178,21 @@ public class TypeLoaderTests {
         Assert.Same(a, b);
     }
 
+    [Fact]
+    public void NestedFullNameReflectsLazilyAttachedEnclosingTypes() {
+        var image = CreateLoader().Image;
+        var outer = new VmClassType(0) { Image = image, TypeDefRid = 1, Namespace = "Vm", Name = "Outer" };
+        var inner = new VmClassType(0) { Image = image, TypeDefRid = 1, Namespace = "Vm", Name = "Inner" };
+        var leaf = new VmClassType(0) { Image = image, TypeDefRid = 1, Namespace = "", Name = "Leaf", DeclaringType = inner };
+
+        Assert.Equal("Vm.Inner+Leaf", leaf.FullName);
+        inner.DeclaringType = outer;
+        Assert.Equal("Vm.Outer+Inner", inner.FullName);
+        Assert.Equal("Vm.Outer+Inner+Leaf", leaf.FullName);
+        inner.DeclaringType = null;
+        Assert.Equal("Vm.Inner+Leaf", leaf.FullName);
+    }
+
     private static string NameOf(DotnetVM.Metadata.Signatures.SigType type) =>
         type.Kind switch {
             DotnetVM.Metadata.Signatures.SigKind.I4 => "System.Int32",

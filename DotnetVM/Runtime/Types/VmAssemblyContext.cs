@@ -18,15 +18,16 @@ public sealed class VmAssemblyContext(
     // 依存解決の再入 (A→B→A の循環参照) で同じファイルを二重ロードしないための排他セット
     private readonly HashSet<string> _loading = new(StringComparer.OrdinalIgnoreCase);
     private readonly VmAssemblyContext? _parent = parent;
+    private sealed class ResolutionEpoch { public long Version; }
+    private readonly ResolutionEpoch _resolutionEpoch = parent?._resolutionEpoch ?? new();
+    internal long ResolutionVersion => Volatile.Read(ref _resolutionEpoch.Version);
     private readonly Func<string, bool> _pathExists = pathExists ?? File.Exists;
     internal Guid Identity { get; } = Guid.NewGuid();
     private int _retired;
-    private long _resolutionVersion;
 
     // Root contexts can cache successful bindings against their own assembly set.
     // Child contexts also depend on parent changes and keep resolving normally.
     internal bool HasParent => _parent is not null;
-    internal long ResolutionVersion => Volatile.Read(ref _resolutionVersion);
 
     /// <summary>Unload 開始後は新しい解決/登録を一切許可しない。</summary>
     internal bool IsRetired => Volatile.Read(ref _retired) != 0;
@@ -35,7 +36,7 @@ public sealed class VmAssemblyContext(
     internal void Retire() {
         lock (_gate) {
             Volatile.Write(ref _retired, 1);
-            Interlocked.Increment(ref _resolutionVersion);
+            Interlocked.Increment(ref _resolutionEpoch.Version);
         }
     }
 
@@ -99,14 +100,13 @@ public sealed class VmAssemblyContext(
             loader.LoadContextIdentity = Identity;
             // 同一単純名の再ロードは最初のものを優先 (CLR のアセンブリ統合と同じ先行勝ち)
             _bySimpleName.TryAdd(loader.Image.Name, loader);
-            Interlocked.Increment(ref _resolutionVersion);
+            Interlocked.Increment(ref _resolutionEpoch.Version);
         }
     }
 
     internal void Unregister(TypeLoader loader) {
         lock (_gate) {
-            if (_loaders.Remove(loader))
-                Interlocked.Increment(ref _resolutionVersion);
+            _loaders.Remove(loader);
             if (_bySimpleName.TryGetValue(loader.Image.Name, out var current) && ReferenceEquals(current, loader)) {
                 _bySimpleName.Remove(loader.Image.Name);
                 var replacement = _loaders.FirstOrDefault(candidate =>
@@ -116,6 +116,7 @@ public sealed class VmAssemblyContext(
             }
             if (ReferenceEquals(loader.Context, this))
                 loader.Context = null;
+            Interlocked.Increment(ref _resolutionEpoch.Version);
         }
     }
 

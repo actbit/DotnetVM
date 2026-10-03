@@ -192,7 +192,7 @@ internal static partial class CoreLibBindings {
     /// 本家は .cctor → ComparerHelpers.CreateDefaultEqualityComparer (RuntimeType 内部表現・
     /// MakeGenericType・未初期化実体化の連鎖) を辿るため、VM 型モデルで直接振り分ける:
     /// string → StringEqualityComparer、enum → EnumEqualityComparer&lt;T&gt;、
-    /// Nullable → NullableEqualityComparer&lt;T&gt;、その他 → GenericEqualityComparer&lt;T&gt;
+    /// Nullable → NullableEqualityComparer&lt;T&gt;、その他 → ObjectEqualityComparer&lt;T&gt;
     /// (本家と同一の振分順序)。実体は公開無引数 .ctor を NewInstanceHook で実行する。
     /// T はクラス型実引数 (!0) で判別する (値パラメータ 0 個のため)。</summary>
     private static void RegisterEqualityComparer(IntrinsicRegistry r) {
@@ -203,7 +203,9 @@ internal static partial class CoreLibBindings {
                 if (string.IsNullOrEmpty(tName) || tName is "!!0" or "!0")
                     throw new InvalidOperationException(
                         "EqualityComparer<T>.get_Default の型引数 T を判別できませんでした。");
-                var t = FindAnyType(ctx, tName);
+                var t = ctx.ClassTypeArguments.FirstOrDefault() ?? FindAnyType(ctx, tName);
+                if (t is not null && ctx.Shared.DefaultEqualityComparers.TryGetValue(t, out var cached))
+                    return StackSlot.OfObject(cached);
                 // 本家 ComparerHelpers.CreateDefaultEqualityComparer と同一の振分順序:
                 // string → IEquatable<T> 実装 → Nullable<T> → enum → 既定
                 string comparerBase;
@@ -217,7 +219,7 @@ internal static partial class CoreLibBindings {
                 } else if (t is not null && t.IsEnum) {
                     comparerBase = "System.Collections.Generic.EnumEqualityComparer`1";
                 } else {
-                    comparerBase = "System.Collections.Generic.GenericEqualityComparer`1";
+                    comparerBase = "System.Collections.Generic.ObjectEqualityComparer`1";
                 }
                 var def = FindAnyType(ctx, comparerBase) as VmClassType
                     ?? throw new InvalidOperationException(
@@ -240,7 +242,7 @@ internal static partial class CoreLibBindings {
                 var instance = typeArgs.Length > 0
                     ? hook(new VmConstructedType { Definition = def, TypeArguments = typeArgs }, ctor, [], classContext)
                     : hook(def, ctor, [], null);
-                return StackSlot.OfObject(instance);
+                return StackSlot.OfObject(t is null ? instance : ctx.Shared.DefaultEqualityComparers.GetOrAdd(t, instance));
             },
             BindingOrigin.InternalCall);
     }

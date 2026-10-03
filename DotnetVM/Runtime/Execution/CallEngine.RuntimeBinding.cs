@@ -183,7 +183,8 @@ internal sealed partial class CallEngine {
     private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result,
         BindingDomain callerDomain, VmType[]? classArgs = null) {
         result = null;
-        if (!CanAttemptRuntimeBinding(method.DeclaringType))
+        if (!CanAttemptRuntimeBinding(method.DeclaringType) ||
+            !_intrinsics.HasBindingForType(method.DeclaringType.FullName))
             return false;
         var names = ParamTypeNamesOf(method, methodArgs, classArgs);
         if (names is null || names.Any(string.IsNullOrEmpty)) {

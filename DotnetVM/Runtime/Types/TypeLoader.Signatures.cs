@@ -94,10 +94,7 @@ public sealed partial class TypeLoader {
     }
 
     private VmType ResolveTypeSpecCore(int typeSpecRid, GenericContext? context) {
-        var blob = _image.GetBlob(_image.Tables.GetRowIndex(TableKind.TypeSpec, typeSpecRid, 0));
-        var sigType = SignatureDecoder.DecodeTypeSpecSignature(blob,
-            _image.Limits?.MaxSignatureDepth ?? 64,
-            _image.Limits?.MaxGenericNestingDepth ?? 64).Type;
+        var sigType = DecodeTypeSpecSignature(typeSpecRid);
         CheckGenericNestingDepth(sigType, 0);
         return GenericSubstitutor.Substitute(ResolveToken(sigType), context);
     }

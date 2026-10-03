@@ -53,14 +53,9 @@ public sealed partial class Interpreter {
         _createAssemblyLoadContext = createAssemblyLoadContext;
         _loadAssemblyInContext = loadAssemblyInContext;
         _loadAssemblyFromPath = loadAssemblyFromPath;
-        // Register each host thread's execution state exactly once when its
-        // ThreadLocal value is first materialized, rather than touching the
-        // concurrent root registry for every guest instruction.
-        _currentExecution = new ThreadLocal<ExecutionState>(() => {
-            var state = new ExecutionState();
-            _executionStates.TryAdd(state, 0);
-            return state;
-        });
+        // Reuse the host thread's state; invocation boundaries register it while
+        // active and remove it when its last frame exits.
+        _currentExecution = new ThreadLocal<ExecutionState>(static () => new());
         var strings = new VmStringPool(heap);
         var primary = CreateEngines(loader, strings);
         _services = primary.Services;
@@ -77,6 +72,12 @@ public sealed partial class Interpreter {
     private LoaderEngines EnginesFor(VmMethod method) {
         var loader = method.Loader;
         VmLifetime.EnsureLiveForGuest(method);
+        if (_engines.TryGetValue(loader ?? _services.Loader, out var cached)) {
+            // Creation still takes the lifetime gate below, so this read path
+            // cannot republish an engine after its loader has been retired.
+            VmLifetime.EnsureLiveForGuest(method);
+            return cached;
+        }
         if (loader?.Context is { } context) {
             lock (context.LifetimeGate) {
                 VmLifetime.EnsureLiveForGuest(method);

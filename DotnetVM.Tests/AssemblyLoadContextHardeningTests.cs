@@ -160,11 +160,13 @@ public sealed class AssemblyLoadContextHardeningTests {
         using var shared = new VmSharedState();
         var facade = new VmRuntimeObject { Target = type };
         shared.TypeFacades[type] = facade;
+        shared.DefaultEqualityComparers[type] = facade;
         shared.TypeInitialization.Ensure(type, static () => { });
         var staticStorage = new UnifiedStaticStorage();
         staticStorage.GetOrCreate(type, null, () => [StackSlot.OfObject(facade)]);
         var arrayType = new VmArrayType { ElementType = type };
         shared.TypeFacades[arrayType] = new VmRuntimeObject { Target = arrayType };
+        shared.DefaultEqualityComparers[arrayType] = facade;
         staticStorage.GetOrCreate(type, [arrayType], () => [StackSlot.OfObject(facade)]);
 
         var retainedImage = AssemblyImage.Parse(TestAssemblyCompiler.CompileToBytes(
@@ -176,6 +178,7 @@ public sealed class AssemblyLoadContextHardeningTests {
         var retainedType = Assert.IsType<VmClassType>(retainedLoader.FindTypeByFullName("Vm.AlcCacheOther.RetainedType"));
         var retainedFacade = new VmRuntimeObject { Target = retainedType };
         shared.TypeFacades[retainedType] = retainedFacade;
+        shared.DefaultEqualityComparers[retainedType] = retainedFacade;
         shared.TypeInitialization.Ensure(retainedType, static () => { });
         staticStorage.GetOrCreate(retainedType, null, () => [StackSlot.OfObject(retainedFacade)]);
 
@@ -200,6 +203,9 @@ public sealed class AssemblyLoadContextHardeningTests {
         Assert.DoesNotContain(type, shared.TypeFacades.Keys);
         Assert.DoesNotContain(arrayType, shared.TypeFacades.Keys);
         Assert.Same(retainedFacade, shared.TypeFacades[retainedType]);
+        Assert.DoesNotContain(type, shared.DefaultEqualityComparers.Keys);
+        Assert.DoesNotContain(arrayType, shared.DefaultEqualityComparers.Keys);
+        Assert.Same(retainedFacade, shared.DefaultEqualityComparers[retainedType]);
         Assert.Equal(TypeInitializationStatus.NotStarted, shared.TypeInitialization.GetStatus(type));
         Assert.Equal(TypeInitializationStatus.Completed, shared.TypeInitialization.GetStatus(retainedType));
         Assert.Single(staticStorage.EnumerateRoots());

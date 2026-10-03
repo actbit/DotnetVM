@@ -569,7 +569,7 @@ internal static partial class CoreLibBindings {
             ctx.Shared.GuestTasks.Run(running, [StackSlot.OfObject(running), a[0]], () => {
                 var result = invoke(guestDelegate, [StackSlot.OfObject(guestDelegate)]) ?? default;
                 if (result.ObjectValue is VmTaskObject nestedTask) {
-                    nestedTask.Wait();
+                    SuspendHostWait(ctx, nestedTask.Wait);
                     if (nestedTask.IsCanceled)
                         throw new UnhandledGuestException("System.OperationCanceledException", null);
                     var nested = nestedTask.Snapshot();
@@ -584,6 +584,24 @@ internal static partial class CoreLibBindings {
             });
             return StackSlot.OfObject(running);
         }
+
+        static StackSlot? InitializeValueTask(StackSlot destination, StackSlot value) {
+            if (destination.ObjectValue is not VmByRef location)
+                throw new UnhandledGuestException("System.InvalidProgramException", "ValueTask constructor requires a managed receiver.");
+            location.Write(value);
+            return null;
+        }
+        RegisterBinding(r, BindingKey.Instance(valueTask, ".ctor", task),
+            (ctx, a) => InitializeValueTask(a[0], NewValueTask(ctx, false, null, AsTask(ctx, a[1]))));
+        RegisterBinding(r, BindingKey.Instance(valueTaskOfT, ".ctor", "!0"),
+            (ctx, a) => {
+                var resultType = ResultType(ctx, fromMethod: false);
+                return InitializeValueTask(a[0], NewValueTask(ctx, true, resultType,
+                    CompletedTask(ctx, true, resultType, a[1])));
+            });
+        RegisterBinding(r, BindingKey.Instance(valueTaskOfT, ".ctor", "System.Threading.Tasks.Task`1<!0>"),
+            (ctx, a) => InitializeValueTask(a[0], NewValueTask(ctx, true,
+                ResultType(ctx, fromMethod: false), AsTask(ctx, a[1], generic: true))));
 
         RegisterBinding(r, BindingKey.InstanceByArity(valueTask, ".ctor", 2),
             (ctx, a) => ValueTaskRuntime.ConstructFromSource(ctx, generic: false, resultType: null,
@@ -693,6 +711,11 @@ internal static partial class CoreLibBindings {
                 var generic = resultType is not null;
                 return StartTaskWorker(ctx, a, resultType, generic);
             });
+        RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<System.Threading.Tasks.Task`1<!!0>>"),
+            (ctx, a) => StartTaskWorker(ctx, a, ResultType(ctx, fromMethod: true), generic: true));
+        RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<System.Threading.Tasks.Task`1<!!0>>", "System.Threading.CancellationToken"),
+            (ctx, a) => StartTaskWorker(ctx, [a[0]], ResultType(ctx, fromMethod: true), generic: true,
+                CancellationTokenOf(a[1])));
         RegisterBinding(r, BindingKey.Static(task, "Run", "System.Func`1<!!0>", "System.Threading.CancellationToken"),
             (ctx, a) => {
                 var resultType = ResultType(ctx, fromMethod: true);
@@ -930,6 +953,10 @@ internal static partial class CoreLibBindings {
         }
 
         static StackSlot? RegisterContinuation(IntrinsicContext ctx, StackSlot[] a, bool flowExecutionContext) {
+            // The detached Release state machine must share the task with the
+            // caller's builder before its fields are copied for suspension.
+            var completionTask = EnsureBuilderTask(ctx, a);
+            void FailContinuation(Exception error) => ctx.Shared.GuestTasks.CompleteHostException(completionTask, error);
             var resume = ctx.RunGuestStateMachine ?? throw new InvalidOperationException("guest state machine runner が初期化されていません。");
             var capturedContext = CapturesSynchronizationContext(a[1])
                 ? ctx.Shared.CurrentSynchronizationContext : null;
@@ -946,14 +973,14 @@ internal static partial class CoreLibBindings {
                 var continuation = new Action<StackSlot>(state => ctx.Shared.RunWithSynchronizationContext(
                     capturedContext, () => resume(state)));
                 ctx.Shared.GuestTasks.ScheduleContinuation(awaitedSourceTask, a[2], continuation,
-                    capturedContext is null ? null : StackSlot.OfObject(capturedContext));
+                    capturedContext is null ? null : StackSlot.OfObject(capturedContext), FailContinuation);
                 return null;
             }
             if (TryAwaitedTask(ctx, a[1], out var awaited)) {
                 var continuation = new Action<StackSlot>(state => ctx.Shared.RunWithSynchronizationContext(
                     capturedContext, () => resume(state)));
                 ctx.Shared.GuestTasks.ScheduleContinuation(awaited, a[2], continuation,
-                    capturedContext is null ? null : StackSlot.OfObject(capturedContext));
+                    capturedContext is null ? null : StackSlot.OfObject(capturedContext), FailContinuation);
                 return null;
             }
 
@@ -973,7 +1000,7 @@ internal static partial class CoreLibBindings {
             registration = ctx.Shared.GuestTasks.RegisterExternalContinuation(a[2], extraRoots, callback,
                 state => {
                     ctx.Shared.RunWithSynchronizationContext(capturedContext, () => resume(state));
-                });
+                }, FailContinuation);
             try {
                 StackSlot? result;
                 try {

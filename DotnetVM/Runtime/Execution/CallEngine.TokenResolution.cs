@@ -61,6 +61,12 @@ internal sealed partial class CallEngine {
                 ParamCount = dynamicMethod.Signature.ParamTypes.Length,
                 HasThis = dynamicMethod.Signature.HasThis,
             };
+        return dynamicTokens is null
+            ? ResolveCachedCallTarget(token, context, throwOnMissingIntrinsic)
+            : ResolveCallTargetCore(token, context, throwOnMissingIntrinsic);
+    }
+
+    private CallTarget ResolveCallTargetCore(int token, GenericContext? context, bool throwOnMissingIntrinsic) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
         switch (table) {
@@ -80,10 +86,7 @@ internal sealed partial class CallEngine {
             }
             case TableKind.MemberRef: {
                 // MemberRef 署名から hasThis/引数個数を得る
-                var signature = SignatureDecoder.DecodeMethodSignature(
-                    _loader.Image.GetMemberRefSignature(rid),
-                    _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-                    _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+                var signature = _loader.DecodeMemberRefMethodSignature(rid);
                 var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
                 var name = _loader.GetMemberRefName(rid);
 
@@ -183,7 +186,10 @@ internal sealed partial class CallEngine {
                     }
                     if (realClass is not null && !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
                         var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes, signature.ReturnType);
-                        if (resolved is { Body: not null })
+                        // An abstract declaration is a resolved call site too.
+                        // Cache it, then select the implementation from each
+                        // receiver during callvirt, using the declaration's slot.
+                        if (resolved is { Body: not null } || resolved is { IsAbstract: true } && !throwOnMissingIntrinsic)
                             return new CallTarget {
                                 Arity = arity,
                                 Method = resolved,
@@ -237,14 +243,24 @@ internal sealed partial class CallEngine {
         MethodSignature signature, string name, GenericContext? context, bool throwOnMissingIntrinsic = true) {
         var arity = signature.ParamTypes.Length + (signature.HasThis ? 1 : 0);
         var constructed = _objectEngine.ResolveConstructedParent(typeSpecRid, context);
+        // MemberRef signature !n belongs to the called constructed type, not
+        // to the caller (e.g. ValueTask<int>(!0) inside a non-generic method).
+        var signatureContext = new GenericContext {
+            ClassArgs = constructed.TypeArguments,
+            MethodArgs = context?.MethodArgs ?? [],
+        };
 
         // 構築ファサード型 (BCL 汎用インターフェース等) → ランタイムバインド / intrinsic 面
         if (constructed.Definition is VmIntrinsicType facade) {
             var bindingAllowed = CanAttemptRuntimeBindingForTypeSpec(typeSpecRid, facade);
-            var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
+            var facadeParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, signatureContext)).ToArray();
             // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
             if (bindingAllowed &&
-                TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames, CallerDomainOfLoader(), out var boundImpl)) {
+                (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames,
+                    CallerDomainOfLoader(), out var boundImpl) ||
+                 TryGetResolvedBinding(facade.FullName, name, signature.HasThis,
+                    signature.ParamTypes.Select(t => ParamTypeName(t, null)).ToArray(),
+                    CallerDomainOfLoader(), out boundImpl))) {
                 return new CallTarget {
                     Arity = arity,
                     Intrinsic = boundImpl,
@@ -289,9 +305,12 @@ internal sealed partial class CallEngine {
 
         var definition = (VmClassType)constructed.Definition;
         if (CanAttemptRuntimeBinding(definition)) {
-            var realParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, context)).ToArray();
+            var realParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, signatureContext)).ToArray();
             if (TryGetResolvedBinding(definition.FullName, name, signature.HasThis, realParamNames,
-                    CallerDomainOfLoader(), out var realBound))
+                    CallerDomainOfLoader(), out var realBound) ||
+                TryGetResolvedBinding(definition.FullName, name, signature.HasThis,
+                    signature.ParamTypes.Select(t => ParamTypeName(t, null)).ToArray(),
+                    CallerDomainOfLoader(), out realBound))
                 return new CallTarget {
                     Arity = arity,
                     Intrinsic = realBound,
@@ -321,11 +340,7 @@ internal sealed partial class CallEngine {
     private CallTarget ResolveMethodSpecTarget(int token, int methodSpecRid, GenericContext? context, bool throwOnMissingIntrinsic = true) {
         var underlying = _loader.Image.Tables.DecodeCoded(
             TableKind.MethodSpec, methodSpecRid, 0, CodedIndexKind.MethodDefOrRef);
-        var instantiationBlobIndex = _loader.Image.Tables.GetRowIndex(TableKind.MethodSpec, methodSpecRid, 1);
-        var methodArgs = SignatureDecoder.DecodeMethodSpecInstantiation(
-            _loader.Image.GetBlob(instantiationBlobIndex),
-            _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-            _loader.Image.Limits?.MaxGenericNestingDepth ?? 64)
+        var methodArgs = _loader.DecodeMethodSpecSignature(methodSpecRid)
             .Select(t => _loader.ResolveToken(t, context))
             .ToArray();
 
@@ -346,10 +361,7 @@ internal sealed partial class CallEngine {
         }
         if (underlying.Table == TableKind.MemberRef) {
             var memberRefRid = underlying.Rid;
-            var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(memberRefRid),
-                _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-                _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+            var signature = _loader.DecodeMemberRefMethodSignature(memberRefRid);
             var name = _loader.GetMemberRefName(memberRefRid);
             var parent = _loader.Image.Tables.DecodeCoded(
                 TableKind.MemberRef, memberRefRid, 0, CodedIndexKind.MemberRefParent);

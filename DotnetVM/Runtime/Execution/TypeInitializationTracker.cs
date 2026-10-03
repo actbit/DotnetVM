@@ -22,7 +22,7 @@ internal sealed class TypeInitializationTracker {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<TypeInitializationKey, Entry> _entries = new();
 
     public bool IsCompleted(VmType type) {
-        if (!_entries.TryGetValue(TypeInitializationKey.For(type), out var entry))
+        if (!_entries.TryGetValue(TypeInitializationKey.For(type, snapshot: false), out var entry))
             return false;
         return Volatile.Read(ref entry.Status) == (int)TypeInitializationStatus.Completed;
     }
@@ -55,7 +55,7 @@ internal sealed class TypeInitializationTracker {
             // guest IL 実行中は entry.Gate も VM-wide gate も保持しない。
             initializer();
             lock (entry.Gate) {
-                entry.Status = (int)TypeInitializationStatus.Completed;
+                Volatile.Write(ref entry.Status, (int)TypeInitializationStatus.Completed);
                 entry.OwnerThreadId = 0;
                 Monitor.PulseAll(entry.Gate);
             }
@@ -71,7 +71,7 @@ internal sealed class TypeInitializationTracker {
     }
 
     internal TypeInitializationStatus GetStatus(VmType type) {
-        if (!_entries.TryGetValue(TypeInitializationKey.For(type), out var entry))
+        if (!_entries.TryGetValue(TypeInitializationKey.For(type, snapshot: false), out var entry))
             return TypeInitializationStatus.NotStarted;
         lock (entry.Gate)
             return (TypeInitializationStatus)entry.Status;
@@ -103,8 +103,11 @@ internal sealed class TypeInitializationTracker {
             _arguments = arguments;
         }
 
-        public static TypeInitializationKey For(VmType type) => type switch {
-            VmConstructedType constructed => new(constructed.Definition, [.. constructed.TypeArguments]),
+        // Stored keys own a snapshot; lookup-only keys borrow the argument
+        // array and are never inserted into the dictionary.
+        public static TypeInitializationKey For(VmType type, bool snapshot = true) => type switch {
+            VmConstructedType constructed => new(constructed.Definition,
+                snapshot ? [.. constructed.TypeArguments] : constructed.TypeArguments),
             _ => new(type, []),
         };
 

@@ -267,7 +267,7 @@ internal sealed class GuestTaskRuntime(
     }
 
     public void ScheduleContinuation(VmTaskObject awaited, StackSlot stateMachine, Action<StackSlot> resume,
-        StackSlot? contextRoot = null) {
+        StackSlot? contextRoot = null, Action<Exception>? onError = null) {
         var state = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef byRef
             ? byRef.Read()
             : stateMachine;
@@ -293,7 +293,7 @@ internal sealed class GuestTaskRuntime(
                 _shutdownToken.ThrowIfCancellationRequested();
                 resume(detachedRef);
                 return default;
-            }, onSuccess: null, onError: _ => { },
+            }, onSuccess: null, onError: onError ?? (_ => { }),
                 onFinished: () => _continuationRoots.TryRemove(id, out _));
         } catch {
             _continuationRoots.TryRemove(id, out _);
@@ -478,7 +478,7 @@ internal sealed class GuestTaskRuntime(
     /// continuation root として保持する。
     /// </summary>
     internal ExternalContinuation RegisterExternalContinuation(StackSlot stateMachine,
-        StackSlot[] extraRoots, VmDelegate callback, Action<StackSlot> resume) {
+        StackSlot[] extraRoots, VmDelegate callback, Action<StackSlot> resume, Action<Exception>? onError = null) {
         var state = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef byRef
             ? byRef.Read()
             : stateMachine;
@@ -500,7 +500,7 @@ internal sealed class GuestTaskRuntime(
             ThrowIfDisposed();
             _continuationRoots[id] = roots;
         }
-        return new ExternalContinuation(this, id, roots, detachedRef, resume);
+        return new ExternalContinuation(this, id, roots, detachedRef, resume, onError);
     }
 
     internal sealed class ExternalContinuation {
@@ -509,15 +509,17 @@ internal sealed class GuestTaskRuntime(
         private readonly StackSlot[] _roots;
         private readonly StackSlot _stateMachine;
         private readonly Action<StackSlot> _resume;
+        private readonly Action<Exception> _onError;
         private int _signalled;
 
         public ExternalContinuation(GuestTaskRuntime owner, long id, StackSlot[] roots,
-            StackSlot stateMachine, Action<StackSlot> resume) {
+            StackSlot stateMachine, Action<StackSlot> resume, Action<Exception>? onError) {
             _owner = owner;
             _id = id;
             _roots = roots;
             _stateMachine = stateMachine;
             _resume = resume;
+            _onError = onError ?? (_ => { });
         }
 
         public void Signal() {
@@ -528,7 +530,7 @@ internal sealed class GuestTaskRuntime(
                     _owner._shutdownToken.ThrowIfCancellationRequested();
                     _resume(_stateMachine);
                     return default;
-                }, onSuccess: null, onError: _ => { },
+                }, onSuccess: null, onError: _onError,
                     onFinished: () => _owner._continuationRoots.TryRemove(_id, out _));
             } catch {
                 _owner._continuationRoots.TryRemove(_id, out _);
@@ -673,8 +675,7 @@ internal sealed class GuestTaskRuntime(
                 if (cancelled)
                     return;
                 if (failure is not null) {
-                    if (trackedTask is not null)
-                        onError(failure);
+                    onError(failure);
                     return;
                 }
                 onSuccess?.Invoke(result);
@@ -817,7 +818,7 @@ internal sealed class GuestTaskRuntime(
     }
 
     /// <summary>型名ではなく VM 型定義と型引数の identity による cache key 比較。</summary>
-    private sealed class VmTypeIdentityComparer : IEqualityComparer<VmType> {
+    internal sealed class VmTypeIdentityComparer : IEqualityComparer<VmType> {
         public static VmTypeIdentityComparer Instance { get; } = new();
 
         public bool Equals(VmType? x, VmType? y) {

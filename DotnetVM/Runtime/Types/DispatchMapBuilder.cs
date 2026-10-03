@@ -130,10 +130,7 @@ internal sealed class DispatchMapBuilder {
     /// スロットキーは暗黙実装と同じくインターフェース定義文脈で正規化する。</summary>
     private void MapExplicitInterfaceImplementation(DispatchMaps maps, int memberRefRid, VmMethod body) {
         try {
-            var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(memberRefRid),
-                _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-                _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+            var signature = _loader.DecodeMemberRefMethodSignature(memberRefRid);
             var name = _loader.GetMemberRefName(memberRefRid);
             var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, memberRefRid, 0, CodedIndexKind.MemberRefParent);
             var declaring = _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: Token.From(parent.Table, parent.Rid).Value));

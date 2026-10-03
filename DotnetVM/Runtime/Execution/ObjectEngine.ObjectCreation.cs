@@ -250,10 +250,7 @@ internal sealed partial class ObjectEngine {
             var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
             if (parent.Table == TableKind.TypeSpec)
                 return NewConstructedObject(token, rid, parent.Rid, caller);
-            var signature = SignatureDecoder.DecodeMethodSignature(
-                _loader.Image.GetMemberRefSignature(rid),
-                _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-                _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+            var signature = _loader.DecodeMemberRefMethodSignature(rid);
             var facadeParamCount = signature.ParamTypes.Length;
             var name = _loader.GetMemberRefName(rid);
             var typeName = _loader.GetMemberRefParentTypeName(rid);
@@ -431,10 +428,7 @@ internal sealed partial class ObjectEngine {
     /// </summary>
     private StackSlot NewConstructedObject(int token, int memberRefRid, int typeSpecRid, InterpreterFrame caller) {
         var constructed = ResolveConstructedParent(typeSpecRid, caller.Context);
-        var signature = SignatureDecoder.DecodeMethodSignature(
-            _loader.Image.GetMemberRefSignature(memberRefRid),
-            _loader.Image.Limits?.MaxSignatureDepth ?? 64,
-            _loader.Image.Limits?.MaxGenericNestingDepth ?? 64);
+        var signature = _loader.DecodeMemberRefMethodSignature(memberRefRid);
         var paramCount = signature.ParamTypes.Length;
         var ctorName = _loader.GetMemberRefName(memberRefRid);
         var context = new GenericContext { ClassArgs = constructed.TypeArguments };
@@ -449,7 +443,9 @@ internal sealed partial class ObjectEngine {
 
         // ValueTask<T> は intrinsic 値型であり、guest TypeDef の .ctor を実行しない。
         // 値から作る ctor と Task<T> を包む ctor を同じ VM Task 表現へ正規化する。
-        if (constructed.Definition is VmIntrinsicType { FullName: "System.Threading.Tasks.ValueTask`1" } &&
+        if (constructed.Definition.FullName == "System.Threading.Tasks.ValueTask`1" &&
+            (constructed.Definition is VmIntrinsicType ||
+             constructed.Definition is VmClassType { Loader.IsTrustedCoreLib: true }) &&
             ctorName == ".ctor" && paramCount is 1 or 2) {
             var resultType = constructed.TypeArguments.FirstOrDefault()
                 ?? _loader.FindIntrinsicType("System.Object")!;

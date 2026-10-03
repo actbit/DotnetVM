@@ -114,6 +114,17 @@ public sealed class SecurityBoundaryTests {
     }
 
     [Fact]
+    public void StringAllocation_RejectsOversizeBeforeBufferSizingAndKeepsAccounting() {
+        var heap = new VmHeap(new MemoryPolicy { TotalAllocationByteLimit = 32 });
+        var strings = new VmStringPool(heap);
+
+        Assert.Throws<MemoryQuotaExceededException>(() => strings.Allocate(int.MaxValue));
+        Assert.Equal(0, heap.Snapshot().TotalAllocatedBytes);
+        Assert.Equal("a", strings.GetOrNew("a").Value);
+        Assert.True(heap.Snapshot().TotalAllocatedBytes <= 32);
+    }
+
+    [Fact]
     public void VmHeap_RejectsNegativeHostWorkWithoutChangingAccounting() {
         var heap = new VmHeap(new MemoryPolicy { HostWorkBudget = 10 });
 

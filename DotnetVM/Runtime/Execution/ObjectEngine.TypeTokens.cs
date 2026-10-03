@@ -10,10 +10,17 @@ internal sealed partial class ObjectEngine {
 
     public VmType ResolveTypeToken(int token, GenericContext? context = null,
         IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        _loader.EnsureLive();
         if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmType dynamicType)
             return dynamicType;
-        return _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token), context);
+        var assemblyContext = dynamicTokens is null && _intrinsics.IsSealed ? _loader.Context : null;
+        var keyContext = (TableKind)(token >> 24) == TableKind.TypeSpec ? context : null;
+        if (_typeTokens.TryGet(assemblyContext, token, keyContext, false, out var cached, out var version))
+            return cached;
+        var type = _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: (uint)token), context);
+        _typeTokens.Add(assemblyContext, version, token, keyContext, false, type);
+        return type;
     }
 
     /// <summary>MemberRef の TypeSpec 親を構築型として解決する。VAR/MVAR を含む場合は context で置換する。</summary>

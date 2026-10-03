@@ -216,6 +216,7 @@ public sealed partial class TypeLoader {
         };
         if (!_intrinsicTypes.TryAdd(type.FullName, type))
             throw new InvalidOperationException($"intrinsic 型 {type.FullName} は既に登録されています。");
+        ClearTypeReferenceCache();
     }
 
     /// <summary>ファサード型を名前で取得 (無ければ null)。</summary>

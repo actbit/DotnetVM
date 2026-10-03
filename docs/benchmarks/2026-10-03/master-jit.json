@@ -1,0 +1,271 @@
+{
+  "Runtime": "10.0.12",
+  "MeasuredAt": "2026-10-03T08:02:05.6450057+00:00",
+  "OS": "Microsoft Windows NT 10.0.26200.0",
+  "HostTieredCompilation": "0",
+  "EnableJit": true,
+  "Warmups": 3,
+  "Samples": 7,
+  "Results": [
+    {
+      "Name": "Arithmetic",
+      "Count": 5000,
+      "MedianMilliseconds": 4.3667,
+      "MedianAllocatedBytes": 302592,
+      "Instructions": 85010,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        4.2832,
+        4.3298,
+        4.3528,
+        4.3667,
+        4.3688,
+        4.6537,
+        5.0578
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00280259,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00276871,
+          0.00277415,
+          0.00277427,
+          0.00280259,
+          0.00283459,
+          0.002882305,
+          0.0029040150000000002
+        ]
+      },
+      "VmToCoreClrRatio": 1558.0944768945867
+    },
+    {
+      "Name": "FieldAccess",
+      "Count": 5000,
+      "MedianMilliseconds": 6.3849,
+      "MedianAllocatedBytes": 308208,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        6.3106,
+        6.3403,
+        6.3515,
+        6.3849,
+        6.391,
+        6.4276,
+        6.4597
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0027982849999999997,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00277722,
+          0.00278502,
+          0.0027857150000000002,
+          0.0027982849999999997,
+          0.0028588349999999997,
+          0.00290017,
+          0.0029013750000000003
+        ]
+      },
+      "VmToCoreClrRatio": 2281.7189814475655
+    },
+    {
+      "Name": "GenericFieldAccess",
+      "Count": 5000,
+      "MedianMilliseconds": 13.3423,
+      "MedianAllocatedBytes": 5909832,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        13.0874,
+        13.2721,
+        13.3297,
+        13.3423,
+        13.4296,
+        14.0054,
+        14.4238
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.002774275,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.002764195,
+          0.002765925,
+          0.002772055,
+          0.002774275,
+          0.002776935,
+          0.0027770399999999997,
+          0.0027882049999999998
+        ]
+      },
+      "VmToCoreClrRatio": 4809.292517865028
+    },
+    {
+      "Name": "MethodCalls",
+      "Count": 1000,
+      "MedianMilliseconds": 1.3736,
+      "MedianAllocatedBytes": 526592,
+      "Instructions": 16010,
+      "Expected": 500500,
+      "ElapsedMilliseconds": [
+        1.3363,
+        1.354,
+        1.3564,
+        1.3736,
+        1.3889,
+        1.4529,
+        1.4981
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0012041712667402679,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 83332,
+        "ElapsedMilliseconds": [
+          0.0011948363173810781,
+          0.0011948939183026928,
+          0.0011969039504632073,
+          0.0012041712667402679,
+          0.0012719111505784093,
+          0.0012986667786684587,
+          0.0013351977631642106
+        ]
+      },
+      "VmToCoreClrRatio": 1140.7015247244533
+    },
+    {
+      "Name": "List",
+      "Count": 500,
+      "MedianMilliseconds": 124.9703,
+      "MedianAllocatedBytes": 23320784,
+      "Instructions": 61597,
+      "Expected": 125250,
+      "ElapsedMilliseconds": [
+        124.3232,
+        124.8012,
+        124.9062,
+        124.9703,
+        126.4847,
+        128.4473,
+        128.9102
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00495244,
+        "MedianAllocatedBytes": 2096,
+        "IterationsPerSample": 10000,
+        "ElapsedMilliseconds": [
+          0.00492252,
+          0.00493377,
+          0.00494024,
+          0.00495244,
+          0.00498079,
+          0.00503133,
+          0.00508729
+        ]
+      },
+      "VmToCoreClrRatio": 25234.086632044004
+    },
+    {
+      "Name": "ListGrowth",
+      "Count": 500,
+      "Error": "NotSupportedException",
+      "Message": "\u578B\u53C2\u7167 \u0027Enumerator\u0027 \u3092\u89E3\u6C7A\u3067\u304D\u307E\u305B\u3093 (\u30B9\u30B3\u30FC\u30D7 TypeRef)\u3002"
+    },
+    {
+      "Name": "Linq",
+      "Count": 500,
+      "Error": "OperationNotAllowedException",
+      "Message": "intrinsic System.Environment::get_CurrentManagedThreadId (\u5F15\u6570 0 \u500B) \u306F\u672A\u767B\u9332\u3067\u3059\u3002BCL \u9762\u306F VM \u8D77\u52D5\u6642\u306B\u767B\u9332\u3055\u308C\u305F\u30E9\u30F3\u30BF\u30A4\u30E0\u30D0\u30A4\u30F3\u30C9 / intrinsic \u306E\u307F\u63D0\u4F9B\u3055\u308C\u307E\u3059\u3002 \u7F72\u540D: "
+    },
+    {
+      "Name": "DictionaryInt",
+      "Count": 200,
+      "Error": "InvalidOperationException",
+      "Message": "DictionaryInt: CLR=59700, VM=796"
+    },
+    {
+      "Name": "DictionaryGrowth",
+      "Count": 200,
+      "Error": "BadImageFormatException",
+      "Message": "\u30E1\u30BD\u30C3\u30C9 System.Array::Copy \u306E IL_001C: \u30A4\u30F3\u30B9\u30BF\u30F3\u30B9\u547C\u51FA\u306E\u30EC\u30B7\u30FC\u30D0\u578B NativeInt \u304C\u4E0D\u6B63\u3067\u3059\u3002"
+    },
+    {
+      "Name": "DictionaryString",
+      "Count": 200,
+      "MedianMilliseconds": 81.0457,
+      "MedianAllocatedBytes": 29688536,
+      "Instructions": 263028,
+      "Expected": 19908,
+      "ElapsedMilliseconds": [
+        80.5022,
+        80.5424,
+        80.71,
+        81.0457,
+        82.2745,
+        93.3534,
+        96.7755
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.005108832429706216,
+        "MedianAllocatedBytes": 440,
+        "IterationsPerSample": 15862,
+        "ElapsedMilliseconds": [
+          0.005065414197453032,
+          0.00508252427184466,
+          0.0050838607993947795,
+          0.005108832429706216,
+          0.0052520426175765985,
+          0.00551912747446728,
+          0.006452320010087
+        ]
+      },
+      "VmToCoreClrRatio": 15863.839950738127
+    },
+    {
+      "Name": "AsyncCompleted",
+      "Count": 200,
+      "MedianMilliseconds": 9.1431,
+      "MedianAllocatedBytes": 1630168,
+      "Instructions": 8257,
+      "Expected": 19900,
+      "ElapsedMilliseconds": [
+        8.6685,
+        8.8266,
+        9.0583,
+        9.1431,
+        10.7229,
+        10.863,
+        11.7712
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0014793789109671753,
+        "MedianAllocatedBytes": 13824,
+        "IterationsPerSample": 72872,
+        "ElapsedMilliseconds": [
+          0.0013744195301350313,
+          0.0013817103963113405,
+          0.001434710176748271,
+          0.0014793789109671753,
+          0.0015022958063453727,
+          0.001554560050499506,
+          0.0016185187726424416
+        ]
+      },
+      "VmToCoreClrRatio": 6180.363889344958
+    },
+    {
+      "Name": "ValueTaskCompleted",
+      "Count": 200,
+      "Error": "UnhandledGuestException",
+      "Message": "\u30B2\u30B9\u30C8\u3067\u672A\u51E6\u7406\u306E\u4F8B\u5916: System.InvalidOperationException"
+    },
+    {
+      "Name": "AsyncWorkers",
+      "Count": 8,
+      "Error": "OperationNotAllowedException",
+      "Message": "\u30E1\u30BD\u30C3\u30C9 System.Diagnostics.Debugger::IsManagedDebuggerAttached \u306F\u30CD\u30A4\u30C6\u30A3\u30D6\u5B9F\u884C (P/Invoke) \u3092\u8981\u6C42\u3057\u307E\u3059\u304C\u3001VM \u306F\u30CD\u30A4\u30C6\u30A3\u30D6\u4F9D\u5B58\u3092\u8A31\u53EF\u3057\u307E\u305B\u3093\u3002"
+    }
+  ]
+}

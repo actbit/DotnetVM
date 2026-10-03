@@ -74,9 +74,13 @@ public struct StackSlot {
 /// 深いゲスト再帰でもホストスタックを消費しないようヒープ確保とする。
 /// </summary>
 public sealed class EvaluationStack {
-    private StackSlot[] _slots;
+    private readonly StackSlot[] _slots;
     public int Count { get; private set; }
     public readonly int MaxStack;
+    // Pop/Clear erase unused slots, so scanning this buffer at a stopped-world
+    // boundary is equivalent to copying the active prefix, without allocation.
+    internal StackSlot[] RootSlots => _slots;
+    internal ReadOnlySpan<StackSlot> ActiveSlots => _slots.AsSpan(0, Count);
 
     public EvaluationStack(int maxStack) {
         if (maxStack < 0)
@@ -90,34 +94,66 @@ public sealed class EvaluationStack {
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Push(in StackSlot slot) {
-        if (Count == _slots.Length)
+        var index = Count;
+        if ((uint)index >= (uint)_slots.Length)
             throw new BadImageFormatException(
-                $"評価スタックがオーバーフローしました (Count={Count}, MaxStack={MaxStack})。");
-        _slots[Count++] = slot;
+                $"評価スタックがオーバーフローしました (Count={index}, MaxStack={MaxStack})。");
+        _slots[index] = slot;
+        Count = index + 1;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public StackSlot Pop() {
-        if (Count == 0)
+        var index = Count - 1;
+        if ((uint)index >= (uint)_slots.Length)
             throw new BadImageFormatException("評価スタックが空です (pop できません)。");
-        var slot = _slots[--Count];
-        _slots[Count] = default;
+        ref var top = ref _slots[index];
+        var slot = top;
+        top = default;
+        Count = index;
         return slot;
     }
 
     /// <summary>peek (取り出さない)。</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref StackSlot Peek() {
-        if (Count == 0)
+        var index = Count - 1;
+        if ((uint)index >= (uint)_slots.Length)
             throw new BadImageFormatException("評価スタックが空です (peek できません)。");
-        return ref _slots[Count - 1];
+        return ref _slots[index];
     }
 
     /// <summary>上から depth 番目を参照 (dup や二項演算の両辺参照用)。</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref StackSlot PeekAt(int depth) {
-        if (depth < 0 || depth >= Count)
-            throw new BadImageFormatException($"評価スタックの深さ {depth} は範囲外です (Count={Count})。");
-        return ref _slots[Count - 1 - depth];
+        var count = Count;
+        var index = count - 1 - depth;
+        if ((uint)depth >= (uint)count || (uint)index >= (uint)_slots.Length)
+            throw new BadImageFormatException($"評価スタックの深さ {depth} は範囲外です (Count={count})。");
+        return ref _slots[index];
+    }
+
+    /// <summary>呼出引数を IL の引数順でコピーし、元のスロットを消去する。</summary>
+    internal StackSlot[] PopArguments(int arity) {
+        var source = ArgumentSlots(arity);
+        var arguments = source.ToArray();
+        source.Clear();
+        Count -= arity;
+        return arguments;
+    }
+
+    // A synchronous primitive leaf can borrow these slots. Keep them active
+    // until it returns so the caller remains a GC root at every safepoint.
+    internal Span<StackSlot> ArgumentSlots(int arity) {
+        var count = Count;
+        if ((uint)arity > (uint)count)
+            throw new BadImageFormatException("評価スタックに呼出引数が足りません。");
+        return _slots.AsSpan(count - arity, arity);
+    }
+
+    internal void DropArguments(int arity) {
+        ArgumentSlots(arity).Clear();
+        Count -= arity;
     }
 
     public void Clear() {

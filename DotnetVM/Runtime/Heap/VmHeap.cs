@@ -47,6 +47,9 @@ public sealed class VmHeap {
     /// <summary>GC 戦略名。</summary>
     public string GcStrategyName => _strategy.Name;
 
+    /// <summary>Lock-free safepoint hint. CollectIfDue rechecks the request under the heap lock.</summary>
+    internal bool IsCollectionDue => Volatile.Read(ref _collectionDue);
+
     /// <summary>オブジェクトを直接ルートとして登録する (GcHandleTable 等)。</summary>
     public void AddRootObjectSource(Func<IEnumerable<VmObject?>> source) {
         lock (_gate)
@@ -179,7 +182,7 @@ public sealed class VmHeap {
         _liveBytes += size;
         _allocatedSinceGc += size;
         if (_allocatedSinceGc >= _memory.GcTriggerAllocationInterval)
-            _collectionDue = true; // 実回収はセーフポイントで (ルート整合のため確保の再入では起動しない)
+            Volatile.Write(ref _collectionDue, true); // 実回収はセーフポイントで (ルート整合のため確保の再入では起動しない)
     }
 
     /// <summary>
@@ -358,7 +361,7 @@ public sealed class VmHeap {
                 _liveBytes += ObjectModel.EstimateSize(obj);
             _collectionCount++;
             _allocatedSinceGc = 0;
-            _collectionDue = false;
+            Volatile.Write(ref _collectionDue, false);
 
             if (_liveBytes > _memory.LiveObjectByteLimit)
                 throw new MemoryQuotaExceededException(

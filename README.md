@@ -146,28 +146,31 @@ dotnet build DotnetVM.slnx --configuration Release
 dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
 ```
 
-2026-09-25 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
+2026-10-03 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
 最適化後のコードを実行した結果は次のとおりです。値は実行環境や負荷で変動します。
 
 | パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Arithmetic (100,000) | 0.805 | 1,944.108 | 1,063.670 | 45.3% | 1,837.696 | 955.202 | 48.0% | 1.11x |
-| Branches (100,000) | 1.843 | 2,098.228 | 1,006.932 | 52.0% | 1,978.085 | 898.421 | 54.6% | 1.12x |
-| Array access (10,000) | 0.106 | 297.485 | 163.757 | 45.0% | 279.503 | 144.034 | 48.5% | 1.14x |
-| Method calls (100,000) | 0.520 | 2,119.416 | 986.856 | 53.4% | 1,975.761 | 571.500 | 71.1% | 1.73x |
-| Object allocation (10,000) | 0.228 | 2,307.112 | 2,070.939 | 10.2% | 2,307.804 | 2,033.294 | 11.9% | 1.02x |
+| Arithmetic (100,000) | 0.786 | 1,197.132 | 550.522 | 54.0% | 960.356 | 388.441 | 59.6% | 1.42x |
+| Branches (100,000) | 1.869 | 1,130.681 | 524.019 | 53.7% | 910.749 | 364.704 | 60.0% | 1.44x |
+| Array access (10,000) | 0.102 | 182.278 | 84.974 | 53.4% | 148.618 | 60.630 | 59.2% | 1.40x |
+| Method calls (100,000) | 0.512 | 1,331.274 | 963.212 | 27.6% | 725.634 | 365.238 | 49.7% | 2.64x |
+| Object allocation (10,000) | 0.323 | 2,750.111 | 2,737.643 | 0.5% | 2,720.397 | 2,660.970 | 2.2% | 1.03x |
 
-`master interp/JIT` は変更前の `origin/master` (`1897c72`) を同じ条件で測定した値、
-改善率は `1 - current / master` です。この測定では interpreter は 10.2〜53.4%、
-JIT は 11.9〜71.1% 高速化し、VM JIT は interpreter より 1.02〜1.73 倍高速でした。一方、CoreCLR は
+`master interp/JIT` は変更前の `origin/master` (`93da98e`) を同じ条件で測定した値、
+改善率は `1 - current / master` (実行時間の削減率) です。この測定では、オブジェクト確保以外の
+4 パターンで interpreter は 27.6〜54.0%、JIT は 49.7〜60.0% の実行時間を削減しました。
+VM JIT は interpreter より 1.03〜2.64 倍高速でした。一方、CoreCLR は
 ネイティブコードを直接実行するため、VM の各命令におけるクォータ・セーフポイント・
 フレーム管理コストとは比較対象の層が異なり、VM より大幅に高速です。これは VM JIT が
 CoreCLR のネイティブ JIT と同じ速度特性を持つことを意味しません。値は実行環境や負荷で
 変動するため、ベンチマークを追加・変更した場合は上記コマンドで README の実測値も更新してください。
 
-今回の `VmHeap.Allocate` の型別サイズ経路は、クォータと GC の意味論を変えずに共通型の型判定を省くものです。
-標準ベンチマークでは Object allocation の変化は計測誤差の範囲に留まったため、次の調査対象は
-`newobj` の型/constructor 解決、インスタンスストレージ生成、constructor 実行フレームです。
+GC 要求がない命令境界では、要求フラグの読み取りだけで全実行スレッドを停止するロックと
+その lease の確保を省きます。要求フラグはスレッド間に公開され、GC が必要な場合は従来どおり
+命令境界で全スレッドを停止してヒープのロック内で再確認します。キャンセル・破棄の検査と
+1,024 命令ごとの read lease 解放は継続します。Object allocation の差は小さく、
+この最適化による確保中心の処理の高速化は確認できませんでした。
 
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。

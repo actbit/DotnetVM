@@ -119,7 +119,11 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         _shared.ThrowIfDisposed();
         // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
         // その場で GC せず、RunFrameCore の次の命令境界で stop-the-world 回収する。
-        if (_coordinator.IsInsideGuestInstruction)
+        // Most instruction boundaries have no pending collection. Avoid taking
+        // the world write lock (and allocating a boundary lease) in that case.
+        // A concurrent allocation publishes its request for the next boundary;
+        // instruction batches still release their read lock every 1024 instructions.
+        if (!_heap.IsCollectionDue || _coordinator.IsInsideGuestInstruction)
             return;
         using (_coordinator.StopTheWorldAtBoundary())
             _services.Heap.CollectIfDue();

@@ -32,4 +32,9 @@ internal sealed partial class CallEngine(
     // generic caller context.  Cache their target object so a hot guest call
     // does not allocate and populate the same CallTarget on every iteration.
     private readonly ConcurrentDictionary<int, CallTarget> _methodDefTargets = new();
+    // Only successful intrinsic MemberRefs are cached, after registry sealing.
+    // Entries are loader-local, bounded by the image's MemberRef rows, and
+    // invalidated whenever the root context's assembly set changes.
+    private readonly ConcurrentDictionary<int, CachedIntrinsicTarget> _memberRefIntrinsicTargets = new();
+    private sealed record CachedIntrinsicTarget(VmAssemblyContext Context, long Version, CallTarget Target);
 }

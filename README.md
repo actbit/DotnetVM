@@ -153,8 +153,31 @@ dotnet build DotnetVM.slnx --configuration Release
 dotnet run --project DotnetVM.Benchmarks/DotnetVM.Benchmarks.csproj --configuration Release --no-build --no-restore
 ```
 
-2026-10-03 に AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
-最適化後のコードを実行した結果は次のとおりです。値は実行環境や負荷で変動します。
+#### 最新の測定: オブジェクト確保の改善 (2026-10-03)
+
+AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で、
+PR #27・#28 マージ後の `origin/master` (`25c5740`) と今回の変更を比較しました。
+値は各入力を 5 回実行する 9 サンプルの中央値です。
+
+| パターン (入力) | CoreCLR (ms) | 変更前 interp (ms) | 変更後 interp (ms) | interp 時間削減 | 変更前 JIT (ms) | 変更後 JIT (ms) | JIT 時間削減 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.782 | 551.551 | 546.315 | 1.0% | 377.949 | 374.608 | 0.9% |
+| Branches (100,000) | 1.819 | 538.902 | 518.720 | 3.7% | 377.342 | 347.572 | 7.9% |
+| Array access (10,000) | 0.100 | 84.725 | 84.884 | -0.2% | 60.066 | 58.797 | 2.1% |
+| Method calls (100,000) | 0.510 | 937.594 | 925.334 | 1.3% | 374.097 | 361.722 | 3.3% |
+| Object allocation (10,000) | 0.217 | 2,698.126 | 196.940 | 92.7% | 2,644.748 | 145.416 | 94.5% |
+
+Object allocation は interpreter で **13.7 倍**、VM JIT で **18.2 倍**高速化しました。
+コンストラクタからの `System.Object::.ctor` 呼出で、依存 DLL の存在確認と署名・バインド解決を
+繰り返していたため、検証済みの intrinsic MemberRef 呼出先を loader ごとに再利用します。
+レジストリが確定した root ロードコンテキストだけを対象にし、アセンブリ追加・除去・
+コンテキスト破棄時は再利用できなくします。ジェネリック呼出元、動的トークン、
+親コンテキストを持つ loader は通常の解決を続けます。命令クォータ、GC、コンストラクタの実行は継続します。
+他パターンの小さな差には測定変動が含まれます。CoreCLR に対しては引き続き大きな速度差があります。
+
+#### 過去の測定: セーフポイントの改善 (2026-10-03、PR #27)
+
+同じ環境で測定した次の結果も履歴として保持します。値は実行環境や負荷で変動します。
 
 | パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -178,6 +201,20 @@ GC 要求がない命令境界では、要求フラグの読み取りだけで�
 命令境界で全スレッドを停止してヒープのロック内で再確認します。キャンセル・破棄の検査と
 1,024 命令ごとの read lease 解放は継続します。Object allocation の差は小さく、
 この最適化による確保中心の処理の高速化は確認できませんでした。
+
+#### 過去の測定: 実行経路の改善 (2026-09-25)
+
+AMD Ryzen 9 3900 / Windows x64 / .NET SDK 10.0.401 (runtime 10.0.12) で記録した結果です。
+この表の `master` は当時の `origin/master` (`1897c72`)、`current` は当時の最適化後です。
+改善率は `1 - current / master` (実行時間の削減率) です。
+
+| パターン (入力) | CoreCLR (ms) | master interp (ms) | current interp (ms) | interp 改善 | master JIT (ms) | current JIT (ms) | JIT 改善 | interp / JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arithmetic (100,000) | 0.805 | 1,944.108 | 1,063.670 | 45.3% | 1,837.696 | 955.202 | 48.0% | 1.11x |
+| Branches (100,000) | 1.843 | 2,098.228 | 1,006.932 | 52.0% | 1,978.085 | 898.421 | 54.6% | 1.12x |
+| Array access (10,000) | 0.106 | 297.485 | 163.757 | 45.0% | 279.503 | 144.034 | 48.5% | 1.14x |
+| Method calls (100,000) | 0.520 | 2,119.416 | 986.856 | 53.4% | 1,975.761 | 571.500 | 71.1% | 1.73x |
+| Object allocation (10,000) | 0.228 | 2,307.112 | 2,070.939 | 10.2% | 2,307.804 | 2,033.294 | 11.9% | 1.02x |
 
 ### Native int
 VM の native int (`I` / `U`、`IntPtr` / `UIntPtr`) は、ホスト OS に依存せず **64-bit に固定**しています。`conv.i` / `conv.u`、`ldelem.i` / `stelem.i`、`ldind.i` / `stind.i`、ポインタ演算、`sizeof(IntPtr)` はこの規約に従います。32-bit guest ABI は提供しません。

@@ -21,14 +21,22 @@ public sealed class VmAssemblyContext(
     private readonly Func<string, bool> _pathExists = pathExists ?? File.Exists;
     internal Guid Identity { get; } = Guid.NewGuid();
     private int _retired;
+    private long _resolutionVersion;
+
+    // Root contexts can cache successful bindings against their own assembly set.
+    // Child contexts also depend on parent changes and keep resolving normally.
+    internal bool HasParent => _parent is not null;
+    internal long ResolutionVersion => Volatile.Read(ref _resolutionVersion);
 
     /// <summary>Unload 開始後は新しい解決/登録を一切許可しない。</summary>
     internal bool IsRetired => Volatile.Read(ref _retired) != 0;
     internal object LifetimeGate => _gate;
 
     internal void Retire() {
-        lock (_gate)
+        lock (_gate) {
             Volatile.Write(ref _retired, 1);
+            Interlocked.Increment(ref _resolutionVersion);
+        }
     }
 
     internal void EnsureActive() {
@@ -91,12 +99,14 @@ public sealed class VmAssemblyContext(
             loader.LoadContextIdentity = Identity;
             // 同一単純名の再ロードは最初のものを優先 (CLR のアセンブリ統合と同じ先行勝ち)
             _bySimpleName.TryAdd(loader.Image.Name, loader);
+            Interlocked.Increment(ref _resolutionVersion);
         }
     }
 
     internal void Unregister(TypeLoader loader) {
         lock (_gate) {
-            _loaders.Remove(loader);
+            if (_loaders.Remove(loader))
+                Interlocked.Increment(ref _resolutionVersion);
             if (_bySimpleName.TryGetValue(loader.Image.Name, out var current) && ReferenceEquals(current, loader)) {
                 _bySimpleName.Remove(loader.Image.Name);
                 var replacement = _loaders.FirstOrDefault(candidate =>

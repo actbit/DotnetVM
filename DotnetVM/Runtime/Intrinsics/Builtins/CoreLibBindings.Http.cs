@@ -40,6 +40,8 @@ internal static partial class CoreLibBindings {
                 ObjectDisposedException.ThrowIf(client.Disposed, "HttpClient");
                 var cancellation = withToken ? CancellationRuntime.State(a[^1])?.Token ?? default : default;
                 var url = StringValue(a[1]) ?? throw new ArgumentNullException("requestUri");
+                ctx.Heap.ChargeHostWork(url.Length);
+                ctx.Heap.ChargeHostBuffer(url.Length);
                 if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) throw new ArgumentException("An absolute HTTP URL is required.");
                 var body = post && a[2].ObjectValue is not null ? BclValue<GuestHttpContent>(a[2]).Bytes : Array.Empty<byte>();
                 var resultType = method == "GetStringAsync" ? "System.String" : method == "GetByteArrayAsync" ? "System.Byte[]" : "System.Net.Http.HttpResponseMessage";

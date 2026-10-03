@@ -114,6 +114,13 @@ BCL は実装しない代わりに、`System.String` / `Math` / `Console` / `Con
 
 ロケールは `VmHostOptions.Culture` に `CultureInfo` を指定できます (既定は `InvariantCulture`)。例: `new VmHostOptions { Culture = CultureInfo.GetCultureInfo("ja-JP") }`。VM は各外側 guest 呼出の間だけ `CurrentCulture` と `CurrentUICulture` に反映し、終了時にホスト thread の値を復元します。文字列比較・大文字小文字変換、数値の書式・Parse、DateTime / TimeSpan の Parse・ToString、および decimal.Parse はこの設定を使います。置換 IL の culture bridge は VM 内部専用で、guest が同名 assembly を持ち込んでも利用できません。`CultureInfo` オブジェクト自体の guest 面は未実装です。ordinal で意味論確定の面 (CompareOrdinal / IndexOf(char) / Contains / Replace / Split 全 overload) は DotnetVM.CoreLib 置換面 (`StringOrdinalOps`) が CLR と同じ結果を提供します。
 
+標準の文字列比較バインド (`Equals` / `Compare` / `CompareTo(string)` / `IndexOf(string)` /
+`LastIndexOf(string)` / `StartsWith(string)` / `EndsWith(string)` と登録済みの `StringComparison` overload)
+は、null 引数と不正な比較種別を各 CLR overload と同じ順序で検証します。
+例えば `"abc".CompareTo((string)null)` は正の値、`"abc".Equals(null, StringComparison.Ordinal)` は false を返し、
+`IndexOf` 等の null 検索値は `ArgumentNullException`、不正な比較種別は CLR が検証する場合に
+`ArgumentException` になります。これらの例外はゲストの `catch` で捕捉できます。
+
 ### 実行トレース (ExecutionTracer)
 `vm.Tracer.Start()` 〜 `Stop()` の間に IL 本体を実行したフレームが (アセンブリ名, 型完全名, メソッド名) で記録されます。intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されず、「CoreLib の managed IL が実際に走ったこと」の証明に使います。
 `ExecutionTraceOptions.MaxEvents` に加えて `MaxFrames` で保持数を制限でき、超過分は `DroppedEventCount` / `DroppedFrameCount` に計上されます。診断機能がゲストのリソース上限を迂回しないよう、既定値にも上限があります。

@@ -211,6 +211,29 @@ public class GcTests {
         Assert.Equal(7, vm.Invoke("Vm.Gc", "KeepStaticThenCollect"));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RepeatedHostInvocationsRegisterLiveFrameRoots(bool enableJit) {
+        using var vm = new VirtualMachine(new VmHostOptions {
+            EnableJit = enableJit,
+            JitPromotionThreshold = 1,
+            Memory = new MemoryPolicy {
+                InstructionQuota = 100_000_000,
+                GcTriggerAllocationInterval = 40,
+            },
+        });
+        vm.LoadAssembly(new MemoryStream(Compiled.Bytes));
+        for (var i = 0; i < 3; i++) {
+            vm.CollectGarbage();
+            Assert.Equal(2042, vm.Invoke("Vm.Gc", "GcDuringRun"));
+            // Returning the correct value alone cannot detect premature VM GC:
+            // the host can still retain the swept object's backing storage.
+            Assert.Contains(vm.Heap.TrackedObjects.OfType<VmClassInstance>(),
+                instance => instance.ClassType.FullName == "Vm.Node" && instance.Fields[0].AsInt32 == 42);
+        }
+    }
+
     [Fact]
     public void TotalAllocationByteLimit_RejectsDuringGuestRun() {
         using var vm = CreateVm(new MemoryPolicy {

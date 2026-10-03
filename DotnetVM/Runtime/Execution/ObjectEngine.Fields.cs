@@ -88,18 +88,29 @@ internal sealed partial class ObjectEngine {
     /// <summary>フィールドトークン (Field / MemberRef) を解決する。TypeSpec 親 (構築型のフィールド) も解決する。</summary>
     public VmField ResolveFieldToken(int token, GenericContext? context = null,
         IReadOnlyDictionary<uint, object>? dynamicTokens = null) {
+        _loader.EnsureLive();
         if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmField dynamicField)
             return dynamicField;
+        if ((TableKind)(token >> 24) == TableKind.Field) {
+            if (_fieldDefTokens.TryGetValue(token, out var cachedField))
+                return cachedField;
+            var definition = _loader.GetFieldByToken(unchecked((uint)token))
+                ?? throw new BadImageFormatException($"Field トークン 0x{token:X8} を解決できません。");
+            return _fieldDefTokens.GetOrAdd(token, definition);
+        }
+        var assemblyContext = dynamicTokens is null && _intrinsics.IsSealed ? _loader.Context : null;
+        var keyContext = (TableKind)(token >> 24) == TableKind.Field ? null : context;
+        if (_fieldTokens.TryGet(assemblyContext, token, keyContext, false, out var cached, out var version))
+            return cached;
+        var field = ResolveFieldTokenCore(token, context);
+        _fieldTokens.Add(assemblyContext, version, token, keyContext, false, field);
+        return field;
+    }
+
+    private VmField ResolveFieldTokenCore(int token, GenericContext? context) {
         var table = (TableKind)(token >> 24);
         var rid = (int)(token & 0xFFFFFF);
-        if (table == TableKind.Field && context is null && dynamicTokens is null) {
-            if (_fieldTokens.TryGetValue(token, out var cachedField))
-                return cachedField;
-            var resolvedField = _loader.GetFieldByToken((uint)token)
-                ?? throw new BadImageFormatException($"Field トークン 0x{token:X8} を解決できません。");
-            return _fieldTokens.GetOrAdd(token, resolvedField);
-        }
         switch (table) {
             case TableKind.Field:
                 return _loader.GetFieldByToken((uint)token)
@@ -152,56 +163,45 @@ internal sealed partial class ObjectEngine {
     /// <summary>ldfld の読み出し専用経路。通常のクラス/ボックス/構造体は
     /// ByRef オブジェクトを一時生成せず、フィールド配列から直接読む。</summary>
     public StackSlot ReadField(in StackSlot objSlot, VmField field) {
+        var storage = FindFieldStorage(objSlot, field);
+        lock (storage.Slots)
+            return storage.Slots[storage.Index];
+    }
+
+    /// <summary>stfld の直接書込経路。参照の readonly とスロット同期を保つ。</summary>
+    public void WriteField(in StackSlot objSlot, VmField field, in StackSlot value) {
+        var storage = FindFieldStorage(objSlot, field);
+        if (storage.IsReadOnly)
+            throw new UnhandledGuestException("System.InvalidProgramException",
+                "readonly. で作られたマネージ参照には書き込めません。");
+        lock (storage.Slots)
+            storage.Slots[storage.Index] = SlotOps.StoreCopyOfValue(value);
+    }
+
+    private (StackSlot[] Slots, int Index, bool IsReadOnly) FindFieldStorage(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
             case StackKind.Object when objSlot.ObjectValue is null:
                 throw new UnhandledGuestException("System.NullReferenceException", null);
             case StackKind.Object when objSlot.ObjectValue is VmString str &&
                 TryGetStringFieldOffset(field.Name, out _):
                 str.SyncFieldSlotsFromBytes();
-                return str.FieldSlots[field.Name is "_stringLength" or "m_stringLength" ? 0 : 1];
+                return (str.FieldSlots, field.Name is "_stringLength" or "m_stringLength" ? 0 : 1, false);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
-                return instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)];
+                return (instance.Fields, GetInstanceFieldIndex(instance.ClassType, field), false);
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
                 if (DefinitionOf(boxed.Type) is VmClassType boxedType)
-                    return boxed.Fields[GetInstanceFieldIndex(boxedType, field)];
-                return boxed.Fields[0];
-            case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer:
-                return ReadField(outer.Read(), field);
+                    return (boxed.Fields, GetInstanceFieldIndex(boxedType, field), false);
+                return (boxed.Fields, 0, false);
+            case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
+                var nested = FindFieldStorage(outer.Read(), field);
+                return (nested.Slots, nested.Index, outer.IsReadOnly || nested.IsReadOnly);
+            }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct:
                 if (DefinitionOf(direct.StructType) is VmClassType directType)
-                    return direct.Fields[GetInstanceFieldIndex(directType, field)];
+                    return (direct.Fields, GetInstanceFieldIndex(directType, field), false);
                 break;
         }
-        return FieldLocation(objSlot, field).Read();
-    }
-
-    /// <summary>stfld の通常クラス/ボックス/構造体向け直接書込経路。
-    /// ByRef ラッパーを作らず、所有済みのフィールド配列へ値コピーを行う。</summary>
-    public void WriteField(in StackSlot objSlot, VmField field, in StackSlot value) {
-        switch (objSlot.Kind) {
-            case StackKind.Object when objSlot.ObjectValue is null:
-                throw new UnhandledGuestException("System.NullReferenceException", null);
-            case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
-                instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)] = SlotOps.StoreCopyOfValue(value);
-                return;
-            case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
-                if (DefinitionOf(boxed.Type) is VmClassType boxedType) {
-                    boxed.Fields[GetInstanceFieldIndex(boxedType, field)] = SlotOps.StoreCopyOfValue(value);
-                    return;
-                }
-                boxed.Fields[0] = SlotOps.StoreCopyOfValue(value);
-                return;
-            case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer:
-                WriteField(outer.Read(), field, value);
-                return;
-            case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct:
-                if (DefinitionOf(direct.StructType) is VmClassType directType) {
-                    direct.Fields[GetInstanceFieldIndex(directType, field)] = SlotOps.StoreCopyOfValue(value);
-                    return;
-                }
-                break;
-        }
-        FieldLocation(objSlot, field).Write(SlotOps.StoreCopyOfValue(value));
+        throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }
 
     /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。

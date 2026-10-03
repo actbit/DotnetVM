@@ -275,6 +275,7 @@ public sealed class IntrinsicRegistry {
     private readonly object _gate = new();
     private readonly Dictionary<IntrinsicKey, IntrinsicImpl> _impls = [];
     private readonly Dictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)> _bindings = [];
+    private readonly HashSet<string> _bindingTypes = new(StringComparer.Ordinal);
     private readonly Dictionary<(string TypeFullName, string FieldName), Func<IntrinsicContext, StackSlot>> _staticFields = [];
     private bool _sealed;
 
@@ -299,6 +300,7 @@ public sealed class IntrinsicRegistry {
             throw new OperationNotAllowedException("VM 実行開始後のランタイムバインド登録は許可されていません。");
         if (!_bindings.TryAdd(key, (impl, origin)))
             throw new InvalidOperationException($"ランタイムバインド {key} は既に登録されています。");
+        _bindingTypes.Add(key.TypeFullName);
         }
     }
 
@@ -330,11 +332,14 @@ public sealed class IntrinsicRegistry {
     }
 
     /// <summary>実行開始前に呼ぶ。以降の登録を拒否する。</summary>
-    public void Seal() { lock (_gate) _sealed = true; }
+    public void Seal() { lock (_gate) Volatile.Write(ref _sealed, true); }
 
-    public bool IsSealed { get { lock (_gate) return _sealed; } }
+    public bool IsSealed => Volatile.Read(ref _sealed);
 
     public bool TryGet(IntrinsicKey key, out IntrinsicImpl impl) {
+        // Seal publishes all registrations and permanently forbids mutation.
+        if (IsSealed)
+            return _impls.TryGetValue(key, out impl!);
         lock (_gate)
             return _impls.TryGetValue(key, out impl!);
     }
@@ -347,7 +352,14 @@ public sealed class IntrinsicRegistry {
     /// </summary>
     public bool TryGetBinding(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin,
         BindingDomain callerDomain = BindingDomain.Guest) {
-        lock (_gate) {
+        if (IsSealed)
+            return TryGetBindingCore(key, out impl, out origin, callerDomain);
+        lock (_gate)
+            return TryGetBindingCore(key, out impl, out origin, callerDomain);
+    }
+
+    private bool TryGetBindingCore(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin,
+        BindingDomain callerDomain) {
         // 完全一致 (domain も含めて照合)
         if (_bindings.TryGetValue(key, out var entry) &&
             (key.Domain != BindingDomain.TrustedCoreLib || callerDomain == BindingDomain.TrustedCoreLib ||
@@ -374,14 +386,14 @@ public sealed class IntrinsicRegistry {
         impl = null!;
         origin = default;
         return false;
-        }
     }
 
     /// <summary>指定型に署名バインドが登録されているか (provenance policy 用)。</summary>
     public bool HasBindingForType(string typeFullName) {
+        if (IsSealed)
+            return _bindingTypes.Contains(typeFullName);
         lock (_gate)
-            return _bindings.Keys.Any(key => string.Equals(key.TypeFullName, typeFullName,
-                StringComparison.Ordinal));
+            return _bindingTypes.Contains(typeFullName);
     }
 
     public bool HasBindingForType(string typeFullName, BindingOrigin origin) {
@@ -401,6 +413,8 @@ public sealed class IntrinsicRegistry {
 
     /// <summary>intrinsic 型の静的フィールド値を取得する (ldsfld の TypeRef 親用)。</summary>
     public bool TryGetStaticField(string typeFullName, string fieldName, out Func<IntrinsicContext, StackSlot> value) {
+        if (IsSealed)
+            return _staticFields.TryGetValue((typeFullName, fieldName), out value!);
         lock (_gate)
             return _staticFields.TryGetValue((typeFullName, fieldName), out value!);
     }

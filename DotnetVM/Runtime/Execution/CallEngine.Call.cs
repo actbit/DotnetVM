@@ -16,7 +16,7 @@ internal sealed partial class CallEngine {
     public StackSlot? Call(int token, InterpreterFrame caller, bool isCallvirt, int constrainedToken,
         bool tailCallAllowed, out TailCallRequest? tailCallRequest) {
         tailCallRequest = null;
-        foreach (var argument in caller.Stack.CopySlots())
+        foreach (ref readonly var argument in caller.Stack.ActiveSlots)
             VmLifetime.EnsureLiveForGuest(argument);
         // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
         // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
@@ -33,10 +33,7 @@ internal sealed partial class CallEngine {
         // 特権判定は callee ではなく実際の呼出元 loader 基準 (caller.Method.Loader)。
         var callerDomain = CallerDomainOf(caller);
 
-        // 引数はスタック上では逆順
-        var args = new StackSlot[target.Arity];
-        for (var i = target.Arity - 1; i >= 0; i--)
-            args[i] = caller.Stack.Pop();
+        var args = caller.Stack.PopArguments(target.Arity);
 
         // constrained. 付けた値型レシーバの前処理 (ECMA III.2.2): 値型レシーバを同値型で
         // ボックス化しておく。仮想ディスパッチ (レシーバ実行時型) と constrained. 多重面の
@@ -48,11 +45,13 @@ internal sealed partial class CallEngine {
         // VmBoxedValue を要求するため。それ以外の値型 (decimal/TimeSpan やプリミティブ) は
         // ByRef のまま渡し、dispatch (ReceiverRuntimeType が参照先を読む) と binding
         // (NormalizeByRefReceiver) に委ねる (既存規約を維持し、回帰を避ける)
+        VmType? constrainedReceiverType = null;
         if (constrainedToken != 0 && isCallvirt && target.HasThis &&
             args[0].Kind is not StackKind.Object) {
             var constrainedType = _objectEngine.ResolveTypeToken(constrainedToken, caller.Context,
                 caller.Method.DynamicTokens);
             if (constrainedType.IsValueType) {
+                constrainedReceiverType = constrainedType;
                 var valueSlot = args[0].Kind == StackKind.ByRef && args[0].ObjectValue is VmByRef receiverByRef
                     ? receiverByRef.Slot
                     : args[0];
@@ -62,6 +61,10 @@ internal sealed partial class CallEngine {
                         : [valueSlot];
                     args[0] = StackSlot.OfObject(_heap.Allocate(new VmBoxedValue(constrainedType, fields)));
                 }
+            } else if (args[0].ObjectValue is VmByRef referenceReceiver) {
+                // A reference type's constrained receiver is an address of the
+                // object reference; dispatch on its actual (possibly derived) type.
+                args[0] = referenceReceiver.Read();
             }
         }
 
@@ -100,7 +103,7 @@ internal sealed partial class CallEngine {
                     if (tailCallAllowed && invoker.TryCreateTailCall(caller, guestOverride, args,
                             context, out tailCallRequest))
                         return null;
-                    var guestRet = invoker.Invoke(guestOverride, args, context);
+                    var guestRet = InvokeResolvedMethod(guestOverride, args, context);
                     return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? guestRet : null;
                 }
                 // ファサード インターフェースの明示的実装 (EII) を実行時型の InterfaceMap で解決する
@@ -116,7 +119,7 @@ internal sealed partial class CallEngine {
                     if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args,
                             context, out tailCallRequest))
                         return null;
-                    var guestRet = invoker.Invoke(explicitImpl, args, context);
+                    var guestRet = InvokeResolvedMethod(explicitImpl, args, context);
                     return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? guestRet : null;
                 }
                 // レシーバが VM ランタイムオブジェクト (typeof() 結果等) の場合、その実面
@@ -174,17 +177,28 @@ internal sealed partial class CallEngine {
         // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)。
         // constrained. 値型レシーバは ByRef/ValueType スロットで来るためディスパッチがそのまま適用される
         var method = target.Method!;
+        VmType[]? staticImplementationArgs = null;
+        if (constrainedToken != 0 && method.IsStatic && method.DeclaringType is VmClassType { IsInterface: true }) {
+            var implementingType = _objectEngine.ResolveTypeToken(constrainedToken, caller.Context,
+                caller.Method.DynamicTokens);
+            if (TryDispatchStaticInterface(method, implementingType, target.ClassArgs) is { } implementation) {
+                method = implementation;
+                staticImplementationArgs = implementingType is VmConstructedType constructed
+                    ? constructed.TypeArguments : [];
+            }
+        }
         if (isCallvirt && method.Signature.HasThis) {
             if (SlotOps.IsNullReference(args[0]))
                 throw new UnhandledGuestException("System.NullReferenceException",
                     $"null レシーバで {method.DeclaringType.FullName}::{method.Name} を呼び出しました。");
-            method = DispatchVirtual(method, args[0]);
+            method = DispatchVirtual(method, args[0], constrainedReceiverType);
         }
 
         // 優先順位 ①: ランタイムバインド (署名照合) を最優先で解決する。
         // 構築型の実引数 (ClassArgs) もキー化に使う (IComparable`1<uint> の !0 等)
         // callerDomain は呼出元フレーム基準 (特権面の callee 基準判定はしない)。
-        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, callerDomain, target.ClassArgs))
+        if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, callerDomain,
+                staticImplementationArgs ?? target.ClassArgs))
             return bound;
 
         // callvirt で宣言どおりに着地した (実行時型で override が見つからなかった) 場合、
@@ -223,7 +237,7 @@ internal sealed partial class CallEngine {
                 if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args,
                         implContext, out tailCallRequest))
                     return null;
-                var implRet = invoker.Invoke(explicitImpl, args, implContext);
+                var implRet = InvokeResolvedMethod(explicitImpl, args, implContext);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? implRet : null;
             }
             // 優先順位 ③: legacy intrinsic (名前 + 引数個数) の救済
@@ -240,15 +254,20 @@ internal sealed partial class CallEngine {
                 $"面 {method.DeclaringType.FullName}::{method.Name} は表現境界 (DelegateContinuingSurfaces) により IL 実行が禁止されており、登録済みのランタイムバインド / intrinsic もありません。");
         }
 
-        var context2 = BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
+        var context2 = staticImplementationArgs is not null
+            ? GenericContext.Of(staticImplementationArgs, target.MethodArgs)
+            : BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
         if (tailCallAllowed && invoker.TryCreateTailCall(caller, method, args, context2, out tailCallRequest))
             return null;
-        if (invoker is Interpreter interpreter &&
-            interpreter.TryInvokeCompiled(method, args, context2, out var compiledResult))
-            return SlotOps.SignatureReturnsValue(method.Signature) ? compiledResult : null;
-        var ret = invoker.Invoke(method, args, context2);
+        var ret = InvokeResolvedMethod(method, args, context2);
         return SlotOps.SignatureReturnsValue(method.Signature) ? ret : null;
     }
+
+    // Binding, virtual dispatch and tail-call checks precede this entry. Reuse
+    // the promoted method on every route, including interface/delegate calls.
+    private StackSlot InvokeResolvedMethod(VmMethod method, StackSlot[] arguments, GenericContext? context) =>
+        invoker is Interpreter interpreter && interpreter.TryInvokeCompiled(method, arguments, context, out var result)
+            ? result : invoker.Invoke(method, arguments, context);
 
     /// <summary>ByRef レシーバを値に読み替えずにそのまま渡す intrinsic 宣言型
     /// (ローカルスロットに可変状態を保持する構造体ファサード)。</summary>
@@ -309,7 +328,7 @@ internal sealed partial class CallEngine {
                 var context = BuildCallContext(target, guestOverride, args[0]);
                 if (tailCallAllowed && invoker.TryCreateTailCall(caller, guestOverride, args, context, out tailCallRequest))
                     return null;
-                var ret = invoker.Invoke(guestOverride, args, context);
+                var ret = InvokeResolvedMethod(guestOverride, args, context);
                 return SlotOps.SignatureReturnsValue(guestOverride.Signature) ? ret : null;
             }
             // ファサード インターフェースの明示的実装 (EII) もここで救済する。
@@ -321,7 +340,7 @@ internal sealed partial class CallEngine {
                 var context = BuildCallContext(target, explicitImpl, args[0]);
                 if (tailCallAllowed && invoker.TryCreateTailCall(caller, explicitImpl, args, context, out tailCallRequest))
                     return null;
-                var ret = invoker.Invoke(explicitImpl, args, context);
+                var ret = InvokeResolvedMethod(explicitImpl, args, context);
                 return SlotOps.SignatureReturnsValue(explicitImpl.Signature) ? ret : null;
             }
         }

@@ -86,6 +86,9 @@ public sealed class VmSharedState : IDisposable {
 
     internal object TypeFacadeGate { get; } = new();
 
+    internal System.Collections.Concurrent.ConcurrentDictionary<VmType, VmObject> DefaultEqualityComparers { get; } =
+        new(GuestTaskRuntime.VmTypeIdentityComparer.Instance);
+
     /// <summary>VM ごとの仮想環境変数ストア (OrdinalIgnoreCase)。
     /// Kernel32.GetEnvironmentVariable 面は host の Environment を直接呼ばずここだけを読む。</summary>
     public readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> VirtualEnvironment =
@@ -129,12 +132,15 @@ public sealed class VmSharedState : IDisposable {
     }
 
     /// <summary>RuntimeType ファサードを GC の直接ルートとして列挙する。</summary>
-    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values;
+    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values.Concat(DefaultEqualityComparers.Values);
 
     /// <summary>ALC 由来の VM-wide 型初期化状態と RuntimeType ファサードを解放する。</summary>
     internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
         TypeInitialization.RemoveForContext(context);
         GuestTasks.RemoveAssemblyContextCaches(context);
+        foreach (var type in DefaultEqualityComparers.Keys)
+            if (context.OwnsType(type))
+                DefaultEqualityComparers.TryRemove(type, out _);
         foreach (var type in TypeFacades.Keys)
             if (context.OwnsType(type))
                 TypeFacades.TryRemove(type, out _);
@@ -148,6 +154,7 @@ public sealed class VmSharedState : IDisposable {
         // その後 Thread worker を interrupt する。どちらも同じ cancellation token を見る。
         GuestTasks.Dispose();
         GuestThreads.Dispose();
+        DefaultEqualityComparers.Clear();
         _workerBudget.Dispose();
         _lastSystemError.Dispose();
         _shutdown.Dispose();

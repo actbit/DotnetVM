@@ -20,4 +20,9 @@
     <ProjectReference Include="..\DotnetVM\DotnetVM.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="../DotnetVM.Benchmarks/GuestWorkloads.cs" LogicalName="GuestWorkloads.cs" />
+    <EmbeddedResource Include="../DotnetVM.BenchmarkGuest/Workloads.cs" LogicalName="LoopWorkloads.cs" />
+  </ItemGroup>
+
 </Project>

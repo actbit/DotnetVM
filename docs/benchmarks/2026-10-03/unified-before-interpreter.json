@@ -1,0 +1,608 @@
+{
+  "Runtime": "10.0.12",
+  "MeasuredAt": "2026-10-03T10:09:58.0402389+00:00",
+  "OS": "Microsoft Windows NT 10.0.26200.0",
+  "HostTieredCompilation": "0",
+  "Protocol": "unified-18",
+  "LoadHostCoreLib": true,
+  "JitPromotionThreshold": 2,
+  "EnableJit": false,
+  "Warmups": 3,
+  "Samples": 7,
+  "Results": [
+    {
+      "Name": "Arithmetic",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 5000,
+      "MedianMilliseconds": 4.6619,
+      "MedianAllocatedBytes": 302568,
+      "Instructions": 85010,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        4.5567,
+        4.5624,
+        4.622,
+        4.6619,
+        4.786,
+        4.7868,
+        4.8702
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.002748525,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00274264,
+          0.00274341,
+          0.00274787,
+          0.002748525,
+          0.002751495,
+          0.00276222,
+          0.0027633600000000003
+        ]
+      },
+      "VmToCoreClrRatio": 1696.1461147342666
+    },
+    {
+      "Name": "ArithmeticLoop",
+      "DeclaringType": "DotnetVM.BenchmarkGuest.Workloads",
+      "Count": 100000,
+      "MedianMilliseconds": 111.349,
+      "MedianAllocatedBytes": 302560,
+      "Instructions": 2300010,
+      "Expected": -1004575550,
+      "ElapsedMilliseconds": [
+        109.2497,
+        109.3963,
+        109.6129,
+        111.349,
+        114.7768,
+        123.0645,
+        125.5287
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.14568973607038124,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 682,
+        "ElapsedMilliseconds": [
+          0.1455101173020528,
+          0.14557551319648093,
+          0.14557976539589443,
+          0.14568973607038124,
+          0.14572624633431086,
+          0.1458541055718475,
+          0.1458733137829912
+        ]
+      },
+      "VmToCoreClrRatio": 764.2885696917484
+    },
+    {
+      "Name": "BranchLoop",
+      "DeclaringType": "DotnetVM.BenchmarkGuest.Workloads",
+      "Count": 100000,
+      "MedianMilliseconds": 104.2728,
+      "MedianAllocatedBytes": 302560,
+      "Instructions": 2150056,
+      "Expected": 1311006979,
+      "ElapsedMilliseconds": [
+        103.5376,
+        104.2124,
+        104.2165,
+        104.2728,
+        104.7188,
+        105.4175,
+        109.592
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.3631115,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 200,
+        "ElapsedMilliseconds": [
+          0.358513,
+          0.3603075,
+          0.361852,
+          0.3631115,
+          0.36841700000000005,
+          0.379697,
+          0.38246899999999995
+        ]
+      },
+      "VmToCoreClrRatio": 287.16468632913035
+    },
+    {
+      "Name": "ArraySum",
+      "DeclaringType": "DotnetVM.BenchmarkGuest.Workloads",
+      "Count": 10000,
+      "MedianMilliseconds": 18.1104,
+      "MedianAllocatedBytes": 622784,
+      "Instructions": 340023,
+      "Expected": 150911208,
+      "ElapsedMilliseconds": [
+        17.8005,
+        17.8723,
+        17.878,
+        18.1104,
+        18.2002,
+        18.2625,
+        31.2565
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.011232947900053164,
+        "MedianAllocatedBytes": 40024,
+        "IterationsPerSample": 7524,
+        "ElapsedMilliseconds": [
+          0.010891068580542266,
+          0.01090867889420521,
+          0.011047501329080276,
+          0.011232947900053164,
+          0.011266241360978204,
+          0.01137929292929293,
+          0.011759237107921318
+        ]
+      },
+      "VmToCoreClrRatio": 1612.2570994844802
+    },
+    {
+      "Name": "FieldAccess",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 5000,
+      "MedianMilliseconds": 6.186,
+      "MedianAllocatedBytes": 304072,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        6.0302,
+        6.133,
+        6.1828,
+        6.186,
+        6.3064,
+        6.3435,
+        6.448
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0027652,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00275519,
+          0.002757265,
+          0.002759485,
+          0.0027652,
+          0.00285556,
+          0.002863065,
+          0.0028662099999999997
+        ]
+      },
+      "VmToCoreClrRatio": 2237.089541443657
+    },
+    {
+      "Name": "GenericFieldAccess",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 5000,
+      "MedianMilliseconds": 6.6031,
+      "MedianAllocatedBytes": 304872,
+      "Instructions": 95015,
+      "Expected": 37724948,
+      "ElapsedMilliseconds": [
+        6.5518,
+        6.5676,
+        6.5819,
+        6.6031,
+        6.7321,
+        6.867,
+        6.874
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00275869,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00273371,
+          0.0027494299999999998,
+          0.002750225,
+          0.00275869,
+          0.002764385,
+          0.002764885,
+          0.00276558
+        ]
+      },
+      "VmToCoreClrRatio": 2393.563611714256
+    },
+    {
+      "Name": "MethodCalls",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 1000,
+      "MedianMilliseconds": 2.349,
+      "MedianAllocatedBytes": 1014568,
+      "Instructions": 16010,
+      "Expected": 500500,
+      "ElapsedMilliseconds": [
+        2.3163,
+        2.3289,
+        2.3297,
+        2.349,
+        2.3624,
+        2.3669,
+        2.6495
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0014261082382021012,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 61494,
+        "ElapsedMilliseconds": [
+          0.001418871759846489,
+          0.0014252772628223893,
+          0.0014258594334406608,
+          0.0014261082382021012,
+          0.0014264269684847303,
+          0.0014264399778840212,
+          0.0014266790255959931
+        ]
+      },
+      "VmToCoreClrRatio": 1647.1400536619797
+    },
+    {
+      "Name": "CallLoop",
+      "DeclaringType": "DotnetVM.BenchmarkGuest.Workloads",
+      "Count": 100000,
+      "MedianMilliseconds": 221.8997,
+      "MedianAllocatedBytes": 74702560,
+      "Instructions": 1900010,
+      "Expected": 1083471201,
+      "ElapsedMilliseconds": [
+        217.3251,
+        220.3515,
+        221.7815,
+        221.8997,
+        222.5549,
+        222.9256,
+        223.0055
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.09446541353383459,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 532,
+        "ElapsedMilliseconds": [
+          0.09437161654135338,
+          0.09446109022556391,
+          0.09446127819548872,
+          0.09446541353383459,
+          0.09446635338345866,
+          0.09447744360902256,
+          0.09453571428571428
+        ]
+      },
+      "VmToCoreClrRatio": 2349.0046959940782
+    },
+    {
+      "Name": "ObjectLoop",
+      "DeclaringType": "DotnetVM.BenchmarkGuest.Workloads",
+      "Count": 10000,
+      "MedianMilliseconds": 69.8665,
+      "MedianAllocatedBytes": 22382560,
+      "Instructions": 250010,
+      "Expected": 49995256,
+      "ElapsedMilliseconds": [
+        69.1133,
+        69.2305,
+        69.6668,
+        69.8665,
+        69.9173,
+        70.384,
+        70.8183
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0322265,
+        "MedianAllocatedBytes": 240000,
+        "IterationsPerSample": 2000,
+        "ElapsedMilliseconds": [
+          0.0305595,
+          0.03144885,
+          0.0320023,
+          0.0322265,
+          0.03230885,
+          0.032341949999999994,
+          0.0332444
+        ]
+      },
+      "VmToCoreClrRatio": 2167.982871239508
+    },
+    {
+      "Name": "List",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 500,
+      "MedianMilliseconds": 10.9589,
+      "MedianAllocatedBytes": 3683032,
+      "Instructions": 61597,
+      "Expected": 125250,
+      "ElapsedMilliseconds": [
+        10.8877,
+        10.9072,
+        10.9371,
+        10.9589,
+        10.9804,
+        11.0972,
+        11.2053
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00497758,
+        "MedianAllocatedBytes": 2096,
+        "IterationsPerSample": 10000,
+        "ElapsedMilliseconds": [
+          0.00494603,
+          0.00494814,
+          0.00494867,
+          0.00497758,
+          0.00498035,
+          0.00508428,
+          0.00519728
+        ]
+      },
+      "VmToCoreClrRatio": 2201.6522085029274
+    },
+    {
+      "Name": "ListGrowth",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 500,
+      "MedianMilliseconds": 6.7516,
+      "MedianAllocatedBytes": 1846656,
+      "Instructions": 40134,
+      "Expected": 124750,
+      "ElapsedMilliseconds": [
+        6.5099,
+        6.5971,
+        6.6891,
+        6.7516,
+        6.8267,
+        6.8386,
+        6.9441
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0013395596808837066,
+        "MedianAllocatedBytes": 4304,
+        "IterationsPerSample": 52144,
+        "ElapsedMilliseconds": [
+          0.0013079664007364224,
+          0.0013129947836759742,
+          0.001324278919914084,
+          0.0013395596808837066,
+          0.001341124578091439,
+          0.0013429982356551091,
+          0.0013720619822031298
+        ]
+      },
+      "VmToCoreClrRatio": 5040.163642090193
+    },
+    {
+      "Name": "Linq",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 500,
+      "MedianMilliseconds": 15.9419,
+      "MedianAllocatedBytes": 6341944,
+      "Instructions": 43296,
+      "Expected": 186750,
+      "ElapsedMilliseconds": [
+        15.7452,
+        15.8531,
+        15.8844,
+        15.9419,
+        15.9682,
+        16.1043,
+        16.2042
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.00404221,
+        "MedianAllocatedBytes": 160,
+        "IterationsPerSample": 20000,
+        "ElapsedMilliseconds": [
+          0.00402299,
+          0.00403418,
+          0.00403942,
+          0.00404221,
+          0.004050195,
+          0.004052245,
+          0.0040849200000000006
+        ]
+      },
+      "VmToCoreClrRatio": 3943.8574443188254
+    },
+    {
+      "Name": "DictionaryInt",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 200,
+      "MedianMilliseconds": 22.3082,
+      "MedianAllocatedBytes": 6500224,
+      "Instructions": 91378,
+      "Expected": 59700,
+      "ElapsedMilliseconds": [
+        22.1808,
+        22.2766,
+        22.2876,
+        22.3082,
+        22.3647,
+        22.3836,
+        23.7698
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0035427739726027396,
+        "MedianAllocatedBytes": 4912,
+        "IterationsPerSample": 14600,
+        "ElapsedMilliseconds": [
+          0.0034566301369863012,
+          0.003478890410958904,
+          0.003526335616438356,
+          0.0035427739726027396,
+          0.0035469520547945204,
+          0.0035795753424657534,
+          0.003679328767123288
+        ]
+      },
+      "VmToCoreClrRatio": 6296.817175613104
+    },
+    {
+      "Name": "DictionaryGrowth",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 200,
+      "MedianMilliseconds": 19.1084,
+      "MedianAllocatedBytes": 5953112,
+      "Instructions": 84974,
+      "Expected": 20100,
+      "ElapsedMilliseconds": [
+        18.9466,
+        18.9648,
+        19.0909,
+        19.1084,
+        19.1127,
+        19.1255,
+        19.8191
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0035130171027627543,
+        "MedianAllocatedBytes": 16064,
+        "IterationsPerSample": 27364,
+        "ElapsedMilliseconds": [
+          0.00337162695512352,
+          0.0033798384739073236,
+          0.0033856563367928665,
+          0.0035130171027627543,
+          0.003534052039175559,
+          0.0035998355503581345,
+          0.0037739877210934076
+        ]
+      },
+      "VmToCoreClrRatio": 5439.313114921221
+    },
+    {
+      "Name": "DictionaryString",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 200,
+      "MedianMilliseconds": 20.237,
+      "MedianAllocatedBytes": 6265144,
+      "Instructions": 99083,
+      "Expected": 19908,
+      "ElapsedMilliseconds": [
+        20.1525,
+        20.1566,
+        20.2354,
+        20.237,
+        20.2969,
+        20.3694,
+        21.0717
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.005043027330063069,
+        "MedianAllocatedBytes": 440,
+        "IterationsPerSample": 9989,
+        "ElapsedMilliseconds": [
+          0.00500454499949945,
+          0.005010781860046051,
+          0.005031484633096406,
+          0.005043027330063069,
+          0.005059084993492843,
+          0.005134077485233758,
+          0.005180658724597057
+        ]
+      },
+      "VmToCoreClrRatio": 4012.867405925185
+    },
+    {
+      "Name": "AsyncCompleted",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 200,
+      "MedianMilliseconds": 1.67,
+      "MedianAllocatedBytes": 866056,
+      "Instructions": 8257,
+      "Expected": 19900,
+      "ElapsedMilliseconds": [
+        1.5925,
+        1.5946,
+        1.6233,
+        1.67,
+        1.7471,
+        1.9747,
+        1.9798
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.0013091133998440316,
+        "MedianAllocatedBytes": 13824,
+        "IterationsPerSample": 74374,
+        "ElapsedMilliseconds": [
+          0.0011395554898217118,
+          0.0012743821765670799,
+          0.0012782034044155216,
+          0.0013091133998440316,
+          0.0013172788877833651,
+          0.0013443878237018312,
+          0.0014390190120203295
+        ]
+      },
+      "VmToCoreClrRatio": 1275.6725278336962
+    },
+    {
+      "Name": "ValueTaskCompleted",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 200,
+      "MedianMilliseconds": 1.8341,
+      "MedianAllocatedBytes": 1000064,
+      "Instructions": 8459,
+      "Expected": 19900,
+      "ElapsedMilliseconds": [
+        1.684,
+        1.7643,
+        1.7788,
+        1.8341,
+        1.8647,
+        1.9133,
+        1.9243
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 0.000435041,
+        "MedianAllocatedBytes": 0,
+        "IterationsPerSample": 200000,
+        "ElapsedMilliseconds": [
+          0.000432839,
+          0.000433765,
+          0.0004343325,
+          0.000435041,
+          0.000435063,
+          0.0004351415,
+          0.00043761699999999995
+        ]
+      },
+      "VmToCoreClrRatio": 4215.924476083864
+    },
+    {
+      "Name": "AsyncWorkers",
+      "DeclaringType": "DotnetVM.Benchmarks.GuestWorkloads",
+      "Count": 8,
+      "MedianMilliseconds": 12.7595,
+      "MedianAllocatedBytes": 494152,
+      "Instructions": 1111,
+      "Expected": 36,
+      "ElapsedMilliseconds": [
+        10.7426,
+        11.56,
+        12.7064,
+        12.7595,
+        13.5056,
+        13.5154,
+        16.2724
+      ],
+      "CoreClr": {
+        "MedianMilliseconds": 13.9754875,
+        "MedianAllocatedBytes": 5056,
+        "IterationsPerSample": 8,
+        "ElapsedMilliseconds": [
+          12.6711875,
+          13.0844625,
+          13.8349375,
+          13.9754875,
+          14.3593625,
+          15.7175,
+          15.8203
+        ]
+      },
+      "VmToCoreClrRatio": 0.9129914072764903
+    }
+  ]
+}

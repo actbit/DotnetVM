@@ -51,25 +51,35 @@ internal static partial class CoreLibBindings {
     }
 
     private static int ComparePrimitives(in StackSlot x, in StackSlot y, bool unsigned, bool floating) {
+        var left = PrimitiveValue(x);
+        var right = PrimitiveValue(y);
         if (floating)
-            return x.DoubleValue.CompareTo(y.DoubleValue);
+            return left.DoubleValue.CompareTo(right.DoubleValue);
         if (unsigned) {
-            var ux = x.Kind == StackKind.Int64 ? (ulong)x.Int64Value : (uint)x.AsInt32;
-            var uy = y.Kind == StackKind.Int64 ? (ulong)y.Int64Value : (uint)y.AsInt32;
+            var ux = left.Kind == StackKind.Int64 ? (ulong)left.Int64Value : (uint)left.AsInt32;
+            var uy = right.Kind == StackKind.Int64 ? (ulong)right.Int64Value : (uint)right.AsInt32;
             return ux.CompareTo(uy);
         }
-        var sx = x.Kind == StackKind.Int64 ? x.Int64Value : (long)x.AsInt32;
-        var sy = y.Kind == StackKind.Int64 ? y.Int64Value : (long)y.AsInt32;
+        var sx = left.Kind == StackKind.Int64 ? left.Int64Value : (long)left.AsInt32;
+        var sy = right.Kind == StackKind.Int64 ? right.Int64Value : (long)right.AsInt32;
         return sx.CompareTo(sy);
     }
 
     private static bool EqualsPrimitives(in StackSlot x, in StackSlot y, bool floating) {
+        var left = PrimitiveValue(x);
+        var right = PrimitiveValue(y);
         if (floating)
-            return x.DoubleValue.Equals(y.DoubleValue);
-        var lx = x.Kind == StackKind.Int64 ? x.Int64Value : (long)x.AsInt32;
-        var ly = y.Kind == StackKind.Int64 ? y.Int64Value : (long)y.AsInt32;
+            return left.DoubleValue.Equals(right.DoubleValue);
+        var lx = left.Kind == StackKind.Int64 ? left.Int64Value : (long)left.AsInt32;
+        var ly = right.Kind == StackKind.Int64 ? right.Int64Value : (long)right.AsInt32;
         return lx == ly;
     }
+
+    private static StackSlot PrimitiveValue(in StackSlot value) => value.ObjectValue switch {
+        VmByRef location => PrimitiveValue(location.Read()),
+        VmBoxedValue boxed when VmPrimitiveTypes.IsSlotPrimitive(boxed.Type.FullName) => boxed.Fields[0],
+        _ => value,
+    };
 
     // ---- ISpanFormattable.TryFormat (JoinCore 等の要素書式面) ----
 

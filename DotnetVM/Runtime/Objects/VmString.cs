@@ -32,18 +32,25 @@ public sealed class VmString {
     /// <summary>ホスト文字列から作る (ldstr / intrinsic 境界からの正規化用)。</summary>
     public VmString(string value) {
         ArgumentNullException.ThrowIfNull(value);
-        _bytes = new byte[HeaderByteCount + value.Length * 2];
+        _bytes = new byte[BufferByteCount(value.Length)];
         BinaryPrimitives.WriteInt32LittleEndian(_bytes, value.Length);
         Encoding.Unicode.GetBytes(value, 0, value.Length, _bytes, CharDataByteOffset);
         _cachedForLength = value.Length;
         _cachedValue = value;
     }
 
-    /// <summary>CoreLib 表現のバッファから作る (FastAllocateString 相当。ヘッダはキャパシティから算出)。</summary>
-    internal VmString(byte[] bytes) {
+    /// <summary>CoreLib 表現のバッファと文字数から作る (FastAllocateString 相当)。</summary>
+    internal VmString(byte[] bytes, int length) {
         _bytes = bytes;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes, (bytes.Length - HeaderByteCount) / 2);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, length);
     }
+
+    // CoreLib reads the final UTF-16 character and null terminator together as
+    // a uint when hashing. Preserve the terminator and align its backing block.
+    internal static long StorageByteCount(int length) =>
+        (HeaderByteCount + 2L * (length + 1L) + 3) & ~3L;
+
+    internal static int BufferByteCount(int length) => checked((int)StorageByteCount(length));
 
     /// <summary>char 数 (CoreLib IL が ldfld する _stringLength と同一の値)。</summary>
     public int Length => BinaryPrimitives.ReadInt32LittleEndian(_bytes);
@@ -146,7 +153,7 @@ public sealed class VmStringPool {
     /// IL の newobj 相当に計上する (実 CLR の FastAllocateString と同じ確保点)。</summary>
     public VmString Allocate(int charCount) {
         _heap?.ChargeString(charCount);
-        return new VmString(new byte[VmString.HeaderByteCount + charCount * 2]);
+        return new VmString(new byte[VmString.BufferByteCount(charCount)], charCount);
     }
 
     public int Count { get { lock (_gate) return _pool.Count; } }

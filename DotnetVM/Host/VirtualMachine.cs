@@ -245,6 +245,8 @@ public sealed class VirtualMachine : IDisposable {
             _interpreter?.RemoveAssemblyContextCaches(context);
         var loaders = context.SnapshotLoaders();
         lock (_assemblyGate) {
+            foreach (var loader in _loaders)
+                loader.ClearTypeReferenceCache();
             foreach (var loader in loaders)
                 _loaders.Remove(loader);
             foreach (var loader in loaders)
@@ -785,8 +787,10 @@ public sealed class VirtualMachine : IDisposable {
             _heap.RemoveRootSlotSource(_guestTaskRoots);
             TypeLoader[] chargedLoaders;
             lock (_assemblyGate) {
-                foreach (var loader in _loaders.ToArray())
+                foreach (var loader in _loaders.ToArray()) {
+                    loader.ClearTypeReferenceCache();
                     loader.Context?.Unregister(loader);
+                }
                 chargedLoaders = _hostImageChargedLoaders.ToArray();
                 _hostImageChargedLoaders.Clear();
                 _loaders.Clear();

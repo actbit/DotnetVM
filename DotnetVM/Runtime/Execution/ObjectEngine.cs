@@ -23,6 +23,15 @@ internal sealed partial class ObjectEngine(
     private readonly VmHeap _heap = services.Heap;
     private readonly IntrinsicContext _intrinsicContext = services.IntrinsicContext;
     private readonly ObjectModel _objects = services.Objects;
+    private readonly MetadataResolutionCache<VmField> _fieldTokens = new();
+    private readonly ConcurrentDictionary<int, VmField> _fieldDefTokens = new();
+    private readonly MetadataResolutionCache<VmType> _typeTokens = new();
+
+    internal void ClearOperandCaches() {
+        _fieldTokens.Clear();
+        _fieldDefTokens.Clear();
+        _typeTokens.Clear();
+    }
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは CLR と同じく 1 つ)。
     /// null = 単一画像実行 (既定動作の ObjectModel ローカル辞書に統一)。</summary>
     private readonly UnifiedStaticStorage? _unifiedStaticStorage = unifiedStaticStorage;
@@ -36,7 +45,6 @@ internal sealed partial class ObjectEngine(
     // resolved objects beside the object engine so hot newobj/ldfld paths do
     // not re-enter TypeLoader.MetadataGate on every iteration.
     private readonly ConcurrentDictionary<int, VmMethod> _methodDefConstructors = new();
-    private readonly ConcurrentDictionary<int, VmField> _fieldTokens = new();
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;

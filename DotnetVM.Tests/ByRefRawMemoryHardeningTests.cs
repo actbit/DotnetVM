@@ -1,5 +1,6 @@
 using DotnetVM.Host;
 using DotnetVM.IL;
+using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Heap;
@@ -73,6 +74,8 @@ public sealed class ByRefRawMemoryHardeningTests {
         public sealed class Holder {
             public int Value;
         }
+
+        public struct Cell { public int Value; }
         """;
 
     private static readonly byte[] Bytes = TestAssemblyCompiler.CompileToBytes(Source, "ByRefRawMemoryHardening", allowUnsafe: true);
@@ -189,6 +192,30 @@ public sealed class ByRefRawMemoryHardeningTests {
 
         var onePast = new VmByRef([], 0);
         Assert.Throws<UnhandledGuestException>(() => _ = onePast.Read());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DirectFieldStoreCannotBypassReadonlyArrayReference(bool enableJit) {
+        using var vm = CreateVm(enableJit);
+        var loader = vm.Loaders[0];
+        var cell = Assert.IsType<VmClassType>(loader.FindTypeByFullName("Vm.Cell"));
+        var builder = new VmDynamicMethodBuilder(loader, vm.Heap, "WriteReadonlyField",
+            new SigType(SigKind.Void), [], maxMethodBodyBytes: 128);
+        builder.EmitOpcode((ushort)ILOp.Ldc_I4_1);
+        builder.EmitReference((ushort)ILOp.Newarr, cell);
+        builder.EmitOpcode((ushort)ILOp.Ldc_I4_0);
+        builder.EmitOpcode((ushort)ILOp.Readonly);
+        builder.EmitReference((ushort)ILOp.Ldelema, cell);
+        builder.EmitInt32((ushort)ILOp.Ldc_I4, 42);
+        builder.EmitReference((ushort)ILOp.Stfld, cell.Fields.Single(field => field.Name == "Value"));
+        builder.EmitOpcode((ushort)ILOp.Ret);
+        var method = builder.CreateMethod();
+
+        var error = Assert.Throws<UnhandledGuestException>(() => vm.Execute(method));
+        Assert.Equal("System.InvalidProgramException", error.ExceptionTypeName);
+        if (enableJit) Assert.True(vm.IsJitCompiled(method));
     }
 
     [Fact]

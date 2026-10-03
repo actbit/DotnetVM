@@ -40,9 +40,15 @@ public sealed partial class Interpreter {
             foreach (var (context, loaders) in pending) {
                 _unifiedStaticStorage.RemoveForContext(context);
                 lock (_enginesGate) {
+                    // Other loaders' generic call sites can reference this ALC.
+                    // Drop those type arguments immediately on unload as well.
+                    foreach (var current in _engines.Values) {
+                        current.Calls.ClearCallTargetCache();
+                        current.Objects.ClearOperandCaches();
+                    }
                     foreach (var loader in loaders) {
                         // Interpreter の primary engine は VM の公開呼出し面が直接保持している。
-                        if (ReferenceEquals(loader, _services.Loader) || !_engines.Remove(loader, out var engines))
+                        if (ReferenceEquals(loader, _services.Loader) || !_engines.TryRemove(loader, out var engines))
                             continue;
                         engines.Jit.Clear();
                         _heap.RemoveRootSlotSource(engines.StaticStorageRoots);
@@ -68,7 +74,7 @@ public sealed partial class Interpreter {
                 yield return frame.Arguments;
                 yield return frame.Locals;
                 if (frame.Stack.Count > 0)
-                    yield return frame.Stack.CopySlots();
+                    yield return frame.Stack.RootSlots;
                 if (frame.CurrentThrow is { } throwing)
                     yield return [StackSlot.OfObject(throwing.ExceptionObject)];
             }
@@ -137,8 +143,11 @@ public sealed partial class Interpreter {
         using (_coordinator.StopTheWorld())
             _heap.RemoveRootSlotSource(_frameRootSource);
         lock (_enginesGate) {
-            foreach (var engines in _engines.Values)
+            foreach (var engines in _engines.Values) {
                 engines.Jit.Clear();
+                engines.Calls.ClearCallTargetCache();
+                engines.Objects.ClearOperandCaches();
+            }
             _engines.Clear();
         }
         _executionStates.Clear();

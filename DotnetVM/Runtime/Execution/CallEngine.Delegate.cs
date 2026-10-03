@@ -59,12 +59,12 @@ internal sealed partial class CallEngine {
                 callArgs[0] = invocation.Target;
                 for (var i = 0; i < argCount; i++)
                     callArgs[i + 1] = args[i + 1];
-                last = invoker.Invoke(method, callArgs, context);
+                last = InvokeResolvedMethod(method, callArgs, context);
             } else {
                 var callArgs = new StackSlot[argCount];
                 for (var i = 0; i < argCount; i++)
                     callArgs[i] = args[i + 1];
-                last = invoker.Invoke(method, callArgs, context);
+                last = InvokeResolvedMethod(method, callArgs, context);
             }
         }
         return SlotOps.SignatureReturnsValue(lastMethod.Signature) ? last : null;

@@ -53,7 +53,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly CallEngine _callEngine;
     private readonly ExceptionDispatcher _exceptionDispatcher;
     /// <summary>loader ごとのエンジンセット (多アセンブリ実行: メソッドの所属画像で token 解決する)。</summary>
-    private readonly Dictionary<TypeLoader, LoaderEngines> _engines = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<TypeLoader, LoaderEngines> _engines = new();
     private readonly object _enginesGate = new();
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは 1 つ)。</summary>
     private readonly UnifiedStaticStorage _unifiedStaticStorage = new();
@@ -62,12 +62,13 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private bool? _enginesRegisteredRootKey;
     // 実行状態はホストスレッドごとに分離する。フレーム一覧は stop-the-world GC が
     // 全ゲスト命令を停止した状態で走査し、独立した呼出しのルートをまとめて返す。
-    private sealed class ExecutionState {
+    internal sealed class ExecutionState {
         public readonly object Gate = new();
         public readonly List<InterpreterFrame> Frames = [];
         public readonly List<StackSlot[]> TemporaryRoots = [];
         public int Depth;
         public long InstructionCount;
+        public bool Registered;
     }
     private readonly ThreadLocal<ExecutionState> _currentExecution;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
@@ -88,8 +89,16 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
     internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
 
-    private ExecutionState CurrentState {
-        get => _currentExecution.Value!;
+    private ExecutionState CurrentState => _currentExecution.Value!;
+    internal ExecutionState CurrentExecutionState => CurrentState;
+
+    // Register at invocation boundaries; instruction accounting reads the
+    // ThreadLocal directly without repeating the registry check for every IL op.
+    private void RegisterExecutionState(ExecutionState state) {
+        if (!state.Registered) {
+            _executionStates.TryAdd(state, 0);
+            state.Registered = true;
+        }
     }
 
     void IExecutionGate.ConsumeInstruction() => ConsumeInstruction();
@@ -100,13 +109,14 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
     // ---- クォータ/セーフポイント ----
 
-    private void ConsumeInstruction() {
+    private void ConsumeInstruction() => ConsumeInstruction(CurrentState);
+
+    private void ConsumeInstruction(ExecutionState state) {
         _shared.ThrowIfDisposed();
         var count = Interlocked.Increment(ref _instructionCount);
         if (count > _memory.InstructionQuota)
             throw new InstructionQuotaExceededException(
                 $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {count:N0})。");
-        var state = CurrentState;
         state.InstructionCount++;
         if (count % SafepointInterval == 0)
             CheckSafepoint();
@@ -133,6 +143,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     // instructions.  These narrow wrappers keep the coordinator private while
     // allowing the generated delegate to bracket each instruction safely.
     internal void ConsumeJitInstruction() => ConsumeInstruction();
+    internal void ConsumeJitInstructionForState(ExecutionState state) => ConsumeInstruction(state);
     internal void CheckJitSafepoint() => CheckSafepoint();
     internal VmExecutionCoordinator.InstructionLease EnterJitInstruction() => _coordinator.EnterInstruction();
     internal VmExecutionCoordinator.InstructionLease EnterJitInstructionInBatch() =>
@@ -154,6 +165,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         var eh = engines.Exceptions;
         var calls = engines.Calls;
         var objects = engines.Objects;
+        var state = CurrentState;
         var instructionBatch = default(VmExecutionCoordinator.InstructionBatchLease);
         var batchInstructions = 0;
         try {
@@ -170,7 +182,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 CheckSafepoint();
                 batchInstructions++;
                 using var instructionLease = _coordinator.EnterInstructionInBatch();
-                ConsumeInstruction();
+                ConsumeInstruction(state);
                 var instruction = frame.Code[frame.Ip];
                 ObserveInstruction(frame, instruction);
             var isPrefix = IsPrefix(instruction.Op);
@@ -644,6 +656,11 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 case ILOp.Box: {
                     var type = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
                     var value = frame.Stack.Pop();
+                    // box !T is a no-op when T resolves to a reference type.
+                    if (!type.IsValueType) {
+                        frame.Stack.Push(value);
+                        break;
+                    }
                     var fields = value.Kind == StackKind.ValueType
                         ? ((VmStructValue)value.ObjectValue!).Clone().Fields
                         : [value];
@@ -785,7 +802,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var args = new StackSlot[argCount];
                     for (var i = argCount - 1; i >= 0; i--)
                         args[i] = frame.Stack.Pop();
-                    ConsumeInstruction(); // 呼出ゲート: クォータ + セーフポイント
+                    ConsumeInstruction(state); // 呼出ゲート: クォータ + セーフポイント
                     CheckSafepoint();
                     StackSlot? result;
                     if (fnptr.ObjectValue is VmMethodPointer pointer) {

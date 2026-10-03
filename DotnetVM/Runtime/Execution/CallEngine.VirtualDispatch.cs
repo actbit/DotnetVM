@@ -11,13 +11,39 @@ using DotnetVM.Runtime.Types;
 namespace DotnetVM.Runtime.Execution;
 
 internal sealed partial class CallEngine {
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(VmType Type, string Name, int Parameters), VmMethod>
+        _virtualTargets = new();
+    private readonly object _virtualTargetGate = new();
+    private long _virtualTargetVersion;
+
+    private VmMethod? TryDispatchStaticInterface(VmMethod declared, VmType implementingType, VmType[]? interfaceArgs) {
+        var definition = implementingType is VmConstructedType constructed ? constructed.Definition : implementingType;
+        if (definition is not VmClassType implementingClass)
+            return null;
+        var parameters = (declared.Loader ?? _loader).TryResolveSlotParams(declared.Signature.ParamTypes);
+        if (parameters is null)
+            return null;
+        var maps = (implementingClass.Loader ?? _loader).EnsureDispatchMaps(implementingClass);
+        var key = VmSlotKeys.InterfaceSlotKey(declared.DeclaringType.FullName, declared.Name, parameters);
+        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } explicitMethod)
+            return explicitMethod;
+        var context = GenericContext.Of(interfaceArgs, null);
+        var concrete = parameters.Select(parameter => GenericSubstitutor.Substitute(parameter, context)).ToArray();
+        key = VmSlotKeys.InterfaceSlotKey(declared.DeclaringType.FullName, declared.Name, concrete);
+        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } concreteMethod)
+            return concreteMethod;
+        // Public static interface implementations have no MethodImpl row.
+        var expectedKey = VmSlotKeys.Of(declared.Name, concrete);
+        return implementingClass.Methods.FirstOrDefault(method => method.IsStatic && method.SlotKey == expectedKey);
+    }
+
     // ---- 仮想ディスパッチ ----
 
     /// <summary>callvirt の実行時型ディスパッチ。宣言メソッドのスロットキー (名前 + 署名) を
     /// レシーバの VTable / InterfaceMap で解決し (署名精度)、解決できない場合は
     /// 名前+引数個数の従来照合にフォールバックする (ファサード系 / 表外メソッドの救済)。</summary>
-    public VmMethod DispatchVirtual(VmMethod declared, in StackSlot receiver) =>
-        TryDispatchDeclared(declared, receiver) ??
+    public VmMethod DispatchVirtual(VmMethod declared, in StackSlot receiver, VmType? constrainedType = null) =>
+        TryDispatchDeclared(declared, receiver, constrainedType) ??
         TryDispatchVirtual(declared.Name, declared.Signature.ParamTypes.Length, receiver) ??
         declared;
 
@@ -47,8 +73,8 @@ internal sealed partial class CallEngine {
     /// "str".ToString() が宣言どおり Object::ToString に着地し、② IL の GetType() 経路が
     /// 文字列自身でなく型名を返す退行のため。名前+引数個数の TryDispatchVirtual へは
     /// 従来どおり VmString を渡さない — InterfaceReceiverType のコメント参照)。</summary>
-    private VmMethod? TryDispatchDeclared(VmMethod declared, in StackSlot receiver) {
-        var receiverType = ReceiverRuntimeType(receiver) ?? InterfaceReceiverType(receiver);
+    private VmMethod? TryDispatchDeclared(VmMethod declared, in StackSlot receiver, VmType? constrainedType = null) {
+        var receiverType = constrainedType ?? ReceiverRuntimeType(receiver) ?? InterfaceReceiverType(receiver);
         if (receiverType is null || declared.DeclaringType is not VmClassType declaringClass)
             return null;
         var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
@@ -111,6 +137,26 @@ internal sealed partial class CallEngine {
         if (receiverType is null)
             return null;
         var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
+        VmLifetime.EnsureLiveForGuest(receiverType);
+        var version = Volatile.Read(ref _virtualTargetVersion);
+        var key = (definition, name, paramCount);
+        if (_intrinsics.IsSealed && _virtualTargets.TryGetValue(key, out var cached)) {
+            VmLifetime.EnsureLiveForGuest(cached);
+            return cached;
+        }
+        var resolved = ResolveVirtualByName(receiverType, definition, name, paramCount);
+        // The receiver definition's methods and dispatch map are immutable.
+        // Type arguments are still taken from each receiver by BuildCallContext.
+        if (resolved is not null && _intrinsics.IsSealed) {
+            lock (_virtualTargetGate) {
+                if (_virtualTargetVersion == version && _virtualTargets.Count < 4096)
+                    _virtualTargets.TryAdd(key, resolved);
+            }
+        }
+        return resolved;
+    }
+
+    private VmMethod? ResolveVirtualByName(VmType receiverType, VmType definition, string name, int paramCount) {
         if (definition is VmClassType receiverClass) {
             var maps = (receiverClass.Loader ?? _loader).EnsureDispatchMaps(receiverClass);
             VmMethod? best = null;

@@ -89,12 +89,23 @@ public sealed class VmClassType : VmType {
     private VmType? _baseType;
     private bool _baseTypeResolved;
 
-    public override string FullName =>
-        // CLR 規約: ネスト型の FullName は包含型を '+' で連結する (Type.FullName 互換)。
-        // DeclaringType は TypeLoader の遅延解決なので、未解決間はメタデータ名のみ。
-        DeclaringType is VmClassType declaring
-            ? declaring.FullName + "+" + Name
-            : string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
+    private sealed record FullNameState(string? ParentName, string Value);
+    private FullNameState? _fullName;
+
+    public override string FullName {
+        get {
+            // Enclosing types are completed lazily. Their name can change while
+            // a nested type is being loaded, so cache the enclosing name too.
+            var parentName = (DeclaringType as VmClassType)?.FullName;
+            var cached = Volatile.Read(ref _fullName);
+            if (cached is not null && ReferenceEquals(cached.ParentName, parentName))
+                return cached.Value;
+            var name = parentName is not null ? parentName + "+" + Name
+                : string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
+            Volatile.Write(ref _fullName, new FullNameState(parentName, name));
+            return name;
+        }
+    }
 
     /// <summary>ネスト型の場合の包含型 (無ければ null)。</summary>
     public VmType? DeclaringType { get; internal set; }
@@ -150,6 +161,7 @@ public sealed class VmClassType : VmType {
 
 /// <summary>アセンブリに実装が無い型 (System.Object 等) を表すファサード。実体は intrinsic が担う。</summary>
 public sealed class VmIntrinsicType : VmType {
+    private string? _fullName;
     public required string Namespace { get; init; }
     public required new string Name { get; init; }
     public required bool IsValue { get; init; }
@@ -162,7 +174,14 @@ public sealed class VmIntrinsicType : VmType {
 
     internal void SetGenericParamFlags(uint[] flags) => _genericParamFlags = flags;
 
-    public override string FullName => string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
+    public override string FullName {
+        get {
+            if (Volatile.Read(ref _fullName) is { } name)
+                return name;
+            name = string.IsNullOrEmpty(Namespace) ? Name : Namespace + "." + Name;
+            return Interlocked.CompareExchange(ref _fullName, name, null) ?? name;
+        }
+    }
     public override VmType? BaseType => Parent;
     public override bool IsValueType => IsValue;
 }

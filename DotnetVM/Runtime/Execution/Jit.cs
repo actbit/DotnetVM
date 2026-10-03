@@ -1,5 +1,6 @@
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Collections.Concurrent;
 using DotnetVM.Host;
 using DotnetVM.IL;
 using DotnetVM.Metadata;
@@ -11,6 +12,8 @@ using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
 
+internal delegate StackSlot JitLeaf(Interpreter interpreter, ReadOnlySpan<StackSlot> arguments);
+
 /// <summary>
 /// A compiled entry point for the small JIT.  The delegate deliberately receives
 /// a VM frame instead of exposing CLR values to generated code; all values still
@@ -18,14 +21,14 @@ namespace DotnetVM.Runtime.Execution;
 /// </summary>
 internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry,
     PreparedMethod prepared,
-    Func<Interpreter, StackSlot[], StackSlot>? leaf = null) {
+    JitLeaf? leaf = null) {
     private readonly Func<JitFrame, StackSlot> _entry = entry;
-    private readonly Func<Interpreter, StackSlot[], StackSlot>? _leaf = leaf;
+    private readonly JitLeaf? _leaf = leaf;
 
     internal PreparedMethod Prepared { get; } = prepared;
     internal bool HasLeaf => _leaf is not null;
 
-    internal bool TryInvokeLeaf(Interpreter interpreter, StackSlot[] arguments, out StackSlot result) {
+    internal bool TryInvokeLeaf(Interpreter interpreter, ReadOnlySpan<StackSlot> arguments, out StackSlot result) {
         if (_leaf is null) {
             result = default;
             return false;
@@ -104,7 +107,7 @@ internal sealed class JitCodeCache(
     private readonly VmHeap _heap = heap;
     private readonly MemoryPolicy _memory = memory;
     private readonly JitResourceBudget _resourceBudget = resourceBudget;
-    private readonly Dictionary<VmMethod, Entry> _entries = [];
+    private readonly ConcurrentDictionary<VmMethod, Entry> _entries = new();
     private readonly object _gate = new();
 
     public JitCompiledMethod? TryGetCompiled(VmMethod method, PreparedMethod prepared,
@@ -112,12 +115,16 @@ internal sealed class JitCodeCache(
         if (!_enabled)
             return null;
 
+        if (_entries.TryGetValue(method, out var published) &&
+            Volatile.Read(ref published.Compiled) is { } ready)
+            return ready;
+
         Entry entry;
         lock (_gate) {
             if (!_entries.TryGetValue(method, out entry!)) {
                 if (!_resourceBudget.TryReserveEntry())
                     return null;
-                _entries.Add(method, entry = new Entry());
+                _entries.TryAdd(method, entry = new Entry());
             }
 
             if (entry.Compiled is not null || entry.Rejected || entry.Compiling)
@@ -172,7 +179,7 @@ internal sealed class JitCodeCache(
                 return null;
             }
             entry.CompiledReserved = true;
-            entry.Compiled = compiled;
+            Volatile.Write(ref entry.Compiled, compiled);
             return compiled;
         }
     }
@@ -182,14 +189,12 @@ internal sealed class JitCodeCache(
             return _entries.TryGetValue(method, out var entry) ? entry.InvocationCount : 0;
     }
 
-    internal bool IsCompiled(VmMethod method) {
-        lock (_gate)
-            return _entries.TryGetValue(method, out var entry) && entry.Compiled is not null;
-    }
+    internal bool IsCompiled(VmMethod method) => GetCompiled(method) is not null;
 
     internal JitCompiledMethod? GetCompiled(VmMethod method) {
-        lock (_gate)
-            return _entries.TryGetValue(method, out var entry) ? entry.Compiled : null;
+        if (!_enabled)
+            return null;
+        return _entries.TryGetValue(method, out var entry) ? Volatile.Read(ref entry.Compiled) : null;
     }
 
     public void Clear() {
@@ -209,6 +214,7 @@ internal sealed class JitCodeCache(
 /// </summary>
 internal struct JitFrame {
     private readonly Interpreter _interpreter;
+    private readonly Interpreter.ExecutionState _executionState;
     private readonly InterpreterServices _services;
     private readonly InterpreterFrame _frame;
     private VmExecutionCoordinator.InstructionBatchLease _instructionBatch;
@@ -218,6 +224,7 @@ internal struct JitFrame {
 
     public JitFrame(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) {
         _interpreter = interpreter;
+        _executionState = interpreter.CurrentExecutionState;
         _services = services;
         _frame = frame;
     }
@@ -253,7 +260,7 @@ internal struct JitFrame {
         _instructionLease = _interpreter.EnterJitInstructionInBatch();
         _instructionActive = true;
         try {
-            _interpreter.ConsumeJitInstruction();
+            _interpreter.ConsumeJitInstructionForState(_executionState);
         } catch {
             _instructionLease.Dispose();
             _instructionLease = default;
@@ -420,9 +427,14 @@ internal struct JitFrame {
         }
 
         var arity = target.Signature.ParamTypes.Length + (target.Signature.HasThis ? 1 : 0);
-        var arguments = new StackSlot[arity];
-        for (var i = arity - 1; i >= 0; i--)
-            arguments[i] = _frame.Stack.Pop();
+        if (_interpreter.TryInvokeCompiledLeaf(target, _frame.Stack.ArgumentSlots(arity), out var leafValue)) {
+            _frame.Stack.DropArguments(arity);
+            if (SlotOps.SignatureReturnsValue(target.Signature))
+                _frame.Stack.Push(leafValue);
+            _frame.Ip = next;
+            return;
+        }
+        var arguments = _frame.Stack.PopArguments(arity);
         if (!_interpreter.TryInvokeCompiled(target, arguments, null, out var value)) {
             for (var i = 0; i < arguments.Length; i++)
                 _frame.Stack.Push(arguments[i]);
@@ -681,6 +693,11 @@ internal struct JitFrame {
         var objects = _interpreter.JitObjectsFor(_frame.Method);
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
+        if (!type.IsValueType) {
+            _frame.Stack.Push(value);
+            _frame.Ip = next;
+            return;
+        }
         var fields = value.Kind == StackKind.ValueType && value.ObjectValue is VmStructValue sv
             ? sv.Clone().Fields
             : [value];
@@ -906,7 +923,7 @@ internal static class JitMethodCompiler {
                 execution,
                 Expression.Call(frame, Method(nameof(JitFrame.EndExecution))));
             var lambda = Expression.Lambda<Func<JitFrame, StackSlot>>(body, frame).Compile();
-            Func<Interpreter, StackSlot[], StackSlot>? leaf = null;
+            JitLeaf? leaf = null;
             try {
                 leaf = TryCompileLeaf(method, prepared, code);
             } catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
@@ -984,7 +1001,11 @@ internal static class JitMethodCompiler {
         return true;
     }
 
-    private static Func<Interpreter, StackSlot[], StackSlot>? TryCompileLeaf(VmMethod method,
+    // Expression trees cannot consume a ref-returning span indexer directly.
+    // Copy the single slot at the IL load, without allocating an argument array.
+    public static StackSlot ReadLeafArgument(ReadOnlySpan<StackSlot> arguments, int index) => arguments[index];
+
+    private static JitLeaf? TryCompileLeaf(VmMethod method,
         PreparedMethod prepared, DecodedInstruction[] code) {
         if (IsConstructorLeafCandidate(method, prepared, code))
             return TryCompileConstructorLeaf(method, code);
@@ -992,7 +1013,8 @@ internal static class JitMethodCompiler {
             return null;
 
         var interpreter = Expression.Parameter(typeof(Interpreter), "interpreter");
-        var arguments = Expression.Parameter(typeof(StackSlot[]), "arguments");
+        var arguments = Expression.Parameter(typeof(ReadOnlySpan<StackSlot>), "arguments");
+        var readArgument = typeof(JitMethodCompiler).GetMethod(nameof(ReadLeafArgument))!;
         var statements = new List<Expression>(code.Length + 1);
         var stack = new List<Expression>();
         var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
@@ -1013,11 +1035,11 @@ internal static class JitMethodCompiler {
                 case ILOp.Nop or ILOp.Break:
                     break;
                 case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
-                    stack.Add(Expression.ArrayIndex(arguments,
+                    stack.Add(Expression.Call(readArgument, arguments,
                         Expression.Constant((int)(instruction.Op - ILOp.Ldarg_0))));
                     break;
                 case ILOp.Ldarg_S or ILOp.Ldarg:
-                    stack.Add(Expression.ArrayIndex(arguments, Expression.Constant(instruction.IntOperand)));
+                    stack.Add(Expression.Call(readArgument, arguments, Expression.Constant(instruction.IntOperand)));
                     break;
                 case ILOp.Ldnull:
                     stack.Add(Expression.Property(null, nullProperty));
@@ -1086,7 +1108,7 @@ internal static class JitMethodCompiler {
                     if (stack.Count != (returnsValue ? 1 : 0))
                         return null;
                     statements.Add(returnsValue ? stack[^1] : Expression.Default(typeof(StackSlot)));
-                    return Expression.Lambda<Func<Interpreter, StackSlot[], StackSlot>>(
+                    return Expression.Lambda<JitLeaf>(
                         Expression.Block(statements), interpreter, arguments).Compile();
                 default:
                     return null;
@@ -1102,9 +1124,15 @@ internal static class JitMethodCompiler {
 
     private static bool IsLeafCandidate(VmMethod method, PreparedMethod prepared,
         DecodedInstruction[] code) =>
-        !method.Signature.HasThis && IsStraightLine(code) && prepared.LocalTypes.Length == 0 &&
+        (!method.Signature.HasThis || !code.Any(LoadsReceiver)) &&
+        IsStraightLine(code) && prepared.LocalTypes.Length == 0 &&
         IsLeafType(method.Signature.ReturnType) &&
         method.Signature.ParamTypes.All(IsLeafType);
+
+    // Capture-free instance lambdas use only primitive parameters. A leaf
+    // must not load the receiver or derive an address from it.
+    private static bool LoadsReceiver(DecodedInstruction instruction) => instruction.Op == ILOp.Ldarg_0 ||
+        instruction.Op is ILOp.Ldarg or ILOp.Ldarg_S or ILOp.Ldarga or ILOp.Ldarga_S && instruction.IntOperand == 0;
 
     private static bool IsConstructorLeafCandidate(VmMethod method, PreparedMethod prepared,
         DecodedInstruction[] code) =>
@@ -1113,10 +1141,11 @@ internal static class JitMethodCompiler {
         method.Signature.ParamTypes.All(IsLeafType) && IsStraightLine(code) &&
         code.Any(instruction => instruction.Op == ILOp.Stfld);
 
-    private static Func<Interpreter, StackSlot[], StackSlot>? TryCompileConstructorLeaf(
+    private static JitLeaf? TryCompileConstructorLeaf(
         VmMethod method, DecodedInstruction[] code) {
         var interpreter = Expression.Parameter(typeof(Interpreter), "interpreter");
-        var arguments = Expression.Parameter(typeof(StackSlot[]), "arguments");
+        var arguments = Expression.Parameter(typeof(ReadOnlySpan<StackSlot>), "arguments");
+        var readArgument = typeof(JitMethodCompiler).GetMethod(nameof(ReadLeafArgument))!;
         var statements = new List<Expression>(code.Length + 1);
         var stack = new List<Expression>();
         var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
@@ -1134,11 +1163,11 @@ internal static class JitMethodCompiler {
                 case ILOp.Nop or ILOp.Break:
                     break;
                 case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
-                    stack.Add(Expression.ArrayIndex(arguments,
+                    stack.Add(Expression.Call(readArgument, arguments,
                         Expression.Constant((int)(instruction.Op - ILOp.Ldarg_0))));
                     break;
                 case ILOp.Ldarg_S or ILOp.Ldarg:
-                    stack.Add(Expression.ArrayIndex(arguments, Expression.Constant(instruction.IntOperand)));
+                    stack.Add(Expression.Call(readArgument, arguments, Expression.Constant(instruction.IntOperand)));
                     break;
                 case ILOp.Ldc_I4_M1:
                     stack.Add(Expression.Call(ofInt32, Expression.Constant(-1)));
@@ -1175,7 +1204,7 @@ internal static class JitMethodCompiler {
                     if (i != code.Length - 1 || stack.Count != 0)
                         return null;
                     statements.Add(Expression.Default(typeof(StackSlot)));
-                    return Expression.Lambda<Func<Interpreter, StackSlot[], StackSlot>>(
+                    return Expression.Lambda<JitLeaf>(
                         Expression.Block(statements), interpreter, arguments).Compile();
                 default:
                     return null;

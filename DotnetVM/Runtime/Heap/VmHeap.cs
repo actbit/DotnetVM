@@ -312,7 +312,7 @@ public sealed class VmHeap {
         if (charCount < 0)
             throw new ArgumentOutOfRangeException(nameof(charCount));
         lock (_gate) {
-        var size = 24 + 2L * charCount;
+        var size = 24L + VmString.StorageByteCount(charCount) - VmString.HeaderByteCount;
         if (size > _memory.TotalAllocationByteLimit - _totalAllocated)
             throw new MemoryQuotaExceededException(
                 $"累計アロケーション上限 {_memory.TotalAllocationByteLimit:N0} バイトを超過しました (文字列 {charCount} 文字)。");
@@ -349,13 +349,7 @@ public sealed class VmHeap {
                 Roots = roots,
             });
 
-            var deadCount = 0;
-            for (var i = _objects.Count - 1; i >= 0; i--) {
-                if (!live.Contains(_objects[i])) {
-                    _objects.RemoveAt(i);
-                    deadCount++;
-                }
-            }
+            _objects.RemoveAll(obj => !live.Contains(obj));
             _liveBytes = 0;
             foreach (var obj in _objects)
                 _liveBytes += ObjectModel.EstimateSize(obj);

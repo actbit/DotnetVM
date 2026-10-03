@@ -20,7 +20,16 @@ internal sealed class GuestThreadRuntime(
     private readonly CancellationToken _shutdownToken = shutdownToken;
     private readonly int _shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
     private int _nextId;
+    private readonly ThreadLocal<int> _currentThreadId = new();
     private bool _disposed;
+
+    public int CurrentManagedThreadId {
+        get {
+            if (_currentThreadId.Value == 0)
+                _currentThreadId.Value = Interlocked.Increment(ref _nextId);
+            return _currentThreadId.Value;
+        }
+    }
 
     public int ActiveCount => _active.Count;
 
@@ -55,6 +64,7 @@ internal sealed class GuestThreadRuntime(
             thread.BudgetAcquired = true;
             thread.HostThread = new Thread(() => {
                 try {
+                    _currentThreadId.Value = thread.Id;
                     _shutdownToken.ThrowIfCancellationRequested();
                     runDelegate(thread.StartDelegate,
                         thread.Parameterized ? (passState ? state : StackSlot.OfObject(null)) : default,
@@ -158,6 +168,7 @@ internal sealed class GuestThreadRuntime(
             if (!hostThread.IsAlive)
                 thread.Completed.Dispose();
         }
+        _currentThreadId.Dispose();
     }
 
     private GuestThread Get(VmObject threadObject) {

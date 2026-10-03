@@ -1,0 +1,82 @@
+{
+  "Runtime": "10.0.12",
+  "MeasuredAt": "2026-10-03T08:43:15.3026896+00:00",
+  "OS": "Microsoft Windows NT 10.0.26200.0",
+  "HostTieredCompilation": "0",
+  "Protocol": "0c419aa",
+  "Warmups": 3,
+  "Samples": 9,
+  "InvocationsPerSample": 5,
+  "Results": [
+    {
+      "Name": "Arithmetic",
+      "Method": "ArithmeticLoop",
+      "Input": 100000,
+      "Expected": -1004575550,
+      "Timings": {
+        "CoreClrMedian": 0.7354,
+        "InterpreterMedian": 544.0138,
+        "JitMedian": 388.935,
+        "InterpreterToCoreClr": 739.7522436769104,
+        "JitToCoreClr": 528.8754419363611,
+        "InterpreterToJit": 1.3987267795389973
+      }
+    },
+    {
+      "Name": "Branches",
+      "Method": "BranchLoop",
+      "Input": 100000,
+      "Expected": 1311006979,
+      "Timings": {
+        "CoreClrMedian": 1.7496,
+        "InterpreterMedian": 542.279,
+        "JitMedian": 387.5547,
+        "InterpreterToCoreClr": 309.94455875628717,
+        "JitToCoreClr": 221.5104595336077,
+        "InterpreterToJit": 1.399232160002188
+      }
+    },
+    {
+      "Name": "Array access",
+      "Method": "ArraySum",
+      "Input": 10000,
+      "Expected": 150911208,
+      "Timings": {
+        "CoreClrMedian": 0.0579,
+        "InterpreterMedian": 90.597,
+        "JitMedian": 66.6258,
+        "InterpreterToCoreClr": 1564.7150259067357,
+        "JitToCoreClr": 1150.7046632124352,
+        "InterpreterToJit": 1.3597885503813838
+      }
+    },
+    {
+      "Name": "Method calls",
+      "Method": "CallLoop",
+      "Input": 100000,
+      "Expected": 1083471201,
+      "Timings": {
+        "CoreClrMedian": 0.4689,
+        "InterpreterMedian": 1262.5366,
+        "JitMedian": 485.554,
+        "InterpreterToCoreClr": 2692.549797398166,
+        "JitToCoreClr": 1035.5171678396246,
+        "InterpreterToJit": 2.6001981242045167
+      }
+    },
+    {
+      "Name": "Object allocation",
+      "Method": "ObjectLoop",
+      "Input": 10000,
+      "Expected": 49995256,
+      "Timings": {
+        "CoreClrMedian": 0.1678,
+        "InterpreterMedian": 256.0699,
+        "JitMedian": 188.7956,
+        "InterpreterToCoreClr": 1526.0423122765196,
+        "JitToCoreClr": 1125.1227651966626,
+        "InterpreterToJit": 1.3563340459205617
+      }
+    }
+  ]
+}

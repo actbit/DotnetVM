@@ -257,10 +257,23 @@ public sealed class ConcurrencyTests {
                     for (var i = 0; i < tasks.Length; i++) tasks[i] = Task.FromResult(i);
                     return Task.WhenAny(tasks).GetAwaiter().GetResult().GetAwaiter().GetResult();
                 }
-                public static int WaitAllTimeoutInt() =>
-                    Task.WaitAll(new[] { Task.Delay(100) }, 1) ? -1 : 1;
-                public static int WaitAllTimeoutTimeSpan() =>
-                    Task.WaitAll(new[] { Task.Delay(100) }, TimeSpan.FromMilliseconds(1)) ? -1 : 1;
+                // Keep the task pending until the timeout has been observed.
+                // A 100ms delay can finish during compilation / host scheduling
+                // under parallel test load, before WaitAll is even entered.
+                public static int WaitAllTimeoutInt() {
+                    using var cts = new CancellationTokenSource();
+                    var pending = Task.Delay(Timeout.Infinite, cts.Token);
+                    var completed = Task.WaitAll(new[] { pending }, 1);
+                    cts.Cancel();
+                    return completed ? -1 : 1;
+                }
+                public static int WaitAllTimeoutTimeSpan() {
+                    using var cts = new CancellationTokenSource();
+                    var pending = Task.Delay(Timeout.Infinite, cts.Token);
+                    var completed = Task.WaitAll(new[] { pending }, TimeSpan.FromMilliseconds(1));
+                    cts.Cancel();
+                    return completed ? -1 : 1;
+                }
                 public static int WaitAllMultipleFaults() {
                     try { Task.WaitAll(new[] { FaultAsync(), FaultAsync() }); return -1; }
                     catch (AggregateException) { return 1; }

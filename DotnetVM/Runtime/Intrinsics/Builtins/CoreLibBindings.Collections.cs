@@ -49,6 +49,8 @@ internal static partial class CoreLibBindings {
         r.RegisterBinding(BindingKey.Static(T, "Copy",
                 "System.Array", "System.Int32", "System.Array", "System.Int32", "System.Int32"),
             static (_, a) => { CopyImpl(a); return null; }, BindingOrigin.Managed);
+        r.RegisterBinding(BindingKey.Static(T, "Copy", "System.Array", "System.Array", "System.Int32"),
+            static (_, a) => { CopyImpl(a[0], 0, a[1], 0, a[2].AsInt32); return null; }, BindingOrigin.Managed);
     }
 
     private static VmArray RequireSzArray(in StackSlot slot, string face) {
@@ -63,7 +65,7 @@ internal static partial class CoreLibBindings {
     private static void CheckRange(int index, int length, int arrayLength, string face) {
         if (index < 0 || length < 0)
             throw new UnhandledGuestException("System.ArgumentOutOfRangeException", null);
-        if (index + length > arrayLength)
+        if (index > arrayLength || length > arrayLength - index)
             throw new UnhandledGuestException("System.ArgumentException",
                 $"{face} の範囲 (index={index}, length={length}) が配列長 {arrayLength} を超えています。");
     }
@@ -125,16 +127,31 @@ internal static partial class CoreLibBindings {
         return -1;
     }
 
-    private static void CopyImpl(StackSlot[] a) {
-        var src = RequireSzArray(a[0], "Array.Copy");
-        var srcIndex = a[1].AsInt32;
-        var dst = RequireSzArray(a[2], "Array.Copy");
-        var dstIndex = a[3].AsInt32;
-        var length = a[4].AsInt32;
+    private static void CopyImpl(StackSlot[] a) => CopyImpl(a[0], a[1].AsInt32, a[2], a[3].AsInt32, a[4].AsInt32);
+
+    private static void CopyImpl(in StackSlot source, int srcIndex, in StackSlot destination, int dstIndex, int length) {
+        var src = RequireSzArray(source, "Array.Copy");
+        var dst = RequireSzArray(destination, "Array.Copy");
         CheckRange(srcIndex, length, src.Length, "Array.Copy");
         CheckRange(dstIndex, length, dst.Length, "Array.Copy");
         var srcName = src.ArrayType.ElementType.FullName;
         var dstName = dst.ArrayType.ElementType.FullName;
+        if (src.ArrayType.ElementType.IsValueType && dst.ArrayType.ElementType.IsValueType &&
+            !VmPrimitiveTypes.IsSlotPrimitive(srcName) && !VmPrimitiveTypes.IsSlotPrimitive(dstName)) {
+            if (!GuestTaskRuntime.VmTypeIdentityComparer.Instance.Equals(
+                    src.ArrayType.ElementType, dst.ArrayType.ElementType))
+                throw new UnhandledGuestException("System.ArrayTypeMismatchException", null);
+            // Preserve value semantics, including nested structs. Copy backwards
+            // when the destination overlaps the source to match memmove.
+            var backwards = ReferenceEquals(src, dst) && dstIndex > srcIndex;
+            for (var offset = 0; offset < length; offset++) {
+                var i = backwards ? length - 1 - offset : offset;
+                var value = src.Elements[srcIndex + i];
+                dst.Elements[dstIndex + i] = value.ObjectValue is VmStructValue structure
+                    ? StackSlot.OfValueType(structure.Clone()) : value;
+            }
+            return;
+        }
         if (VmPrimitiveTypes.IsSlotPrimitive(srcName) || VmPrimitiveTypes.IsSlotPrimitive(dstName)) {
             // プリミティブ配列は完全一致のみ (int[]→uint[] 等の同一幅も CLR は拒否する)
             if (!string.Equals(srcName, dstName, StringComparison.Ordinal))

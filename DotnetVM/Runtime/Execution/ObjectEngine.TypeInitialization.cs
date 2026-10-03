@@ -10,6 +10,12 @@ internal sealed partial class ObjectEngine {
     public void EnsureInitialized(VmClassType type) {
         if (_typeInitialization.IsCompleted(type))
             return;
+        EnsureInitializedSlow(type);
+    }
+
+    // Keep captured lambdas out of the completed path: their display class is
+    // allocated on entry even when an early return precedes delegate creation.
+    private void EnsureInitializedSlow(VmClassType type) {
         EnsureInitializationOutsideExecutionLease(() => _typeInitialization.Ensure(type, () => {
             var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
             if (cctor?.Body is not null)
@@ -20,6 +26,12 @@ internal sealed partial class ObjectEngine {
     /// <summary>構築ジェネリック型の .cctor 起動 (CLR と同じく型実引数ごとに 1 回。
     /// 定義参照 + 型引数参照列で鍵化し、FullName 文字列は使わない)。</summary>
     public void EnsureConstructedInitialized(VmConstructedType type) {
+        if (_typeInitialization.IsCompleted(type))
+            return;
+        EnsureConstructedInitializedSlow(type);
+    }
+
+    private void EnsureConstructedInitializedSlow(VmConstructedType type) {
         EnsureInitializationOutsideExecutionLease(() => _typeInitialization.Ensure(type, () => {
             var definition = (VmClassType)type.Definition;
             var cctor = definition.Methods.FirstOrDefault(m => m.Name == ".cctor");

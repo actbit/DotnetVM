@@ -316,6 +316,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Array", "Reverse", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 3);
         Add("System.Array", "IndexOf", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 4);
         Add("System.Array", "Copy", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 5);
+        Add("System.Array", "Copy", CoreLibSurfaceKind.RuntimeInternal, arrayCoreJ, hasThis: false, paramCount: 3);
         Add("System.Array", "IndexOf", CoreLibSurfaceKind.RuntimeInternal,
             arrayCoreJ + " (ジェネリック面は開いたキーで 1 件。SpanHelpers の SIMD/static-abstract 依存を迂回する)", hasThis: false, paramCount: 4);
         // EqualityComparer<T>.get_Default (本家は .cctor → ComparerHelpers 連鎖で比較子実体を
@@ -377,6 +378,10 @@ internal static class CoreLibSurfaceAudit {
             CultureOutOfScope + "。AppContext スイッチ面 (culture 機構) のため false 固定で提供", hasThis: false, paramCount: 0);
 
         var threadJ = InternalCall + "。guest Thread をホスト worker に割り当て、delegate 呼出は VM の共有 quota / heap / stop-the-world GC を通る";
+        Add("System.Environment", "get_CurrentManagedThreadId", CoreLibSurfaceKind.RuntimeInternal,
+            threadJ + "。VM 内のスレッド ID を返し、LINQ iterator のスレッド一致検査にも使用する", hasThis: false, paramCount: 0);
+        Add("System.Diagnostics.Debugger", "IsManagedDebuggerAttached", CoreLibSurfaceKind.RuntimeInternal,
+            InternalCall + "。guest debugger は未接続のため false。CoreLib の Task 診断 probe に限定する", hasThis: false, paramCount: 0);
         Add("System.Threading.Thread", ".ctor", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 1);
         Add("System.Threading.Thread", "Start", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 0);
         Add("System.Threading.Thread", "Start", CoreLibSurfaceKind.RuntimeInternal, threadJ, hasThis: true, paramCount: 1);
@@ -409,6 +414,8 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Threading.SynchronizationContext", "Send", CoreLibSurfaceKind.RuntimeInternal, synchronizationJ, hasThis: true);
 
         var taskJ = InternalCall + "。VM Task と awaiter の状態を保持し、async state machine 継続を guest worker で再開";
+        Add("System.Threading.Tasks.ValueTask", ".ctor", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 1);
+        Add("System.Threading.Tasks.ValueTask`1", ".ctor", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: true, paramCount: 1);
         Add("System.Threading.Tasks.Task", "Delay", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
         Add("System.Threading.Tasks.Task", "Run", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);
         Add("System.Threading.Tasks.Task", "FromResult", CoreLibSurfaceKind.RuntimeInternal, taskJ, hasThis: false);

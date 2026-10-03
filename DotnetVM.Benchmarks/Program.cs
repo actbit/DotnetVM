@@ -1,184 +1,171 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
-using DotnetVM.BenchmarkGuest;
+using System.Text.Json;
+using DotnetVM.Benchmarks;
 using DotnetVM.Host;
 
-namespace DotnetVM.Benchmarks;
-
-internal static class Program {
-    private const string GuestType = "DotnetVM.BenchmarkGuest.Workloads";
-    private const int WarmupInvocations = 3;
-    private const int InvocationsPerSample = 5;
-    private const int Samples = 9;
-    private static readonly WorkloadDefinition[] Definitions = [
-        new("Arithmetic", "ArithmeticLoop", 100_000),
-        new("Branches", "BranchLoop", 100_000),
-        new("Array access", "ArraySum", 10_000),
-        new("Method calls", "CallLoop", 100_000),
-        new("Object allocation", "ObjectLoop", 10_000),
-    ];
-
-    private static int Main() {
-        var guestPath = Path.Combine(AppContext.BaseDirectory, "DotnetVM.BenchmarkGuest.dll");
-        if (!File.Exists(guestPath)) {
-            Console.Error.WriteLine($"ゲストアセンブリが見つかりません: {guestPath}");
-            return 1;
-        }
-
-        var workloads = Definitions.Select(Bind).ToArray();
-        var interpreted = Prepare(enableJit: false, guestPath);
-        var jitted = Prepare(enableJit: true, guestPath);
-        try {
-            foreach (var workload in workloads) {
-                Warmup(interpreted, workload);
-                Warmup(jitted, workload);
-                Warmup(workload);
-            }
-
-            Console.WriteLine("DotnetVM execution benchmark");
-            Console.WriteLine($"Runtime: {Environment.Version}");
-            Console.WriteLine($"OS: {Environment.OSVersion}");
-            Console.WriteLine($"Architecture: {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}");
-            Console.WriteLine("CoreCLR: same guest assembly called through a typed delegate");
-            Console.WriteLine($"Samples: {Samples} x {InvocationsPerSample} invocations per pattern (warmup: {WarmupInvocations})");
-            Console.WriteLine();
-            Console.WriteLine("Pattern             CoreCLR ms   VM interp ms   VM JIT ms");
-            Console.WriteLine("                    (median)     (median)      (median)");
-            var summaries = new TimingSummary[workloads.Length];
-            for (var i = 0; i < workloads.Length; i++)
-                summaries[i] = Measure(interpreted, jitted, workloads[i]);
-            for (var i = 0; i < workloads.Length; i++)
-                Print(workloads[i], summaries[i]);
-            Console.WriteLine();
-            Console.WriteLine("Ratios: VM/CoreCLR and VM interpreter/JIT (median)");
-            for (var i = 0; i < workloads.Length; i++) {
-                var workload = workloads[i];
-                var result = summaries[i];
-                Console.WriteLine($"{workload.Name,-18} interp/CoreCLR {result.InterpreterToCoreClr,7:F1}x  " +
-                    $"JIT/CoreCLR {result.JitToCoreClr,7:F1}x  interp/JIT {result.InterpreterToJit,6:F2}x");
-            }
-            return 0;
-        } finally {
-            interpreted.Dispose();
-            jitted.Dispose();
-        }
+var samples = 7;
+var warmups = 3;
+var enableJit = false;
+var legacy = false;
+string? output = null;
+string? filter = null;
+int? size = null;
+var trace = false;
+for (var i = 0; i < args.Length; i++) {
+    switch (args[i]) {
+        case "--jit": enableJit = true; break;
+        case "--legacy": legacy = true; break;
+        case "--samples": samples = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--warmups": warmups = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--output": output = args[++i]; break;
+        case "--filter": filter = args[++i]; break;
+        case "--size": size = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--trace": trace = true; break;
+        default: throw new ArgumentException($"Unknown option: {args[i]}");
     }
+}
+if (samples < 1 || warmups < 1) throw new ArgumentException("Samples and warmups must be positive.");
+if (size is < 0) throw new ArgumentException("Size must be nonnegative.");
+if (legacy) {
+    Environment.ExitCode = LegacyBenchmarks.Run(output);
+    return;
+}
 
-    private static VirtualMachine Prepare(bool enableJit, string guestPath) {
-        var vm = new VirtualMachine(new VmHostOptions {
-            EnableJit = enableJit,
-            // Compile the workload on its first invocation when JIT is enabled.
-            JitPromotionThreshold = 1,
-            Memory = new MemoryPolicy {
-                InstructionQuota = 1_000_000_000,
-            },
-        });
-        vm.LoadAssembly(guestPath);
-        return vm;
+var mixedGuest = typeof(GuestWorkloads);
+var loopGuest = typeof(DotnetVM.BenchmarkGuest.Workloads);
+var workloads = new (string Name, Type GuestType, int Count)[] {
+    (nameof(GuestWorkloads.Arithmetic), mixedGuest, 5000),
+    (nameof(DotnetVM.BenchmarkGuest.Workloads.ArithmeticLoop), loopGuest, 100000),
+    (nameof(DotnetVM.BenchmarkGuest.Workloads.BranchLoop), loopGuest, 100000),
+    (nameof(DotnetVM.BenchmarkGuest.Workloads.ArraySum), loopGuest, 10000),
+    (nameof(GuestWorkloads.FieldAccess), mixedGuest, 5000),
+    (nameof(GuestWorkloads.GenericFieldAccess), mixedGuest, 5000),
+    (nameof(GuestWorkloads.MethodCalls), mixedGuest, 1000),
+    (nameof(DotnetVM.BenchmarkGuest.Workloads.CallLoop), loopGuest, 100000),
+    (nameof(DotnetVM.BenchmarkGuest.Workloads.ObjectLoop), loopGuest, 10000),
+    (nameof(GuestWorkloads.List), mixedGuest, 500),
+    (nameof(GuestWorkloads.ListGrowth), mixedGuest, 500),
+    (nameof(GuestWorkloads.Linq), mixedGuest, 500),
+    (nameof(GuestWorkloads.DictionaryInt), mixedGuest, 200),
+    (nameof(GuestWorkloads.DictionaryGrowth), mixedGuest, 200),
+    (nameof(GuestWorkloads.DictionaryString), mixedGuest, 200),
+    (nameof(GuestWorkloads.AsyncCompleted), mixedGuest, 200),
+    (nameof(GuestWorkloads.ValueTaskCompleted), mixedGuest, 200),
+    (nameof(GuestWorkloads.AsyncWorkers), mixedGuest, 8),
+};
+var results = new List<object>();
+Console.WriteLine($"{Environment.Version}; JIT={enableJit}; warmups={warmups}; samples={samples}");
+Console.WriteLine("Workload                 CoreCLR ms      VM ms   VM / CLR    Alloc bytes    Instructions");
+foreach (var workload in workloads) {
+    if (filter is not null && !workload.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+    var count = size ?? workload.Count;
+    var method = workload.GuestType.GetMethod(workload.Name, BindingFlags.Public | BindingFlags.Static)!;
+    var coreClrRun = method.CreateDelegate<Func<int, int>>();
+    var expected = coreClrRun(count);
+    using var vm = new VirtualMachine(new VmHostOptions {
+        LoadHostCoreLib = true,
+        EnableJit = enableJit,
+        JitPromotionThreshold = 2,
+        Memory = new MemoryPolicy { InstructionQuota = long.MaxValue, HostWorkBudget = long.MaxValue },
+    });
+    vm.LoadAssembly(workload.GuestType.Assembly.Location);
+    vm.LoadAssembly(typeof(Enumerable).Assembly.Location);
+    void Run() {
+        var actual = (int)vm.Invoke(workload.GuestType.FullName!, workload.Name, count)!;
+        if (actual != expected) throw new InvalidOperationException($"{workload.Name}: CLR={expected}, VM={actual}");
     }
-
-    private static Workload Bind(WorkloadDefinition definition) {
-        var method = typeof(Workloads).GetMethod(definition.Method,
-            BindingFlags.Public | BindingFlags.Static)
-            ?? throw new InvalidOperationException($"ワークロードが見つかりません: {definition.Method}");
-        var coreClr = (WorkloadDelegate)method.CreateDelegate(typeof(WorkloadDelegate));
-        return new Workload(definition.Name, definition.Method, definition.Input, coreClr(definition.Input), coreClr);
-    }
-
-    private static void Warmup(VirtualMachine vm, Workload workload) {
-        for (var i = 0; i < WarmupInvocations; i++)
-            _ = InvokeAndCheck(vm, workload);
-    }
-
-    private static void Warmup(Workload workload) {
-        for (var i = 0; i < WarmupInvocations; i++)
-            _ = InvokeAndCheck(workload);
-    }
-
-    private static TimingSummary Measure(VirtualMachine interpreted, VirtualMachine jitted,
-        Workload workload) {
-        var samples = MeasureSamples(interpreted, jitted, workload);
-        var coreClrMedian = Median(samples.CoreClr);
-        var interpreterMedian = Median(samples.Interpreter);
-        var jitMedian = Median(samples.Jit);
-        return new TimingSummary(
-            coreClrMedian, interpreterMedian, jitMedian,
-            interpreterMedian / coreClrMedian,
-            jitMedian / coreClrMedian,
-            interpreterMedian / jitMedian);
-    }
-
-    private static TimingSamples MeasureSamples(VirtualMachine interpreted, VirtualMachine jitted,
-        Workload workload) {
-        var coreClr = new double[Samples];
-        var interpreter = new double[Samples];
-        var jit = new double[Samples];
-        for (var sample = 0; sample < Samples; sample++) {
+    try {
+        var coreClr = MeasureCoreClr(coreClrRun, count, expected, warmups, samples);
+        if (trace) vm.Tracer.Start();
+        for (var i = 0; i < warmups; i++) Run();
+        vm.Tracer.Stop();
+        var elapsed = new double[samples];
+        var allocated = new long[samples];
+        var instructions = new long[samples];
+        for (var i = 0; i < samples; i++) {
             GC.Collect();
             GC.WaitForPendingFinalizers();
-            GC.Collect();
-
-            // Rotate the order to avoid systematically favoring one mode when
-            // the host changes frequency or receives background work.
-            switch (sample % 3) {
-                case 0:
-                    coreClr[sample] = MeasureSample(() => InvokeAndCheck(workload));
-                    interpreter[sample] = MeasureSample(() => InvokeAndCheck(interpreted, workload));
-                    jit[sample] = MeasureSample(() => InvokeAndCheck(jitted, workload));
-                    break;
-                case 1:
-                    jit[sample] = MeasureSample(() => InvokeAndCheck(jitted, workload));
-                    coreClr[sample] = MeasureSample(() => InvokeAndCheck(workload));
-                    interpreter[sample] = MeasureSample(() => InvokeAndCheck(interpreted, workload));
-                    break;
-                default:
-                    interpreter[sample] = MeasureSample(() => InvokeAndCheck(interpreted, workload));
-                    jit[sample] = MeasureSample(() => InvokeAndCheck(jitted, workload));
-                    coreClr[sample] = MeasureSample(() => InvokeAndCheck(workload));
-                    break;
-            }
+            var allocationBefore = GC.GetTotalAllocatedBytes(precise: true);
+            var instructionBefore = vm.InstructionCount;
+            var start = Stopwatch.GetTimestamp();
+            Run();
+            elapsed[i] = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+            instructions[i] = vm.InstructionCount - instructionBefore;
+            allocated[i] = GC.GetTotalAllocatedBytes(precise: true) - allocationBefore;
         }
-        return new TimingSamples(coreClr, interpreter, jit);
+        Array.Sort(elapsed);
+        Array.Sort(allocated);
+        Array.Sort(instructions);
+        var median = samples / 2;
+        var ratio = elapsed[median] / coreClr.MedianMilliseconds;
+        Console.WriteLine($"{workload.Name,-24} {coreClr.MedianMilliseconds,10:F6} {elapsed[median],10:F3} {ratio,10:F1} {allocated[median],14:N0} {instructions[median],15:N0}");
+        results.Add(new { workload.Name, DeclaringType = workload.GuestType.FullName, Count = count, MedianMilliseconds = elapsed[median],
+            MedianAllocatedBytes = allocated[median], Instructions = instructions[median], Expected = expected,
+            ElapsedMilliseconds = elapsed, CoreClr = coreClr, VmToCoreClrRatio = ratio });
+    } catch (Exception error) {
+        vm.Tracer.Stop();
+        Console.WriteLine($"{workload.Name,-24} ERROR: {error.GetType().Name}: {error.Message}");
+        if (trace) foreach (var frame in vm.Tracer.Frames.TakeLast(25)) Console.WriteLine(frame);
+        results.Add(new { workload.Name, Count = count, Error = error.GetType().Name, error.Message });
+        Environment.ExitCode = 1;
     }
-
-    private static double MeasureSample(Func<int> invoke) {
-        var stopwatch = Stopwatch.StartNew();
-        for (var invocation = 0; invocation < InvocationsPerSample; invocation++)
-            _ = invoke();
-        stopwatch.Stop();
-        return stopwatch.Elapsed.TotalMilliseconds;
-    }
-
-    private static int InvokeAndCheck(VirtualMachine vm, Workload workload) {
-        var result = vm.Invoke(GuestType, workload.Method, workload.Input);
-        if (result is not int value)
-            throw new InvalidOperationException($"予期しないベンチマーク結果です: {result}");
-        if (value != workload.Expected)
-            throw new InvalidOperationException($"{workload.Name} の VM 結果が CLR と一致しません: {value} (期待値 {workload.Expected})");
-        return value;
-    }
-
-    private static int InvokeAndCheck(Workload workload) {
-        var value = workload.CoreClr(workload.Input);
-        if (value != workload.Expected)
-            throw new InvalidOperationException($"{workload.Name} の CoreCLR 結果が不一致です: {value} (期待値 {workload.Expected})");
-        return value;
-    }
-
-    private static double Median(double[] values) {
-        var sorted = values.Order().ToArray();
-        return sorted[sorted.Length / 2];
-    }
-
-    private static void Print(Workload workload, TimingSummary result) {
-        Console.WriteLine($"{workload.Name,-18} {result.CoreClrMedian,11:F3} {result.InterpreterMedian,14:F3} {result.JitMedian,12:F3}");
-    }
-
-    private delegate int WorkloadDelegate(int input);
-    private sealed record WorkloadDefinition(string Name, string Method, int Input);
-    private sealed record Workload(string Name, string Method, int Input, int Expected, WorkloadDelegate CoreClr);
-    private sealed record TimingSamples(double[] CoreClr, double[] Interpreter, double[] Jit);
-    private sealed record TimingSummary(
-        double CoreClrMedian, double InterpreterMedian, double JitMedian,
-        double InterpreterToCoreClr, double JitToCoreClr, double InterpreterToJit);
 }
+if (output is not null) {
+    var path = Path.GetFullPath(output);
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllText(path, JsonSerializer.Serialize(new { Runtime = Environment.Version.ToString(),
+        MeasuredAt = DateTimeOffset.UtcNow, OS = Environment.OSVersion.ToString(),
+        HostTieredCompilation = Environment.GetEnvironmentVariable("DOTNET_TieredCompilation") ?? "default",
+        Protocol = "unified-18", LoadHostCoreLib = true, JitPromotionThreshold = 2,
+        EnableJit = enableJit, Warmups = warmups, Samples = samples, Results = results },
+        new JsonSerializerOptions { WriteIndented = true }));
+}
+
+static CoreClrMeasurement MeasureCoreClr(Func<int, int> run, int count, int expected, int warmups, int samples) {
+    for (var i = 0; i < warmups; i++) Check(RunBatch(run, count, 1), expected);
+
+    // Batch short CoreCLR calls so timer resolution and sampling overhead are negligible.
+    const double targetMilliseconds = 50;
+    const int maxIterations = 1_000_000;
+    var iterations = 1;
+    while (true) {
+        var start = Stopwatch.GetTimestamp();
+        var actual = RunBatch(run, count, iterations);
+        var milliseconds = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        Check(actual, expected);
+        if (milliseconds >= targetMilliseconds || iterations == maxIterations) break;
+        var scale = Math.Clamp(targetMilliseconds / Math.Max(milliseconds, 0.001), 2, 10);
+        iterations = (int)Math.Min(maxIterations, Math.Ceiling(iterations * scale));
+    }
+
+    var elapsed = new double[samples];
+    var allocated = new double[samples];
+    for (var i = 0; i < samples; i++) {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        var allocationBefore = GC.GetTotalAllocatedBytes(precise: true);
+        var start = Stopwatch.GetTimestamp();
+        var actual = RunBatch(run, count, iterations);
+        elapsed[i] = Stopwatch.GetElapsedTime(start).TotalMilliseconds / iterations;
+        allocated[i] = (double)(GC.GetTotalAllocatedBytes(precise: true) - allocationBefore) / iterations;
+        Check(actual, expected);
+    }
+    Array.Sort(elapsed);
+    Array.Sort(allocated);
+    return new CoreClrMeasurement(elapsed[samples / 2], allocated[samples / 2], iterations, elapsed);
+
+    static int RunBatch(Func<int, int> run, int count, int iterations) {
+        var actual = 0;
+        for (var i = 0; i < iterations; i++) actual = run(count);
+        return actual;
+    }
+
+    static void Check(int actual, int expected) {
+        if (actual != expected) throw new InvalidOperationException($"CoreCLR returned {actual}, expected {expected}.");
+    }
+}
+
+sealed record CoreClrMeasurement(double MedianMilliseconds, double MedianAllocatedBytes,
+    int IterationsPerSample, double[] ElapsedMilliseconds);

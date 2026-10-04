@@ -7,6 +7,7 @@ namespace DotnetVM.Runtime.Objects;
 
 /// <summary>VM ヒープ上のオブジェクトの基底。世代別 GC 拡張用の Generation を初段から保持する。</summary>
 public abstract class VmObject {
+    internal VmClassInstance? ManagedInstance { get; set; }
     internal VmObject[] BclReferences { get; set; } = [];
     /// <summary>GC 世代 (0 = 新世代)。世代別戦略 (M6 以降) で利用。</summary>
     public byte Generation { get; internal set; }
@@ -427,7 +428,7 @@ public sealed class VmRuntimeObject : VmObject {
 
     public required VmType Target { get; init; }
 
-    public override VmType Type => RuntimeTypeFacade;
+    public override VmType Type => ManagedInstance?.Type ?? RuntimeTypeFacade;
 }
 
 /// <summary>MethodBase.GetCurrentMethod() 等の結果 (System.Reflection.MethodBase ファサードの実体)。</summary>

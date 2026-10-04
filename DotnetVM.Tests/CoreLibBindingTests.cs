@@ -137,6 +137,16 @@ public class CoreLibBindingTests {
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToList();
         var expected = new List<string>();
+        expected.AddRange([
+            "System.ModuleHandle::GetModuleType",
+            "System.RuntimeTypeHandle::ConstructName",
+            "System.RuntimeTypeHandle::GetRuntimeTypeFromHandleSlow",
+            "System.RuntimeTypeHandle::GetGCHandle",
+            "System.RuntimeTypeHandle::FreeGCHandle",
+            "System.Runtime.CompilerServices.TypeHandle::GetCorElementType",
+            "System.Runtime.CompilerServices.TypeHandle::CanCastTo_NoCacheLookup",
+            "System.Reflection.RuntimeModule::GetScopeName",
+        ]);
         if (OperatingSystem.IsWindows()) {
             expected.Add("Interop+BCrypt::BCryptGenRandom");
             expected.Add("Interop+Kernel32::<GetEnvironmentVariable>g____PInvoke|296_0");
@@ -157,9 +167,29 @@ public class CoreLibBindingTests {
             var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName);
             Assert.NotNull(type);
             var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
-                method => method.Name == binding.Key.MethodName);
+                method => method.Name == binding.Key.MethodName && string.Join(",", method.GetParameters()
+                    .Select(parameter => parameter.ParameterType.FullName)) == binding.Key.ParamSignature);
             Assert.Null(method.GetMethodBody());
             Assert.NotNull(System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Runtime.InteropServices.DllImportAttribute>(method));
+        }
+    }
+
+    [Fact]
+    public void NativeReflectionBindingsTargetBodylessInternalCalls() {
+        using var vm = CreateVm(loadCoreLib: true);
+        var nativeTypes = new[] { "System.RuntimeTypeHandle", "System.Reflection.MetadataImport" };
+        var nativeMethods = new[] { "GetAttributes", "GetToken", "IsGenericVariable", "GetNumVirtuals", "GetModuleIfExists", "GetMetadataImport" };
+        var bindings = vm.Bindings.Where(binding => binding.Origin == BindingOrigin.InternalCall &&
+            nativeTypes.Contains(binding.Key.TypeFullName) && nativeMethods.Contains(binding.Key.MethodName)).ToArray();
+        Assert.NotEmpty(bindings);
+        foreach (var binding in bindings) {
+            var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName)!;
+            var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
+                method => method.Name == binding.Key.MethodName && string.Join(",", method.GetParameters()
+                    .Select(parameter => parameter.ParameterType.FullName)) == binding.Key.ParamSignature);
+            Assert.Null(method.GetMethodBody());
+            Assert.True((method.MethodImplementationFlags & System.Reflection.MethodImplAttributes.InternalCall) != 0);
+            Assert.Equal(BindingDomain.TrustedCoreLib, binding.Key.Domain);
         }
     }
 

@@ -35,7 +35,7 @@ internal static class MemoryOps {
     }
 
     private static readonly ConditionalWeakTable<AssemblyImage, LayoutMetadata> s_layoutMetadata = new();
-    private sealed record ByteField(VmType Type, int Slot, int Offset, int Size);
+    private sealed record ByteField(VmType Type, int Slot, int Offset, int Size, VmField? Definition = null);
     private sealed record ByteLayout(int Size, int Alignment, ByteField[] Fields);
     private static readonly ConditionalWeakTable<VmType, ByteLayout> s_byteLayouts = new();
     private sealed record FixedStorage(VmType? ElementType, int Length);
@@ -72,6 +72,15 @@ internal static class MemoryOps {
 
     internal static int SizeOfRawType(VmType type) => IsBlittableStruct(type) ? GetByteLayout(type).Size : SizeOfType(type);
 
+    internal static VmNativePointer RawFieldAddress(VmNativePointer pointer, VmField field, bool isReadOnly = false) {
+        var layout = GetByteLayout(field.DeclaringType);
+        var member = layout.Fields.First(member => ReferenceEquals(member.Definition, field));
+        var result = new VmNativePointer { Memory = pointer.Memory,
+            ByteOffset = checked(pointer.ByteOffset + member.Offset), IsReadOnly = pointer.IsReadOnly || isReadOnly };
+        result.EnsureBounds(member.Size);
+        return result;
+    }
+
     private static ByteLayout GetByteLayout(VmType type, HashSet<VmType>? active = null) {
         if (s_byteLayouts.TryGetValue(type, out var cached)) return cached;
         active ??= [];
@@ -87,7 +96,8 @@ internal static class MemoryOps {
                 if (FixedBufferStorage(definition) is { } fixedStorage) {
                     var stride = SizeOfType(fixedStorage.ElementType);
                     for (var i = 0; i < fixedStorage.Length; i++)
-                        fields.Add(new ByteField(fixedStorage.ElementType, i, checked(i * stride), stride));
+                        fields.Add(new ByteField(fixedStorage.ElementType, i, checked(i * stride), stride,
+                            definition.Fields.First(field => field.Name == "FixedElementField")));
                     return new ByteLayout(checked(stride * fixedStorage.Length), Math.Min(stride, packing), fields.ToArray());
                 }
                 var end = 0; var alignment = 1;
@@ -102,7 +112,7 @@ internal static class MemoryOps {
                     var explicitOffset = GetFieldOffset(field, metadata);
                     if ((definition.Flags & 0x18) == 0x10 && explicitOffset is null) throw new BadImageFormatException("Explicit struct field has no offset.");
                     var offset = explicitOffset ?? checked((end + align - 1) / align * align);
-                    fields.Add(new ByteField(fieldType, slots[field], offset, size));
+                    fields.Add(new ByteField(fieldType, slots[field], offset, size, field));
                     end = checked(Math.Max(end, offset + size)); alignment = Math.Max(alignment, align);
                 }
                 end = Math.Max(end, DeclaredClassSize(definition, metadata));

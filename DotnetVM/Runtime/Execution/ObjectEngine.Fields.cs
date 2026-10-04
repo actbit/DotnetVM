@@ -63,6 +63,8 @@ internal sealed partial class ObjectEngine {
     /// unmanaged ポインタを返し (CoreLib IL が Unsafe.Add / Buffer.Memmove に渡す形)、
     /// それ以外は ByRef を返す。</summary>
     public StackSlot FieldAddress(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
+        if (objSlot.ObjectValue is VmNativePointer pointer)
+            return StackSlot.OfObject(MemoryOps.RawFieldAddress(pointer, field, isReadOnly));
         if (objSlot.Kind == StackKind.Object && objSlot.ObjectValue is VmString str &&
             TryGetStringFieldOffset(field.Name, out var offset))
             return StackSlot.OfObject(new VmNativePointer {
@@ -163,6 +165,11 @@ internal sealed partial class ObjectEngine {
     /// <summary>ldfld の読み出し専用経路。通常のクラス/ボックス/構造体は
     /// ByRef オブジェクトを一時生成せず、フィールド配列から直接読む。</summary>
     public StackSlot ReadField(in StackSlot objSlot, VmField field) {
+        if (objSlot.ObjectValue is VmNativePointer pointer) {
+            var address = MemoryOps.RawFieldAddress(pointer, field);
+            var size = MemoryOps.SizeOfRawType(field.FieldType!);
+            return MemoryOps.ValueFromBytes(address.Bytes.AsSpan(address.ByteOffset, size), field.FieldType!, size);
+        }
         var storage = FindFieldStorage(objSlot, field);
         lock (storage.Slots)
             return storage.Slots[storage.Index];
@@ -170,6 +177,13 @@ internal sealed partial class ObjectEngine {
 
     /// <summary>stfld の直接書込経路。参照の readonly とスロット同期を保つ。</summary>
     public void WriteField(in StackSlot objSlot, VmField field, in StackSlot value) {
+        if (objSlot.ObjectValue is VmNativePointer pointer) {
+            var address = MemoryOps.RawFieldAddress(pointer, field);
+            address.EnsureWritable();
+            var size = MemoryOps.SizeOfRawType(field.FieldType!);
+            MemoryOps.BytesOfValue(value, field.FieldType!, size, address.Bytes.AsSpan(address.ByteOffset, size));
+            return;
+        }
         var storage = FindFieldStorage(objSlot, field);
         if (storage.IsReadOnly)
             throw new UnhandledGuestException("System.InvalidProgramException",
@@ -180,6 +194,10 @@ internal sealed partial class ObjectEngine {
 
     private (StackSlot[] Slots, int Index, bool IsReadOnly) FindFieldStorage(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
+            case StackKind.NativeInt when _intrinsicContext.Shared.RuntimeMetadata.TryStorage(objSlot.Int64Value, out var native):
+                return (native.Fields, GetInstanceFieldIndex((VmClassType)native.StructType, field), true);
+            case StackKind.Object when objSlot.ObjectValue is VmObject { ManagedInstance: { } managed }:
+                return (managed.Fields, GetInstanceFieldIndex(managed.ClassType, field), false);
             case StackKind.Object when objSlot.ObjectValue is null:
                 throw new UnhandledGuestException("System.NullReferenceException", null);
             case StackKind.Object when objSlot.ObjectValue is VmString str &&
@@ -220,6 +238,10 @@ internal sealed partial class ObjectEngine {
     /// 構築ジェネリック型は定義に解いてレイアウトを取る (VmClassInstance/ボックス/構造体の全経路)。</summary>
     public VmByRef FieldLocation(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
         switch (objSlot.Kind) {
+            case StackKind.NativeInt when _intrinsicContext.Shared.RuntimeMetadata.TryStorage(objSlot.Int64Value, out var native):
+                return VmByRef.Frame(native.Fields, GetInstanceFieldIndex((VmClassType)native.StructType, field), isReadOnly: true);
+            case StackKind.Object when objSlot.ObjectValue is VmObject { ManagedInstance: { } managed }:
+                return VmByRef.OwnedStorage(managed, managed.Fields, GetInstanceFieldIndex(managed.ClassType, field), isReadOnly);
             case StackKind.Object when objSlot.ObjectValue is null:
                 throw new UnhandledGuestException("System.NullReferenceException", null);
             case StackKind.Object when objSlot.ObjectValue is VmString str &&

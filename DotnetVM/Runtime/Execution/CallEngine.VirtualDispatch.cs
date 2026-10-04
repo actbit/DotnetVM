@@ -57,6 +57,7 @@ internal sealed partial class CallEngine {
             StackKind.Object => value.ObjectValue switch {
                 VmClassInstance ci => (VmType)ci.ClassType,
                 VmBoxedValue bv => bv.Type,
+                VmObject { ManagedInstance: { } managed } => managed.RuntimeType,
                 // VmString の仮想ディスパッチ (名前+引数個数) はオーバーロード誤解決の恐れが
                 // あるため実型を与えない (バインド / 置換面 / legacy の従来経路を優先)。
                 // インターフェースキー照合 (署名完全一致) は TryDispatchInterfaceKey で別途解決する

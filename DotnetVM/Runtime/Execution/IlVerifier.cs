@@ -1138,6 +1138,11 @@ internal static class IlVerifier {
         }
 
         private void RequireReceiver(IlAbstractType type, DecodedInstruction instruction) {
+            // CoreCLR's own IL invokes struct members through MethodTable*.
+            // These addresses remain VM-owned and checked at execution time.
+            if (type == IlAbstractType.NativeInt && _loader.IsTrustedCoreLib &&
+                instruction.Op is ILOp.Call or ILOp.Ldfld or ILOp.Ldflda or ILOp.Stfld)
+                return;
             if (type is not (IlAbstractType.Unknown or IlAbstractType.Object or IlAbstractType.ByRef or IlAbstractType.ValueType))
                 FailAt(instruction, $"インスタンス呼出のレシーバ型 {type} が不正です。");
         }

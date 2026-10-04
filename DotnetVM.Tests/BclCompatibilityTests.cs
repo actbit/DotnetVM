@@ -361,7 +361,7 @@ public sealed class BclCompatibilityTests {
     public void SystemTextJsonMatchesClr(string method) {
         using var vm = CreateVm();
         vm.LoadAssembly(typeof(JsonSerializer).Assembly.Location);
-        vm.Tracer.Start();
+        vm.Tracer.Start(new DotnetVM.Diagnostics.ExecutionTraceOptions { MaxFrames = 500_000 });
         try { Assert.Equal(Clr(method, []), vm.Invoke("BclChecks", method)); }
         catch (Exception ex) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(90)), ex); }
         Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Json");

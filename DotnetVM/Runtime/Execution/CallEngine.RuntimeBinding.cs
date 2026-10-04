@@ -220,6 +220,20 @@ internal sealed partial class CallEngine {
         var hasBinding = TryGetBindingWithCaller(key, callerDomain, out var impl);
         if (!hasBinding && returnName.Length != 0)
             hasBinding = TryGetBindingWithCaller(key.WithAnyReturn(), callerDomain, out impl);
+        // Existing managed compatibility bindings on a BCL virtual declaration
+        // also cover its trusted BCL overrides. Guest overrides always run their
+        // own IL. Remove the declaration binding when migrating that API to IL.
+        if (!hasBinding && method.IsVirtual && (method.Flags & 0x0100) == 0 &&
+            method.Loader?.IsTrustedCoreLib == true && args.Length > 0 &&
+            args[0].ObjectValue is VmObject { ManagedInstance: not null }) {
+            for (var parent = method.DeclaringType.BaseType; parent is not null; parent = parent.BaseType) {
+                if (!IsAllowedRuntimeBindingType(parent)) break;
+                var inherited = BindingKey.InstanceWithReturn(parent.FullName, method.Name, returnName, names).WithAnyReturn();
+                if (_intrinsics.TryGetBinding(inherited, out var existing, out var origin, callerDomain) && origin == BindingOrigin.Managed) {
+                    impl = existing; hasBinding = true; break;
+                }
+            }
+        }
         if (!hasBinding)
             hasBinding = TryInvokeOpenGenericBinding(method, methodArgs, names, returnName, callerDomain, args, out impl);
         if (!hasBinding && TryGetBindingWithCaller(method.Signature.HasThis

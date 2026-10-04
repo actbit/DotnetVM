@@ -343,6 +343,10 @@ internal static partial class CoreLibBindings {
             // GetRawData バインド側で受ける)
             static (_, a) => a[0],
             BindingOrigin.InternalCall);
+        // CLR recognizes this method as a compiler intrinsic; its managed
+        // fallback throws. Preserve the VM address and its owning storage.
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "AsPointer", "!!0&"),
+            static (_, a) => a[0], BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(UnsafeType, "As", "!!0&"),
             // static TTo Unsafe.As<TFrom, TTo>(ref TFrom source): 参照の型視点再解釈
             // (アドレス不変)。バイト実体ポインタは素通り、スロット列参照 (string 内部 char
@@ -795,7 +799,10 @@ internal static partial class CoreLibBindings {
             }
             return StackSlot.OfByRef(new VmByRef(slotRef.Container, (int)target, slotRef.IsReadOnly, slotRef.Owner));
         }
-        var stride = elementStride ? SlotStride(ctx.ParamAt(0)) : 1;
+        var elementType = ctx.MethodTypeArguments.FirstOrDefault()
+            ?? FindAnyType(ctx, ctx.ParamAt(0).TrimEnd('&'));
+        var stride = elementStride ? elementType is null ? SlotStride(ctx.ParamAt(0))
+            : MemoryOps.SizeOfRawType(elementType) : 1;
         long byteOffset;
         try {
             byteOffset = checked((long)native!.ByteOffset + checked(offset * stride));

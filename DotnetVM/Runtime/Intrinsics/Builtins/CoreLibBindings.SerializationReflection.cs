@@ -196,9 +196,6 @@ internal static partial class CoreLibBindings {
                 var element = ((VmRuntimeObject)a[0].ObjectValue!).Target switch { VmArrayType array => array.ElementType, VmMultiDimArrayType array => array.ElementType, VmByRefType reference => reference.ElementType, _ => null };
                 return element is null ? StackSlot.Null : DefaultIntrinsics.MakeRuntimeObject(ctx, element);
             });
-            BclFace(r, type, "GetProperties", true, [], static (ctx, a) =>
-                ReflectionProperties(ctx, ((VmRuntimeObject)a[0].ObjectValue!).Target,
-                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public));
             BclFace(r, type, "GetProperties", true, ["System.Reflection.BindingFlags"], static (ctx, a) =>
                 ReflectionProperties(ctx, ((VmRuntimeObject)a[0].ObjectValue!).Target, (BindingFlags)a[1].AsInt32));
             BclFace(r, type, "GetFields", true, ["System.Reflection.BindingFlags"], static (ctx, a) =>

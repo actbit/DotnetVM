@@ -18,9 +18,9 @@ internal sealed class DependentHandleTable {
         if (ReferenceEquals(current.ObjectValue, comparand.ObjectValue)) SetTarget(id, value);
         return current;
     } }
-    internal (StackSlot Target, StackSlot Dependent) Get(long id) { lock (_gate) return _entries.TryGetValue(id, out var pair) ? pair : default; }
+    internal (StackSlot Target, StackSlot Dependent) Get(long id) { lock (_gate) return _entries.TryGetValue(id, out var pair) ? pair : (StackSlot.Null, StackSlot.Null); }
     internal void SetDependent(long id, StackSlot value) { lock (_gate) if (_entries.TryGetValue(id, out var pair)) _entries[id] = (pair.Target, value); }
-    internal void ClearTarget(long id) { lock (_gate) if (_entries.ContainsKey(id)) _entries[id] = default; }
+    internal void ClearTarget(long id) { lock (_gate) if (_entries.ContainsKey(id)) _entries[id] = (StackSlot.Null, StackSlot.Null); }
     internal bool Free(long id) { lock (_gate) { _strong.Remove(id); return _entries.Remove(id); } }
     internal VmObject[] ConditionalRoots(HashSet<VmObject> live) {
         lock (_gate) {
@@ -32,6 +32,6 @@ internal sealed class DependentHandleTable {
     }
     internal void Sweep(HashSet<VmObject> live) {
         lock (_gate) foreach (var (id, pair) in _entries.ToArray())
-            if (pair.Target.ObjectValue is VmObject target && !live.Contains(target)) _entries[id] = default;
+            if (pair.Target.ObjectValue is VmObject target && !live.Contains(target)) _entries[id] = (StackSlot.Null, StackSlot.Null);
     }
 }

@@ -7,6 +7,16 @@ PR #34 は元の managed IL を実行する方針への修正中です。TextEnc
 `System.Text.Encodings.Web` の実 DLL を実行します。C# fixed バッファの値コピー・ポインタ演算・
 生メモリ変換は共通の VM ストレージで処理し、確保量も計上します。
 `Type.GetTypeFromHandle` は `RuntimeTypeHandle.m_type` を読む元の IL を実行します。
+`RuntimeType` の型名、属性、トークン、モジュール取得、基底型、型変換の IL も実行します。
+本体を持たない実在の `RuntimeTypeHandle.GetAttributes / GetToken / IsGenericVariable /
+GetNumVirtuals / GetModuleIfExists` と `MetadataImport.GetMetadataImport` を VM メタデータへ接続し、
+型名構築・型変換・モジュール・型キャッシュの実 DllImport 末端を登録します。
+ランタイムのハンドルと MethodTable は VM 内の識別子・検査付きストレージで表現し、
+ホストのポインタを読み書きしません。GC とコンテキストの unload / dispose にも接続します。
+型変換キャッシュは読み取り専用の空テーブルから native leaf の判定へ進み、現時点では
+CLR のキャッシュ更新・Nullable の MethodTable 表現・型記述子の全形式までは実装していません。
+属性データやメソッド呼び出しの元 IL への移行も未完了です。既存の managed バインドは
+宣言元にある面を引き続き受け、今回その専用実装は追加していません。
 Windows の環境変数取得と Marshal の system-error wrapper も元の IL を実行し、実在する DllImport
 の末端を VM の仮想環境・last-error 状態へ接続します。
 Reflection、CultureInfo、Encoding、Regex、HTTP、Compression、Crypto には managed API の

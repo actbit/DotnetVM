@@ -14,6 +14,7 @@ public static class ObjectGraphWalker {
     /// <summary>ヒープオブジェクトから直接到達する参照を列挙する。</summary>
     public static void CollectReferences(VmObject obj, Action<VmObject> visit) {
         foreach (var reference in obj.BclReferences) visit(reference);
+        if (obj.ManagedInstance is { } managed) visit(managed);
         switch (obj) {
             case VmTypeHandle { ManagedFields: { } fields }:
                 CollectFromSlots(fields, visit);

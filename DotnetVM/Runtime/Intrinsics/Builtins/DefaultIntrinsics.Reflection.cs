@@ -29,7 +29,7 @@ public static partial class DefaultIntrinsics {
             VmAssemblyLoadContext loadContext => loadContext.Type,
             VmAssemblyNameObject assemblyName => assemblyName.Type,
             VmMemoryStreamObject stream => stream.Type,
-            VmRuntimeObject rt => rt.Target,
+            VmRuntimeObject rt => rt.ManagedInstance is not null ? rt.Type : rt.Target,
             null => throw new UnhandledGuestException("System.NullReferenceException", null),
             _ => ctx.Types.FindIntrinsicType("System.Object")
                 ?? throw new InvalidOperationException("ファサード型 System.Object が未登録です。"),
@@ -39,10 +39,15 @@ public static partial class DefaultIntrinsics {
     /// 実 CLR の RuntimeType と同じく型ごとに単一実体 (VM 単位でインターンする)。
     /// CoreLib IL が bne.un 等の参照同一性で型分岐するため、都度 new では誤分岐する。</summary>
     internal static StackSlot MakeRuntimeObject(IntrinsicContext ctx, VmType type) {
+        if (type is VmIntrinsicType && ctx.Types.TryResolveTrustedUnifiedType(type.FullName) is
+            VmClassType { Loader.IsTrustedCoreLib: true } realType)
+            type = realType;
         lock (ctx.Shared.TypeFacadeGate) {
         if (!ctx.Shared.TypeFacades.TryGetValue(type, out var facade)) {
             facade = ctx.Heap.Allocate(new VmRuntimeObject { Target = type });
             ctx.Shared.TypeFacades[type] = facade;
+            try { ctx.Shared.RuntimeMetadata.InitializeType(ctx, facade); }
+            catch { ctx.Shared.TypeFacades.TryRemove(type, out _); throw; }
         }
         return StackSlot.OfObject(facade);
         }

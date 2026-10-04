@@ -129,9 +129,12 @@ public sealed class GuestTaskRuntimeHardeningTests {
         var state = new VmCancellationState(type);
 
         shared.GuestTasks.ScheduleCancellation(state, 0);
+        // Timer callbacks share the host ThreadPool with parallel VM tests.
+        // Publication and release are the invariant; a one-second scheduling
+        // deadline is unreliable while the full suite initializes real BCL IL.
         Assert.True(SpinWait.SpinUntil(
             () => state.IsCancellationRequested && shared.GuestTasks.PendingTimerCount == 0,
-            TimeSpan.FromSeconds(1)));
+            TimeSpan.FromSeconds(5)));
     }
 
     [Fact]

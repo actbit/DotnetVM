@@ -91,6 +91,7 @@ public sealed class VmSharedState : IDisposable {
     internal DotnetVM.Runtime.Heap.DependentHandleTable DependentHandles { get; } = new();
 
     internal object TypeFacadeGate { get; } = new();
+    internal VmRuntimeMetadata RuntimeMetadata { get; } = new();
 
     internal System.Collections.Concurrent.ConcurrentDictionary<VmType, VmObject> DefaultEqualityComparers { get; } =
         new(GuestTaskRuntime.VmTypeIdentityComparer.Instance);
@@ -138,10 +139,11 @@ public sealed class VmSharedState : IDisposable {
     }
 
     /// <summary>RuntimeType ファサードを GC の直接ルートとして列挙する。</summary>
-    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values.Concat(DefaultEqualityComparers.Values);
+    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values.Concat(DefaultEqualityComparers.Values).Concat(RuntimeMetadata.Roots());
 
     /// <summary>ALC 由来の VM-wide 型初期化状態と RuntimeType ファサードを解放する。</summary>
     internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
+        RuntimeMetadata.RemoveContext(context);
         TypeInitialization.RemoveForContext(context);
         GuestTasks.RemoveAssemblyContextCaches(context);
         foreach (var type in DefaultEqualityComparers.Keys)
@@ -160,6 +162,7 @@ public sealed class VmSharedState : IDisposable {
         // その後 Thread worker を interrupt する。どちらも同じ cancellation token を見る。
         GuestTasks.Dispose();
         GuestThreads.Dispose();
+        RuntimeMetadata.Clear();
         DefaultEqualityComparers.Clear();
         _workerBudget.Dispose();
         _lastSystemError.Dispose();

@@ -96,10 +96,6 @@ internal static partial class CoreLibBindings {
                 var dot = name.LastIndexOf('.');
                 return dot < 0 ? StackSlot.Null : StackSlot.OfObject(ctx.MakeString(name[..dot]));
             }, BindingOrigin.InternalCall);
-            r.RegisterBinding(BindingKey.Instance(type, "get_Module"), static (ctx, a) => {
-                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (t is VmConstructedType c) t = c.Definition;
-                return WrapBcl(ctx, "System.Reflection.Module", (t as VmClassType)?.Loader ?? ctx.Types);
-            }, BindingOrigin.InternalCall);
             r.RegisterBinding(BindingKey.Instance(type, "GetConstructorImpl", "System.Reflection.BindingFlags", "System.Reflection.Binder", "System.Reflection.CallingConventions", "System.Type[]", "System.Reflection.ParameterModifier[]"), static (ctx, a) => {
                 var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
                 var definition = target is VmConstructedType c ? c.Definition : target;
@@ -120,7 +116,6 @@ internal static partial class CoreLibBindings {
                 if (t is VmConstructedType constructed) t = constructed.Definition;
                 return StackSlot.OfInt32(t.FullName.StartsWith("System.Span`1", StringComparison.Ordinal) || t.FullName.StartsWith("System.ReadOnlySpan`1", StringComparison.Ordinal) ? 1 : 0);
             }, BindingOrigin.InternalCall);
-            r.RegisterBinding(BindingKey.Instance(type, "GetAttributeFlagsImpl"), static (_, a) => StackSlot.OfInt32(unchecked((int)((VmRuntimeObject)a[0].ObjectValue!).Target.Flags)), BindingOrigin.InternalCall);
             foreach (var method in new[] { "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl" })
                 r.RegisterBinding(BindingKey.Instance(type, method), (_, a) => {
                     var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
@@ -231,7 +226,10 @@ internal static partial class CoreLibBindings {
         // 本家 IL は box への生ポインタを Unsafe.As で基底型幅ごとに読む。
         // VM では box / インスタンスの先頭フィールドへの ByRef、文字列はバイト実体で提供する
         r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "GetRawData", "System.Object"),
-            static (_, a) => a[0].ObjectValue switch {
+            static (ctx, a) => a[0].ObjectValue switch {
+                VmArray array when ctx.Shared.RuntimeMetadata.TryArrayData(array, out var pointer) => StackSlot.OfObject(pointer),
+                VmObject { ManagedInstance: { } instance } when instance.Fields.Length > 0 =>
+                    StackSlot.OfByRef(VmByRef.OwnedStorage(instance, instance.Fields, 0)),
                 VmBoxedValue box => StackSlot.OfByRef(VmByRef.BoxedValue(box)),
                 VmClassInstance instance when instance.Fields.Length > 0 =>
                     StackSlot.OfByRef(VmByRef.OwnedStorage(instance, instance.Fields, 0)),
@@ -240,7 +238,7 @@ internal static partial class CoreLibBindings {
                     ByteOffset = VmString.CharDataByteOffset,
                 }),
                 _ => throw new InvalidOperationException(
-                    $"RuntimeHelpers.GetRawData の引数を生データ参照にできません ({a[0].Kind})。"),
+                    $"RuntimeHelpers.GetRawData の引数を生データ参照にできません ({a[0].Kind}, {SlotOps.Describe(a[0])})。"),
             },
             BindingOrigin.InternalCall);
     }

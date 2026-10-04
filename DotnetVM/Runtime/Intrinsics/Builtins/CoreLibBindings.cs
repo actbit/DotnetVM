@@ -27,6 +27,7 @@ internal static partial class CoreLibBindings {
         RegisterString(r);
         RegisterStringInternals(r);
         RegisterRuntimeHelpers(r);
+        RegisterNativeReflection(r);
         RegisterMemoryMarshal(r);
         RegisterVectorIntrinsics(r);
         RegisterEnvironmentAndMarshal(r);

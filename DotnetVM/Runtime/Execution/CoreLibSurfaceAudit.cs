@@ -91,6 +91,12 @@ internal static class CoreLibSurfaceAudit {
         void Bcl(string type, string[] methods, bool? hasThis = null, string? justification = null) {
             foreach (var method in methods) Add(type, method, CoreLibSurfaceKind.RuntimeInternal, justification ?? bclJ, hasThis);
         }
+        foreach (var import in Intrinsics.Builtins.CoreLibBindings.NativeReflectionImports)
+            Add(import.Key.TypeFullName, import.Key.MethodName, CoreLibSurfaceKind.RuntimeInternal,
+                import.Origin == Intrinsics.BindingOrigin.InternalCall
+                    ? InternalCall + "。実 CoreLib の本体 IL を持たない metadata / runtime リーフを VM 型系に接続する"
+                    : "pinvoke-replacement: 実 CoreLib の DllImport metadata / runtime リーフを VM 型系に接続する",
+                hasThis: false, paramCount: import.Key.ParamSignature.Length == 0 ? 0 : import.Key.ParamSignature.Split(',').Length);
         foreach (var type in Intrinsics.Builtins.CoreLibBindings.HttpBoundaryTypes)
             foreach (var member in Intrinsics.Builtins.CoreLibBindings.BoundaryMembers(type))
                 Bcl(type.FullName!, [member.Name], member is System.Reflection.ConstructorInfo || !member.IsStatic, DeviceFace + "。標準 HTTP BCL 状態を VM 表現に正規化し、通信は制限付き gateway に限定");
@@ -171,7 +177,7 @@ internal static class CoreLibSurfaceAudit {
         Bcl("System.Net.Http.HttpClient", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを client に渡す");
         Bcl("System.Net.Http.HttpMessageInvoker", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを invoker に渡す");
         Bcl("System.Runtime.DependentHandle", ["InternalAlloc", "InternalGetTarget", "InternalGetDependent", "InternalGetTargetAndDependent", "InternalSetDependent", "InternalSetTargetToNull", "InternalFree"], false, InternalCall + "。VM GC の ephemeron 到達性と連携する");
-        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetProperties", "GetFields", "get_Module", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "GetAttributeFlagsImpl", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetProperties", "GetFields", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
         Bcl("System.Enum", ["GetHashCode"], true, JitIntrinsic);
         Bcl("System.ComAwareWeakReference", ["PossiblyComObject"], false, RuntimeRepresentation + "。VM object は COM object を保持しない");
         Bcl("System.Exception", ["set_Source", "get_Source", "CaptureDispatchState", "RestoreDispatchState"], true, RuntimeRepresentation + "。例外の guest identity を維持し、VM tracer がスタックを管理する");
@@ -687,6 +693,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.CompilerServices.Unsafe", "Add", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "AddByteOffset", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "As", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "AsPointer", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false, paramCount: 1);
         Add("System.Runtime.CompilerServices.Unsafe", "AreSame", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "AsRef", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "SizeOf", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);

@@ -108,30 +108,11 @@ internal static partial class CoreLibBindings {
                     return null;
                 }
 
-                // Marvin の seed は stackalloc ではなくローカル ulong のアドレスとして
-                // 渡る構成もあるため、byref の Int64 スロット列も扱う。
+                // Marvin/HashCode はローカルの ulong/uint を渡す構成がある。
+                // 共通実装で各 managed スロット幅 (Int32/Int64) を保持して書き戻す。
                 if (slotRef is not null) {
-                    slotRef.EnsureWritable();
-                    var slots = (int)(((long)count + 7) / 8);
-                    if (slotRef.Index < 0 || slots > slotRef.Container.Length - slotRef.Index)
-                        throw new InvalidOperationException(
-                            $"GetNonCryptographicallySecureRandomBytes がスロット列の範囲外を参照します (index={slotRef.Index}, {count} バイト)。");
-                    var remaining = count;
-                    var index = slotRef.Index;
-                    Span<byte> bytes = stackalloc byte[8];
-                    while (remaining > 0) {
-                        var slot = slotRef.Container[index];
-                        if (slot.Kind != StackKind.Int64)
-                            throw new InvalidOperationException(
-                                $"GetNonCryptographicallySecureRandomBytes のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
-                        BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
-                        var writeCount = Math.Min(8, remaining);
-                        ctx.Shared.FillRandom(bytes[..writeCount]);
-                        slotRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
-                        remaining -= writeCount;
-                        index++;
-                    }
-                    return null;
+                    return FillRandomBytes(ctx, a[0], count,
+                        "Interop+Sys.GetNonCryptographicallySecureRandomBytes");
                 }
 
                 throw new InvalidOperationException(

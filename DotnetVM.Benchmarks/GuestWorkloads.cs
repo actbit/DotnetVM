@@ -6,6 +6,38 @@ using System.Threading.Tasks;
 namespace DotnetVM.Benchmarks;
 
 public static class GuestWorkloads {
+    [AttributeUsage(AttributeTargets.Class)]
+    private sealed class BenchmarkAttribute(int value) : Attribute { public int Value { get; } = value; }
+    [Benchmark(7)]
+    public sealed class JsonModel { public int Value { get; set; } public string Text { get; set; } = "日本語"; }
+
+    public static int ReflectionInvoke(int count) {
+        var method = typeof(GuestWorkloads).GetMethod(nameof(ReflectionTarget))!;
+        object[] arguments = [3];
+        var total = 0;
+        for (var i = 0; i < count; i++) total += (int)method.Invoke(null, arguments)!;
+        return total;
+    }
+    public static int ReflectionTarget(int value) => value + 1;
+
+    public static int ReflectionAttributes(int count) {
+        var total = 0;
+        for (var i = 0; i < count; i++)
+            total += ((BenchmarkAttribute)typeof(JsonModel).GetCustomAttributes(typeof(BenchmarkAttribute), false)[0]).Value;
+        return total;
+    }
+
+    public static int JsonRoundTrip(int count) {
+        var value = new JsonModel { Value = 7 };
+        var total = 0;
+        for (var i = 0; i < count; i++) {
+            var json = System.Text.Json.JsonSerializer.Serialize(value);
+            var copy = System.Text.Json.JsonSerializer.Deserialize<JsonModel>(json)!;
+            total += copy.Value + copy.Text.Length;
+        }
+        return total;
+    }
+
     public static int SpanCopies(int count) {
         var source = new int[256]; var target = new int[256]; source[255] = 7;
         var total = 0;

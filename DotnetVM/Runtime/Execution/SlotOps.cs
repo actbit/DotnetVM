@@ -48,7 +48,7 @@ internal static class SlotOps {
             return false;
         // 片側が null (native int 0): VM のポインタは常に有効 → p != null は常に真
         if (lp is null || rp is null) {
-            var intSide = lp is null ? right : left;
+            var intSide = lp is null ? left : right;
             if (intSide.Kind is not (StackKind.NativeInt or StackKind.Int32) || intSide.Int64Value != 0)
                 throw new InvalidOperationException("ポインタと null 以外の整数の比較は対応していません。");
             return op is ILOp.Cgt or ILOp.Cgt_Un; // eq/lt は false (非 null), gt 系は true

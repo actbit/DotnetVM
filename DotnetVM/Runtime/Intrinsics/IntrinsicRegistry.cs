@@ -124,6 +124,8 @@ public sealed class IntrinsicContext {
     /// <summary>ホスト側ランタイムが guest の instance method を VM 呼出ゲート経由で実行するフック。</summary>
     internal Func<StackSlot, string, StackSlot[], StackSlot?>? InvokeGuestInstanceMethod { get; set; }
     internal Func<VmMethod, StackSlot[], GenericContext?, StackSlot>? InvokeGuestMethod { get; set; }
+    internal Func<VmMethod, StackSlot, VmMethod>? ResolveVirtualMethod { get; set; }
+    internal Func<TypeLoader, int, GenericContext?, (VmMethod Method, GenericContext? Context)>? ResolveReflectionMethod { get; set; }
     internal Func<StackSlot, VmField, StackSlot>? ReadFieldHook { get; set; }
     internal Action<StackSlot, VmField, StackSlot>? WriteFieldHook { get; set; }
 

@@ -558,8 +558,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (ldNative.ByteOffset < 0 || (long)ldNative.ByteOffset + ldSize > ldNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"ldobj がブロック外を参照します (offset={ldNative.ByteOffset}, {ldSize} バイト)。");
-                        frame.Stack.Push(MemoryOps.ValueFromBytes(
-                            ldNative.Bytes.AsSpan(ldNative.ByteOffset, ldSize), ldType, ldSize));
+                        frame.Stack.Push(MemoryOps.ReadPointerValue(ldNative, ldType));
                         break;
                     }
                     var byref = address.ObjectValue as VmByRef
@@ -578,9 +577,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (stNative.ByteOffset < 0 || (long)stNative.ByteOffset + stSize > stNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException",
                                 $"stobj がブロック外を参照します (offset={stNative.ByteOffset}, {stSize} バイト)。");
-                        Span<byte> stBytes = stackalloc byte[8];
-                        MemoryOps.BytesOfValue(value, stType, stSize, stBytes);
-                        stBytes[..stSize].CopyTo(stNative.Bytes.AsSpan(stNative.ByteOffset, stSize));
+                        MemoryOps.WritePointerValue(stNative, stType, value);
                         break;
                     }
                     var byref = stAddress.ObjectValue as VmByRef
@@ -593,21 +590,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var src = frame.Stack.Pop();
                     var dst = frame.Stack.Pop();
                     var cpType = objects.ResolveTypeToken(instruction.IntOperand, frame.Context, frame.Method.DynamicTokens);
-                    var cpSize = MemoryOps.SizeOfType(cpType);
                     if (src.ObjectValue is VmNativePointer srcNative && dst.ObjectValue is VmNativePointer dstNative) {
-                        if ((long)srcNative.ByteOffset + cpSize > srcNative.Bytes.Length ||
-                            (long)dstNative.ByteOffset + cpSize > dstNative.Bytes.Length)
-                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
-                        dstNative.EnsureWritable();
-                        srcNative.Bytes.AsSpan(srcNative.ByteOffset, cpSize)
-                            .CopyTo(dstNative.Bytes.AsSpan(dstNative.ByteOffset, cpSize));
+                        MemoryOps.CopyMemoryBlock(dst, src, MemoryOps.SizeOfRawType(cpType));
                         break;
                     }
                     if (src.ObjectValue is VmNativePointer srcOnly) {
-                        if (srcOnly.ByteOffset < 0 || (long)srcOnly.ByteOffset + cpSize > srcOnly.Bytes.Length)
-                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
-                        var value = MemoryOps.ValueFromBytes(
-                            srcOnly.Bytes.AsSpan(srcOnly.ByteOffset, cpSize), cpType, cpSize);
+                        var value = MemoryOps.ReadPointerValue(srcOnly, cpType);
                         if (dst.ObjectValue is not VmByRef dstManaged)
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の宛先がマネージ参照ではありません。");
@@ -618,13 +606,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (src.ObjectValue is not VmByRef srcManaged)
                             throw new UnhandledGuestException("System.InvalidProgramException",
                                 "cpobj の送信元がマネージ参照ではありません。");
-                        var srcValue = srcManaged.Read();
-                        Span<byte> dstBytes = stackalloc byte[8];
-                        MemoryOps.BytesOfValue(srcValue, cpType, cpSize, dstBytes);
-                        if ((long)dstOnly.ByteOffset + cpSize > dstOnly.Bytes.Length)
-                            throw new UnhandledGuestException("System.IndexOutOfRangeException", "cpobj がブロック外を参照します。");
-                        dstOnly.EnsureWritable();
-                        dstBytes[..cpSize].CopyTo(dstOnly.Bytes.AsSpan(dstOnly.ByteOffset, cpSize));
+                        MemoryOps.WritePointerValue(dstOnly, cpType, srcManaged.Read());
                         break;
                     }
                     var srcRef = src.ObjectValue as VmByRef
@@ -643,6 +625,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         if (initNative.ByteOffset < 0 || (long)initNative.ByteOffset + initSize > initNative.Bytes.Length)
                             throw new UnhandledGuestException("System.IndexOutOfRangeException", "initobj がブロック外を参照します。");
                         Array.Clear(initNative.Bytes, initNative.ByteOffset, initSize);
+                        initNative.Memory.ClearReferences(initNative.ByteOffset, initSize);
                         break;
                     }
                     var byref = initAddress.ObjectValue as VmByRef
@@ -810,7 +793,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             this is IGuestInvoker guestInvoker &&
                             guestInvoker.TryCreateTailCall(frame, pointer.Target, args, null, out var tailRequest))
                             throw new TailCallTransfer(tailRequest!);
-                        result = Invoke(pointer.Target, args);
+                        result = Invoke(pointer.Target, args, pointer.Context);
+                    } else if (fnptr.ObjectValue is VmRuntimeCallback callback) {
+                        result = callback.Invoke(args);
                     } else if (fnptr.ObjectValue is VmDelegate @delegate) {
                         result = calls.InvokeDelegate(@delegate, args);
                     } else {

@@ -76,6 +76,9 @@ public sealed class ByRefRawMemoryHardeningTests {
         }
 
         public struct Cell { public int Value; }
+        public ref struct ReferenceCell { public ref int Value; }
+        [System.Runtime.CompilerServices.InlineArray(4)]
+        public struct InlineCells<T> { private T first; }
         """;
 
     private static readonly byte[] Bytes = TestAssemblyCompiler.CompileToBytes(Source, "ByRefRawMemoryHardening", allowUnsafe: true);
@@ -236,5 +239,69 @@ public sealed class ByRefRawMemoryHardeningTests {
     public void OverlappingNativeCopyUsesMemmoveSemantics() {
         using var vm = CreateVm();
         Assert.Equal(15, vm.Invoke("Vm.Raw", "OverlapCopy"));
+    }
+
+    [Fact]
+    public void TemporaryNativeReferencesRootOwnersAndByteWritesInvalidateThem() {
+        using var vm = CreateVm();
+        var type = vm.Loaders[0].FindTypeByFullName("Vm.Cell")!;
+        var owner = vm.Heap.Allocate(new VmClassInstance(type, new ObjectModel().CreateInstanceStorage(type, vm.Loaders[0])));
+        var memory = vm.Heap.Allocate(new VmLocallocMemory { Bytes = new byte[16] });
+        var first = StackSlot.OfObject(new VmNativePointer { Memory = memory });
+        var second = StackSlot.OfObject(new VmNativePointer { Memory = memory, ByteOffset = 8 });
+        MemoryOps.StoreIndirect(ILOp.Stind_I, second, StackSlot.OfByRef(VmByRef.OwnedStorage(owner, owner.Fields, 0)));
+        MemoryOps.CopyMemoryBlock(first, second, 8);
+        MemoryOps.InitMemoryBlock(second, StackSlot.OfInt32(0), 8);
+        Func<IEnumerable<StackSlot[]>> roots = () => [[first]];
+        vm.Heap.AddRootSlotSource(roots);
+        try {
+            vm.CollectGarbage();
+            Assert.Contains(owner, vm.Heap.TrackedObjects);
+            Assert.Same(owner, Assert.IsType<VmByRef>(MemoryOps.LoadIndirect(ILOp.Ldind_I, first).ObjectValue).Owner);
+            MemoryOps.StoreIndirect(ILOp.Stind_I1, first, StackSlot.OfInt32(0));
+            vm.CollectGarbage();
+            Assert.DoesNotContain(owner, vm.Heap.TrackedObjects);
+        } finally { vm.Heap.RemoveRootSlotSource(roots); }
+    }
+
+    [Fact]
+    public void GenericInlineArrayRawLayoutUsesElementTypeAndDeclaredLength() {
+        using var vm = CreateVm();
+        var type = new VmConstructedType {
+            Definition = vm.Loaders[0].FindTypeByFullName("Vm.InlineCells`1")!,
+            TypeArguments = [vm.Loaders[0].ResolveToken(new SigType(SigKind.I8))],
+        };
+        Assert.Equal(32, MemoryOps.SizeOfRawType(type));
+        var pointer = new VmNativePointer { Memory = new VmLocallocMemory { Bytes = new byte[32] } };
+        MemoryOps.WritePointerValue(pointer, type, StackSlot.OfValueType(new VmStructValue(type,
+            [StackSlot.OfInt64(11), StackSlot.OfInt64(22), StackSlot.OfInt64(33), StackSlot.OfInt64(44)])));
+        var value = Assert.IsType<VmStructValue>(MemoryOps.ReadPointerValue(pointer, type).ObjectValue);
+        Assert.Equal(new long[] {11, 22, 33, 44}, value.Fields.Select(field => field.Int64Value));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TypedNativeCopyPreservesManagedReferences(bool enableJit) {
+        using var vm = CreateVm(enableJit);
+        var loader = vm.Loaders[0];
+        var type = loader.FindTypeByFullName("Vm.ReferenceCell")!;
+        var ownerType = loader.FindTypeByFullName("Vm.Cell")!;
+        var owner = vm.Heap.Allocate(new VmClassInstance(ownerType, new ObjectModel().CreateInstanceStorage(ownerType, loader)));
+        var reference = VmByRef.OwnedStorage(owner, owner.Fields, 0);
+        var source = new VmNativePointer { Memory = vm.Heap.Allocate(new VmLocallocMemory { Bytes = new byte[VmPrimitiveTypes.NativeIntSizeBytes] }) };
+        var destination = new VmNativePointer { Memory = vm.Heap.Allocate(new VmLocallocMemory { Bytes = new byte[VmPrimitiveTypes.NativeIntSizeBytes] }) };
+        MemoryOps.WritePointerValue(source, type, StackSlot.OfValueType(new VmStructValue(type, [StackSlot.OfByRef(reference)])));
+        var builder = new VmDynamicMethodBuilder(loader, vm.Heap, "CopyReferences", new SigType(SigKind.Void),
+            [new SigType(SigKind.I), new SigType(SigKind.I)], maxMethodBodyBytes: 128);
+        builder.EmitOpcode((ushort)ILOp.Ldarg_0);
+        builder.EmitOpcode((ushort)ILOp.Ldarg_1);
+        builder.EmitReference((ushort)ILOp.Cpobj, type);
+        builder.EmitOpcode((ushort)ILOp.Ret);
+        var method = builder.CreateMethod();
+        vm.Execute(method, destination, source);
+        var copied = Assert.IsType<VmStructValue>(MemoryOps.ReadPointerValue(destination, type).ObjectValue);
+        Assert.Same(owner, Assert.IsType<VmByRef>(copied.Fields[0].ObjectValue).Owner);
+        if (enableJit) Assert.True(vm.IsJitCompiled(method));
     }
 }

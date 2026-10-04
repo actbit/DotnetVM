@@ -31,7 +31,13 @@ public static class SignatureDecoder {
     /// maxSignatureDepth は署名再帰の深さ上限、maxGenericNestingDepth は GenericInst の
     /// ネスト上限 (hostile 署名の再帰でホストスタックを枯渇させない)。</summary>
     public static MethodSignature DecodeMethodSignature(ReadOnlySpan<byte> blob,
-        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) {
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) => DecodeCallableSignature(blob, false, maxSignatureDepth, maxGenericNestingDepth);
+
+    public static MethodSignature DecodePropertyCallableSignature(ReadOnlySpan<byte> blob,
+        int maxSignatureDepth = 64, int maxGenericNestingDepth = 64) => DecodeCallableSignature(blob, true, maxSignatureDepth, maxGenericNestingDepth);
+
+    private static MethodSignature DecodeCallableSignature(ReadOnlySpan<byte> blob, bool property,
+        int maxSignatureDepth, int maxGenericNestingDepth) {
         try {
             var reader = new SpanReader(blob);
             var callingConv = reader.ReadByte();
@@ -40,7 +46,7 @@ public static class SignatureDecoder {
             var hasThis = (callingConv & 0x20) != 0;
             var isGeneric = (callingConv & 0x10) != 0;
             var baseConv = callingConv & 0x0F;
-            if (baseConv is not (0x00 or 0x05))
+            if (property ? baseConv != 0x08 || isGeneric : baseConv is not (0x00 or 0x05))
                 throw new NotSupportedException($"未対応の呼び出し規約 0x{callingConv:X2} です。");
             var isVarArg = baseConv == 0x05;
 
@@ -261,8 +267,17 @@ public static class SignatureDecoder {
             case 0x45: // PINNED <type> (ローカル変数のみ)
                 return DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
 
-            case 0x1B: // FNPTR <method sig> — 未対応 (MethodSignature は返せない)
-                throw new NotSupportedException("関数ポインタ (FNPTR) の署名は対応していません。");
+            case 0x1B: { // FNPTR <method sig>
+                var convention = reader.ReadByte();
+                if ((convention & 0x0f) > 5 || (convention & 0x80) != 0)
+                    throw new BadImageFormatException("Invalid function pointer calling convention.");
+                var genericCount = (convention & 0x10) != 0 ? ReadCount(ref reader, "function generic parameter", false) : 0;
+                var count = ReadCount(ref reader, "function parameter", true);
+                var result = DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
+                var parameters = new SigType[count];
+                for (var i = 0; i < count; i++) parameters[i] = DecodeType(ref reader, depth + 1, genericDepth, maxSignatureDepth, maxGenericNestingDepth);
+                return new SigType(SigKind.FunctionPointer) { FunctionSignature = new MethodSignature((convention & 0x20) != 0, (convention & 0x0f) == 5, genericCount, result, parameters) };
+            }
 
             default:
                 throw new BadImageFormatException($"未知の ELEMENT_TYPE 0x{kind:X2} が署名に含まれています。");

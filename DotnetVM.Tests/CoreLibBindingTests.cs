@@ -146,6 +146,23 @@ public class CoreLibBindingTests {
             "System.Runtime.CompilerServices.TypeHandle::GetCorElementType",
             "System.Runtime.CompilerServices.TypeHandle::CanCastTo_NoCacheLookup",
             "System.Reflection.RuntimeModule::GetScopeName",
+            "System.RuntimeTypeHandle::GetActivationInfo",
+            "System.RuntimeType+BoxCache::GetBoxInfo",
+            "System.RuntimeTypeHandle::GetInstantiation",
+            "System.RuntimeTypeHandle::GetMethodAt",
+            "System.RuntimeMethodHandle::GetIsCollectible",
+            "System.Signature::Init",
+            "System.RuntimeMethodHandle::InvokeMethod",
+            "System.RuntimeMethodHandle::IsCAVisibleFromDecoratedType",
+            "System.Runtime.CompilerServices.CastHelpers::<IsInstanceOf_NoCacheLookup>g____PInvoke|4_0",
+            "System.Reflection.MetadataImport::<Enum>g____PInvoke|8_0",
+            "System.ModuleHandle::ResolveMethod",
+            "System.ModuleHandle::ResolveType",
+            "System.Reflection.CustomAttribute::<CreateCustomAttributeInstance>g____PInvoke|30_0",
+            "System.Reflection.CustomAttribute::<CreatePropertyOrFieldData>g____PInvoke|32_0",
+            "System.Reflection.CustomAttribute::ParseAttributeUsageAttribute",
+            "System.Reflection.Metadata.MetadataUpdater::<IsApplyUpdateSupported>g____PInvoke|1_0",
+            "System.Array::<InternalCreate>g____PInvoke|0_0",
         ]);
         if (OperatingSystem.IsWindows()) {
             expected.Add("Interop+BCrypt::BCryptGenRandom");
@@ -168,11 +185,17 @@ public class CoreLibBindingTests {
             Assert.NotNull(type);
             var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
                 method => method.Name == binding.Key.MethodName && string.Join(",", method.GetParameters()
-                    .Select(parameter => parameter.ParameterType.FullName)) == binding.Key.ParamSignature);
+                    .Select(parameter => NativeTypeName(parameter.ParameterType))) == binding.Key.ParamSignature);
             Assert.Null(method.GetMethodBody());
             Assert.NotNull(System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Runtime.InteropServices.DllImportAttribute>(method));
         }
     }
+
+    private static string NativeTypeName(Type type) => type.IsFunctionPointer
+        ? NativeTypeName(type.GetFunctionPointerReturnType()) + "(" + string.Join(",", type.GetFunctionPointerParameterTypes().Select(NativeTypeName)) + ")"
+        : type.IsPointer ? NativeTypeName(type.GetElementType()!) + "*"
+        : type.IsByRef ? NativeTypeName(type.GetElementType()!) + "&"
+        : type.FullName!;
 
     [Fact]
     public void NativeReflectionBindingsTargetBodylessInternalCalls() {

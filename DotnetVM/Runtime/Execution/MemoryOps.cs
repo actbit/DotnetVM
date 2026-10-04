@@ -44,8 +44,10 @@ internal static class MemoryOps {
     internal static (VmType ElementType, int Length)? FixedBufferStorage(VmClassType type) {
         var storage = s_fixedStorage.GetValue(type, static definition => {
             var fields = definition.Fields.Where(field => !field.IsStatic && !field.IsLiteral).ToArray();
-            if (fields is not [{ Name: "FixedElementField", FieldType: { } element }]) return new(null, 0);
-            if (!VmPrimitiveTypes.IsSlotPrimitive(element.FullName)) return new(null, 0);
+            if (fields is not [{ FieldType: { } element }]) return new(null, 0);
+            var inlineLength = InlineArrayLength(definition);
+            if (inlineLength > 0) return new(element, inlineLength);
+            if (fields[0].Name != "FixedElementField" || !VmPrimitiveTypes.IsSlotPrimitive(element.FullName)) return new(null, 0);
             var metadata = s_layoutMetadata.GetValue(definition.Image, static image => LayoutMetadata.Read(image));
             var size = DeclaredClassSize(definition, metadata);
             var stride = SizeOfType(element);
@@ -65,6 +67,32 @@ internal static class MemoryOps {
             return new(null, 0);
         });
         return storage.ElementType is { } elementType ? (elementType, storage.Length) : null;
+    }
+
+    private static int InlineArrayLength(VmClassType definition) {
+        var tables = definition.Image.Tables;
+        for (var rid = 1; rid <= tables.GetRowCount(TableKind.CustomAttribute); rid++) {
+            var parent = tables.DecodeCoded(TableKind.CustomAttribute, rid, 0, CodedIndexKind.HasCustomAttribute);
+            if (parent.Table != TableKind.TypeDef || parent.Rid != definition.TypeDefRid) continue;
+            var constructor = tables.DecodeCoded(TableKind.CustomAttribute, rid, 1, CodedIndexKind.CustomAttributeType);
+            var owner = constructor.Table == TableKind.MemberRef
+                ? tables.DecodeCoded(TableKind.MemberRef, constructor.Rid, 0, CodedIndexKind.MemberRefParent) : default;
+            string? name = null;
+            if (owner.Table == TableKind.TypeRef) { var type = definition.Image.GetTypeRefName(owner.Rid); name = type.Namespace + "." + type.Name; }
+            else if (constructor.Table == TableKind.MethodDef) {
+                for (var typeRid = tables.GetRowCount(TableKind.TypeDef); typeRid > 0; typeRid--)
+                    if (tables.GetRowIndex(TableKind.TypeDef, typeRid, 5) <= constructor.Rid) {
+                        name = definition.Loader!.GetTypeDef(typeRid).FullName; break;
+                    }
+            }
+            if (name != "System.Runtime.CompilerServices.InlineArrayAttribute") continue;
+            var blob = definition.Image.GetBlob(tables.GetRowIndex(TableKind.CustomAttribute, rid, 2));
+            if (blob.Length < 8 || BinaryPrimitives.ReadUInt16LittleEndian(blob) != 1) throw new BadImageFormatException("Invalid inline array metadata.");
+            var length = BinaryPrimitives.ReadInt32LittleEndian(blob[2..]);
+            if (length <= 0) throw new BadImageFormatException("Invalid inline array length.");
+            return length;
+        }
+        return 0;
     }
 
     private static bool IsBlittableStruct(VmType type) => type.IsValueType && !type.IsEnum &&
@@ -94,18 +122,22 @@ internal static class MemoryOps {
                 var slots = new ObjectModel().GetLayout(definition);
                 var fields = new List<ByteField>();
                 if (FixedBufferStorage(definition) is { } fixedStorage) {
-                    var stride = SizeOfType(fixedStorage.ElementType);
+                    var element = fixedStorage.ElementType;
+                    if (constructed is not null) element = GenericSubstitutor.Substitute(element, new GenericContext { ClassArgs = constructed.TypeArguments });
+                    if (!element.IsValueType && element is not VmByRefType) throw new UnhandledGuestException("System.ArgumentException", "Raw structs cannot contain references.");
+                    var nested = IsBlittableStruct(element) ? GetByteLayout(element, active) : null;
+                    var stride = nested?.Size ?? SizeOfType(element);
+                    var field = definition.Fields.Single(field => !field.IsStatic && !field.IsLiteral);
                     for (var i = 0; i < fixedStorage.Length; i++)
-                        fields.Add(new ByteField(fixedStorage.ElementType, i, checked(i * stride), stride,
-                            definition.Fields.First(field => field.Name == "FixedElementField")));
-                    return new ByteLayout(checked(stride * fixedStorage.Length), Math.Min(stride, packing), fields.ToArray());
+                        fields.Add(new ByteField(element, i, checked(i * stride), stride, field));
+                    return new ByteLayout(checked(stride * fixedStorage.Length), Math.Min(nested?.Alignment ?? stride, packing), fields.ToArray());
                 }
                 var end = 0; var alignment = 1;
                 foreach (var field in definition.Fields) {
                     if (field.IsStatic || field.IsLiteral) continue;
                     var fieldType = field.FieldType ?? throw new InvalidOperationException("Field type is unavailable.");
                     if (constructed is not null) fieldType = GenericSubstitutor.Substitute(fieldType, new GenericContext { ClassArgs = constructed.TypeArguments });
-                    if (!fieldType.IsValueType || fieldType is VmByRefType) throw new UnhandledGuestException("System.ArgumentException", "Raw structs cannot contain references.");
+                    if (!fieldType.IsValueType && fieldType is not VmByRefType) throw new UnhandledGuestException("System.ArgumentException", "Raw structs cannot contain references.");
                     var nested = IsBlittableStruct(fieldType) ? GetByteLayout(fieldType, active) : null;
                     var size = nested?.Size ?? SizeOfType(fieldType);
                     var align = Math.Min(nested?.Alignment ?? size, packing);
@@ -122,6 +154,36 @@ internal static class MemoryOps {
     }
 
     // ---- 配列要素 ----
+
+    internal static StackSlot ReadPointerValue(VmNativePointer pointer, VmType type) {
+        if (IsBlittableStruct(type)) {
+            var layout = GetByteLayout(type);
+            pointer.EnsureBounds(layout.Size);
+            var fields = new StackSlot[layout.Fields.Length == 0 ? 0 : layout.Fields.Max(field => field.Slot) + 1];
+            foreach (var field in layout.Fields) fields[field.Slot] = ReadPointerValue(new VmNativePointer { Memory = pointer.Memory, ByteOffset = pointer.ByteOffset + field.Offset, IsReadOnly = pointer.IsReadOnly }, field.Type);
+            return StackSlot.OfValueType(new VmStructValue(type, fields, (type as VmConstructedType)?.TypeArguments));
+        }
+        if (type is VmByRefType) return LoadIndirect(ILOp.Ldind_I, StackSlot.OfObject(pointer));
+        var size = SizeOfRawType(type);
+        pointer.EnsureBounds(size);
+        return ValueFromBytes(pointer.Bytes.AsSpan(pointer.ByteOffset, size), type, size);
+    }
+
+    internal static void WritePointerValue(VmNativePointer pointer, VmType type, StackSlot value) {
+        pointer.EnsureWritable();
+        if (IsBlittableStruct(type)) {
+            var layout = GetByteLayout(type);
+            pointer.EnsureBounds(layout.Size);
+            var fields = value.ObjectValue switch { VmStructValue structure => structure.Fields, VmBoxedValue boxed => boxed.Fields, _ => throw new UnhandledGuestException("System.InvalidProgramException", "Struct value expected.") };
+            foreach (var field in layout.Fields) WritePointerValue(new VmNativePointer { Memory = pointer.Memory, ByteOffset = pointer.ByteOffset + field.Offset }, field.Type, fields[field.Slot]);
+            return;
+        }
+        if (type is VmByRefType) { StoreIndirect(ILOp.Stind_I, StackSlot.OfObject(pointer), value); return; }
+        var size = SizeOfRawType(type);
+        pointer.EnsureBounds(size);
+        pointer.Memory.ClearReferences(pointer.ByteOffset, size);
+        BytesOfValue(value, type, size, pointer.Bytes.AsSpan(pointer.ByteOffset, size));
+    }
 
     /// <summary>
     /// 配列命令がスタックへ返す/配列へ格納する表現。小整数は IL の signed/unsigned
@@ -253,6 +315,9 @@ internal static class MemoryOps {
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"cpblk が仮想メモリブロックの範囲外です (size={size}, dst offset={dst.ByteOffset}/{dst.Bytes.Length}, src offset={src.ByteOffset}/{src.Bytes.Length})。");
             src.Bytes.AsSpan(src.ByteOffset, size).CopyTo(dst.Bytes.AsSpan(dst.ByteOffset, size));
+            var references = src.Memory.References.Where(entry => entry.Key >= src.ByteOffset && (long)entry.Key + VmPrimitiveTypes.NativeIntSizeBytes <= (long)src.ByteOffset + size).ToArray();
+            dst.Memory.ClearReferences(dst.ByteOffset, size);
+            foreach (var reference in references) dst.Memory.References[dst.ByteOffset + reference.Key - src.ByteOffset] = reference.Value;
             return;
         }
         // StackSlot の 1 要素は int/参照/値型のいずれにもなり得るため、8 バイト丸めで
@@ -278,6 +343,7 @@ internal static class MemoryOps {
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"initblk が仮想メモリブロックの範囲外です (size={size}, offset={dst.ByteOffset}/{dst.Bytes.Length})。");
             dst.Bytes.AsSpan(dst.ByteOffset, size).Fill(fill);
+            dst.Memory.ClearReferences(dst.ByteOffset, size);
             return;
         }
         if (dstSlot.ObjectValue is VmByRef)
@@ -310,6 +376,10 @@ internal static class MemoryOps {
             managed = rightReference; displacement = left;
         }
         if (managed is not null) {
+            if (!managed.IsNullOrOnePast && managed.Read().ObjectValue is VmStructValue inline &&
+                inline.StructType is VmClassType definition && FixedBufferStorage(definition) is { } storage)
+                managed = new VmByRef(inline.Fields, 0, managed.IsReadOnly, managed.Owner,
+                    GenericSubstitutor.Substitute(storage.ElementType, GenericContext.Of(inline.TypeArguments, null)));
             var elementType = managed.Owner is VmArray array ? array.ArrayType.ElementType : managed.ElementType;
             if (elementType is null)
                 throw new UnhandledGuestException("System.NotSupportedException", "Pointer arithmetic requires typed array storage.");
@@ -361,6 +431,10 @@ internal static class MemoryOps {
     /// リトルエンディアン読み出し (命令幅どおり)、マネージポインタ (ByRef) はスロット読み出し。</summary>
     public static StackSlot LoadIndirect(ILOp op, in StackSlot address) {
         if (address.ObjectValue is VmNativePointer ptr) {
+            if (op is ILOp.Ldind_I or ILOp.Ldind_Ref && ptr.Memory.References.TryGetValue(ptr.ByteOffset, out var reference)) {
+                ptr.EnsureBounds(VmPrimitiveTypes.NativeIntSizeBytes);
+                return reference;
+            }
             return op switch {
                 ILOp.Ldind_I1 => ReadInt8(ptr),
                 ILOp.Ldind_U1 => ReadUInt8(ptr),
@@ -384,6 +458,7 @@ internal static class MemoryOps {
             lock (boxed.Fields) {
                 var slot = boxed.Fields[0];
                 return op switch {
+                    ILOp.Ldind_I when slot.ObjectValue is VmByRef or VmNativePointer or VmMethodPointer or VmRuntimeCallback => slot,
                     ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
                     ILOp.Ldind_R4 => StackSlot.OfFloat((float)slot.DoubleValue),
                     ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
@@ -395,6 +470,7 @@ internal static class MemoryOps {
         if (address.ObjectValue is VmByRef byRef) {
             var slot = byRef.Read();
             return op switch {
+                ILOp.Ldind_I when slot.ObjectValue is VmByRef or VmNativePointer or VmMethodPointer or VmRuntimeCallback => slot,
                 ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
                 ILOp.Ldind_R4 => StackSlot.OfFloat((float)slot.DoubleValue),
                 ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
@@ -410,6 +486,13 @@ internal static class MemoryOps {
     public static void StoreIndirect(ILOp op, in StackSlot address, in StackSlot value) {
         if (address.ObjectValue is VmNativePointer ptr) {
             ptr.EnsureWritable();
+            if (op is ILOp.Stind_I or ILOp.Stind_Ref && value.ObjectValue is not null) {
+                ptr.EnsureBounds(VmPrimitiveTypes.NativeIntSizeBytes);
+                ptr.Memory.ClearReferences(ptr.ByteOffset, VmPrimitiveTypes.NativeIntSizeBytes);
+                ptr.Bytes.AsSpan(ptr.ByteOffset, VmPrimitiveTypes.NativeIntSizeBytes).Clear();
+                ptr.Memory.References[ptr.ByteOffset] = value;
+                return;
+            }
             switch (op) {
                 case ILOp.Stind_I1: ptr.EnsureBounds(1); ptr.WriteInt8((int)value.Int64Value); return;
                 case ILOp.Stind_I2: ptr.EnsureBounds(2); ptr.WriteInt16((int)value.Int64Value); return;
@@ -417,7 +500,9 @@ internal static class MemoryOps {
                 case ILOp.Stind_I8: ptr.EnsureBounds(8); ptr.WriteInt64(value.Int64Value); return;
                 case ILOp.Stind_R4: ptr.EnsureBounds(4); ptr.WriteSingle((float)value.DoubleValue); return;
                 case ILOp.Stind_R8: ptr.EnsureBounds(8); ptr.WriteDouble(value.DoubleValue); return;
-                default: // Stind_Ref / Stind_I
+                case ILOp.Stind_I: ptr.EnsureBounds(VmPrimitiveTypes.NativeIntSizeBytes); ptr.WriteInt64(value.Int64Value); return;
+                case ILOp.Stind_Ref when value.ObjectValue is null: ptr.EnsureBounds(VmPrimitiveTypes.NativeIntSizeBytes); ptr.WriteInt64(0); return;
+                default:
                     throw new UnhandledGuestException("System.InvalidProgramException",
                         "unmanaged ポインタへの参照書き込み (stind.ref) は対応していません。");
             }
@@ -438,6 +523,7 @@ internal static class MemoryOps {
         }
         if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(op switch {
+                ILOp.Stind_I => value,
                 ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
                 ILOp.Stind_R4 => StackSlot.OfFloat((float)value.DoubleValue),
                 ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),

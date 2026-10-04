@@ -168,7 +168,7 @@ internal sealed partial class ObjectEngine {
         if (objSlot.ObjectValue is VmNativePointer pointer) {
             var address = MemoryOps.RawFieldAddress(pointer, field);
             var size = MemoryOps.SizeOfRawType(field.FieldType!);
-            return MemoryOps.ValueFromBytes(address.Bytes.AsSpan(address.ByteOffset, size), field.FieldType!, size);
+            return MemoryOps.ReadPointerValue(address, field.FieldType!);
         }
         var storage = FindFieldStorage(objSlot, field);
         lock (storage.Slots)
@@ -181,7 +181,7 @@ internal sealed partial class ObjectEngine {
             var address = MemoryOps.RawFieldAddress(pointer, field);
             address.EnsureWritable();
             var size = MemoryOps.SizeOfRawType(field.FieldType!);
-            MemoryOps.BytesOfValue(value, field.FieldType!, size, address.Bytes.AsSpan(address.ByteOffset, size));
+            MemoryOps.WritePointerValue(address, field.FieldType!, value);
             return;
         }
         var storage = FindFieldStorage(objSlot, field);

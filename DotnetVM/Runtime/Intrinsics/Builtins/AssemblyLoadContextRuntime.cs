@@ -266,7 +266,7 @@ internal static class AssemblyLoadContextRuntime {
     }
 
     private static StackSlot Assembly(IntrinsicContext ctx, TypeLoader loader) =>
-        StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader }));
+        DefaultIntrinsics.MakeRuntimeAssembly(ctx, loader);
 
     private static StackSlot LoadFromStream(IntrinsicContext ctx, VmAssemblyLoadContext loadContext, StackSlot streamSlot) {
         var stream = streamSlot.ObjectValue as VmMemoryStreamObject
@@ -332,7 +332,7 @@ internal static class AssemblyLoadContextRuntime {
             var assemblyType = (VmType?)ctx.Types.FindTypeByFullName("System.Reflection.Assembly")
                 ?? VmAssemblyObject.AssemblyFacade;
             var elements = loadContext.Context.Loaders
-                .Select(loader => StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader })))
+                .Select(loader => DefaultIntrinsics.MakeRuntimeAssembly(ctx, loader))
                 .ToArray();
             return StackSlot.OfObject(ctx.Heap.Allocate(new VmArray(
                 new VmArrayType { ElementType = assemblyType }, elements)));

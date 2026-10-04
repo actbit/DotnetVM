@@ -133,6 +133,12 @@ public sealed partial class Interpreter {
         intrinsicContext.InvokeGuestInstanceMethod = (receiver, name, arguments) =>
             calls.InvokeGuestInstanceMethod(receiver, name, arguments);
         intrinsicContext.InvokeGuestMethod = Invoke;
+        intrinsicContext.ResolveVirtualMethod = (method, receiver) => GetOrCreateEngines(method.Loader ?? loader).Calls.DispatchVirtual(method, receiver);
+        intrinsicContext.ResolveReflectionMethod = (module, token, context) => {
+            var target = GetOrCreateEngines(module).Calls.ResolveCallTarget(token, context, throwOnMissingIntrinsic: false);
+            return (target.Method ?? throw new UnhandledGuestException("System.MissingMethodException", "Invalid reflected method."),
+                GenericContext.Of(target.ClassArgs ?? context?.ClassArgs, target.MethodArgs ?? context?.MethodArgs));
+        };
         intrinsicContext.ReadFieldHook = (receiver, field) => objects.ReadField(receiver, field);
         intrinsicContext.WriteFieldHook = (receiver, field, value) => objects.WriteField(receiver, field, value);
         intrinsicContext.RunGuestStateMachine = stateMachine => {

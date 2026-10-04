@@ -53,6 +53,8 @@ internal sealed partial class CallEngine {
         SigKind.SzArray => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } inner ? inner + "[]" : null,
         SigKind.ByRef => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } element ? element + "&" : null,
         SigKind.Pointer => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } pointee ? pointee + "*" : null,
+        SigKind.FunctionPointer => DescribeBindingType(type.FunctionSignature!.ReturnType, methodArgs, classArgs, loader) + "(" +
+            string.Join(",", type.FunctionSignature.ParamTypes.Select(parameter => DescribeBindingType(parameter, methodArgs, classArgs, loader))) + ")",
         SigKind.Array => DescribeBindingType(type.Inner!, methodArgs, classArgs, loader) is { } multi ? $"{multi}[{type.Rank}]" : null,
         SigKind.GenericMethodVar => type.VarNumber < (methodArgs?.Length ?? 0)
             ? methodArgs![type.VarNumber].FullName
@@ -96,6 +98,8 @@ internal sealed partial class CallEngine {
     /// <summary>署名上のパラメータ型名を得る (intrinsic ゲートが IntrinsicContext に渡し、
     /// char / bool 等の i4 統合面のオーバーロード判別に使われる)。</summary>
     private string ParamTypeName(SigType type, GenericContext? context) => type.Kind switch {
+        SigKind.Void => "System.Void",
+        SigKind.FunctionPointer => ParamTypeName(type.FunctionSignature!.ReturnType, context) + "(" + string.Join(",", type.FunctionSignature.ParamTypes.Select(parameter => ParamTypeName(parameter, context))) + ")",
         SigKind.Boolean => "System.Boolean",
         SigKind.Char => "System.Char",
         SigKind.I1 => "System.SByte",

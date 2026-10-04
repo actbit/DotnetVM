@@ -229,6 +229,14 @@ internal sealed partial class CallEngine {
         var isCountable = declaringTypeName is "System.Collections.ICollection"
             or "System.Collections.Generic.ICollection`1"
             or "System.Collections.Generic.IReadOnlyCollection`1";
+        if (declaringTypeName is "System.Collections.Generic.IList`1" or "System.Collections.Generic.IReadOnlyList`1" && name == "get_Item" && paramCount == 1) {
+            var method = FindSZArrayHelper()?.Methods.Single(m => m.Name == "get_Item" && m.Signature.GenericParamCount == 1);
+            if (method is not null) return invoker.Invoke(method, args, GenericContext.Of(null, [array.ArrayType.ElementType]));
+        }
+        if (declaringTypeName == "System.Collections.Generic.ICollection`1" && name == "CopyTo" && paramCount == 2) {
+            var method = FindSZArrayHelper()?.Methods.Single(m => m.Name == "CopyTo" && m.Signature.GenericParamCount == 1);
+            if (method is not null) return invoker.Invoke(method, args, GenericContext.Of(null, [array.ArrayType.ElementType]));
+        }
         if (name == "GetEnumerator" && paramCount == 0 && isEnumerable) {
             var helper = FindSZArrayHelper();
             if (helper is null)

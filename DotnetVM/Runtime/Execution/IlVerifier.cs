@@ -1220,7 +1220,7 @@ internal static class IlVerifier {
             SigKind.I or SigKind.U => IlAbstractType.NativeInt,
             SigKind.String or SigKind.Object => IlAbstractType.Object,
             SigKind.ByRef => IlAbstractType.ByRef,
-            SigKind.Pointer => IlAbstractType.NativeInt,
+            SigKind.Pointer or SigKind.FunctionPointer => IlAbstractType.NativeInt,
             SigKind.SzArray or SigKind.Array => IlAbstractType.Object,
             SigKind.TypedByRef => IlAbstractType.TypedByRef,
             SigKind.GenericVar or SigKind.GenericMethodVar => IlAbstractType.Unknown,

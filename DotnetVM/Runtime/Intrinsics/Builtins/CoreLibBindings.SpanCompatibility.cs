@@ -86,7 +86,11 @@ internal static partial class CoreLibBindings {
             return (long)right.ByteOffset - left.ByteOffset;
         if (leftRef is not null && rightRef is not null && ReferenceEquals(leftRef.Container, rightRef.Container))
             return ((long)rightRef.Index - leftRef.Index) * SlotStride(ctx.MethodTypeArgAt(0));
-        throw new UnhandledGuestException("System.NotSupportedException", "References must share VM storage.");
+        var leftAddress = left is not null ? ctx.Shared.RuntimeMetadata.MemoryAddress(ctx, left.Memory) + left.ByteOffset
+            : ctx.Shared.RuntimeMetadata.MemoryAddress(ctx, leftRef!.Container) + (long)leftRef.Index * SlotStride(ctx.MethodTypeArgAt(0));
+        var rightAddress = right is not null ? ctx.Shared.RuntimeMetadata.MemoryAddress(ctx, right.Memory) + right.ByteOffset
+            : ctx.Shared.RuntimeMetadata.MemoryAddress(ctx, rightRef!.Container) + (long)rightRef.Index * SlotStride(ctx.MethodTypeArgAt(0));
+        return rightAddress - leftAddress;
     }
 
     private static StackSlot BitCastValue(IntrinsicContext ctx, in StackSlot value) {

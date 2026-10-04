@@ -177,25 +177,17 @@ internal static class CoreLibSurfaceAudit {
         Bcl("System.Net.Http.HttpClient", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを client に渡す");
         Bcl("System.Net.Http.HttpMessageInvoker", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを invoker に渡す");
         Bcl("System.Runtime.DependentHandle", ["InternalAlloc", "InternalGetTarget", "InternalGetDependent", "InternalGetTargetAndDependent", "InternalSetDependent", "InternalSetTargetToNull", "InternalFree"], false, InternalCall + "。VM GC の ephemeron 到達性と連携する");
-        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetProperties", "GetFields", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetFields", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
         Bcl("System.Enum", ["GetHashCode"], true, JitIntrinsic);
         Bcl("System.ComAwareWeakReference", ["PossiblyComObject"], false, RuntimeRepresentation + "。VM object は COM object を保持しない");
         Bcl("System.Exception", ["set_Source", "get_Source", "CaptureDispatchState", "RestoreDispatchState"], true, RuntimeRepresentation + "。例外の guest identity を維持し、VM tracer がスタックを管理する");
         Bcl("System.Reflection.Assembly", ["Equals", "GetHashCode"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.Assembly", "System.Reflection.MemberInfo", "System.Type", "System.RuntimeType", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributes", "IsDefined"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.ParameterInfo", "System.Reflection.MemberInfo", "System.Reflection.Assembly", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributesData"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.CustomAttributeData", ["get_AttributeType", "get_Constructor", "get_ConstructorArguments"], true, RuntimeRepresentation);
         foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo" }) Bcl(type, ["get_DeclaringType"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.MethodBase", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetParameters", "get_Attributes", "GetMethodImplementationFlags"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.ConstructorInfo", ["Invoke"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.MethodBase", ["Invoke"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod", "get_ReturnParameter"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.ParameterInfo", ["get_ParameterType", "get_Position", "get_Attributes", "get_Name", "get_Member", "get_HasDefaultValue", "get_DefaultValue", "get_RawDefaultValue"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.PropertyInfo", ["get_PropertyType", "GetIndexParameters", "GetGetMethod", "GetSetMethod", "get_CanRead", "get_CanWrite", "GetValue", "SetValue", "get_GetMethod", "get_SetMethod"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.MethodBase", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["get_Attributes", "GetMethodImplementationFlags"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod"], true, RuntimeRepresentation);
         Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes", "GetValue", "SetValue"], true, RuntimeRepresentation);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 2);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 5);
-        foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.MethodBase" }) Bcl(type, ["get_MemberType"], true, RuntimeRepresentation);
         Bcl("System.Runtime.InteropServices.GCHandle", ["_InternalAlloc", "InternalGet", "InternalSet", "InternalCompareExchange", "_InternalFree"], false, InternalCall);
 
         // ---- CultureSettings bridge / no-CoreLib fallback ----

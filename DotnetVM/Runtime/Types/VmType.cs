@@ -218,6 +218,16 @@ public sealed class VmMultiDimArrayType : VmType {
     public override uint[] GenericParamFlags => [];
 }
 
+/// <summary>A managed function pointer signature.</summary>
+public sealed class VmFunctionPointerType : VmType {
+    public required VmType ReturnType { get; init; }
+    public required VmType[] ParameterTypes { get; init; }
+    public override string FullName => ReturnType.FullName + "(" + string.Join(",", ParameterTypes.Select(type => type.FullName)) + ")";
+    public override VmType? BaseType => null;
+    public override bool IsValueType => false;
+    public override uint[] GenericParamFlags => [];
+}
+
 /// <summary>ByRef 型 (ref T)。</summary>
 public sealed class VmByRefType : VmType {
     public required VmType ElementType { get; init; }

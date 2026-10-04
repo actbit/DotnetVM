@@ -17,7 +17,21 @@ internal sealed class VmRuntimeMetadata {
     private readonly Dictionary<VmArray, VmNativePointer> _runtimeArrayData = [];
     private VmArray? _castCache;
     private long _nextAddress = 0x10000;
+    private sealed record MemoryIdentity(long Address);
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, MemoryIdentity> _memoryIdentities = new();
+    private long _nextMemoryAddress = 0x100000000;
     private readonly ObjectModel _objects = new();
+
+    internal long MemoryAddress(IntrinsicContext ctx, object storage) {
+        lock (_gate) {
+            if (_memoryIdentities.TryGetValue(storage, out var identity)) return identity.Address;
+            ctx.Heap.ChargeHostBuffer(64);
+            var address = _nextMemoryAddress;
+            _nextMemoryAddress = checked(address + 0x100000000);
+            _memoryIdentities.Add(storage, new MemoryIdentity(address));
+            return address;
+        }
+    }
 
     internal long Identity(IntrinsicContext ctx, object value) {
         lock (_gate) {
@@ -75,7 +89,7 @@ internal sealed class VmRuntimeMetadata {
         }
     }
 
-    private static VmClassType CoreType(IntrinsicContext ctx, string name) =>
+    internal static VmClassType CoreType(IntrinsicContext ctx, string name) =>
         ctx.Types.TryResolveTrustedUnifiedType(name) as VmClassType
         ?? throw new UnhandledGuestException("System.TypeLoadException", name);
 
@@ -129,7 +143,17 @@ internal sealed class VmRuntimeMetadata {
     internal StackSlot Get(VmClassInstance instance, string name) => instance.Fields[FieldIndex(instance.ClassType, name)];
     internal StackSlot Get(VmStructValue value, string name) => value.Fields[FieldIndex((VmClassType)value.StructType, name)];
     internal void Set(VmClassInstance instance, string name, StackSlot value) => instance.Fields[FieldIndex(instance.ClassType, name)] = value;
-    private void Set(VmStructValue instance, string name, StackSlot value) => instance.Fields[FieldIndex((VmClassType)instance.StructType, name)] = value;
+    internal void Set(VmStructValue instance, string name, StackSlot value) => instance.Fields[FieldIndex((VmClassType)instance.StructType, name)] = value;
+
+    internal VmClassInstance Instance(IntrinsicContext ctx, string name) {
+        var type = CoreType(ctx, name);
+        return ctx.Heap.Allocate(new VmClassInstance(type, _objects.CreateInstanceStorage(type, type.Loader!)));
+    }
+
+    internal VmStructValue Structure(IntrinsicContext ctx, string name) {
+        var type = CoreType(ctx, name);
+        return _objects.DefaultStruct(type, type.Loader!);
+    }
 
     private int FieldIndex(VmClassType type, string name) {
         var layout = _objects.GetLayout(type);
@@ -140,6 +164,7 @@ internal sealed class VmRuntimeMetadata {
     internal IEnumerable<VmObject> Roots() {
         lock (_gate) {
             var roots = _modules.Values.Cast<VmObject>().ToList();
+            roots.AddRange(_handles.Values.OfType<VmObject>());
             foreach (var pair in _runtimeArrayData) { roots.Add(pair.Key); roots.Add(pair.Value.Memory); }
             foreach (var value in _storage.Values)
                 DotnetVM.Runtime.Heap.ObjectGraphWalker.CollectFromSlots(value.Fields, roots.Add);
@@ -153,6 +178,8 @@ internal sealed class VmRuntimeMetadata {
                 var owned = entry.Key switch {
                     VmType type => context.OwnsType(type),
                     TypeLoader loader => ReferenceEquals(loader.Context, context),
+                    VmRuntimeMethod method => context.OwnsType(method.Target.DeclaringType),
+                    VmRuntimeField field => context.OwnsType(field.Target.DeclaringType),
                     VmStructValue value => value.Fields.Any(slot => slot.ObjectValue is VmRuntimeObject type && context.OwnsType(type.Target)),
                     _ => false,
                 };
@@ -168,6 +195,7 @@ internal sealed class VmRuntimeMetadata {
         lock (_gate) {
             _identities.Clear(); _handles.Clear(); _storage.Clear(); _modules.Clear();
             _runtimeArrayData.Clear(); _castCache = null;
+            _memoryIdentities.Clear();
         }
     }
 }

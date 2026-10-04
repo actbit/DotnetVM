@@ -19,7 +19,6 @@ internal static partial class CoreLibBindings {
     // ---- System.Runtime.CompilerServices.RuntimeHelpers (InternalCall 面) ----
 
     private static void RegisterRuntimeHelpers(IntrinsicRegistry r) {
-        RegisterAttributeReflection(r);
         RegisterSerializationReflection(r);
         r.RegisterBinding(BindingKey.Instance("System.Exception", "CaptureDispatchState"), static (ctx, _) => {
             var type = FindAnyType(ctx, "System.Exception+DispatchState")!;
@@ -68,7 +67,7 @@ internal static partial class CoreLibBindings {
             r.RegisterBinding(BindingKey.Instance(type, "GetConstructors", "System.Reflection.BindingFlags"), static (ctx, a) => {
                 var t = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (t is VmConstructedType c) t = c.Definition;
                 var flags = (BindingFlags)a[1].AsInt32;
-                return MetadataArray(ctx, "System.Reflection.ConstructorInfo", t.Methods.Where(m => m.Name == ".ctor" && flags.HasFlag(BindingFlags.Instance) && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic))).Select(m => StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = m }))));
+                return MetadataArray(ctx, "System.Reflection.ConstructorInfo", t.Methods.Where(m => m.Name == ".ctor" && flags.HasFlag(BindingFlags.Instance) && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic))).Select(m => DefaultIntrinsics.MakeRuntimeMethod(ctx, m)));
             }, BindingOrigin.InternalCall);
             r.RegisterBinding(BindingKey.Instance(type, "GetInterfaces"), static (ctx, a) => {
                 var found = new Dictionary<string, VmType>();
@@ -103,13 +102,13 @@ internal static partial class CoreLibBindings {
                 var flags = (BindingFlags)a[1].AsInt32;
                 var constructor = definition.Methods.FirstOrDefault(m => m.Name == ".ctor" && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)) &&
                     m.Signature.ParamTypes.Length == wanted.Length && m.Signature.ParamTypes.Select(t => (m.Loader ?? ctx.Types).ResolveToken(t).FullName).SequenceEqual(wanted));
-                return constructor is null ? StackSlot.Null : StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = constructor, ReflectedType = target }));
+                return constructor is null ? StackSlot.Null : DefaultIntrinsics.MakeRuntimeMethod(ctx, constructor, target);
             }, BindingOrigin.InternalCall);
             r.RegisterBinding(BindingKey.Instance(type, "get_Assembly"), static (ctx, a) => {
                 var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
                 if (target is VmConstructedType constructed) target = constructed.Definition;
                 var loader = (target as VmClassType)?.Loader ?? ctx.Types;
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader }));
+                return DefaultIntrinsics.MakeRuntimeAssembly(ctx, loader);
             }, BindingOrigin.InternalCall);
             r.RegisterBinding(BindingKey.Instance(type, "get_IsByRefLike"), static (_, a) => {
                 var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;

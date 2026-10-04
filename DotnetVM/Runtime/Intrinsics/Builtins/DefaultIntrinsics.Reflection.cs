@@ -129,7 +129,7 @@ public static partial class DefaultIntrinsics {
             var method = current.Methods.FirstOrDefault(candidate =>
                 candidate.Name == name && (expectedCount < 0 || candidate.Signature.ParamTypes.Length == expectedCount));
             if (method is not null)
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method, ReflectedType = type }));
+                return DefaultIntrinsics.MakeRuntimeMethod(ctx, method, type);
         }
         return StackSlot.Null;
     }
@@ -138,14 +138,14 @@ public static partial class DefaultIntrinsics {
         var values = new List<StackSlot>();
         for (VmType? current = type; current is not null; current = current.BaseType)
             foreach (var method in current.Methods)
-                values.Add(StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method })));
+                values.Add(DefaultIntrinsics.MakeRuntimeMethod(ctx, method));
         return StackSlot.OfObject(ctx.MakeObjectArray(values));
     }
 
     internal static StackSlot MakeFieldObject(IntrinsicContext ctx, VmType type, string name) {
         for (VmType? current = type; current is not null; current = current.BaseType)
             if (current.Fields.FirstOrDefault(field => field.Name == name) is { } field)
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeField { Target = field }));
+                return MakeRuntimeField(ctx, field);
         return StackSlot.Null;
     }
 
@@ -153,7 +153,7 @@ public static partial class DefaultIntrinsics {
         var values = new List<StackSlot>();
         for (VmType? current = type; current is not null; current = current.BaseType)
             foreach (var field in current.Fields)
-                values.Add(StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeField { Target = field })));
+                values.Add(MakeRuntimeField(ctx, field));
         return StackSlot.OfObject(ctx.MakeObjectArray(values));
     }
 
@@ -161,7 +161,7 @@ public static partial class DefaultIntrinsics {
         for (VmType? current = type; current is not null; current = current.BaseType)
             if (current.Methods.FirstOrDefault(method => method.Name == "get_" + name && method.Signature.ParamTypes.Length == 0) is { } getter) {
                 var setter = current.Methods.FirstOrDefault(method => method.Name == "set_" + name && method.Signature.ParamTypes.Length == 1);
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeProperty { Name = name, Getter = getter, Setter = setter, ReflectedType = type }));
+                return MakeRuntimeProperty(ctx, name, getter, setter, type);
             }
         return StackSlot.Null;
     }
@@ -174,11 +174,11 @@ public static partial class DefaultIntrinsics {
         const string T = "System.Reflection.MethodBase";
         r.Register(IntrinsicKey.Static(T, "GetMethodFromHandle", 1), static (ctx, a) =>
             a[0].ObjectValue is VmMethodHandle handle
-                ? StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = handle.Target }))
+                ? DefaultIntrinsics.MakeRuntimeMethod(ctx, handle.Target)
                 : throw new InvalidOperationException("GetMethodFromHandle の引数が RuntimeMethodHandle ではありません。"));
         r.Register(IntrinsicKey.Static(T, "GetCurrentMethod", 0), static (ctx, _) =>
             ctx.CurrentMethodHook is { } hook && hook() is { } method
-                ? StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method }))
+                ? DefaultIntrinsics.MakeRuntimeMethod(ctx, method)
                 : StackSlot.Null);
 
         void Instance(string name, int ps, IntrinsicImpl impl) =>
@@ -200,7 +200,7 @@ public static partial class DefaultIntrinsics {
             var namedLoader = ctx.Types.Context?.FindBySimpleName(simpleName)
                 ?? throw new UnhandledGuestException("System.IO.FileNotFoundException",
                     $"アセンブリ '{simpleName}' が見つかりません。");
-            return StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = namedLoader }));
+            return MakeRuntimeAssembly(ctx, namedLoader);
         }
         if (args[0].ObjectValue is not VmArray bytes)
             throw new UnhandledGuestException("System.ArgumentNullException", null);
@@ -211,7 +211,7 @@ public static partial class DefaultIntrinsics {
         var imageBytes = ctx.ReadByteArray(args[0]);
         var loader = ctx.LoadAssemblyFromBytes?.Invoke(imageBytes)
             ?? throw new OperationNotAllowedException("Assembly.Load は VM の動的ローダーから利用できません。");
-        return StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader }));
+        return MakeRuntimeAssembly(ctx, loader);
     }
 
     private static string SimpleAssemblyName(string fullName) {

@@ -105,7 +105,7 @@ internal static class ReflectionEmitRuntime {
                 break;
             case "System.Reflection.MethodInfo":
             case "System.Reflection.ConstructorInfo":
-                builder.EmitReference(opcode, ReadMethod(args[2]));
+                builder.EmitReference(opcode, ReadMethod(context, args[2]));
                 break;
             case "System.Reflection.FieldInfo":
                 builder.EmitReference(opcode, ReadRuntimeField(args[2]));
@@ -128,7 +128,7 @@ internal static class ReflectionEmitRuntime {
 
     public static StackSlot EmitCall(IntrinsicContext context, StackSlot[] args) {
         var builder = GetBuilder(args[0]);
-        builder.EmitReference(ReadOpcode(args[1]), ReadMethod(args[2]));
+        builder.EmitReference(ReadOpcode(args[1]), ReadMethod(context, args[2]));
         return default;
     }
 
@@ -171,9 +171,10 @@ internal static class ReflectionEmitRuntime {
         ? local.Index
         : throw new UnhandledGuestException("System.ArgumentException", "LocalBuilder 値が必要です。");
 
-    private static object ReadMethod(in StackSlot slot) => slot.ObjectValue is VmRuntimeMethod method
-        ? method.ReflectedType is null ? method.Target : method
-        : throw new UnhandledGuestException("System.ArgumentException", "MethodInfo 値が必要です。");
+    private static object ReadMethod(IntrinsicContext context, in StackSlot slot) {
+        var method = CoreLibBindings.RuntimeMethodInfo(context, slot);
+        return method.ReflectedType is null ? method.Target : method;
+    }
 
     private static VmField ReadRuntimeField(in StackSlot slot) {
         if (slot.ObjectValue is not VmRuntimeField field)

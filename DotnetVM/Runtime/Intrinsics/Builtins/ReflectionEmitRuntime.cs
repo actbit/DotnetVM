@@ -171,8 +171,8 @@ internal static class ReflectionEmitRuntime {
         ? local.Index
         : throw new UnhandledGuestException("System.ArgumentException", "LocalBuilder 値が必要です。");
 
-    private static VmMethod ReadMethod(in StackSlot slot) => slot.ObjectValue is VmRuntimeMethod method
-        ? method.Target
+    private static object ReadMethod(in StackSlot slot) => slot.ObjectValue is VmRuntimeMethod method
+        ? method.ReflectedType is null ? method.Target : method
         : throw new UnhandledGuestException("System.ArgumentException", "MethodInfo 値が必要です。");
 
     private static VmField ReadRuntimeField(in StackSlot slot) {

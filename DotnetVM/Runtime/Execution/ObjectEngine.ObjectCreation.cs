@@ -16,7 +16,7 @@ internal sealed partial class ObjectEngine {
     /// 関数ポインタは ldftn/ldvirtftn の VmMethodPointer、既存デリゲートの複製 (マルチキャスト含む) も可。</summary>
     private VmDelegate NewDelegate(VmType delegateType, StackSlot targetSlot, StackSlot pointerSlot) {
         var invocations = pointerSlot.ObjectValue switch {
-            VmMethodPointer pointer => new[] { new DelegateInvocation(targetSlot, pointer.Target) },
+            VmMethodPointer pointer => new[] { new DelegateInvocation(targetSlot, pointer.Target, pointer.Context) },
             VmDelegate source => source.CopyInvocations(),
             _ => throw new UnhandledGuestException("System.ArgumentException",
                 "デリゲート生成の第 2 引数が関数ポインタ (ldftn/ldvirtftn の結果) ではありません。"),
@@ -231,6 +231,10 @@ internal sealed partial class ObjectEngine {
     }
 
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
+        if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var reflectedReference) == true && reflectedReference is VmRuntimeMethod reflectedCtor) {
+            var values = caller.Stack.PopArguments(reflectedCtor.Target.Signature.ParamTypes.Length);
+            return StackSlot.OfObject(CreateInstanceByCtor(reflectedCtor.ReflectedType ?? reflectedCtor.Target.DeclaringType, reflectedCtor.Target, values, null));
+        }
         if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmMethod dynamicCtor) {
             var values = new StackSlot[dynamicCtor.Signature.ParamTypes.Length];
@@ -297,8 +301,9 @@ internal sealed partial class ObjectEngine {
                     // Preserve overload identity for host-backed facade constructors.
                     // Only a framework AssemblyRef can select a normalized binding.
                     string[]? ctorParameterNames = null;
-                    if (parent.Table == TableKind.TypeRef && typeName is ("System.Globalization.CultureInfo" or "System.Text.UTF8Encoding" or "System.Globalization.NumberFormatInfo" or
-                        "System.Text.RegularExpressions.Regex" or "System.IO.Compression.GZipStream" or "System.IO.Compression.DeflateStream" or "System.IO.Compression.BrotliStream" or "System.IO.Compression.ZLibStream")) {
+                    if (parent.Table == TableKind.TypeRef && (typeName is ("System.Globalization.CultureInfo" or "System.Text.UTF8Encoding" or "System.Globalization.NumberFormatInfo" or
+                        "System.Text.RegularExpressions.Regex" or "System.IO.Compression.GZipStream" or "System.IO.Compression.DeflateStream" or "System.IO.Compression.BrotliStream" or "System.IO.Compression.ZLibStream") ||
+                        CoreLibBindings.HttpBoundaryTypes.Concat(CoreLibBindings.CryptoBoundaryTypes).Any(t => t.FullName == typeName))) {
                         var scope = _loader.Image.GetTerminalTypeRefScope(parent.Rid);
                         if (scope.Table == TableKind.AssemblyRef && TypeLoader.IsKnownFrameworkContract(_loader.Image.GetAssemblyRefIdentity(scope.Rid))) {
                             ctorParameterNames = signature.ParamTypes.Select(t => _loader.ResolveToken(t, caller.Context).FullName).ToArray();

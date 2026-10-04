@@ -38,6 +38,26 @@ public sealed class VmMethod {
     public bool IsAbstract => (Flags & 0x0400) != 0;
     public bool IsPublic => (Flags & 0x0006) == 0x0006;
     public bool IsConstructor => Name == ".ctor" || Name == ".cctor";
+    private bool? _initSetter;
+    internal bool IsInitSetter {
+        get {
+            if (_initSetter is { } cached) return cached;
+            if (Loader is null || !Name.StartsWith("set_", StringComparison.Ordinal) || Signature.ReturnType.Kind != SigKind.Void) return (_initSetter = false).Value;
+            var reader = new DotnetVM.Binary.SpanReader(Loader.Image.GetMethodSignature(MethodDefRid));
+            var convention = reader.ReadByte(); if ((convention & 0x10) != 0) _ = reader.ReadCompressedUInt32();
+            _ = reader.ReadCompressedUInt32();
+            while (!reader.EndOfBuffer) {
+                var kind = reader.ReadByte(); if (kind is not (0x1F or 0x20)) break;
+                var encoded = reader.ReadCompressedUInt32();
+                var table = (encoded & 3) switch { 0 => TableKind.TypeDef, 1 => TableKind.TypeRef, 2 => TableKind.TypeSpec, _ => throw new BadImageFormatException("Invalid modifier token.") };
+                var type = Loader.ResolveToken(new SigType(SigKind.TypeToken, Token: global::DotnetVM.Metadata.Token.From(table, (int)(encoded >> 2)).Value));
+                if (kind == 0x1F && type.FullName == "System.Runtime.CompilerServices.IsExternalInit") return (_initSetter = true).Value;
+            }
+            return (_initSetter = false).Value;
+        }
+    }
+    internal bool CanWriteInitOnly(VmField field) => !field.IsInitOnly ||
+        (field.IsStatic ? Name == ".cctor" : Name == ".ctor" || IsInitSetter && field.DeclaringType.FullName == DeclaringType.FullName);
 
     /// <summary>IL を事前デコードする (Body が無い場合は例外)。</summary>
     public DecodedInstruction[] DecodeIl() {

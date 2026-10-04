@@ -203,6 +203,7 @@ internal sealed partial class CallEngine {
             _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
             _intrinsicContext.ClassTypeArguments = classArgs ?? [];
             result = InvokeDelegated(anyImpl, [], args);
+            if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
             return true;
         }
         var declaringName = method.DeclaringType.FullName;
@@ -230,6 +231,7 @@ internal sealed partial class CallEngine {
             _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
             _intrinsicContext.ClassTypeArguments = classArgs ?? [];
             result = InvokeMethodDelegated(method, impl, names, args);
+        if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
             return true;
         }
         if (!hasBinding) {
@@ -249,6 +251,7 @@ internal sealed partial class CallEngine {
         _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
         _intrinsicContext.ClassTypeArguments = classArgs ?? [];
         result = InvokeMethodDelegated(method, impl, names, args);
+        if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
         return true;
     }
 
@@ -333,6 +336,7 @@ internal sealed partial class CallEngine {
             return false;
         NormalizeByRefReceiver(method, args);
         result = InvokeMethodDelegated(method, impl, ParamTypeNamesOf(method, null) ?? [], args);
+        if (!SlotOps.SignatureReturnsValue(method.Signature)) result = null;
         return true;
     }
 

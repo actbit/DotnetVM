@@ -16,6 +16,8 @@ public static partial class DefaultIntrinsics {
                 ? new VmConstructedType { Definition = ci.ClassType, TypeArguments = ci.TypeArguments }
                 : (VmType)ci.ClassType,
             VmBoxedValue bv => bv.Type,
+            VmBclObject bcl => bcl.Type,
+            VmIntrinsicInstance intrinsic => intrinsic.Type,
             VmArray arr => arr.ArrayType,
             // C5.5 Wave 4: Object.ToString の IL 化で "str".GetType() がこの面を辿る。
             // VmString の実行時型は System.String (旧 ③ intrinsic の「VmString は自分自身」
@@ -122,7 +124,7 @@ public static partial class DefaultIntrinsics {
             var method = current.Methods.FirstOrDefault(candidate =>
                 candidate.Name == name && (expectedCount < 0 || candidate.Signature.ParamTypes.Length == expectedCount));
             if (method is not null)
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method }));
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method, ReflectedType = type }));
         }
         return StackSlot.Null;
     }
@@ -158,8 +160,8 @@ public static partial class DefaultIntrinsics {
     }
 
     private static bool SameType(StackSlot[] a) =>
-        a[0].ObjectValue is VmRuntimeObject left && a[1].ObjectValue is VmRuntimeObject right &&
-        left.Target.FullName == right.Target.FullName;
+        a[0].ObjectValue is null && a[1].ObjectValue is null ||
+        a[0].ObjectValue is VmRuntimeObject left && a[1].ObjectValue is VmRuntimeObject right && left.Target.FullName == right.Target.FullName;
 
     private static void RegisterMethodBase(IntrinsicRegistry r) {
         const string T = "System.Reflection.MethodBase";

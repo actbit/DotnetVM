@@ -775,9 +775,13 @@ internal static class IlVerifier {
         private MethodShape GetMethodShape(DecodedInstruction instruction) {
             var token = unchecked((uint)instruction.IntOperand);
             if (TryGetDynamicToken(token, instruction, out var dynamicReference)) {
+                var reflectedMethod = dynamicReference as DotnetVM.Runtime.Objects.VmRuntimeMethod;
+                if (reflectedMethod is not null) dynamicReference = reflectedMethod.Target;
                 if (dynamicReference is not VmMethod)
                     FailAt(instruction, $"動的 method token 0x{token:X8} が VmMethod ではありません。");
-                return MethodShape.From((VmMethod)dynamicReference, TypeOf);
+                var method = (VmMethod)dynamicReference;
+                var context = GenericContext.Of((reflectedMethod?.ReflectedType as VmConstructedType)?.TypeArguments, reflectedMethod?.MethodArguments);
+                return MethodShape.From(method, signature => TypeOf((method.Loader ?? _loader).ResolveToken(signature, context)));
             }
 
             var table = (TableKind)(token >> 24);
@@ -829,7 +833,8 @@ internal static class IlVerifier {
             if (TryGetDynamicToken(token, instruction, out var dynamicReference)) {
                 if (dynamicReference is not VmField)
                     FailAt(instruction, $"動的 field token 0x{token:X8} が VmField ではありません。");
-                return new FieldShape(TypeOf(((VmField)dynamicReference).Signature.FieldType));
+                var field = (VmField)dynamicReference;
+                return new FieldShape(TypeOf(field.FieldType!));
             }
             var table = (TableKind)(token >> 24);
             var rid = (int)(token & 0xFFFFFF);
@@ -849,6 +854,7 @@ internal static class IlVerifier {
         private IlAbstractType GetNewObjectKind(DecodedInstruction instruction) {
             var token = unchecked((uint)instruction.IntOperand);
             if (TryGetDynamicToken(token, instruction, out var dynamicReference)) {
+                if (dynamicReference is DotnetVM.Runtime.Objects.VmRuntimeMethod reflectedMethod) dynamicReference = reflectedMethod.Target;
                 if (dynamicReference is not VmMethod)
                     FailAt(instruction, "newobj の動的 token が VmMethod ではありません。");
                 var method = (VmMethod)dynamicReference;
@@ -927,7 +933,7 @@ internal static class IlVerifier {
         private void ValidateLdtoken(DecodedInstruction instruction) {
             var token = unchecked((uint)instruction.IntOperand);
             if (TryGetDynamicToken(token, instruction, out var dynamicReference)) {
-                if (dynamicReference is not (VmMethod or VmField or VmType))
+                if (dynamicReference is not (VmMethod or DotnetVM.Runtime.Objects.VmRuntimeMethod or VmField or VmType))
                     FailAt(instruction, $"動的 ldtoken 0x{token:X8} の参照種別が不正です。");
                 return;
             }
@@ -1334,7 +1340,7 @@ internal static class IlVerifier {
                 reader.Fail("メソッド署名に予約済みフラグがあります。");
             var genericCount = (callingConvention & 0x10) != 0 ? reader.ReadCount("ジェネリック引数") : 0;
             var parameterCount = reader.ReadCount("引数");
-            var returnIsVoid = reader.PeekIs(0x01);
+            var returnIsVoid = reader.PeekVoidReturn();
             var returnType = reader.ReadType(allowVoid: true, allowPinned: false);
             var parameters = new IlAbstractType[parameterCount];
             var sentinelSeen = false;
@@ -1408,6 +1414,11 @@ internal static class IlVerifier {
             }
 
             public bool PeekIs(byte value) => _offset < _blob.Length && _blob[_offset] == value;
+            public bool PeekVoidReturn() {
+                var probe = this;
+                while (probe.PeekIs(0x1F) || probe.PeekIs(0x20)) { probe.ReadByte(); _ = probe.ReadTypeToken("return modifier"); }
+                return probe.PeekIs(0x01);
+            }
 
             public int ReadCount(string what) {
                 var value = ReadCompressed($"{what} 数");

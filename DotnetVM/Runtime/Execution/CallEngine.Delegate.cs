@@ -50,10 +50,7 @@ internal sealed partial class CallEngine {
             if (method.Signature.ParamTypes.Length != argCount)
                 throw new UnhandledGuestException("System.ArgumentException",
                     $"デリゲート {@delegate.DeclaredType.FullName} の呼出 ({method.DeclaringType.FullName}::{method.Name}) に引数個数が一致しません (期待 {method.Signature.ParamTypes.Length}, 実際 {argCount})。");
-            GenericContext? context = null;
-            if (method.Signature.HasThis &&
-                SlotOps.TryGetReceiverTypeArguments(invocation.Target, method.DeclaringType.GenericParamCount, out var classArgs))
-                context = GenericContext.Of(classArgs, null);
+            var context = BuildCallContext(new CallTarget { ClassArgs = invocation.Context?.ClassArgs, MethodArgs = invocation.Context?.MethodArgs }, method, invocation.Target);
             if (method.Signature.HasThis) {
                 var callArgs = new StackSlot[argCount + 1];
                 callArgs[0] = invocation.Target;

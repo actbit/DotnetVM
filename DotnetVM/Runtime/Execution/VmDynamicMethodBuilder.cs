@@ -44,7 +44,7 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
         "System.Object" => new SigType(SigKind.Object),
         _ when type is VmArrayType array => new SigType(SigKind.SzArray, Inner: SignatureType(array.ElementType)),
         _ when type is VmByRefType byRef => new SigType(SigKind.ByRef, Inner: SignatureType(byRef.ElementType)),
-        _ => throw new NotSupportedException($"DynamicMethod の型 {type.FullName} はまだ対応していません。"),
+        _ => new SigType(SigKind.TypeToken) { RuntimeType = type },
     };
 
     public void EmitOpcode(ushort opcode) {
@@ -388,10 +388,10 @@ internal sealed class VmDynamicMethodBuilder(TypeLoader loader, VmHeap heap, str
 
         if (_references.TryGetValue(token, out var reference)) {
             var valid = instruction.OperandKind switch {
-                IlOperandKind.Method => reference is VmMethod,
+                IlOperandKind.Method => reference is VmMethod or DotnetVM.Runtime.Objects.VmRuntimeMethod,
                 IlOperandKind.Field => reference is VmField,
                 IlOperandKind.Type => reference is VmType,
-                IlOperandKind.Token => reference is VmMethod or VmField or VmType,
+                IlOperandKind.Token => reference is VmMethod or DotnetVM.Runtime.Objects.VmRuntimeMethod or VmField or VmType,
                 _ => false,
             };
             if (!valid)

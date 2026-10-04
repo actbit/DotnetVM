@@ -269,7 +269,8 @@ public sealed record IlOpcodeInfo(ILOp Op, string Name, IlOperandKind Operand) {
     private int BaseSize => Operand switch {
         IlOperandKind.None => 1,
         IlOperandKind.ShortVar or IlOperandKind.ShortI or IlOperandKind.ShortBrTarget => 2,
-        IlOperandKind.Var or IlOperandKind.I4 or IlOperandKind.R4 or IlOperandKind.BrTarget
+        IlOperandKind.Var => 2,
+        IlOperandKind.I4 or IlOperandKind.R4 or IlOperandKind.BrTarget
             or IlOperandKind.Method or IlOperandKind.Signature or IlOperandKind.Type
             or IlOperandKind.Field or IlOperandKind.String or IlOperandKind.Token => 5,
         IlOperandKind.I8 or IlOperandKind.R8 => 9,

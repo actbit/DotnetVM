@@ -20,14 +20,21 @@ internal sealed partial class CallEngine {
             VmLifetime.EnsureLiveForGuest(argument);
         // 未登録 intrinsic はこの時点では例外にしない (callvirt ならレシーバのゲスト実装を
         // 引数ポップ後に試すため。旧来の即時例外は最後のフォールバックで再現する)
-        var target = caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
-            dynamicReference is VmMethod dynamicMethod
+        object? dynamicReference = null;
+        var hasDynamic = caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out dynamicReference) == true;
+        var reflected = hasDynamic ? dynamicReference as VmRuntimeMethod : null;
+        var dynamicMethod = hasDynamic ? reflected?.Target ?? dynamicReference as VmMethod : null;
+        var target = dynamicMethod is not null
             ? new CallTarget {
                 Arity = dynamicMethod.Signature.ParamTypes.Length + (dynamicMethod.Signature.HasThis ? 1 : 0),
                 Method = dynamicMethod,
                 Name = dynamicMethod.Name,
                 ParamCount = dynamicMethod.Signature.ParamTypes.Length,
                 HasThis = dynamicMethod.Signature.HasThis,
+                ClassArgs = (reflected?.ReflectedType as VmConstructedType)?.TypeArguments,
+                MethodArgs = reflected?.MethodArguments,
+                DeclaringType = dynamicMethod.DeclaringType.FullName,
+                ReturnsValue = SlotOps.SignatureReturnsValue(dynamicMethod.Signature),
             }
             : ResolveCallTarget(token, caller.Context, throwOnMissingIntrinsic: false);
         // 特権判定は callee ではなく実際の呼出元 loader 基準 (caller.Method.Loader)。
@@ -131,7 +138,8 @@ internal sealed partial class CallEngine {
                     gate.ConsumeInstruction();
                     gate.CheckSafepoint();
                     _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
-                    return surfaceImpl(_intrinsicContext, args);
+                    var surfaceResult = surfaceImpl(_intrinsicContext, args);
+                    return target.ReturnsValue == false ? null : surfaceResult;
                 }
             }
             // constrained. 値型レシーバが intrinsic 宣言型 (System.Object 等) に着地した場合、
@@ -164,9 +172,10 @@ internal sealed partial class CallEngine {
             _intrinsicContext.MethodTypeArguments = target.MethodArgs ?? [];
             _intrinsicContext.ClassTypeArguments = target.ClassArgs ?? [];
             using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
-            return target.DeclaringType == "System.Threading.Interlocked"
+            var intrinsicResult = target.DeclaringType == "System.Threading.Interlocked"
                 ? InvokeInterlocked(intrinsic, target.ParamTypeNames ?? [], args, alreadyGated: true)
                 : intrinsic(_intrinsicContext, args);
+            return target.ReturnsValue == false ? null : intrinsicResult;
         }
 
         // 解決未了 (未登録 intrinsic): レシーバへの仮想ディスパッチを最終試行してから拒否
@@ -177,6 +186,11 @@ internal sealed partial class CallEngine {
         // ゲスト呼出。callvirt はレシーバの実行時型で仮想解決 (VTable 相当)。
         // constrained. 値型レシーバは ByRef/ValueType スロットで来るためディスパッチがそのまま適用される
         var method = target.Method!;
+        if (isCallvirt && method.Name == "ToString" && method.Signature.ParamTypes.Length == 0 &&
+            args[0].ObjectValue is VmBclObject or VmIntrinsicInstance &&
+            DotnetVM.Runtime.Intrinsics.Builtins.CoreLibBindings.BclToString(_intrinsicContext, args[0]) is { } bclText) {
+            gate.ConsumeInstruction(); gate.CheckSafepoint(); return StackSlot.OfObject(bclText);
+        }
         VmType[]? staticImplementationArgs = null;
         if (constrainedToken != 0 && method.IsStatic && method.DeclaringType is VmClassType { IsInterface: true }) {
             var implementingType = _objectEngine.ResolveTypeToken(constrainedToken, caller.Context,
@@ -214,7 +228,8 @@ internal sealed partial class CallEngine {
             gate.ConsumeInstruction();
             gate.CheckSafepoint();
             _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
-            return runtimeSurfaceImpl(_intrinsicContext, args);
+            var surfaceResult = runtimeSurfaceImpl(_intrinsicContext, args);
+            return SlotOps.SignatureReturnsValue(method.Signature) ? surfaceResult : null;
         }
 
         if (method.Body is null) {
@@ -357,9 +372,12 @@ internal sealed partial class CallEngine {
     internal GenericContext? BuildCallContext(CallTarget target, VmMethod method, in StackSlot receiver) {
         var classArgs = target.ClassArgs;
         var declaringParamCount = method.DeclaringType.GenericParamCount;
-        if (declaringParamCount > 0 &&
-            SlotOps.TryGetReceiverTypeArguments(receiver, declaringParamCount, out var receiverArgs))
-            classArgs = receiverArgs;
+        if (declaringParamCount > 0) {
+            var receiverType = receiver.ObjectValue is VmClassInstance instance ? instance.RuntimeType : ReceiverRuntimeType(receiver);
+            var inherited = receiverType is null ? null : InheritanceTypeArguments(receiverType, method.DeclaringType);
+            if (inherited is { Length: > 0 }) classArgs = inherited;
+            else if (SlotOps.TryGetReceiverTypeArguments(receiver, declaringParamCount, out var receiverArgs)) classArgs = receiverArgs;
+        }
         return GenericContext.Of(classArgs, target.MethodArgs);
     }
 }

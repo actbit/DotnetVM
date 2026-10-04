@@ -132,6 +132,7 @@ public sealed partial class Interpreter {
         intrinsicContext.InvokeGuestDelegate = (guestDelegate, arguments) => calls.InvokeDelegate(guestDelegate, arguments);
         intrinsicContext.InvokeGuestInstanceMethod = (receiver, name, arguments) =>
             calls.InvokeGuestInstanceMethod(receiver, name, arguments);
+        intrinsicContext.InvokeGuestMethod = Invoke;
         intrinsicContext.RunGuestStateMachine = stateMachine => {
             var byRef = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef reference
                 ? reference
@@ -166,7 +167,7 @@ public sealed partial class Interpreter {
         // Activator.CreateInstance 等が .ctor を実行するためのフック
         intrinsicContext.NewInstanceHook = objects.CreateInstanceByCtor;
         // ゲストオブジェクトの暗黙 ToString (Console.Write(object) / String.Concat(object) 用)
-        intrinsicContext.ToStringHook = calls.InvokeToStringSlot;
+        intrinsicContext.ToStringHook = slot => Intrinsics.Builtins.CoreLibBindings.BclToString(intrinsicContext, slot) ?? calls.InvokeToStringSlot(slot);
         // MethodBase.GetCurrentMethod() 用の現在メソッドフック
         intrinsicContext.CurrentMethodHook = () => {
             var state = CurrentState;

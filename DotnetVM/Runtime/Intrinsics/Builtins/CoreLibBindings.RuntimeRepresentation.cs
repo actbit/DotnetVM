@@ -9,9 +9,158 @@ using DotnetVM.Runtime.Types;
 namespace DotnetVM.Runtime.Intrinsics.Builtins;
 
 internal static partial class CoreLibBindings {
+    internal static readonly string[] AdditionalIsaCapabilities = typeof(object).Assembly.GetTypes()
+        .Where(t => t.Namespace?.StartsWith("System.Runtime.Intrinsics.", StringComparison.Ordinal) == true &&
+            t.GetMethod("get_IsSupported", BindingFlags.Static | BindingFlags.Public | BindingFlags.DeclaredOnly) is not null)
+        .Select(t => t.FullName!).Except(new[] {
+            "System.Runtime.Intrinsics.X86.Sse2", "System.Runtime.Intrinsics.X86.Ssse3", "System.Runtime.Intrinsics.X86.Sse41",
+            "System.Runtime.Intrinsics.X86.Avx", "System.Runtime.Intrinsics.X86.Avx2", "System.Runtime.Intrinsics.X86.Lzcnt", "System.Runtime.Intrinsics.X86.Lzcnt+X64",
+        }).ToArray();
     // ---- System.Runtime.CompilerServices.RuntimeHelpers (InternalCall 面) ----
 
     private static void RegisterRuntimeHelpers(IntrinsicRegistry r) {
+        RegisterAttributeReflection(r);
+        RegisterSerializationReflection(r);
+        r.RegisterBinding(BindingKey.Instance("System.Exception", "CaptureDispatchState"), static (ctx, _) => {
+            var type = FindAnyType(ctx, "System.Exception+DispatchState")!;
+            return StackSlot.OfValueType(new VmStructValue(type, type.Fields.Where(f => !f.IsStatic && !f.IsLiteral).Select(SlotDefaultZero).ToArray()));
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Exception", "RestoreDispatchState", "System.Exception+DispatchState&"), static (_, _) => null, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Reflection.Assembly", "Equals", "System.Object"), static (_, a) => StackSlot.OfInt32(a[0].ObjectValue is VmAssemblyObject left && a[1].ObjectValue is VmAssemblyObject right && ReferenceEquals(left.Loader, right.Loader) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Reflection.Assembly", "GetHashCode"), static (ctx, a) => StackSlot.OfInt32(ctx.IdentityHash(((VmAssemblyObject)a[0].ObjectValue!).Loader)), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static("System.ComAwareWeakReference", "PossiblyComObject", "System.Object"), static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Instance("System.Enum", "GetHashCode"), static (_, a) => {
+            var value = a[0];
+            if (value.ObjectValue is VmByRef reference) value = reference.Read();
+            if (value.ObjectValue is VmBoxedValue boxed) value = boxed.Fields[0];
+            if (value.ObjectValue is VmStructValue structure) value = structure.Fields[0];
+            return StackSlot.OfInt32(value.Int64Value.GetHashCode());
+        }, BindingOrigin.InternalCall);
+        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) {
+            foreach (var property in new[] { "IsGenericType", "IsGenericTypeDefinition", "ContainsGenericParameters", "IsConstructedGenericType" })
+                r.RegisterBinding(BindingKey.Instance(type, "get_" + property), (_, a) => {
+                    var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                    bool Open(VmType v) => v is VmGenericParameterType || v is VmConstructedType c && c.TypeArguments.Any(Open) || v.GenericParamCount > 0 && v is not VmConstructedType;
+                    return StackSlot.OfInt32((property switch {
+                        "IsGenericType" => t is VmConstructedType || t.GenericParamCount > 0,
+                        "IsGenericTypeDefinition" => t is not VmConstructedType && t.GenericParamCount > 0,
+                        "IsConstructedGenericType" => t is VmConstructedType,
+                        _ => Open(t),
+                    }) ? 1 : 0);
+                }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetGenericArguments"), static (ctx, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                var arguments = t is VmConstructedType c ? c.TypeArguments : Enumerable.Range(0, t.GenericParamCount).Select(i => (VmType)new VmGenericParameterType { Number = i, IsMethodParameter = false }).ToArray();
+                return MetadataArray(ctx, "System.Type", arguments.Select(t => DefaultIntrinsics.MakeRuntimeObject(ctx, t)));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetGenericTypeDefinition"), static (ctx, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                if (t is VmConstructedType c) t = c.Definition;
+                if (t.GenericParamCount == 0) throw new UnhandledGuestException("System.InvalidOperationException", "Type is not generic.");
+                return DefaultIntrinsics.MakeRuntimeObject(ctx, t);
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "MakeGenericType", "System.Type[]"), static (ctx, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                var args = ((VmArray)a[1].ObjectValue!).Elements.Select(v => ((VmRuntimeObject)v.ObjectValue!).Target).ToArray();
+                if (t is VmConstructedType || t.GenericParamCount == 0 || args.Length != t.GenericParamCount) throw new UnhandledGuestException("System.ArgumentException", "Invalid generic type arguments.");
+                return DefaultIntrinsics.MakeRuntimeObject(ctx, new VmConstructedType { Definition = t, TypeArguments = args });
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetConstructors", "System.Reflection.BindingFlags"), static (ctx, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (t is VmConstructedType c) t = c.Definition;
+                var flags = (BindingFlags)a[1].AsInt32;
+                return MetadataArray(ctx, "System.Reflection.ConstructorInfo", t.Methods.Where(m => m.Name == ".ctor" && flags.HasFlag(BindingFlags.Instance) && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic))).Select(m => StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = m }))));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetInterfaces"), static (ctx, a) => {
+                var found = new Dictionary<string, VmType>();
+                void Visit(VmType current) {
+                    var c = current as VmConstructedType;
+                    if ((c?.Definition ?? current) is not VmClassType definition) return;
+                    var context = c is null ? null : new GenericContext { ClassArgs = c.TypeArguments };
+                    var image = definition.Image; var loader = definition.Loader!;
+                    for (int rid = 1; rid <= image.Tables.GetRowCount(TableKind.InterfaceImpl); rid++) {
+                        if (image.Tables.GetRowIndex(TableKind.InterfaceImpl, rid, 0) != definition.TypeDefRid) continue;
+                        var token = image.Tables.DecodeCoded(TableKind.InterfaceImpl, rid, 1, CodedIndexKind.TypeDefOrRef);
+                        var iface = GenericSubstitutor.Substitute(loader.ResolveToken(new DotnetVM.Metadata.Signatures.SigType(DotnetVM.Metadata.Signatures.SigKind.TypeToken, Token: Token.From(token.Table, token.Rid).Value)), context);
+                        if (found.TryAdd(iface.FullName, iface)) Visit(iface);
+                    }
+                    if (definition.BaseType is { } parent) Visit(GenericSubstitutor.Substitute(parent, context));
+                }
+                Visit(((VmRuntimeObject)a[0].ObjectValue!).Target);
+                using var allocation = ctx.Heap.ReserveArray(found.Count);
+                return StackSlot.OfObject(allocation.Commit(new VmArray(new VmArrayType { ElementType = FindAnyType(ctx, "System.Type")! }, found.Values.Select(t => DefaultIntrinsics.MakeRuntimeObject(ctx, t)).ToArray())));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "get_Namespace"), static (ctx, a) => {
+                var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                if (target is VmConstructedType c) target = c.Definition;
+                var name = target.FullName.Split('+')[0];
+                var dot = name.LastIndexOf('.');
+                return dot < 0 ? StackSlot.Null : StackSlot.OfObject(ctx.MakeString(name[..dot]));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "get_Module"), static (ctx, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (t is VmConstructedType c) t = c.Definition;
+                return WrapBcl(ctx, "System.Reflection.Module", (t as VmClassType)?.Loader ?? ctx.Types);
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetConstructorImpl", "System.Reflection.BindingFlags", "System.Reflection.Binder", "System.Reflection.CallingConventions", "System.Type[]", "System.Reflection.ParameterModifier[]"), static (ctx, a) => {
+                var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                var definition = target is VmConstructedType c ? c.Definition : target;
+                var wanted = ((VmArray)a[4].ObjectValue!).Elements.Select(e => ((VmRuntimeObject)e.ObjectValue!).Target.FullName).ToArray();
+                var flags = (BindingFlags)a[1].AsInt32;
+                var constructor = definition.Methods.FirstOrDefault(m => m.Name == ".ctor" && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)) &&
+                    m.Signature.ParamTypes.Length == wanted.Length && m.Signature.ParamTypes.Select(t => (m.Loader ?? ctx.Types).ResolveToken(t).FullName).SequenceEqual(wanted));
+                return constructor is null ? StackSlot.Null : StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = constructor, ReflectedType = target }));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "get_Assembly"), static (ctx, a) => {
+                var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                if (target is VmConstructedType constructed) target = constructed.Definition;
+                var loader = (target as VmClassType)?.Loader ?? ctx.Types;
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmAssemblyObject { Loader = loader }));
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "get_IsByRefLike"), static (_, a) => {
+                var t = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                if (t is VmConstructedType constructed) t = constructed.Definition;
+                return StackSlot.OfInt32(t.FullName.StartsWith("System.Span`1", StringComparison.Ordinal) || t.FullName.StartsWith("System.ReadOnlySpan`1", StringComparison.Ordinal) ? 1 : 0);
+            }, BindingOrigin.InternalCall);
+            r.RegisterBinding(BindingKey.Instance(type, "GetAttributeFlagsImpl"), static (_, a) => StackSlot.OfInt32(unchecked((int)((VmRuntimeObject)a[0].ObjectValue!).Target.Flags)), BindingOrigin.InternalCall);
+            foreach (var method in new[] { "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl" })
+                r.RegisterBinding(BindingKey.Instance(type, method), (_, a) => {
+                    var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;
+                    var answer = method switch {
+                        "IsPointerImpl" => target.FullName.EndsWith("*", StringComparison.Ordinal),
+                        "IsByRefImpl" => target is VmByRefType,
+                        "IsArrayImpl" => target is VmArrayType,
+                        "HasElementTypeImpl" => target is VmArrayType or VmByRefType || target.FullName.EndsWith("*", StringComparison.Ordinal),
+                        "IsPrimitiveImpl" => target.FullName is "System.Boolean" or "System.Char" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64" or "System.Single" or "System.Double" or "System.IntPtr" or "System.UIntPtr",
+                        _ => false,
+                    };
+                    return StackSlot.OfInt32(answer ? 1 : 0);
+                }, BindingOrigin.InternalCall);
+        }
+        const string dependent = "System.Runtime.DependentHandle";
+        const string handle = "System.Runtime.InteropServices.GCHandle";
+        r.RegisterBinding(BindingKey.Static(handle, "_InternalAlloc", "System.Object", "System.Runtime.InteropServices.GCHandleType"), static (ctx, a) => {
+            if ((uint)a[1].AsInt32 > 3) throw new UnhandledGuestException("System.ArgumentOutOfRangeException", "type");
+            ctx.Heap.ChargeHostBuffer(64); ctx.Heap.DependentHandles = ctx.Shared.DependentHandles;
+            return StackSlot.OfNativeInt(ctx.Shared.DependentHandles.Allocate(a[0], default, a[1].AsInt32 >= 2));
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(handle, "InternalGet", "System.IntPtr"), static (ctx, a) => ctx.Shared.DependentHandles.Get(a[0].Int64Value).Target, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(handle, "InternalSet", "System.IntPtr", "System.Object"), static (ctx, a) => { ctx.Shared.DependentHandles.SetTarget(a[0].Int64Value, a[1]); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(handle, "InternalCompareExchange", "System.IntPtr", "System.Object", "System.Object"), static (ctx, a) => ctx.Shared.DependentHandles.CompareExchange(a[0].Int64Value, a[1], a[2]), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(handle, "_InternalFree", "System.IntPtr"), static (ctx, a) => StackSlot.OfInt32(ctx.Shared.DependentHandles.Free(a[0].Int64Value) ? 1 : 0), BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(dependent, "InternalAlloc", "System.Object", "System.Object"), static (ctx, a) => {
+            ctx.Heap.ChargeHostBuffer(64); ctx.Heap.DependentHandles = ctx.Shared.DependentHandles;
+            return StackSlot.OfNativeInt(ctx.Shared.DependentHandles.Allocate(a[0], a[1]));
+        }, BindingOrigin.InternalCall);
+        foreach (var method in new[] { "InternalGetTarget", "InternalGetDependent" })
+            r.RegisterBinding(BindingKey.Static(dependent, method, "System.IntPtr"), (ctx, a) => {
+                var pair = ctx.Shared.DependentHandles.Get(a[0].Int64Value);
+                return method == "InternalGetTarget" ? pair.Target : pair.Dependent;
+            }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(dependent, "InternalGetTargetAndDependent", "System.IntPtr", "System.Object&"), static (ctx, a) => {
+            var pair = ctx.Shared.DependentHandles.Get(a[0].Int64Value); ((VmByRef)a[1].ObjectValue!).Write(pair.Dependent); return pair.Target;
+        }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(dependent, "InternalSetDependent", "System.IntPtr", "System.Object"), static (ctx, a) => { ctx.Shared.DependentHandles.SetDependent(a[0].Int64Value, a[1]); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(dependent, "InternalSetTargetToNull", "System.IntPtr"), static (ctx, a) => { ctx.Shared.DependentHandles.ClearTarget(a[0].Int64Value); return null; }, BindingOrigin.InternalCall);
+        r.RegisterBinding(BindingKey.Static(dependent, "InternalFree", "System.IntPtr"), static (ctx, a) => StackSlot.OfInt32(ctx.Shared.DependentHandles.Free(a[0].Int64Value) ? 1 : 0), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "TryGetHashCode", "System.Object"), static (ctx, a) => StackSlot.OfInt32(ctx.IdentityHash(a[0].ObjectValue)), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(RuntimeHelpersType, "ObjectHasComponentSize", "System.Object"),
             static (_, a) => StackSlot.OfInt32(a[0].ObjectValue is VmArray or VmString ? 1 : 0), BindingOrigin.Managed);
@@ -202,7 +351,8 @@ internal static partial class CoreLibBindings {
             "System.Runtime.Intrinsics.X86.Avx",
             "System.Runtime.Intrinsics.X86.Avx2",
             "System.Runtime.Intrinsics.X86.Lzcnt",
-        }) {
+            "System.Runtime.Intrinsics.X86.Lzcnt+X64",
+        }.Concat(AdditionalIsaCapabilities)) {
             r.RegisterBinding(BindingKey.Static(x86Type, "get_IsSupported"),
                 static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
         }

@@ -16,12 +16,33 @@ public sealed class BclCompatibilityTests {
         using System.Globalization;
         using System.Text;
         using System.Text.Json;
+        using System.Text.Json.Serialization;
+        using System.Collections.Generic;
         using System.Runtime.CompilerServices;
         using System.Runtime.InteropServices;
         using System.Runtime.Intrinsics;
         using System.Threading.Tasks;
         using System.IO;
         public static class BclChecks {
+            public sealed class JsonModel {
+                public string Name { get; set; } = "";
+                [JsonPropertyName("count")] public int Count { get; set; }
+                [JsonIgnore] public int Hidden { get; set; }
+                public List<int> Items { get; set; } = new();
+            }
+            public sealed class JsonImmutable {
+                public int Number { get; }
+                public string Text { get; init; }
+                [JsonConstructor] public JsonImmutable(int number, string text) { Number = number; Text = text; }
+            }
+            public sealed class PlusOneConverter : JsonConverter<int> {
+                public override int Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions options) => reader.GetInt32() - 1;
+                public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options) => writer.WriteNumberValue(value + 1);
+            }
+            public static string JsonNullable() => JsonSerializer.Serialize<int?[]>(new int?[] { null, 42 }) + "|" + JsonSerializer.Deserialize<int?[]>("[null,42]")[1].Value;
+            public static string JsonConstructor() { var value = JsonSerializer.Deserialize<JsonImmutable>("{\"Number\":42,\"Text\":\"日本\"}"); return JsonSerializer.Serialize(value); }
+            public static string JsonConverter() { var options = new JsonSerializerOptions(); options.Converters.Add(new PlusOneConverter()); return JsonSerializer.Serialize(42, options) + "|" + JsonSerializer.Deserialize<int>("43", options); }
+            public static string JsonUtf8() { var bytes = JsonSerializer.SerializeToUtf8Bytes(new [] {1,2}); return JsonSerializer.Deserialize<int[]>(bytes)[1] + "|" + Encoding.UTF8.GetString(bytes); }
             public static string StreamingUtf8Arrays() {
                 var encoding = new UTF8Encoding(false, true); var encoder = encoding.GetEncoder();
                 char[] chars = new char[] { '日', '本' }; var bytes = new byte[6];
@@ -184,6 +205,29 @@ public sealed class BclCompatibilityTests {
                 }
                 return Encoding.UTF8.GetString(stream.ToArray());
             }
+            public static string JsonSerializeInt() => JsonSerializer.Serialize(42);
+            public static int JsonDeserializeInt() => JsonSerializer.Deserialize<int>("42");
+            public static bool TupleEquality() {
+                var left = (typeof(int), typeof(string), true);
+                var right = (typeof(int), typeof(string), true);
+                return System.Collections.Generic.EqualityComparer<(Type,Type,bool)>.Default.Equals(left, right)
+                    && !System.Collections.Generic.EqualityComparer<(Type,Type,bool)>.Default.Equals(left, (typeof(int), typeof(string), false));
+            }
+            public static string JsonCollections() {
+                var value = new Dictionary<string, List<int>> { ["items"] = new List<int> { 1, 2, 3 } };
+                var json = JsonSerializer.Serialize(value);
+                return json + "|" + JsonSerializer.Deserialize<Dictionary<string, List<int>>>(json)["items"][2];
+            }
+            public static string JsonObjects() {
+                var options = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true };
+                var value = new JsonModel { Name = "日本😀", Count = 42, Hidden = 9, Items = new List<int> { 4, 5 } };
+                var json = JsonSerializer.Serialize(value, options);
+                var restored = JsonSerializer.Deserialize<JsonModel>(json, options);
+                return json + "|" + restored.Name + "|" + restored.Count + "|" + restored.Items.Count + "|" + restored.Hidden;
+            }
+            public static bool JsonInvalid() {
+                try { JsonSerializer.Deserialize<int>("{}"); return false; } catch (JsonException) { return true; }
+            }
         }
         """;
     private static readonly Lazy<(byte[] Bytes, Assembly Clr)> Guest = new(() => {
@@ -288,6 +332,15 @@ public sealed class BclCompatibilityTests {
     [Theory]
     [InlineData("JsonRead")]
     [InlineData("JsonWrite")]
+    [InlineData("JsonSerializeInt")]
+    [InlineData("JsonDeserializeInt")]
+    [InlineData("JsonCollections")]
+    [InlineData("JsonObjects")]
+    [InlineData("JsonInvalid")]
+    [InlineData("JsonNullable")]
+    [InlineData("JsonConstructor")]
+    [InlineData("JsonConverter")]
+    [InlineData("JsonUtf8")]
     public void SystemTextJsonMatchesClr(string method) {
         using var vm = CreateVm();
         vm.LoadAssembly(typeof(JsonSerializer).Assembly.Location);
@@ -295,6 +348,12 @@ public sealed class BclCompatibilityTests {
         try { Assert.Equal(Clr(method, []), vm.Invoke("BclChecks", method)); }
         catch (Exception ex) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(90)), ex); }
         Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Json");
+    }
+
+    [Fact]
+    public void ConstructedInterfacesChooseTheTypedEqualsOverload() {
+        using var vm = CreateVm();
+        Assert.Equal(true, vm.Invoke("BclChecks", "TupleEquality"));
     }
 
     [Fact]

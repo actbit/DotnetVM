@@ -344,10 +344,23 @@ public sealed class VmHeap {
                 foreach (var slots in source())
                     ObjectGraphWalker.CollectFromSlots(slots, roots.Add);
 
+            if (DependentHandles is { } handles) roots.AddRange(handles.StrongRoots());
             var live = _strategy.Collect(new GcCollectionContext {
                 HeapObjects = _objects,
                 Roots = roots,
             });
+            if (DependentHandles is { } dependents) {
+                // Reach a fixed point: one ephemeron's secondary can be another's key.
+                while (true) {
+                    var conditional = dependents.ConditionalRoots(live).Where(o => !live.Contains(o)).ToArray();
+                    if (conditional.Length == 0) break;
+                    roots.AddRange(conditional);
+                    var expanded = _strategy.Collect(new GcCollectionContext { HeapObjects = _objects, Roots = roots });
+                    if (expanded.SetEquals(live)) break;
+                    live = expanded;
+                }
+                dependents.Sweep(live);
+            }
 
             _objects.RemoveAll(obj => !live.Contains(obj));
             _liveBytes = 0;
@@ -391,4 +404,5 @@ public sealed class VmHeap {
     internal IReadOnlyList<VmObject> TrackedObjects {
         get { lock (_gate) return _objects.ToArray(); }
     }
+    internal DependentHandleTable? DependentHandles { get; set; }
 }

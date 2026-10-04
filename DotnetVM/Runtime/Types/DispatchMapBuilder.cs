@@ -208,8 +208,9 @@ internal sealed class DispatchMapBuilder {
     private IEnumerable<VmClassType> ImplementedInterfaces(VmClassType type) {
         var queue = new Queue<VmClassType>();
         foreach (var rid in InterfaceImplRids(type)) {
-            var tag = _loader.Image.Tables.DecodeCoded(TableKind.InterfaceImpl, rid, 1, CodedIndexKind.TypeDefOrRef);
-            if (ResolveInterfaceDefinition(tag) is { } iface)
+            var owner = OwnerBuilder(type);
+            var tag = owner._loader.Image.Tables.DecodeCoded(TableKind.InterfaceImpl, rid, 1, CodedIndexKind.TypeDefOrRef);
+            if (owner.ResolveInterfaceDefinition(tag) is { } iface)
                 queue.Enqueue(iface);
         }
         var visited = new HashSet<string>(StringComparer.Ordinal);
@@ -220,8 +221,9 @@ internal sealed class DispatchMapBuilder {
             yield return iface;
             // インターフェース継承 (I : IBase) — 実装クラスのマップに基底インターフェースも載せる
             foreach (var rid in InterfaceImplRids(iface)) {
-                var tag = _loader.Image.Tables.DecodeCoded(TableKind.InterfaceImpl, rid, 1, CodedIndexKind.TypeDefOrRef);
-                if (ResolveInterfaceDefinition(tag) is { } baseIface)
+                var owner = OwnerBuilder(iface);
+                var tag = owner._loader.Image.Tables.DecodeCoded(TableKind.InterfaceImpl, rid, 1, CodedIndexKind.TypeDefOrRef);
+                if (owner.ResolveInterfaceDefinition(tag) is { } baseIface)
                     queue.Enqueue(baseIface);
             }
         }
@@ -232,8 +234,9 @@ internal sealed class DispatchMapBuilder {
     private VmClassType? ResolveInterfaceDefinition((TableKind Table, int Rid) tag) {
         try {
             var token = Token.From(tag.Table, tag.Rid).Value;
-            return _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: token)) is VmClassType cls && cls.IsInterface
-                ? cls : null;
+            var resolved = _loader.ResolveToken(new SigType(SigKind.TypeToken, Token: token));
+            var definition = resolved is VmConstructedType constructed ? constructed.Definition : resolved;
+            return definition is VmClassType { IsInterface: true } cls ? cls : null;
         } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
             or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
             return null;

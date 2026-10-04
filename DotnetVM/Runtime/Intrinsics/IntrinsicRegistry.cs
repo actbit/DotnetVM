@@ -123,6 +123,7 @@ public sealed class IntrinsicContext {
 
     /// <summary>ホスト側ランタイムが guest の instance method を VM 呼出ゲート経由で実行するフック。</summary>
     internal Func<StackSlot, string, StackSlot[], StackSlot?>? InvokeGuestInstanceMethod { get; set; }
+    internal Func<VmMethod, StackSlot[], GenericContext?, StackSlot>? InvokeGuestMethod { get; set; }
 
     internal Action<StackSlot>? RunGuestStateMachine { get; set; }
 

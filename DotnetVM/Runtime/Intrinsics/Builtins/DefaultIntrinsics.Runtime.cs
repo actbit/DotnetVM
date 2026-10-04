@@ -15,7 +15,7 @@ public static partial class DefaultIntrinsics {
     /// </summary>
     private static void RegisterDisposable(IntrinsicRegistry registry) {
         registry.Register(IntrinsicKey.Instance("System.IDisposable", "Dispose", 0),
-            (ctx, a) => null);
+            (ctx, a) => { CoreLibBindings.DisposeBcl(a[0]); return null; });
     }
 
     // ---- System.Delegate (デリゲート機構の面。呼出実体は VmDelegate + Interpreter.InvokeDelegate) ----

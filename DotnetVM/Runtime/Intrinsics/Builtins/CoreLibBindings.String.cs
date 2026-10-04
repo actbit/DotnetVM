@@ -595,9 +595,10 @@ internal static partial class CoreLibBindings {
         // 型名が解決できず呼出 VM 形状に乗らないものは fail-closed にする。
         // strideOverride は CopyBlockUnaligned 等の「byteCount リテラルとバイト長が一致する面」
         // (全型 1 バイト固定 stride) 用。
+        var count = ReadElementCount(ctx, a[2]);
+        if (count == 0) return null;
         var (dstNative, dstRef) = ResolvePointerBase(a[0], "Buffer.Memmove");
         var (srcNative, srcRef) = ResolvePointerBase(a[1], "Buffer.Memmove");
-        var count = ReadElementCount(ctx, a[2]);
         // スロット列 ↔ スロット列 (Span._reference がローカル/配列スロットを指す形):
         // 1 要素 = 1 スロットとして要素ごとにコピーする
         if (dstRef is not null && srcRef is not null) {

@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace DotnetVM.Policy;
 
 /// <summary>
@@ -17,6 +19,9 @@ public sealed class NetworkPolicy {
 
 /// <summary>ブリッジに渡される 1 要求。</summary>
 public sealed class NetworkRequest {
+    public Version Version { get; init; } = HttpVersion.Version11;
+    public HttpVersionPolicy VersionPolicy { get; init; } = HttpVersionPolicy.RequestVersionOrLower;
+    public bool ContentPresent { get; init; }
     public string Method { get; init; } = "GET";
     public IReadOnlyDictionary<string, string> Headers { get; init; } = new Dictionary<string, string>();
     public CancellationToken CancellationToken { get; init; }
@@ -27,7 +32,7 @@ public sealed class NetworkRequest {
     public ReadOnlyMemory<byte> Body { get; init; }
 
     /// <summary>ボディ有無の簡易フラグ (取得系なら false)。</summary>
-    public bool HasBody => Body.Length > 0;
+    public bool HasBody => ContentPresent || Body.Length > 0;
 
     /// <summary>応答側が許される最大バイト数 (VM が事前に上限を伝える、タスク 2 hardening)。
     /// ブリッジはこの上限HOST側で丸めた応答バッファを作るべきであり、
@@ -53,6 +58,7 @@ public interface INetworkBridge {
 /// ホストブリッジへ委譲する。ゲストからの全通信はこの境界を通る。
 /// </summary>
 public sealed class NetworkGateway {
+    public int MaxHttpRequestBodyBytes => _policy.Http?.MaxRequestBodyBytes ?? 0;
     private readonly NetworkPolicy _policy;
     private readonly INetworkBridge? _bridge;
     private readonly object _gate = new();
@@ -83,8 +89,104 @@ public sealed class NetworkGateway {
         return uri.GetLeftPart(UriPartial.Authority);
     }
 
+    public StreamingHttpResponse OpenHttp(string method, Uri uri, ReadOnlyMemory<byte> body,
+        IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default,
+        Version? version = null, HttpVersionPolicy versionPolicy = HttpVersionPolicy.RequestVersionOrLower, bool contentPresent = false) {
+        cancellationToken.ThrowIfCancellationRequested();
+        var http = _policy.Http ?? throw new OperationNotAllowedException("HTTP capability is not configured.");
+        if (_bridge is not IHttpNetworkBridge bridge || !_origins.Contains(Origin(uri)) || !_methods.Contains(method) || uri.Fragment.Length != 0)
+            throw new OperationNotAllowedException("HTTP destination or method is not permitted.");
+        headers ??= new Dictionary<string, string>();
+        long headerBytes = 0;
+        foreach (var (name, value) in headers) {
+            if (!_headers.Contains(name) || name.Equals("Host", StringComparison.OrdinalIgnoreCase) || name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) || name.Contains('\r') || name.Contains('\n') || value.Contains('\r') || value.Contains('\n'))
+                throw new OperationNotAllowedException("HTTP request header is not permitted.");
+            headerBytes += System.Text.Encoding.UTF8.GetByteCount(name) + System.Text.Encoding.UTF8.GetByteCount(value);
+        }
+        if (headerBytes > http.MaxRequestHeaderBytes) throw new NetworkQuotaExceededException("HTTP request headers exceed their byte budget.");
+        long limit;
+        lock (_gate) {
+            if (_httpRequests >= http.MaxRequests) throw new NetworkQuotaExceededException("HTTP request count exceeded.");
+            if (body.Length > http.MaxRequestBodyBytes || body.Length > _policy.MaxBytesPerRequest || body.Length > _policy.TotalTransferByteLimit - _totalBytesTransferred)
+                throw new NetworkQuotaExceededException("HTTP request exceeds its byte budget.");
+            cancellationToken.ThrowIfCancellationRequested();
+            _httpRequests++; _totalBytesTransferred += body.Length;
+            limit = Math.Min(http.MaxResponseBodyBytes, Math.Min(_policy.MaxBytesPerRequest - body.Length, _policy.TotalTransferByteLimit - _totalBytesTransferred));
+        }
+        var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(http.RequestTimeout);
+        try {
+            var request = new NetworkRequest { Url = uri, Method = method.ToUpperInvariant(), Body = body, Headers = new Dictionary<string, string>(headers),
+                Version = version ?? HttpVersion.Version11, VersionPolicy = versionPolicy, ContentPresent = contentPresent,
+                CancellationToken = timeout.Token, MaxResponseBytes = limit, MaxResponseHeaderBytes = http.MaxResponseHeaderBytes };
+            StreamingHttpResponse response;
+            if (bridge is IStreamingHttpNetworkBridge streaming) response = streaming.OpenHttp(request);
+            else {
+                var buffered = bridge.RequestHttp(request);
+                if (buffered?.Body is null || buffered.Body.LongLength > limit) throw new NetworkQuotaExceededException("HTTP response exceeds its byte budget.");
+                response = new StreamingHttpResponse { StatusCode = buffered.StatusCode, Version = buffered.Version, ReasonPhrase = buffered.ReasonPhrase,
+                    Headers = buffered.Headers.ToDictionary(h => h.Key, h => new[] { h.Value }),
+                    TrailingHeaders = () => buffered.TrailingHeaders.ToDictionary(h => h.Key, h => new[] { h.Value }), Body = new MemoryStream(buffered.Body, false) };
+            }
+            try {
+                timeout.Token.ThrowIfCancellationRequested();
+                ValidateStreamingHeaders(response.Headers, http.MaxResponseHeaderBytes);
+                var bounded = new GatewayResponseStream(this, response, timeout, limit, http.MaxResponseHeaderBytes);
+                var result = new StreamingHttpResponse { StatusCode = response.StatusCode, Version = response.Version, ReasonPhrase = response.ReasonPhrase,
+                    Headers = response.Headers, TrailingHeaders = response.TrailingHeaders, Body = bounded };
+                bounded.Completed = () => result.BodyCompleted?.Invoke(); return result;
+            } catch { response.Dispose(); throw; }
+        } catch { timeout.Dispose(); throw; }
+    }
+
+    private static void ValidateStreamingHeaders(IEnumerable<KeyValuePair<string, string[]>> headers, int maximum) {
+        long size = 0;
+        foreach (var (name, values) in headers) foreach (var value in values) {
+            size += System.Text.Encoding.UTF8.GetByteCount(name) + System.Text.Encoding.UTF8.GetByteCount(value);
+            if (size > maximum) throw new NetworkQuotaExceededException("HTTP response headers exceed their byte budget.");
+        }
+    }
+
+    private sealed class GatewayResponseStream(NetworkGateway gateway, StreamingHttpResponse response, CancellationTokenSource lifetime, long maximum, int headerMaximum) : Stream {
+        private long _read;
+        private bool _ended;
+        public Action? Completed { get; set; }
+        public override bool CanRead => response.Body.CanRead;
+        public override bool CanWrite => false;
+        public override bool CanSeek => false;
+        public override long Length => response.Body.Length;
+        public override long Position { get => _read; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token) => ReadAsync(buffer.AsMemory(offset, count), token).AsTask();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken token = default) {
+            try {
+            if (buffer.Length == 0) return 0;
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+            linked.Token.ThrowIfCancellationRequested();
+            var count = (int)Math.Min(buffer.Length, Math.Min(int.MaxValue, maximum - _read + 1));
+            var read = await response.Body.ReadAsync(buffer[..count], linked.Token).ConfigureAwait(false);
+            lock (gateway._gate) {
+                if (read > maximum - _read || read > gateway._policy.TotalTransferByteLimit - gateway._totalBytesTransferred)
+                    throw new NetworkQuotaExceededException("HTTP response exceeds its byte budget.");
+                _read += read; gateway._totalBytesTransferred += read;
+            }
+            if (read == 0 && !_ended) {
+                _ended = true;
+                ValidateStreamingHeaders(response.Headers.Concat(response.TrailingHeaders()), headerMaximum); Completed?.Invoke();
+            }
+            return read;
+            } catch { Dispose(); throw; }
+        }
+        protected override void Dispose(bool disposing) { if (disposing) { response.Dispose(); lifetime.Dispose(); } base.Dispose(disposing); }
+    }
+
     public HttpNetworkResponse TransferHttp(string method, Uri uri, ReadOnlyMemory<byte> body,
-        IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default) {
+        IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default,
+        Version? version = null, HttpVersionPolicy versionPolicy = HttpVersionPolicy.RequestVersionOrLower, bool contentPresent = false) {
         lock (_gate) {
             var http = _policy.Http ?? throw new OperationNotAllowedException("HTTP capability is not configured.");
             if (_bridge is not IHttpNetworkBridge bridge || !_origins.Contains(Origin(uri)) || !_methods.Contains(method))
@@ -110,6 +212,7 @@ public sealed class NetworkGateway {
             var limit = Math.Min(http.MaxResponseBodyBytes, Math.Min(_policy.MaxBytesPerRequest - body.Length, _policy.TotalTransferByteLimit - _totalBytesTransferred));
             var response = bridge.RequestHttp(new NetworkRequest {
                 Url = uri, Method = method.ToUpperInvariant(), Body = body,
+                Version = version ?? HttpVersion.Version11, VersionPolicy = versionPolicy, ContentPresent = contentPresent,
                 Headers = new Dictionary<string, string>(headers), MaxResponseBytes = limit,
                 CancellationToken = timeout.Token, MaxResponseHeaderBytes = http.MaxResponseHeaderBytes,
             });
@@ -117,7 +220,7 @@ public sealed class NetworkGateway {
             if (response?.Body is null || response.Body.LongLength > limit)
                 throw new NetworkQuotaExceededException("HTTP response exceeds its byte budget.");
             long headerBytes = 0;
-            foreach (var (name, value) in response.Headers)
+            foreach (var (name, value) in response.Headers.Concat(response.TrailingHeaders))
                 headerBytes += System.Text.Encoding.UTF8.GetByteCount(name) + System.Text.Encoding.UTF8.GetByteCount(value);
             if (headerBytes > http.MaxResponseHeaderBytes) throw new NetworkQuotaExceededException("HTTP response headers exceed their byte budget.");
             _totalBytesTransferred += response.Body.Length;

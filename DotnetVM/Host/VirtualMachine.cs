@@ -574,11 +574,27 @@ public sealed class VirtualMachine : IDisposable {
         ThrowIfDisposed();
         lock (_interpreterGate) {
             ThrowIfDisposed();
-            return _interpreter ??= new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
+            if (_interpreter is not null) return _interpreter;
+            var interpreter = new Interpreter(GetPrimaryLoader(), _intrinsics, _console, _options.Memory, _heap,
                 _options.EnableJit, _options.JitPromotionThreshold,
                 _network, _storage, Tracer, Debugger, _coreLibSurfaces, _stringType, _sharedState, LoadAssemblyBytes,
                 _defaultAssemblyLoadContext, CreateAssemblyLoadContext, LoadAssemblyBytesInContext,
                 LoadAssemblyPathInContext);
+            try {
+                if (_options.LoadHostCoreLib) {
+                    // CoreCLR's emitted reflection thunks require native return addresses.
+                    // Configure the original BCL to use its native invocation boundary;
+                    // neither Invoke nor its strategy selection IL is substituted.
+                    var setSwitch = FindMethod("System.AppContext", "SetSwitch",
+                        ["Switch.System.Reflection.ForceInterpretedInvoke", true]);
+                    interpreter.Invoke(setSwitch, [StackSlot.OfObject(interpreter.Strings.GetOrNew(
+                        "Switch.System.Reflection.ForceInterpretedInvoke")), StackSlot.OfInt32(1)]);
+                }
+                return _interpreter = interpreter;
+            } catch {
+                interpreter.Dispose();
+                throw;
+            }
         }
     }
 

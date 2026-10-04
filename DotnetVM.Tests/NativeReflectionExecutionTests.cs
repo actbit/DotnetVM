@@ -36,6 +36,15 @@ public sealed class NativeReflectionExecutionTests {
             public static string PropertyName() => typeof(MarkerAttribute).GetProperty("Label", BindingFlags.Public | BindingFlags.Instance, null, typeof(string), Type.EmptyTypes, null).Name;
             public static int NoArgs() => (int)typeof(Model).GetMethod("NoArgs").Invoke(null, null);
             public static int OneArg() => (int)typeof(Model).GetMethod("Add").Invoke(null, new object[] { 4 });
+            public static int Repeated() {
+                var method = typeof(Model).GetMethod("Add");
+                object[] args = { 4 };
+                var total = 0;
+                for (int i = 0; i < 100; i++) total += (int)method.Invoke(null, args);
+                return total;
+            }
+            public static bool InvocationSwitch() => AppContext.TryGetSwitch("Switch.System.Reflection.ForceInterpretedInvoke", out var enabled) && enabled;
+            public static string MethodName() => typeof(Model).GetMethod("Add").Name;
             public static int Instance() => (int)typeof(Model).GetMethod("Read").Invoke(new Model(17), null);
             public static int Constructor() => ((Model)typeof(Model).GetConstructor(new[] { typeof(int) }).Invoke(new object[] { 19 })).Value;
             public static int Data() => (int)typeof(Model).GetCustomAttributesData()[0].ConstructorArguments[0].Value;
@@ -88,6 +97,8 @@ public sealed class NativeReflectionExecutionTests {
     [InlineData("Defined", "System.Reflection.CustomAttribute", "IsDefined")]
     [InlineData("NoArgs", "System.Reflection.RuntimeMethodInfo", "Invoke")]
     [InlineData("OneArg", "System.Reflection.RuntimeMethodInfo", "Invoke")]
+    [InlineData("Repeated", "System.Reflection.RuntimeMethodInfo", "Invoke")]
+    [InlineData("MethodName", "System.Reflection.RuntimeMethodInfo", "get_Name")]
     [InlineData("Instance", "System.Reflection.RuntimeMethodInfo", "Invoke")]
     [InlineData("Constructor", "System.Reflection.RuntimeConstructorInfo", "Invoke")]
     public void OriginalInvocationIlMatchesClr(string name, string owner, string operation) {
@@ -97,5 +108,10 @@ public sealed class NativeReflectionExecutionTests {
         catch (Exception e) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.Where(f => f.ToString().Contains("Reflection") || f.ToString().Contains("RuntimeType")).TakeLast(60)), e); }
         Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", owner, operation));
         if (name == "Defaults") Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.String", "Ctor"));
+        if (name == "Repeated") {
+            Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Reflection.MethodBaseInvoker", "InvokeWithOneArg"));
+            Assert.True((bool)vm.Invoke("Vm.NativeReflection.Entry", "InvocationSwitch")!);
+            Assert.DoesNotContain(vm.Tracer.Frames, frame => frame.ToString().Contains("InvokeStub_"));
+        }
     }
 }

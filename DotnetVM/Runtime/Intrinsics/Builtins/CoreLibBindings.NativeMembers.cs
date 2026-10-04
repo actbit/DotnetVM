@@ -13,6 +13,8 @@ internal static partial class CoreLibBindings {
 
     private static void AddNativeMemberImports(System.Action<string, string, IntrinsicImpl> internalCall, System.Action<string, string, IntrinsicImpl> import) {
         const string method = "System.RuntimeMethodHandle";
+        internalCall(method, "GetUtf8NameInternal", static (ctx, a) => MetadataBytes(ctx,
+            System.Text.Encoding.UTF8.GetBytes(NativeMethod(ctx, a[0]).Target.Name + "\0")));
         internalCall("System.RuntimeFieldHandle", "GetToken", static (ctx, a) => StackSlot.OfInt32(0x04000000 | ctx.Shared.RuntimeMetadata.Resolve<VmRuntimeField>(a[0].Int64Value).Target.FieldRid));
         internalCall("System.RuntimeFieldHandle", "GetAttributes", static (ctx, a) => StackSlot.OfInt32((int)ctx.Shared.RuntimeMetadata.Resolve<VmRuntimeField>(NativeStructureField(ctx, a[0], "m_handle").Int64Value).Target.Flags));
         internalCall("System.RuntimeFieldHandle", "GetApproxDeclaringMethodTable", static (ctx, a) => StackSlot.OfNativeInt(ctx.Shared.RuntimeMetadata.TypeAddress(ctx,

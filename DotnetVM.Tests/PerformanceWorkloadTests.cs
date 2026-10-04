@@ -38,7 +38,7 @@ public class PerformanceWorkloadTests {
         vm.LoadAssembly(typeof(Enumerable).Assembly.Location);
         const string typeName = "DotnetVM.Benchmarks.GuestWorkloads";
         foreach (var name in new[] { "Arithmetic", "FieldAccess", "GenericFieldAccess", "MethodCalls", "List", "ListGrowth", "Linq",
-            "DictionaryInt", "DictionaryGrowth", "DictionaryString", "AsyncCompleted", "ValueTaskCompleted", "AsyncWorkers" }) {
+            "DictionaryInt", "DictionaryGrowth", "DictionaryString", "AsyncCompleted", "ValueTaskCompleted", "AsyncWorkers", "ReflectionInvoke" }) {
             var count = name == "AsyncWorkers" ? 8 : 80;
             var expected = (int)guest.Clr.GetType(typeName)!.GetMethod(name)!.Invoke(null, [count])!;
             // Repeat in one VM to exercise warm caches, state machine reuse and

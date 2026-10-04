@@ -347,52 +347,49 @@ foreach (var frame in vm.Tracer.Frames)
 
 ### 最新の CoreCLR 比較（2026-10-04、PR #34）
 
-PRのランタイム `92304de`、測定項目追加 `e277241` を再測定した値です。
+反復Invoke修正後のPR `8455575` を再測定した値です。25項目すべてが成功しました。
 AMD Ryzen 9 3900 / Windows x64（build 26200）/ SDK 10.0.401 / runtime 10.0.12、
 Release、host tiered compilation無効。warmup 3回、7 samples、VM JIT昇格閾値2です。
 
 既存22項目にReflectionのInvoke・属性取得・属性付きDTOのJSON往復を加えた**25項目**です。
 成功項目の戻り値をCoreCLRと照合しました。時間は表の入力を処理するゲストメソッド**1呼び出し全体のms中央値**で、
 ロード・初回準備・JITコンパイルを含みません。CoreCLR列はPR JIT測定プロセスの値です。
-`ERROR` はVMの実行失敗、`—` は比較値未取得です。
 
 | ワークロード | 入力 | CoreCLR ms | VM インタプリタ ms | VM JIT ms |
 |---|---:|---:|---:|---:|
-| SpanCopies | 1,000 | 0.016299 | 38.087 | 37.227 |
-| IntegerFormatting | 1,000 | 0.021503 | 8.389 | 7.877 |
-| IntegerParsing | 1,000 | 0.017297 | 5.598 | 5.534 |
-| StringCopies | 1,000 | 0.007951 | 4.715 | 4.314 |
-| ReflectionInvoke | 100 | — | ERROR | ERROR |
-| ReflectionAttributes | 50 | 0.062117 | 81.739 | 74.064 |
-| JsonRoundTrip | 10 | 0.015210 | 46.270 | 48.238 |
-| Arithmetic | 5,000 | 0.002732 | 4.981 | 3.555 |
-| ArithmeticLoop | 100,000 | 0.145068 | 116.378 | 79.534 |
-| BranchLoop | 100,000 | 0.372634 | 109.991 | 75.691 |
-| ArraySum | 10,000 | 0.010953 | 18.796 | 13.170 |
-| FieldAccess | 5,000 | 0.002735 | 6.775 | 5.332 |
-| GenericFieldAccess | 5,000 | 0.002735 | 7.071 | 7.268 |
-| MethodCalls | 1,000 | 0.001417 | 2.887 | 1.486 |
-| CallLoop | 100,000 | 0.093573 | 211.475 | 81.840 |
-| ObjectLoop | 10,000 | 0.029752 | 67.762 | 49.403 |
-| List | 500 | 0.005083 | 11.018 | 11.406 |
-| ListGrowth | 500 | 0.001341 | 7.077 | 7.336 |
-| Linq | 500 | 0.004280 | 16.165 | 15.283 |
-| DictionaryInt | 200 | 0.003590 | 26.689 | 23.392 |
-| DictionaryGrowth | 200 | 0.003718 | 19.933 | 19.332 |
-| DictionaryString | 200 | 0.005034 | 20.350 | 18.378 |
-| AsyncCompleted | 200 | 0.001348 | 1.997 | 1.993 |
-| ValueTaskCompleted | 200 | 0.000439 | 2.058 | 2.280 |
-| AsyncWorkers | 8 | 14.413925 | 12.174 | 11.249 |
+| SpanCopies | 1,000 | 0.016525 | 38.085 | 37.736 |
+| IntegerFormatting | 1,000 | 0.022379 | 9.693 | 8.540 |
+| IntegerParsing | 1,000 | 0.019425 | 6.976 | 5.700 |
+| StringCopies | 1,000 | 0.008226 | 5.088 | 4.380 |
+| ReflectionInvoke | 100 | 0.002530 | 21.145 | 17.972 |
+| ReflectionAttributes | 50 | 0.066028 | 88.644 | 85.419 |
+| JsonRoundTrip | 10 | 0.015998 | 50.680 | 55.874 |
+| Arithmetic | 5,000 | 0.002841 | 5.265 | 3.955 |
+| ArithmeticLoop | 100,000 | 0.147011 | 121.068 | 88.663 |
+| BranchLoop | 100,000 | 0.371290 | 116.104 | 84.277 |
+| ArraySum | 10,000 | 0.011865 | 19.613 | 14.153 |
+| FieldAccess | 5,000 | 0.002769 | 6.905 | 5.501 |
+| GenericFieldAccess | 5,000 | 0.002785 | 7.062 | 7.464 |
+| MethodCalls | 1,000 | 0.001230 | 2.634 | 1.400 |
+| CallLoop | 100,000 | 0.093954 | 219.183 | 89.319 |
+| ObjectLoop | 10,000 | 0.030545 | 71.454 | 53.497 |
+| List | 500 | 0.005116 | 11.693 | 11.924 |
+| ListGrowth | 500 | 0.001472 | 7.182 | 8.223 |
+| Linq | 500 | 0.004511 | 23.316 | 16.262 |
+| DictionaryInt | 200 | 0.003782 | 29.127 | 25.092 |
+| DictionaryGrowth | 200 | 0.003783 | 21.086 | 20.770 |
+| DictionaryString | 200 | 0.005340 | 21.416 | 20.159 |
+| AsyncCompleted | 200 | 0.001292 | 2.124 | 2.475 |
+| ValueTaskCompleted | 200 | 0.000464 | 2.228 | 2.308 |
+| AsyncWorkers | 8 | 14.853875 | 11.073 | 10.873 |
 
-最新master `2950044` と比べ、属性取得はinterpreterで51.45倍、JITで50.83倍の時間がかかりました。
-Spanコピーの時間は12.5%／8.6%、確保量は28.4%／27.1%増加し、Dictionaryにも増加があります。
-**このPRの全体的な高速化や性能回帰がないことは主張しません。**
+最新master `2950044` と比較すると、属性取得はInterpreter 50.60×／JIT 61.98×の時間がかかりました。
+SpanやDictionaryにも時間・確保量の増加があります。**このPRの全体的な高速化や性能回帰がないことは主張しません。**
 
-Invokeの追加項目はPR側で `RuntimeMethodHandle.GetUtf8NameInternal` の未登録により失敗しました。
-JSONはPR側で測定できましたが、master側は `IList<T>.get_Item` の未対応で失敗し、速度比はありません。
-`AsyncWorkers` は待機時間を含むため速度改善の評価から除外します。
-JSONの初回メタデータ構築はwarmupに含まれ、上表には含みません。
-
+ReflectionInvokeの反復呼び出しを修正し、100回のInvokeは21.145／17.972 msでした。
+CoreLib標準のForceInterpretedInvokeを設定し、元のBCL ILとネイティブ境界で実行します。生成Invokeスタブの完全対応は含みません。
+JSONはPRで成功しましたが、masterはIList<T>.get_Itemの未対応で失敗し、速度比はありません。
+AsyncWorkersは待機時間を含むため高速化の評価から除外します。ロード、VM起動設定、初回準備、JIT昇格、JSON初回メタデータ構築は測定時間から除外しました。
 [最新masterとの全25項目の比較・確保量・命令数・生データ・再現手順](docs/performance-pr34.md)を参照してください。
 [2026-10-03の測定](docs/performance.md)と[BCLの初回測定](docs/performance-bcl.md)は過去の記録として保持し、
 そこでの改善率を現在のPRの効果としては扱いません。

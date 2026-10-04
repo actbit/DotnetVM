@@ -453,6 +453,8 @@ public sealed class VmRuntimeProperty : VmObject {
         new() { Namespace = "System.Reflection", Name = "RuntimePropertyInfo", IsValue = false };
     public required string Name { get; init; }
     public required VmMethod Getter { get; init; }
+    public VmMethod? Setter { get; init; }
+    public VmType? ReflectedType { get; init; }
     public override VmType Type => PropertyInfoFacade;
 }
 

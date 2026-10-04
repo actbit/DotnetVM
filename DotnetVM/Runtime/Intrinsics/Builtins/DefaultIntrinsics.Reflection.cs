@@ -154,8 +154,10 @@ public static partial class DefaultIntrinsics {
 
     internal static StackSlot MakePropertyObject(IntrinsicContext ctx, VmType type, string name) {
         for (VmType? current = type; current is not null; current = current.BaseType)
-            if (current.Methods.FirstOrDefault(method => method.Name == "get_" + name && method.Signature.ParamTypes.Length == 0) is { } getter)
-                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeProperty { Name = name, Getter = getter }));
+            if (current.Methods.FirstOrDefault(method => method.Name == "get_" + name && method.Signature.ParamTypes.Length == 0) is { } getter) {
+                var setter = current.Methods.FirstOrDefault(method => method.Name == "set_" + name && method.Signature.ParamTypes.Length == 1);
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeProperty { Name = name, Getter = getter, Setter = setter, ReflectedType = type }));
+            }
         return StackSlot.Null;
     }
 

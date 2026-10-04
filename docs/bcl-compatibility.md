@@ -1,6 +1,6 @@
 # BCL 互換性と HTTP 制限
 
-`origin/master` の `e42b3e1` を基点に、カルチャ・UTF-8・Span と追加 BCL の互換性を拡張しています。
+`origin/master` の `10001c1` (PR #32) を基点に、カルチャ・UTF-8・Span と追加 BCL の互換性を拡張しています。
 以下は今回登録した API の範囲です。BCL 全体の互換性を保証するものではありません。
 
 ## 対応範囲
@@ -17,7 +17,8 @@
 | Compression | GZip / Deflate / Brotli / ZLib とゲスト MemoryStream、CompressionMode / CompressionLevel、leaveOpen、Read / Write / CopyTo / Flush / Dispose |
 | Crypto | SHA256 / 384 / 512.HashData と TryHashData、HMACSHA256.HashData、FixedTimeEquals、ZeroMemory、RandomNumberGenerator.GetBytes / Fill、AES の Key / IV、CBC / ECB / CFB の配列・Span・Try API、CryptoStream、AesGcm の配列・Span API |
 | HttpClient | HttpClient / HttpMessageInvoker、BaseAddress、要求・応答・各種コンテンツ、標準メソッド、同期・非同期 Send、ResponseHeadersRead の遅延ストリーム、独自 DelegatingHandler / HttpMessageHandler / HttpContent、HttpRequestOptions、CancellationToken、タイムアウト、複数値ヘッダーと trailing headers。全通信は origin / method / header / body / response / timeout の gateway 制限下 |
-| System.Text.Json | 実在 DLL の managed IL を実行。JsonDocument / JsonElement / Utf8JsonWriter に加え JsonSerializer の通常型、属性、命名ポリシー、辞書・リスト、nullable、引数付きコンストラクター、UTF-8 API、独自 JsonConverter を CLR と比較 |
+| System.Reflection | VM 型・メソッド・フィールド・プロパティを反映する Type / MethodInfo / ConstructorInfo / PropertyInfo / FieldInfo、属性、パラメータ既定値、Invoke、PropertyInfo.GetValue / SetValue、FieldInfo.GetValue / SetValue、Activator、ジェネリック型・メソッド |
+| System.Text.Json | 実在 DLL の managed IL を実行。JsonDocument / JsonElement / Utf8JsonWriter に加え、既定の reflection resolver (`DefaultJsonTypeInfoResolver`) を使う JsonSerializer の通常型、属性、命名ポリシー、辞書・リスト、nullable、引数付きコンストラクター、UTF-8 API、独自 JsonConverter を CLR と比較 |
 
 ホスト BCL の状態は VM オブジェクトをキーにした内部の weak table に保持します。
 ゲストオブジェクトをホストの任意の IFormatProvider やネイティブポインタとして渡しません。
@@ -95,7 +96,7 @@ Crypto の乱数は `VmHostOptions.RandomFill` を通します。HTTP worker は
 ハードウェア ISA の IsSupported / IsHardwareAccelerated は false を維持します。
 参照を含む構造体の raw memory 解釈、任意のホストアドレス、独自 ICustomFormatter のゲストコールバック、
 Encoding の pointer overload / 独自 fallback、Regex の evaluator / Matches collection、RSA、HTTP の proxy / cookie / redirect / auto-decompression は追加していません。
-JSON は一般的な JsonSerializer の型・属性・コンバーター面を対象にしていますが、source generator、unsafe pointer overload、複雑な polymorphic resolver など未登録の framework surface は拒否します。
+JSON は一般的な JsonSerializer の reflection 型・属性・コンバーター面を対象にしていますが、source generator、unsafe pointer overload、複雑な polymorphic resolver など未登録の framework surface は拒否します。
 
 ## テストと性能
 

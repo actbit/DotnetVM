@@ -17,6 +17,89 @@ internal static partial class CoreLibBindings {
     }
     private static StackSlot MethodParameters(IntrinsicContext ctx, VmMethod method) => MetadataArray(ctx, "System.Reflection.ParameterInfo",
         Enumerable.Range(0, method.Signature.ParamTypes.Length).Select(i => WrapBcl(ctx, "System.Reflection.ParameterInfo", new ParameterDescription(method, i))));
+
+    private static VmType ReflectionDefinition(VmType type) => type is VmConstructedType constructed ? constructed.Definition : type;
+
+    private static StackSlot ReflectionProperties(IntrinsicContext ctx, VmType type, BindingFlags flags) {
+        type = ReflectionDefinition(type);
+        return MetadataArray(ctx, "System.Reflection.PropertyInfo", type.Methods
+            .Where(method => method.Name.StartsWith("get_", StringComparison.Ordinal)
+                && (method.IsStatic ? flags.HasFlag(BindingFlags.Static) : flags.HasFlag(BindingFlags.Instance))
+                && (method.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)))
+            .Select(method => {
+                var name = method.Name[4..];
+                var setter = type.Methods.FirstOrDefault(candidate => candidate.Name == "set_" + name
+                    && candidate.Signature.ParamTypes.Length == method.Signature.ParamTypes.Length + 1);
+                return StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeProperty {
+                    Name = name, Getter = method, Setter = setter, ReflectedType = type,
+                }));
+            }));
+    }
+
+    private static StackSlot ReflectionFields(IntrinsicContext ctx, VmType type, BindingFlags flags) {
+        type = ReflectionDefinition(type);
+        return MetadataArray(ctx, "System.Reflection.FieldInfo", type.Fields
+            .Where(field => (field.IsStatic ? flags.HasFlag(BindingFlags.Static) : flags.HasFlag(BindingFlags.Instance))
+                && ((field.Flags & 7) == 6 ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)))
+            .Select(field => StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeField { Target = field }))));
+    }
+
+    private static StackSlot ReflectionArgument(IntrinsicContext ctx, StackSlot value, VmType expected) {
+        if (value.ObjectValue is VmBoxedValue boxed && expected.IsValueType)
+            return boxed.Fields.Length == 1 ? boxed.Fields[0] : StackSlot.OfValueType(new VmStructValue(expected, boxed.Fields));
+        return value;
+    }
+
+    private static StackSlot[] ReflectionArguments(IntrinsicContext ctx, VmMethod method, StackSlot argumentSlot) {
+        var args = argumentSlot.ObjectValue is VmArray array ? array.Elements : [];
+        if (args.Length != method.Signature.ParamTypes.Length)
+            throw new UnhandledGuestException("System.Reflection.TargetParameterCountException", null);
+        var loader = method.Loader ?? ctx.Types;
+        return args.Select((value, index) => ReflectionArgument(ctx, value, loader.ResolveToken(method.Signature.ParamTypes[index]))).ToArray();
+    }
+
+    private static StackSlot BoxReflectionResult(IntrinsicContext ctx, StackSlot result, VmType returnType) {
+        if (!returnType.IsValueType || result.ObjectValue is VmBoxedValue) return result;
+        var fields = result.ObjectValue is VmStructValue structure ? structure.Fields : [result];
+        return StackSlot.OfObject(ctx.Heap.Allocate(new VmBoxedValue(returnType, fields)));
+    }
+
+    private static StackSlot InvokeReflectedPropertyGet(IntrinsicContext ctx, VmRuntimeProperty property, StackSlot receiver, StackSlot indexSlot) {
+        var getter = property.Getter;
+        var index = ReflectionArguments(ctx, getter, indexSlot);
+        var arguments = getter.IsStatic ? index : [receiver, .. index];
+        var context = GenericContext.Of((property.ReflectedType as VmConstructedType)?.TypeArguments, null);
+        var result = ctx.InvokeGuestMethod!(getter, arguments, context);
+        var returnType = (getter.Loader ?? ctx.Types).ResolveToken(getter.Signature.ReturnType, context);
+        return BoxReflectionResult(ctx, result, returnType);
+    }
+
+    private static StackSlot InvokeReflectedPropertySet(IntrinsicContext ctx, VmRuntimeProperty property, StackSlot receiver, StackSlot value, StackSlot indexSlot) {
+        var setter = property.Setter ?? throw new UnhandledGuestException("System.ArgumentException", "Property is read-only.");
+        var index = indexSlot.ObjectValue is VmArray array ? array.Elements : [];
+        if (index.Length + 1 != setter.Signature.ParamTypes.Length)
+            throw new UnhandledGuestException("System.Reflection.TargetParameterCountException", null);
+        var loader = setter.Loader ?? ctx.Types;
+        var values = new StackSlot[index.Length + 1];
+        for (int i = 0; i < index.Length; i++) values[i] = ReflectionArgument(ctx, index[i], loader.ResolveToken(setter.Signature.ParamTypes[i]));
+        values[^1] = ReflectionArgument(ctx, value, loader.ResolveToken(setter.Signature.ParamTypes[^1]));
+        var arguments = setter.IsStatic ? values : [receiver, .. values];
+        var context = GenericContext.Of((property.ReflectedType as VmConstructedType)?.TypeArguments, null);
+        ctx.InvokeGuestMethod!(setter, arguments, context);
+        return StackSlot.Null;
+    }
+
+    private static StackSlot InvokeReflectedFieldGet(IntrinsicContext ctx, VmRuntimeField field, StackSlot receiver) {
+        var target = field.Target;
+        var result = ctx.ReadFieldHook!(receiver, target);
+        return BoxReflectionResult(ctx, result, target.FieldType!);
+    }
+
+    private static StackSlot InvokeReflectedFieldSet(IntrinsicContext ctx, VmRuntimeField field, StackSlot receiver, StackSlot value) {
+        var target = field.Target;
+        ctx.WriteFieldHook!(receiver, target, ReflectionArgument(ctx, value, target.FieldType!));
+        return StackSlot.Null;
+    }
     private static void RegisterSerializationReflection(IntrinsicRegistry r) {
         foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo" })
             BclFace(r, type, "get_DeclaringType", true, [], static (ctx, a) => {
@@ -113,20 +196,13 @@ internal static partial class CoreLibBindings {
                 var element = ((VmRuntimeObject)a[0].ObjectValue!).Target switch { VmArrayType array => array.ElementType, VmMultiDimArrayType array => array.ElementType, VmByRefType reference => reference.ElementType, _ => null };
                 return element is null ? StackSlot.Null : DefaultIntrinsics.MakeRuntimeObject(ctx, element);
             });
-            BclFace(r, type, "GetProperties", true, ["System.Reflection.BindingFlags"], static (ctx, a) => {
-                var target = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (target is VmConstructedType c) target = c.Definition;
-                var flags = (BindingFlags)a[1].AsInt32;
-                return MetadataArray(ctx, "System.Reflection.PropertyInfo", target.Methods.Where(m => m.Name.StartsWith("get_", StringComparison.Ordinal) &&
-                    (m.IsStatic ? flags.HasFlag(BindingFlags.Static) : flags.HasFlag(BindingFlags.Instance)) && (m.IsPublic ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)))
-                    .Select(m => StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeProperty { Name = m.Name[4..], Getter = m }))));
-            });
-            BclFace(r, type, "GetFields", true, ["System.Reflection.BindingFlags"], static (ctx, a) => {
-                var target = ((VmRuntimeObject)a[0].ObjectValue!).Target; if (target is VmConstructedType c) target = c.Definition;
-                var flags = (BindingFlags)a[1].AsInt32;
-                return MetadataArray(ctx, "System.Reflection.FieldInfo", target.Fields.Where(f => (f.IsStatic ? flags.HasFlag(BindingFlags.Static) : flags.HasFlag(BindingFlags.Instance)) &&
-                    ((f.Flags & 7) == 6 ? flags.HasFlag(BindingFlags.Public) : flags.HasFlag(BindingFlags.NonPublic)))
-                    .Select(f => StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeField { Target = f }))));
-            });
+            BclFace(r, type, "GetProperties", true, [], static (ctx, a) =>
+                ReflectionProperties(ctx, ((VmRuntimeObject)a[0].ObjectValue!).Target,
+                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public));
+            BclFace(r, type, "GetProperties", true, ["System.Reflection.BindingFlags"], static (ctx, a) =>
+                ReflectionProperties(ctx, ((VmRuntimeObject)a[0].ObjectValue!).Target, (BindingFlags)a[1].AsInt32));
+            BclFace(r, type, "GetFields", true, ["System.Reflection.BindingFlags"], static (ctx, a) =>
+                ReflectionFields(ctx, ((VmRuntimeObject)a[0].ObjectValue!).Target, (BindingFlags)a[1].AsInt32));
         }
         BclFace(r, "System.Reflection.PropertyInfo", "get_PropertyType", true, [], static (ctx, a) => {
             var m = ((VmRuntimeProperty)a[0].ObjectValue!).Getter; return DefaultIntrinsics.MakeRuntimeObject(ctx, (m.Loader ?? ctx.Types).ResolveToken(m.Signature.ReturnType));
@@ -134,11 +210,43 @@ internal static partial class CoreLibBindings {
         BclFace(r, "System.Reflection.PropertyInfo", "GetIndexParameters", true, [], static (ctx, a) => MethodParameters(ctx, ((VmRuntimeProperty)a[0].ObjectValue!).Getter));
         foreach (var get in new[] { true, false }) BclFace(r, "System.Reflection.PropertyInfo", get ? "GetGetMethod" : "GetSetMethod", true, ["System.Boolean"], (ctx, a) => {
             var property = (VmRuntimeProperty)a[0].ObjectValue!;
-            var method = get ? property.Getter : property.Getter.DeclaringType.Methods.FirstOrDefault(m => m.Name == "set_" + property.Name);
+            var method = get ? property.Getter : property.Setter;
             return method is null || !method.IsPublic && a[1].AsInt32 == 0 ? StackSlot.Null : StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = method }));
+        });
+        BclFace(r, "System.Reflection.PropertyInfo", "get_CanRead", true, [], static (_, a) =>
+            StackSlot.OfInt32(((VmRuntimeProperty)a[0].ObjectValue!).Getter is not null ? 1 : 0));
+        BclFace(r, "System.Reflection.PropertyInfo", "get_CanWrite", true, [], static (_, a) =>
+            StackSlot.OfInt32(((VmRuntimeProperty)a[0].ObjectValue!).Setter is not null ? 1 : 0));
+        foreach (var parameters in new[] {
+            new[] { "System.Object", "System.Object[]" },
+            new[] { "System.Object", "System.Reflection.BindingFlags", "System.Reflection.Binder", "System.Object[]", "System.Globalization.CultureInfo" },
+        }) BclFace(r, "System.Reflection.PropertyInfo", "GetValue", true, parameters, (ctx, a) => {
+            var property = (VmRuntimeProperty)a[0].ObjectValue!;
+            var index = a[parameters.Length == 2 ? 2 : 4];
+            return InvokeReflectedPropertyGet(ctx, property, a[1], index);
+        });
+        foreach (var parameters in new[] {
+            new[] { "System.Object", "System.Object", "System.Object[]" },
+            new[] { "System.Object", "System.Object", "System.Reflection.BindingFlags", "System.Reflection.Binder", "System.Object[]", "System.Globalization.CultureInfo" },
+        }) BclFace(r, "System.Reflection.PropertyInfo", "SetValue", true, parameters, (ctx, a) => {
+            var property = (VmRuntimeProperty)a[0].ObjectValue!;
+            var index = a[parameters.Length == 3 ? 3 : 5];
+            return InvokeReflectedPropertySet(ctx, property, a[1], a[2], index);
+        });
+        BclFace(r, "System.Reflection.PropertyInfo", "get_GetMethod", true, [], static (ctx, a) => {
+            var property = (VmRuntimeProperty)a[0].ObjectValue!;
+            return property.Getter is { } getter ? StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = getter })) : StackSlot.Null;
+        });
+        BclFace(r, "System.Reflection.PropertyInfo", "get_SetMethod", true, [], static (ctx, a) => {
+            var property = (VmRuntimeProperty)a[0].ObjectValue!;
+            return property.Setter is { } setter ? StackSlot.OfObject(ctx.Heap.Allocate(new VmRuntimeMethod { Target = setter })) : StackSlot.Null;
         });
         BclFace(r, "System.Reflection.FieldInfo", "get_FieldType", true, [], static (ctx, a) => DefaultIntrinsics.MakeRuntimeObject(ctx, ((VmRuntimeField)a[0].ObjectValue!).Target.FieldType!));
         BclFace(r, "System.Reflection.FieldInfo", "get_Attributes", true, [], static (_, a) => StackSlot.OfInt32((int)((VmRuntimeField)a[0].ObjectValue!).Target.Flags));
+        BclFace(r, "System.Reflection.FieldInfo", "GetValue", true, ["System.Object"], static (ctx, a) =>
+            InvokeReflectedFieldGet(ctx, (VmRuntimeField)a[0].ObjectValue!, a[1]));
+        BclFace(r, "System.Reflection.FieldInfo", "SetValue", true, ["System.Object", "System.Object"], static (ctx, a) =>
+            InvokeReflectedFieldSet(ctx, (VmRuntimeField)a[0].ObjectValue!, a[1], a[2]));
         foreach (var parameters in new[] { new[] { "System.Type", "System.Object[]" }, new[] { "System.Type", "System.Reflection.BindingFlags", "System.Reflection.Binder", "System.Object[]", "System.Globalization.CultureInfo" } })
             BclFace(r, "System.Activator", "CreateInstance", false, parameters, (ctx, a) => {
                 var target = ((VmRuntimeObject)a[0].ObjectValue!).Target;

@@ -133,6 +133,8 @@ public sealed partial class Interpreter {
         intrinsicContext.InvokeGuestInstanceMethod = (receiver, name, arguments) =>
             calls.InvokeGuestInstanceMethod(receiver, name, arguments);
         intrinsicContext.InvokeGuestMethod = Invoke;
+        intrinsicContext.ReadFieldHook = (receiver, field) => objects.ReadField(receiver, field);
+        intrinsicContext.WriteFieldHook = (receiver, field, value) => objects.WriteField(receiver, field, value);
         intrinsicContext.RunGuestStateMachine = stateMachine => {
             var byRef = stateMachine.Kind == StackKind.ByRef && stateMachine.ObjectValue is VmByRef reference
                 ? reference

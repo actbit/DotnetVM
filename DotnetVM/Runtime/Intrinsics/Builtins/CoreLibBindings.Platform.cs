@@ -108,30 +108,11 @@ internal static partial class CoreLibBindings {
                     return null;
                 }
 
-                // Marvin の seed は stackalloc ではなくローカル ulong のアドレスとして
-                // 渡る構成もあるため、byref の Int64 スロット列も扱う。
+                // Marvin/HashCode はローカルの ulong/uint を渡す構成がある。
+                // 共通実装で各 managed スロット幅 (Int32/Int64) を保持して書き戻す。
                 if (slotRef is not null) {
-                    slotRef.EnsureWritable();
-                    var slots = (int)(((long)count + 7) / 8);
-                    if (slotRef.Index < 0 || slots > slotRef.Container.Length - slotRef.Index)
-                        throw new InvalidOperationException(
-                            $"GetNonCryptographicallySecureRandomBytes がスロット列の範囲外を参照します (index={slotRef.Index}, {count} バイト)。");
-                    var remaining = count;
-                    var index = slotRef.Index;
-                    Span<byte> bytes = stackalloc byte[8];
-                    while (remaining > 0) {
-                        var slot = slotRef.Container[index];
-                        if (slot.Kind != StackKind.Int64)
-                            throw new InvalidOperationException(
-                                $"GetNonCryptographicallySecureRandomBytes のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
-                        BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
-                        var writeCount = Math.Min(8, remaining);
-                        ctx.Shared.FillRandom(bytes[..writeCount]);
-                        slotRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
-                        remaining -= writeCount;
-                        index++;
-                    }
-                    return null;
+                    return FillRandomBytes(ctx, a[0], count,
+                        "Interop+Sys.GetNonCryptographicallySecureRandomBytes");
                 }
 
                 throw new InvalidOperationException(
@@ -170,13 +151,17 @@ internal static partial class CoreLibBindings {
             ctx.Shared.FillRandom(native.Bytes.AsSpan(native.ByteOffset, count));
             return StackSlot.OfInt32(0);
         }
-        // マネージポインタ (Marvin seed の stackalloc ulong)。既知の Int64 スロット
-        // のみ扱い、他の managed バッファ表現は誤書込みを避けて fail-closed にする。
+        // Marvin uses ulong and HashCode uses uint locals. Respect each slot's
+        // width rather than interpreting every managed random buffer as ulong.
         if (buffer.Kind == StackKind.ByRef && buffer.ObjectValue is VmByRef byRef) {
             if (byRef.Container.Length == 0)
                 throw new UnhandledGuestException("System.NullReferenceException", null);
-            var slots = (int)(((long)count + 7) / 8);
-            if (byRef.Index < 0 || slots > byRef.Container.Length - byRef.Index)
+            byRef.EnsureWritable();
+            long capacity = 0;
+            for (int i = byRef.Index; capacity < count && i < byRef.Container.Length; i++) {
+                capacity += byRef.Container[i].Kind switch { StackKind.Int32 => 4, StackKind.Int64 => 8, _ => throw new InvalidOperationException("Random buffer is not an integer slot.") };
+            }
+            if (byRef.Index < 0 || count > capacity)
                 throw new InvalidOperationException(
                     $"{operation} がスロット列の範囲外を参照します (index={byRef.Index}, {count} バイト)。");
             var remaining = count;
@@ -184,13 +169,11 @@ internal static partial class CoreLibBindings {
             Span<byte> bytes = stackalloc byte[8];
             while (remaining > 0) {
                 var slot = byRef.Container[index];
-                if (slot.Kind != StackKind.Int64)
-                    throw new InvalidOperationException(
-                        $"{operation} のマネージバッファ要素が Int64 スロットではありません ({slot.Kind})。");
+                var width = slot.Kind == StackKind.Int32 ? 4 : 8;
                 BinaryPrimitives.WriteInt64LittleEndian(bytes, slot.Int64Value);
-                var writeCount = Math.Min(8, remaining);
+                var writeCount = Math.Min(width, remaining);
                 ctx.Shared.FillRandom(bytes[..writeCount]);
-                byRef.Container[index] = StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
+                byRef.Container[index] = width == 4 ? StackSlot.OfInt32(BinaryPrimitives.ReadInt32LittleEndian(bytes)) : StackSlot.OfInt64(BinaryPrimitives.ReadInt64LittleEndian(bytes));
                 remaining -= writeCount;
                 index++;
             }

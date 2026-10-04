@@ -161,6 +161,8 @@ public sealed class VirtualMachine : IDisposable {
         foreach (var assembly in new[] {
             typeof(System.Text.RegularExpressions.Regex).Assembly,
             typeof(System.Net.Http.HttpClient).Assembly,
+            typeof(Uri).Assembly,
+            typeof(System.Text.Json.JsonSerializer).Assembly,
             typeof(System.IO.Compression.GZipStream).Assembly,
             typeof(System.IO.Compression.BrotliStream).Assembly,
             typeof(System.Security.Cryptography.SHA256).Assembly,

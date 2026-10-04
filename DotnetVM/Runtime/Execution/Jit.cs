@@ -683,7 +683,7 @@ internal struct JitFrame {
     private void EnsureFieldWritable(VmField field) {
         if (!field.IsInitOnly)
             return;
-        var allowed = field.IsStatic ? _frame.Method.Name == ".cctor" : _frame.Method.Name == ".ctor";
+        var allowed = _frame.Method.CanWriteInitOnly(field);
         if (!allowed)
             throw new UnhandledGuestException("System.FieldAccessException",
                 $"readonly フィールド {field} はコンストラクター外から書き込めません。");

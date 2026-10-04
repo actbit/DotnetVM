@@ -14,11 +14,19 @@ internal static partial class CoreLibBindings {
     private static readonly ConditionalWeakTable<VmObject, BclState> BclStates = new();
 
     private static StackSlot WrapBcl(IntrinsicContext ctx, string type, object value) {
+        if (ctx.Shared.BclWrappers.TryGetValue(value, out var existing) && existing.TryGetTarget(out var previous)) return StackSlot.OfObject(previous);
         var vmType = FindAnyType(ctx, type)
             ?? throw new InvalidOperationException($"BCL 型 {type} が見つかりません。");
         var instance = ctx.Heap.Allocate(new VmBclObject(vmType));
         BclStates.Add(instance, new BclState { Value = value });
+        RememberBclWrapper(ctx, value, instance);
         return StackSlot.OfObject(instance);
+    }
+    private static void RememberBclWrapper(IntrinsicContext ctx, object value, VmObject instance) {
+        lock (ctx.Shared.BclWrappers) {
+            ctx.Shared.BclWrappers.Remove(value);
+            ctx.Shared.BclWrappers.Add(value, new WeakReference<VmObject>(instance));
+        }
     }
 
     private static T BclValue<T>(in StackSlot slot) where T : class =>
@@ -29,6 +37,12 @@ internal static partial class CoreLibBindings {
         if (slot.ObjectValue is not VmObject obj)
             throw new UnhandledGuestException("System.InvalidProgramException", "BCL receiver is unavailable.");
         BclStates.GetValue(obj, _ => new BclState { Value = value }).Value = value;
+    }
+    internal static VmString? BclToString(IntrinsicContext ctx, in StackSlot slot) =>
+        slot.ObjectValue is VmObject obj && BclStates.TryGetValue(obj, out var state) ? ctx.MakeString(state.Value.ToString() ?? "") : null;
+    internal static void DisposeBcl(in StackSlot slot) {
+        if (slot.ObjectValue is VmObject obj && BclStates.TryGetValue(obj, out var state) && state.Value is IDisposable disposable)
+            BclCall(() => { disposable.Dispose(); return null; });
     }
 
     private static IFormatProvider GuestProvider(IntrinsicContext ctx, in StackSlot slot) =>

@@ -260,6 +260,23 @@ internal static class MemoryOps {
     public static StackSlot? TryPointerArithmetic(ILOp op, in StackSlot left, in StackSlot right) {
         if (op is not (ILOp.Add or ILOp.Sub))
             return null;
+        var managed = left.ObjectValue as VmByRef;
+        var displacement = right;
+        if (managed is null && op == ILOp.Add && right.ObjectValue is VmByRef rightReference) {
+            managed = rightReference; displacement = left;
+        }
+        if (managed is not null) {
+            if (managed.Owner is not VmArray array)
+                throw new UnhandledGuestException("System.NotSupportedException", "Pointer arithmetic requires typed array storage.");
+            var stride = SizeOfRawType(array.ArrayType.ElementType);
+            if (op == ILOp.Sub && displacement.ObjectValue is VmByRef second && ReferenceEquals(managed.Container, second.Container))
+                return StackSlot.OfNativeInt(checked((long)(managed.Index - second.Index) * stride));
+            if (displacement.Kind is not (StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt) || displacement.Int64Value % stride != 0)
+                throw new UnhandledGuestException("System.NotSupportedException", "Pointer displacement must align with array element storage.");
+            var index = checked((long)managed.Index + (op == ILOp.Add ? displacement.Int64Value : -displacement.Int64Value) / stride);
+            if (index < 0 || index > managed.Container.Length) throw new UnhandledGuestException("System.IndexOutOfRangeException", "Pointer displacement exceeds array storage.");
+            return StackSlot.OfByRef(new VmByRef(managed.Container, (int)index, managed.IsReadOnly, managed.Owner));
+        }
         VmNativePointer? pointer;
         StackSlot other;
         if (left.ObjectValue is VmNativePointer lp) {

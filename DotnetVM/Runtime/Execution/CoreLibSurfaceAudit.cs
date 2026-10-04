@@ -91,6 +91,22 @@ internal static class CoreLibSurfaceAudit {
         void Bcl(string type, string[] methods, bool? hasThis = null, string? justification = null) {
             foreach (var method in methods) Add(type, method, CoreLibSurfaceKind.RuntimeInternal, justification ?? bclJ, hasThis);
         }
+        foreach (var type in Intrinsics.Builtins.CoreLibBindings.HttpBoundaryTypes)
+            foreach (var member in Intrinsics.Builtins.CoreLibBindings.BoundaryMembers(type))
+                Bcl(type.FullName!, [member.Name], member is System.Reflection.ConstructorInfo || !member.IsStatic, DeviceFace + "。標準 HTTP BCL 状態を VM 表現に正規化し、通信は制限付き gateway に限定");
+        foreach (var type in new[] { "HttpMessageHandler", "HttpClientHandler", "SocketsHttpHandler", "DelegatingHandler" }) Bcl("System.Net.Http." + type, [".ctor", "Dispose"], true);
+        Bcl("System.Net.Http.DelegatingHandler", ["get_InnerHandler", "set_InnerHandler", "Send", "SendAsync"], true, DeviceFace);
+        Bcl("System.Net.Http.HttpContent", [".ctor"], true, DeviceFace);
+        Bcl("System.Net.Http.HttpRequestOptionsKey`1", [".ctor", "get_Key"], true, RuntimeRepresentation);
+        Bcl("System.Net.Http.HttpRequestOptions", ["Set", "TryGetValue"], true, RuntimeRepresentation);
+        foreach (var member in Intrinsics.Builtins.CoreLibBindings.BoundaryMembers(typeof(Stream)))
+            if (member.Name.Contains("Async", StringComparison.Ordinal) || member.Name is "get_Length" or "get_Position" or "set_Position" or "Seek" or "SetLength" or "ReadByte" or "WriteByte")
+                Bcl("System.IO.Stream", [member.Name], !member.IsStatic, DeviceFace);
+        foreach (var type in Intrinsics.Builtins.CoreLibBindings.CryptoBoundaryTypes)
+            foreach (var member in Intrinsics.Builtins.CoreLibBindings.BoundaryMembers(type).Where(Intrinsics.Builtins.CoreLibBindings.IncludeCryptoBoundary))
+                Bcl(type.FullName!, [member.Name], member is System.Reflection.ConstructorInfo || !member.IsStatic);
+        Bcl("System.Security.Cryptography.ICryptoTransform", ["Dispose"], true);
+        Bcl("System.Security.Cryptography.AesGcm", [".ctor", "Encrypt", "Decrypt"], true);
         Bcl("System.Globalization.CultureInfo", [".cctor", ".ctor", "GetCultureInfo", "get_InvariantCulture", "get_CurrentCulture", "get_CurrentUICulture", "set_CurrentCulture", "set_CurrentUICulture", "ReadOnly", "Clone", "ToString", "Equals", "GetHashCode", "get_Name", "get_DisplayName", "get_EnglishName", "get_NativeName", "get_TwoLetterISOLanguageName", "get_ThreeLetterISOLanguageName", "get_LCID", "get_IsReadOnly", "get_IsNeutralCulture", "get_Parent", "get_NumberFormat", "get_DateTimeFormat", "get_TextInfo", "get_CompareInfo", "GetFormat"]);
         Bcl("System.Globalization.NumberFormatInfo", [".ctor", "Clone", "get_IsReadOnly"], true);
         foreach (var property in new[] { "NumberDecimalSeparator", "NumberGroupSeparator", "NegativeSign", "PositiveSign", "CurrencySymbol", "CurrencyDecimalSeparator", "PercentSymbol", "NaNSymbol", "PositiveInfinitySymbol", "NegativeInfinitySymbol" })
@@ -121,6 +137,7 @@ internal static class CoreLibSurfaceAudit {
         foreach (var type in new[] { "System.Threading.Tasks.Task", "System.Threading.Tasks.Task`1" }) Bcl(type, ["get_IsCanceled"], true);
         Bcl("System.Numerics.Vector", ["get_IsHardwareAccelerated"], false, JitIntrinsic);
         foreach (var type in new[] { "Ssse3", "Sse41", "Avx" }) Bcl("System.Runtime.Intrinsics.X86." + type, ["get_IsSupported"], false, JitIntrinsic);
+        foreach (var type in DotnetVM.Runtime.Intrinsics.Builtins.CoreLibBindings.AdditionalIsaCapabilities) Bcl(type, ["get_IsSupported"], false, JitIntrinsic);
         foreach (var width in new[] { 64, 128, 256, 512 }) {
             var type = "System.Runtime.Intrinsics.Vector" + width;
             Bcl(type, ["Create", "GetElement", "WithElement", "Add", "Subtract", "Multiply"], false, JitIntrinsic);
@@ -144,18 +161,36 @@ internal static class CoreLibSurfaceAudit {
         foreach (var algorithm in new[] { "SHA256", "SHA384", "SHA512" }) Bcl("System.Security.Cryptography." + algorithm, ["HashData", "TryHashData"], false);
         Bcl("System.Security.Cryptography.HMACSHA256", ["HashData"], false);
         Bcl("System.Security.Cryptography.Aes", ["Create"], false);
-        foreach (var type in new[] { "Aes", "SymmetricAlgorithm" }) Bcl("System.Security.Cryptography." + type, ["Dispose", "get_Key", "set_Key", "get_IV", "set_IV", "EncryptCbc", "DecryptCbc", "EncryptEcb", "DecryptEcb"], true);
+        foreach (var type in new[] { "Aes", "SymmetricAlgorithm" }) Bcl("System.Security.Cryptography." + type, ["GenerateKey", "GenerateIV", "Dispose", "get_Key", "set_Key", "get_IV", "set_IV", "EncryptCbc", "DecryptCbc", "EncryptEcb", "DecryptEcb", "EncryptCfb", "DecryptCfb", "TryEncryptCbc", "TryDecryptCbc", "TryEncryptEcb", "TryDecryptEcb", "TryEncryptCfb", "TryDecryptCfb"], true);
         Bcl("System.Security.Cryptography.CryptographicOperations", ["FixedTimeEquals", "ZeroMemory"], false);
         Bcl("System.Security.Cryptography.RandomNumberGenerator", ["GetBytes", "Fill"], false, DeviceFace + "。VM の RandomFill を通じて乱数を供給する");
         foreach (var type in new[] { "GZipStream", "DeflateStream", "BrotliStream", "ZLibStream" })
             Bcl("System.IO.Compression." + type, [".ctor", "get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Read", "Dispose", "Close", "Flush", "CopyTo"], true);
         Bcl("System.IO.MemoryStream", ["get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Dispose", "Close", "Flush", "CopyTo"], true);
         Bcl("System.IO.Stream", ["get_CanRead", "get_CanWrite", "get_CanSeek", "Write", "Read", "Dispose", "Close", "Flush", "CopyTo"], true);
-        Bcl("System.Net.Http.HttpClient", [".ctor", "Dispose", "GetStringAsync", "GetByteArrayAsync", "GetAsync", "PostAsync"], true, DeviceFace + "。HttpPolicy 付き NetworkGateway と guest Task worker を通す");
-        Bcl("System.Net.Http.HttpMessageInvoker", ["Dispose"], true, DeviceFace + "。HttpClient の継承面を同じ guest client state で破棄");
-        Bcl("System.Net.Http.HttpResponseMessage", ["get_StatusCode", "get_IsSuccessStatusCode", "get_Content", "EnsureSuccessStatusCode", "Dispose"], true);
-        foreach (var type in new[] { "HttpContent", "StringContent", "ByteArrayContent" }) Bcl("System.Net.Http." + type, ["Dispose", "ReadAsStringAsync", "ReadAsByteArrayAsync"], true);
-        foreach (var type in new[] { "StringContent", "ByteArrayContent" }) Bcl("System.Net.Http." + type, [".ctor"], true);
+        Bcl("System.Net.Http.HttpClient", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを client に渡す");
+        Bcl("System.Net.Http.HttpMessageInvoker", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを invoker に渡す");
+        Bcl("System.Runtime.DependentHandle", ["InternalAlloc", "InternalGetTarget", "InternalGetDependent", "InternalGetTargetAndDependent", "InternalSetDependent", "InternalSetTargetToNull", "InternalFree"], false, InternalCall + "。VM GC の ephemeron 到達性と連携する");
+        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetProperties", "GetFields", "get_Module", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "GetAttributeFlagsImpl", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
+        Bcl("System.Enum", ["GetHashCode"], true, JitIntrinsic);
+        Bcl("System.ComAwareWeakReference", ["PossiblyComObject"], false, RuntimeRepresentation + "。VM object は COM object を保持しない");
+        Bcl("System.Exception", ["set_Source", "get_Source", "CaptureDispatchState", "RestoreDispatchState"], true, RuntimeRepresentation + "。例外の guest identity を維持し、VM tracer がスタックを管理する");
+        Bcl("System.Reflection.Assembly", ["Equals", "GetHashCode"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.Assembly", "System.Reflection.MemberInfo", "System.Type", "System.RuntimeType", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributes", "IsDefined"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.ParameterInfo", "System.Reflection.MemberInfo", "System.Reflection.Assembly", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributesData"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.CustomAttributeData", ["get_AttributeType", "get_Constructor", "get_ConstructorArguments"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo" }) Bcl(type, ["get_DeclaringType"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.MethodBase", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetParameters", "get_Attributes", "GetMethodImplementationFlags"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.ConstructorInfo", ["Invoke"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.MethodBase", ["Invoke"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod", "get_ReturnParameter"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.ParameterInfo", ["get_ParameterType", "get_Position", "get_Attributes", "get_Name", "get_Member", "get_HasDefaultValue", "get_DefaultValue", "get_RawDefaultValue"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.PropertyInfo", ["get_PropertyType", "GetIndexParameters", "GetGetMethod", "GetSetMethod"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes"], true, RuntimeRepresentation);
+        Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 2);
+        Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 5);
+        foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.MethodBase" }) Bcl(type, ["get_MemberType"], true, RuntimeRepresentation);
+        Bcl("System.Runtime.InteropServices.GCHandle", ["_InternalAlloc", "InternalGet", "InternalSet", "InternalCompareExchange", "_InternalFree"], false, InternalCall);
         Bcl("System.Text.Encodings.Web.JavaScriptEncoder", ["get_Default", "get_UnsafeRelaxedJsonEscaping"], false);
         foreach (var type in new[] { "JavaScriptEncoder", "TextEncoder" }) Bcl("System.Text.Encodings.Web." + type, ["FindFirstCharacterToEncode", "FindFirstCharacterToEncodeUtf8", "EncodeUtf8", "Encode", "WillEncode"], true);
 
@@ -703,6 +738,7 @@ internal static class CoreLibSurfaceAudit {
         foreach (var x86Type in new[] {
             "System.Runtime.Intrinsics.X86.Avx2",
             "System.Runtime.Intrinsics.X86.Lzcnt",
+            "System.Runtime.Intrinsics.X86.Lzcnt+X64",
         }) {
             Add(x86Type, "get_IsSupported", CoreLibSurfaceKind.RuntimeInternal, vectorJ,
                 hasThis: false, paramCount: 0);

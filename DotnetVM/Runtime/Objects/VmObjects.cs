@@ -241,6 +241,9 @@ public sealed class VmCancellationState : VmObject {
         _type = type;
         _token = _source.Token;
     }
+    internal VmCancellationState(VmType type, CancellationToken token) {
+        _type = type; _token = token;
+    }
     public override VmType Type => _type;
     /// <summary>The token remains usable after the source itself has been disposed.</summary>
     public CancellationToken Token => _token;
@@ -250,7 +253,7 @@ public sealed class VmCancellationState : VmObject {
             return _token;
         }
     }
-    public bool IsCancellationRequested => _source.IsCancellationRequested;
+    public bool IsCancellationRequested => _token.IsCancellationRequested;
     internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
     public void Cancel() {
         ThrowIfDisposed();
@@ -313,6 +316,7 @@ public sealed class VmExceptionObject : VmObject {
     public override VmType Type => _exceptionType;
     public VmType ExceptionType => _exceptionType;
     public VmString? Message { get; internal set; }
+    public VmString? Source { get; internal set; }
 }
 
 /// <summary>配列。要素はゼロ初期化済みスロット配列。</summary>
@@ -428,6 +432,8 @@ public sealed class VmRuntimeMethod : VmObject {
         new() { Namespace = "System.Reflection", Name = "RuntimeMethodInfo", IsValue = false };
 
     public required VmMethod Target { get; init; }
+    public VmType? ReflectedType { get; init; }
+    public VmType[] MethodArguments { get; init; } = [];
 
     public override VmType Type => MethodBaseFacade;
 }
@@ -660,13 +666,14 @@ public sealed class VmLocalBuilder : VmObject {
 }
 
 /// <summary>デリゲートの 1 呼出エントリ (レシーバ + 束縛先メソッド)。</summary>
-public readonly record struct DelegateInvocation(StackSlot Target, VmMethod Method);
+public readonly record struct DelegateInvocation(StackSlot Target, VmMethod Method, GenericContext? Context = null);
 
 /// <summary>
 /// ldftn / ldvirtftn の結果 (オープンな関数ポインタ)。レシーバは束縛せずメソッドのみ参照する。
 /// newobj デリゲート生成時にレシーバと束ねて VmDelegate になる。Target は VM 型系 (GC 管理外)。
 /// </summary>
 public sealed class VmMethodPointer : VmObject {
+    public GenericContext? Context { get; init; }
     public static readonly VmIntrinsicType PointerType =
         new() { Namespace = "DotnetVM", Name = "MethodPointer", IsValue = false };
 

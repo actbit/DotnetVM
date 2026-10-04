@@ -12,6 +12,7 @@ namespace DotnetVM.Runtime.Execution;
 /// lastError は CLR の TLS と同じく実行 host thread ごとに分離する。
 /// </summary>
 public sealed class VmSharedState : IDisposable {
+    internal System.Runtime.CompilerServices.ConditionalWeakTable<object, WeakReference<VmObject>> BclWrappers { get; } = new();
     private readonly System.Threading.ThreadLocal<int> _lastSystemError = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly GuestWorkerBudget _workerBudget;
@@ -87,6 +88,7 @@ public sealed class VmSharedState : IDisposable {
 
     /// <summary>VM-wide atomic section used by Interlocked bindings over StackSlot references.</summary>
     internal object InterlockedGate { get; } = new();
+    internal DotnetVM.Runtime.Heap.DependentHandleTable DependentHandles { get; } = new();
 
     internal object TypeFacadeGate { get; } = new();
 

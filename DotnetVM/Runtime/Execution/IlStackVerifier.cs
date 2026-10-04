@@ -307,6 +307,8 @@ internal static class IlStackVerifier {
         if (caller.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true) {
             if (dynamicReference is VmMethod dynamicMethod)
                 return dynamicMethod.Signature;
+            if (dynamicReference is DotnetVM.Runtime.Objects.VmRuntimeMethod reflectedMethod)
+                return reflectedMethod.Target.Signature;
             throw new BadImageFormatException($"呼出トークン 0x{token:X8} の動的参照がメソッドではありません。");
         }
 

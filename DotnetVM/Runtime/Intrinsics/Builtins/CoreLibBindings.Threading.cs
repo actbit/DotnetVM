@@ -12,7 +12,7 @@ internal static partial class CoreLibBindings {
     private static void RegisterTimeSpanConstruction(IntrinsicRegistry r) {
         const string timeSpan = "System.TimeSpan";
         static StackSlot FromMilliseconds(IntrinsicContext ctx, double milliseconds) {
-            var type = ctx.Types.FindIntrinsicType(timeSpan)
+            var type = FindAnyType(ctx, timeSpan)
                 ?? throw new InvalidOperationException("TimeSpan facade が見つかりません。");
             return StackSlot.OfValueType(new VmStructValue(type,
                 [StackSlot.OfInt64(TimeSpan.FromMilliseconds(milliseconds).Ticks)]));

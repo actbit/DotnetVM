@@ -723,6 +723,13 @@ internal sealed class GuestTaskRuntime(
             registration.Dispose();
     }
 
+    public void KeepTaskRoots(VmTaskObject task, StackSlot[] roots) {
+        lock (_lifetimeGate) {
+            ThrowIfDisposed();
+            if (!task.IsCompleted) _activeRoots.AddOrUpdate(task, [StackSlot.OfObject(task), .. roots], (_, previous) => [.. previous, .. roots]);
+        }
+    }
+
     // A completed task must already have released its pending-timer quota. Publishing
     // completion first allowed a continuation to observe completion but exhaust Delay.
     private void ReleaseTaskTimer(VmTaskObject task) {

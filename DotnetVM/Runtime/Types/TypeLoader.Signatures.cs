@@ -16,11 +16,12 @@ public sealed partial class TypeLoader {
     /// VmGenericParameterType をそのまま返す (インタプリタは ResolveToken(sigType, context) を使う)。
     /// GenericInst の解決時にもネスト上限を強制する (TypeSpec 連鎖の再帰対策)。</summary>
     public VmType ResolveToken(SigType sigType) {
+        if (sigType.RuntimeType is { } runtimeType) return runtimeType;
         lock (MetadataGate)
             return ResolveTokenWithDepth(sigType, 0);
     }
 
-    private VmType ResolveTokenWithDepth(SigType sigType, int genericDepth) => sigType.Kind switch {
+    private VmType ResolveTokenWithDepth(SigType sigType, int genericDepth) => sigType.RuntimeType ?? (sigType.Kind switch {
         SigKind.TypeToken => ResolveTypeDefOrRefToken(sigType.Token),
         SigKind.GenericInst => ResolveGenericInst(sigType, genericDepth),
         SigKind.SzArray => ArrayWithBase(new VmArrayType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) }),
@@ -48,7 +49,7 @@ public sealed partial class TypeLoader {
         SigKind.TypedByRef => RequiredIntrinsic("System.TypedReference"),
         SigKind.Void => RequiredIntrinsic("System.Void"),
         _ => throw new NotSupportedException($"未対応の署名型です: {sigType}"),
-    };
+    });
 
     private VmType ResolveGenericInst(SigType sigType, int genericDepth) {
         var max = _image.Limits?.MaxGenericNestingDepth ?? 64;

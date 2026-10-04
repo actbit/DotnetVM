@@ -37,7 +37,7 @@ internal static partial class CoreLibBindings {
             static (ctx, a) =>
                 a[0].ObjectValue is VmRuntimeObject rt && rt.Target.BaseType is { } baseType
                     ? DefaultIntrinsics.MakeRuntimeObject(ctx, baseType)
-                    : null, // BaseType 無し (System.Object 等) = CLR と同一の null
+                    : StackSlot.Null,
             BindingOrigin.InternalCall);
         // Type::get_TypeHandle: 本家は RuntimeTypeHandle (runtime representation)。
         // VM 型への参照 (VmTypeHandle) を返す (GetCultureInfo 機構 IL 内の静的リテラル type handle 面)

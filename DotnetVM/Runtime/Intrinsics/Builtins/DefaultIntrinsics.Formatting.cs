@@ -130,6 +130,8 @@ public static partial class DefaultIntrinsics {
                 VmRuntimeMethod m => m.Target.ToString() ?? "",
                 VmExceptionObject e => FormatExceptionText(e.Type.FullName, e.Message),
                 VmClassInstance ci => ctx.InvokeToString(slot)?.Value ?? ci.ClassType.FullName,
+                VmBclObject bcl => ctx.InvokeToString(slot)?.Value ?? bcl.Type.FullName,
+                VmIntrinsicInstance intrinsic => ctx.InvokeToString(slot)?.Value ?? intrinsic.Type.FullName,
                 VmArray arr => arr.ArrayType.FullName,
                 var other => other.ToString() ?? "",
             },

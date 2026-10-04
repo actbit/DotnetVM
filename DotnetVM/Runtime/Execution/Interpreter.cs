@@ -774,7 +774,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (target.Method is null)
                         throw new OperationNotAllowedException(
                             $"ldftn: intrinsic 面 {target.DeclaringType}::{target.Name} への関数ポインタ取得は対応していません。");
-                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = target.Method }));
+                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = target.Method, Context = GenericContext.Of(target.ClassArgs, target.MethodArgs) }));
                     break;
                 }
                 case ILOp.Ldvirtftn: {
@@ -789,7 +789,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         : calls.TryDispatchVirtual(target.Name!, target.ParamCount, receiver)
                           ?? throw new OperationNotAllowedException(
                               $"ldvirtftn: {target.DeclaringType}::{target.Name} への関数ポインタ取得は対応していません。");
-                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = resolved }));
+                    frame.Stack.Push(StackSlot.OfObject(new VmMethodPointer { Target = resolved, Context = calls.BuildCallContext(target, resolved, receiver) }));
                     break;
                 }
                 case ILOp.Calli: {
@@ -1020,7 +1020,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private static void EnsureFieldWritable(VmField field, VmMethod method) {
         if (!field.IsInitOnly)
             return;
-        var allowed = field.IsStatic ? method.Name == ".cctor" : method.Name == ".ctor";
+        var allowed = method.CanWriteInitOnly(field);
         if (!allowed)
             throw new UnhandledGuestException("System.FieldAccessException",
                 $"readonly フィールド {field} はコンストラクター外から書き込めません。");

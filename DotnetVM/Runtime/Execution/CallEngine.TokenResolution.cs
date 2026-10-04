@@ -103,6 +103,7 @@ internal sealed partial class CallEngine {
                         TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound)) {
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             Intrinsic = bound,
                             DeclaringType = typeName,
                             Name = name,
@@ -119,10 +120,11 @@ internal sealed partial class CallEngine {
                     if ((DelegateContinuingSurfaces.PrefersIl(typeName) ||
                          DelegateContinuingSurfaces.PrefersIlFace(typeName, name, paramNames)) &&
                         _loader.ResolveTypeRefType(parent.Rid) is VmClassType preferred) {
-                        var ilFirst = FindMethodThroughChain(preferred, name, signature.ParamTypes);
+                        var ilFirst = FindMethodThroughChain(preferred, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
                         if (ilFirst is { Body: not null })
                             return new CallTarget {
                                 Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                                 Method = ilFirst,
                                 Name = ilFirst.Name,
                                 ParamCount = ilFirst.Signature.ParamTypes.Length,
@@ -135,10 +137,11 @@ internal sealed partial class CallEngine {
                     // 面 (Convert.ToInt32(object) 等のボックス化経由面) は従来どおり ③ で処理される
                     if (_coreLibSurfaces?.HasFace(typeName, name, paramNames) == true &&
                         _loader.ResolveTypeRefType(parent.Rid) is VmClassType faceOwner) {
-                        var faceMethod = FindMethodThroughChain(faceOwner, name, signature.ParamTypes);
+                        var faceMethod = FindMethodThroughChain(faceOwner, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
                         if (faceMethod is { Body: not null })
                             return new CallTarget {
                                 Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                                 Method = faceMethod,
                                 Name = faceMethod.Name,
                                 ParamCount = faceMethod.Signature.ParamTypes.Length,
@@ -149,6 +152,7 @@ internal sealed partial class CallEngine {
                         _intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             Intrinsic = impl,
                             DeclaringType = typeName,
                             Name = name,
@@ -162,6 +166,7 @@ internal sealed partial class CallEngine {
                         _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, arity, signature.HasThis, out var inherited)) {
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             Intrinsic = inherited,
                             DeclaringType = typeName,
                             Name = name,
@@ -185,13 +190,14 @@ internal sealed partial class CallEngine {
                             $"intrinsic {typeName}::{name} は provenance が確認できないため拒否されました。");
                     }
                     if (realClass is not null && !DelegateContinuingSurfaces.Contains(realClass.FullName)) {
-                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes, signature.ReturnType);
+                        var resolved = FindMethodThroughChain(realClass, name, signature.ParamTypes, signature.ReturnType, signature.GenericParamCount);
                         // An abstract declaration is a resolved call site too.
                         // Cache it, then select the implementation from each
                         // receiver during callvirt, using the declaration's slot.
                         if (resolved is { Body: not null } || resolved is { IsAbstract: true } && !throwOnMissingIntrinsic)
                             return new CallTarget {
                                 Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                                 Method = resolved,
                                 Name = resolved.Name,
                                 ParamCount = resolved.Signature.ParamTypes.Length,
@@ -204,6 +210,7 @@ internal sealed partial class CallEngine {
                     if (!throwOnMissingIntrinsic)
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             DeclaringType = typeName,
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
@@ -215,10 +222,11 @@ internal sealed partial class CallEngine {
                 }
                 if (parent.Table == TableKind.TypeDef) {
                     var owner = _loader.GetTypeDef(parent.Rid);
-                    var method = FindMethodThroughChain(owner, name, signature.ParamTypes)
+                    var method = FindMethodThroughChain(owner, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
                         ?? throw new BadImageFormatException($"MemberRef 0x{token:X8} の解決先メソッド {owner.FullName}::{name} が見つかりません。");
                     return new CallTarget {
                         Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                         Method = method,
                         Name = method.Name,
                         ParamCount = method.Signature.ParamTypes.Length,
@@ -263,6 +271,7 @@ internal sealed partial class CallEngine {
                     CallerDomainOfLoader(), out boundImpl))) {
                 return new CallTarget {
                     Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                     Intrinsic = boundImpl,
                     DeclaringType = facade.FullName,
                     Name = name,
@@ -277,6 +286,7 @@ internal sealed partial class CallEngine {
                 _objectEngine.TryGetIntrinsicThroughHierarchy(facade.FullName, name, arity, signature.HasThis, out impl))) {
                 return new CallTarget {
                     Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                     Intrinsic = impl,
                     DeclaringType = facade.FullName,
                     Name = name,
@@ -291,6 +301,7 @@ internal sealed partial class CallEngine {
             if (!throwOnMissingIntrinsic)
                 return new CallTarget {
                     Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                     DeclaringType = facade.FullName,
                     Name = name,
                     ParamCount = signature.ParamTypes.Length,
@@ -313,6 +324,7 @@ internal sealed partial class CallEngine {
                     CallerDomainOfLoader(), out realBound))
                 return new CallTarget {
                     Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                     Intrinsic = realBound,
                     DeclaringType = definition.FullName,
                     Name = name,
@@ -322,11 +334,12 @@ internal sealed partial class CallEngine {
                     ClassArgs = constructed.TypeArguments,
                 };
         }
-        var method = FindMethodThroughChain(definition, name, signature.ParamTypes)
+        var method = FindMethodThroughChain(definition, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
             ?? throw new BadImageFormatException(
                 $"MemberRef 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
         return new CallTarget {
             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
             Method = method,
             Name = method.Name,
             ParamCount = method.Signature.ParamTypes.Length,
@@ -388,6 +401,7 @@ internal sealed partial class CallEngine {
                      TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl))) {
                     return new CallTarget {
                         Arity = specArity,
+                        ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                         Intrinsic = boundImpl,
                         DeclaringType = typeName,
                         Name = name,
@@ -411,7 +425,7 @@ internal sealed partial class CallEngine {
                     if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClassEarly &&
                         !DelegateContinuingSurfaces.Contains(realClassEarly.FullName) &&
                         !PreservesByRefReceiver(realClassEarly.FullName))
-                        realMethodEarly = FindMethodThroughChain(realClassEarly, name, signature.ParamTypes);
+                        realMethodEarly = FindMethodThroughChain(realClassEarly, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
                 } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
                     or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
                     // 依存欠落等の解決不能は legacy 救済・拒否へ流す (ここで落とさない)
@@ -422,6 +436,7 @@ internal sealed partial class CallEngine {
                             $"MethodSpec 0x{token:X8} の型引数は {methodArgs.Length} 個ですが、{realMethodEarly} は {realMethodEarly.Signature.GenericParamCount} 個を要求します。");
                     return new CallTarget {
                         Arity = specArity,
+                        ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                         Method = realMethodEarly,
                         Name = realMethodEarly.Name,
                         ParamCount = realMethodEarly.Signature.ParamTypes.Length,
@@ -434,6 +449,7 @@ internal sealed partial class CallEngine {
                     _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, specArity, signature.HasThis, out impl))) {
                     return new CallTarget {
                         Arity = specArity,
+                        ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                         Intrinsic = impl,
                         DeclaringType = typeName,
                         Name = name,
@@ -451,6 +467,7 @@ internal sealed partial class CallEngine {
                 if (!throwOnMissingIntrinsic)
                     return new CallTarget {
                         Arity = specArity,
+                        ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                         DeclaringType = typeName,
                         Name = name,
                         ParamCount = signature.ParamTypes.Length,
@@ -465,7 +482,7 @@ internal sealed partial class CallEngine {
             if (parent.Table == TableKind.TypeDef) {
                 // 同アセンブリのジェネリックメソッド (Roslyn は MethodDef でも MemberRef 形式で出す)
                 var owner = _loader.GetTypeDef(parent.Rid);
-                var method = FindMethodThroughChain(owner, name, signature.ParamTypes)
+                var method = FindMethodThroughChain(owner, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
                     ?? throw new BadImageFormatException(
                         $"MethodSpec 0x{token:X8} の解決先メソッド {owner.FullName}::{name} が見つかりません。");
                 return new CallTarget {
@@ -493,6 +510,7 @@ internal sealed partial class CallEngine {
                             CallerDomainOfLoader(), out facadeImpl))) {
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             Intrinsic = facadeImpl,
                             DeclaringType = facade.FullName,
                             Name = name,
@@ -507,6 +525,7 @@ internal sealed partial class CallEngine {
                         _intrinsics.TryGet(new IntrinsicKey(facade.FullName, name, arity, signature.HasThis), out var facadeLegacy)) {
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             Intrinsic = facadeLegacy,
                             DeclaringType = facade.FullName,
                             Name = name,
@@ -520,6 +539,7 @@ internal sealed partial class CallEngine {
                     if (!throwOnMissingIntrinsic)
                         return new CallTarget {
                             Arity = arity,
+                    ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
                             DeclaringType = facade.FullName,
                             Name = name,
                             ParamCount = signature.ParamTypes.Length,
@@ -531,7 +551,7 @@ internal sealed partial class CallEngine {
                     throw new OperationNotAllowedException($"intrinsic {facade.FullName}::{name} (引数 {arity} 個) は未登録です。");
                 }
                 var definition = (VmClassType)constructed.Definition;
-                var method = FindMethodThroughChain(definition, name, signature.ParamTypes)
+                var method = FindMethodThroughChain(definition, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
                     ?? throw new BadImageFormatException(
                         $"MethodSpec 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
                 return new CallTarget {
@@ -553,7 +573,7 @@ internal sealed partial class CallEngine {
     /// <summary>宣言署名 (名前 + パラメータ型) でメソッドを探す (継承チェーンを辿る。抽象宣言も解決対象)。
     /// スロットキーが一致する候補を署名精度で優先し、無い場合は従来どおり名前+パラメータ数の
     /// 最初の一致にフォールバックする (ジェネリック変数の文脈差等でキー照合できない呼出の救済)。</summary>
-    private VmMethod? FindMethodThroughChain(VmClassType type, string name, SigType[] paramTypes, SigType? returnType = null) {
+    private VmMethod? FindMethodThroughChain(VmClassType type, string name, SigType[] paramTypes, SigType? returnType = null, int? genericParameterCount = null) {
         var queryKey = _loader.TryResolveSlotParams(paramTypes) is { } parameters
             ? VmSlotKeys.Of(name, parameters) : null;
         // 戻り型で区別される面 (decimal の op_Implicit / op_Explicit 群) は戻り型名も照合する。
@@ -568,7 +588,7 @@ internal sealed partial class CallEngine {
             if (t is not VmClassType cls)
                 break;
             foreach (var method in cls.Methods) {
-                if (method.Name != name)
+                if (method.Name != name || genericParameterCount is { } arity && method.Signature.GenericParamCount != arity)
                     continue;
                 var matchedReturn = true;
                 if (returnName is not null)
@@ -591,6 +611,7 @@ internal sealed partial class CallEngine {
 /// <summary>解決済みの呼出先 (ゲスト メソッド / intrinsic / 解決未了)。</summary>
 internal sealed class CallTarget {
     public int Arity;
+    public bool? ReturnsValue;
     public VmMethod? Method;
     public IntrinsicImpl? Intrinsic;
     /// <summary>intrinsic ターゲットの宣言型名/メソッド名 (callvirt の仮想ディスパッチ用)。</summary>

@@ -212,7 +212,7 @@ internal static class SlotOps {
     // a managed ByRef expression node; the semantics stay in the canonical
     // in-parameter implementations above.
     public static StackSlot LeafBinaryArithmetic(ILOp op, StackSlot left, StackSlot right) =>
-        BinaryArithmetic(op, in left, in right);
+        MemoryOps.TryPointerArithmetic(op, left, right) ?? BinaryArithmetic(op, in left, in right);
 
     public static StackSlot LeafUnaryArithmetic(ILOp op, StackSlot value) =>
         UnaryArithmetic(op, in value);

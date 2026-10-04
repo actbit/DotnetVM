@@ -42,6 +42,19 @@ public sealed partial class TypeLoader {
             ("System.Security.Cryptography", "SHA512"), ("System.Security.Cryptography", "HMACSHA256"),
             ("System.Security.Cryptography", "CryptographicOperations"), ("System.Security.Cryptography", "RandomNumberGenerator"),
         }) Add(new VmIntrinsicType { Namespace = ns, Name = name, IsValue = false, Parent = @object });
+        VmType BoundaryFacade(Type type) {
+            if (_intrinsicTypes.TryGetValue(type.FullName!, out var known)) return known;
+            var parent = type.BaseType is null ? @object : BoundaryFacade(type.BaseType);
+            var facade = new VmIntrinsicType { Namespace = type.Namespace!, Name = type.Name, IsValue = type.IsValueType, Parent = parent };
+            Add(facade, type.IsGenericTypeDefinition ? new uint[type.GetGenericArguments().Length] : null);
+            return facade;
+        }
+        foreach (var type in DotnetVM.Runtime.Intrinsics.Builtins.CoreLibBindings.HttpBoundaryTypes.Concat(DotnetVM.Runtime.Intrinsics.Builtins.CoreLibBindings.CryptoBoundaryTypes)) {
+            var parent = type.BaseType is null ? @object : BoundaryFacade(type.BaseType);
+            var facade = new VmIntrinsicType { Namespace = type.Namespace!, Name = type.Name, IsValue = type.IsValueType, Parent = parent };
+            Add(facade, type.IsGenericTypeDefinition ? new uint[type.GetGenericArguments().Length] : null);
+        }
+        foreach (var type in new[] { typeof(System.Net.Http.HttpMessageHandler), typeof(System.Net.Http.HttpClientHandler), typeof(System.Net.Http.SocketsHttpHandler), typeof(System.Net.Http.DelegatingHandler) }) BoundaryFacade(type);
         foreach (var (ns, name) in new[] { ("System.Text.RegularExpressions", "RegexOptions"), ("System.IO.Compression", "CompressionMode"), ("System.IO.Compression", "CompressionLevel") })
             Add(new VmIntrinsicType { Namespace = ns, Name = name, IsValue = true, Parent = @enum });
         var symmetric = new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "SymmetricAlgorithm", IsValue = false, Parent = @object };
@@ -106,6 +119,7 @@ public sealed partial class TypeLoader {
         // Activator.CreateInstance の失敗分類 (CLR の継承鎖どおり MemberAccess ← MissingMember ← MissingMethod)
         var memberAccess = new VmIntrinsicType { Namespace = "System", Name = "MemberAccessException", IsValue = false, Parent = systemException };
         Add(memberAccess);
+        Add(new VmIntrinsicType { Namespace = "System", Name = "FieldAccessException", IsValue = false, Parent = memberAccess });
         var missingMember = new VmIntrinsicType { Namespace = "System", Name = "MissingMemberException", IsValue = false, Parent = memberAccess };
         Add(missingMember);
         Add(new VmIntrinsicType { Namespace = "System", Name = "MissingMethodException", IsValue = false, Parent = missingMember });
@@ -113,6 +127,7 @@ public sealed partial class TypeLoader {
         Add(new VmIntrinsicType { Namespace = "System.Text.RegularExpressions", Name = "RegexMatchTimeoutException", IsValue = false, Parent = _intrinsicTypes["System.TimeoutException"] });
         Add(new VmIntrinsicType { Namespace = "System.Text.RegularExpressions", Name = "RegexParseException", IsValue = false, Parent = argumentException });
         Add(new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "CryptographicException", IsValue = false, Parent = systemException });
+        Add(new VmIntrinsicType { Namespace = "System.Security.Cryptography", Name = "AuthenticationTagMismatchException", IsValue = false, Parent = _intrinsicTypes["System.Security.Cryptography.CryptographicException"] });
         Add(new VmIntrinsicType { Namespace = "System.Net.Http", Name = "HttpRequestException", IsValue = false, Parent = _intrinsicTypes["System.Exception"] });
 
         // プリミティブはすべて ValueType の派生

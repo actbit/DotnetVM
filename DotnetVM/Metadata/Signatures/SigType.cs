@@ -45,6 +45,9 @@ public enum SigKind : byte {
 /// </summary>
 public sealed record SigType(SigKind Kind, uint Token = 0, SigType? Inner = null,
                              SigType[]? Args = null, int VarNumber = 0, int Rank = 0) {
+    // Dynamic methods carry VM type identities without inventing metadata tokens.
+    // The metadata decoder never sets this runtime-only field.
+    internal DotnetVM.Runtime.Types.VmType? RuntimeType { get; init; }
     public bool IsPrimitive =>
         Kind is SigKind.Boolean or SigKind.Char or SigKind.I1 or SigKind.U1
             or SigKind.I2 or SigKind.U2 or SigKind.I4 or SigKind.U4

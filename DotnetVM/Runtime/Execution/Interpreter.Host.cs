@@ -245,7 +245,7 @@ public sealed partial class Interpreter {
     internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
         var objects = JitObjectsFor(method);
         var field = objects.ResolveFieldToken(token, null, method.DynamicTokens);
-        if (field.IsInitOnly && method.Name is not (".ctor" or ".cctor"))
+        if (!method.CanWriteInitOnly(field))
             throw new UnhandledGuestException("System.FieldAccessException",
                 $"readonly フィールド {field} はコンストラクター外から書き込めません。");
         if (!objects.TryStoreStringField(receiver, field, value))

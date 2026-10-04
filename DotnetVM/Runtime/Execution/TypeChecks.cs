@@ -72,9 +72,15 @@ internal static class TypeChecks {
         VmMemoryStreamObject => target.FullName is "System.IO.MemoryStream" or "System.IO.Stream" or "System.Object",
         VmExpressionObject expression => ExpressionAssignable(expression, target),
         VmArray array => target switch {
-            VmArrayType other => array.ArrayType.ElementType.IsAssignableTo(other.ElementType),
+            VmArrayType other => IsExactUnboxType(array.ArrayType.ElementType, other.ElementType) ||
+                !array.ArrayType.ElementType.IsValueType && !other.ElementType.IsValueType && array.ArrayType.ElementType.IsAssignableTo(other.ElementType),
+            VmConstructedType generic when generic.TypeArguments.Length == 1 && generic.Definition.FullName is
+                "System.Collections.Generic.IEnumerable`1" or "System.Collections.Generic.ICollection`1" or "System.Collections.Generic.IList`1" or
+                "System.Collections.Generic.IReadOnlyCollection`1" or "System.Collections.Generic.IReadOnlyList`1" =>
+                array.ArrayType.ElementType.FullName == generic.TypeArguments[0].FullName ||
+                !array.ArrayType.ElementType.IsValueType && !generic.TypeArguments[0].IsValueType && array.ArrayType.ElementType.IsAssignableTo(generic.TypeArguments[0]),
             _ => target.FullName is "System.Array" or "System.Object" or "System.ICloneable"
-                or "System.Collections.IList" or "System.Collections.ICollection",
+                or "System.Collections.IList" or "System.Collections.ICollection" or "System.Collections.IEnumerable",
         },
         VmBoxedValue boxed => boxed.Type.IsAssignableTo(target) || target.FullName is "System.Object" or "System.ValueType",
         VmDelegate @delegate => @delegate.DeclaredType.IsAssignableTo(target) ||

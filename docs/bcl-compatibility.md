@@ -15,9 +15,9 @@
 | SIMD | Vector64 / 128 / 256 / 512 の software 値表現、broadcast Create、Count / Zero / IsSupported、GetElement / WithElement、加減乗算。byte の桁あふれ、float / double、各幅を CLR と比較 |
 | Regex | instance / static の IsMatch / Match / Replace / Split、Match / Group / Capture の基本プロパティ、Groups の名前 / 番号アクセス |
 | Compression | GZip / Deflate / Brotli / ZLib とゲスト MemoryStream、CompressionMode / CompressionLevel、leaveOpen、Read / Write / CopyTo / Flush / Dispose |
-| Crypto | SHA256 / 384 / 512.HashData と TryHashData、HMACSHA256.HashData、FixedTimeEquals、ZeroMemory、RandomNumberGenerator.GetBytes / Fill、AES の Key / IV と CBC / ECB の基本暗号化・復号 |
-| HttpClient | string URL の GetStringAsync / GetByteArrayAsync / GetAsync / PostAsync、CancellationToken、StringContent / ByteArrayContent、response status / content / EnsureSuccessStatusCode。結果は VM の Task と値へ正規化 |
-| System.Text.Json | 実在 DLL の JsonDocument / JsonElement と Utf8JsonWriter の managed IL を実行。日本語・絵文字・エスケープ・数値・bool・配列を CLR の結果と比較し、System.Text.Json の IL フレームを確認 |
+| Crypto | SHA256 / 384 / 512.HashData と TryHashData、HMACSHA256.HashData、FixedTimeEquals、ZeroMemory、RandomNumberGenerator.GetBytes / Fill、AES の Key / IV、CBC / ECB / CFB の配列・Span・Try API、CryptoStream、AesGcm の配列・Span API |
+| HttpClient | HttpClient / HttpMessageInvoker、BaseAddress、要求・応答・各種コンテンツ、標準メソッド、同期・非同期 Send、ResponseHeadersRead の遅延ストリーム、独自 DelegatingHandler / HttpMessageHandler / HttpContent、HttpRequestOptions、CancellationToken、タイムアウト、複数値ヘッダーと trailing headers。全通信は origin / method / header / body / response / timeout の gateway 制限下 |
+| System.Text.Json | 実在 DLL の managed IL を実行。JsonDocument / JsonElement / Utf8JsonWriter に加え JsonSerializer の通常型、属性、命名ポリシー、辞書・リスト、nullable、引数付きコンストラクター、UTF-8 API、独自 JsonConverter を CLR と比較 |
 
 ホスト BCL の状態は VM オブジェクトをキーにした内部の weak table に保持します。
 ゲストオブジェクトをホストの任意の IFormatProvider やネイティブポインタとして渡しません。
@@ -94,9 +94,8 @@ Crypto の乱数は `VmHostOptions.RandomFill` を通します。HTTP worker は
 
 ハードウェア ISA の IsSupported / IsHardwareAccelerated は false を維持します。
 参照を含む構造体の raw memory 解釈、任意のホストアドレス、独自 ICustomFormatter のゲストコールバック、
-Encoding の pointer overload / 独自 fallback、Regex の evaluator / Matches collection、CryptoStream / RSA は追加していません。
-HttpClient の SendAsync / HttpRequestMessage、BaseAddress、guest handler / headers も今回の範囲外です。
-JSON の検証は reader / document / writer に絞っています。reflection を使う JsonSerializer の全面互換性は未対応です。
+Encoding の pointer overload / 独自 fallback、Regex の evaluator / Matches collection、RSA、HTTP の proxy / cookie / redirect / auto-decompression は追加していません。
+JSON は一般的な JsonSerializer の型・属性・コンバーター面を対象にしていますが、source generator、unsafe pointer overload、複雑な polymorphic resolver など未登録の framework surface は拒否します。
 
 ## テストと性能
 

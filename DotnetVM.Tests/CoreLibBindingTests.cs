@@ -72,6 +72,7 @@ public class CoreLibBindingTests {
                 private static extern int NativeAdd(int x, int y);
 
                 public static int CallNative() => NativeAdd(1, 2);
+                public static string? ReadVirtualEnvironment() => Environment.GetEnvironmentVariable("VM_ENV_PROBE");
             }
         }
         """;
@@ -128,21 +129,54 @@ public class CoreLibBindingTests {
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "Write"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "WriteLine"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "ReadLine"));
-        // P/Invoke 代替バインドは監査表に載った例外面のみ (未登録 P/Invoke は fail-closed のまま、
-        // PInvoke_Is_Rejected_As_OperationNotAllowed が検査)。既定登録の PInvokeReplacement は
-        // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現) と
-        // Interop+BCrypt::BCryptGenRandom / Interop+Sys::GetNonCryptographicallySecureRandomBytes
-        // (ホスト暗号乱数 API に限定した代替) の 3 面に限る (いずれも
-        // CoreLibSurfaceAudit に pinvoke-replacement として監査済み)
+        // Pin the registered native boundaries. The separate metadata test
+        // verifies that each import present in the host CoreLib is a DllImport.
         var pinvokeFaces = vm.Bindings
             .Where(b => b.Origin == BindingOrigin.PInvokeReplacement)
             .Select(b => $"{b.Key.TypeFullName}::{b.Key.MethodName}")
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToList();
-        Assert.Equal(new[] {
+        var expected = new List<string> {
             "Interop+BCrypt::BCryptGenRandom",
-            "Interop+Kernel32::GetEnvironmentVariable",
+            "Interop+Kernel32::<GetEnvironmentVariable>g____PInvoke|296_0",
             "Interop+Sys::GetNonCryptographicallySecureRandomBytes",
-        }, pinvokeFaces);
+        };
+        if (OperatingSystem.IsWindows()) {
+            expected.Add("System.Runtime.InteropServices.Marshal::<IsBuiltInComSupportedInternal>g____PInvoke|30_0");
+            expected.Add("Interop+Kernel32::GetCPInfo");
+            expected.Add("Interop+Kernel32::GetLastError");
+            expected.Add("Interop+Kernel32::SetLastError");
+        }
+        Assert.Equal(expected.OrderBy(name => name, StringComparer.Ordinal), pinvokeFaces);
+    }
+
+    [Fact]
+    public void PInvokeBindingsTargetRealDllImportsOnHost() {
+        using var vm = CreateVm(loadCoreLib: true);
+        foreach (var binding in vm.Bindings.Where(binding => binding.Origin == BindingOrigin.PInvokeReplacement)) {
+            var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName);
+            if (type is null) continue; // OS-specific imports absent from this CoreLib.
+            var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
+                method => method.Name == binding.Key.MethodName);
+            Assert.Null(method.GetMethodBody());
+            Assert.NotNull(System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Runtime.InteropServices.DllImportAttribute>(method));
+        }
+    }
+
+    [Fact]
+    public void WindowsEnvironmentMarshallingExecutesOriginalIl() {
+        if (!OperatingSystem.IsWindows()) return;
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", "value-日本語");
+        vm.Tracer.Start();
+        Assert.Equal("value-日本語", vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        var longValue = new string('日', 180);
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", longValue);
+        Assert.Equal(longValue, vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", null);
+        Assert.Null(vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "Interop+Kernel32", "GetEnvironmentVariable"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Runtime.InteropServices.Marshal", "GetLastSystemError"));
+        Assert.DoesNotContain(vm.Bindings, binding => binding.Key.TypeFullName == "Interop+Kernel32" && binding.Key.MethodName == "GetEnvironmentVariable");
     }
 }

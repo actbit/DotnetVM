@@ -404,5 +404,9 @@ public sealed class VmHeap {
     internal IReadOnlyList<VmObject> TrackedObjects {
         get { lock (_gate) return _objects.ToArray(); }
     }
+
+    internal void ChargeInlineValueStorage(long byteCount) =>
+        ChargeHostAllocation(byteCount, "inline value storage", includeVmAllocation: true,
+            _memory.HostTempAllocationByteLimit, ref _hostTempAllocated);
     internal DependentHandleTable? DependentHandles { get; set; }
 }

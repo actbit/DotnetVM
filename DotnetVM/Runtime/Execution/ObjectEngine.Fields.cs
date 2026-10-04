@@ -186,6 +186,8 @@ internal sealed partial class ObjectEngine {
                 TryGetStringFieldOffset(field.Name, out _):
                 str.SyncFieldSlotsFromBytes();
                 return (str.FieldSlots, field.Name is "_stringLength" or "m_stringLength" ? 0 : 1, false);
+            case StackKind.Object when objSlot.ObjectValue is VmTypeHandle handle && IsRuntimeTypeHandleField(field):
+                return (TypeHandleFields(handle), 0, false);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
                 return (instance.Fields, GetInstanceFieldIndex(instance.ClassType, field), false);
             case StackKind.Object when objSlot.ObjectValue is VmBoxedValue boxed:
@@ -204,6 +206,16 @@ internal sealed partial class ObjectEngine {
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }
 
+    private static bool IsRuntimeTypeHandleField(VmField field) =>
+        field.Name == "m_type" && field.DeclaringType.FullName == "System.RuntimeTypeHandle" &&
+        field.DeclaringType is VmClassType { Loader.IsTrustedCoreLib: true };
+
+    private StackSlot[] TypeHandleFields(VmTypeHandle handle) {
+        if (handle.ManagedFields is { } fields) return fields;
+        var initialized = new[] { DefaultIntrinsics.MakeRuntimeObject(_intrinsicContext, handle.Target) };
+        return Interlocked.CompareExchange(ref handle.ManagedFields, initialized, null) ?? initialized;
+    }
+
     /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。
     /// 構築ジェネリック型は定義に解いてレイアウトを取る (VmClassInstance/ボックス/構造体の全経路)。</summary>
     public VmByRef FieldLocation(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
@@ -216,6 +228,8 @@ internal sealed partial class ObjectEngine {
                 // 合成スロットへ同期してから返す (直近のポインタ書込が反映される)
                 str.SyncFieldSlotsFromBytes();
                 return VmByRef.Frame(str.FieldSlots, stringFieldOffset == 0 ? 0 : 1, isReadOnly);
+            case StackKind.Object when objSlot.ObjectValue is VmTypeHandle handle && IsRuntimeTypeHandleField(field):
+                return VmByRef.OwnedStorage(handle, TypeHandleFields(handle), 0, isReadOnly);
             case StackKind.Object when objSlot.ObjectValue is VmClassInstance instance:
                 return VmByRef.OwnedStorage(instance, instance.Fields,
                     GetInstanceFieldIndex(instance.ClassType, field), isReadOnly);
@@ -229,10 +243,13 @@ internal sealed partial class ObjectEngine {
             case StackKind.ByRef when objSlot.ObjectValue is VmByRef outer: {
                 // 構造体ローカル/引数へのフィールド書込 (ldloca → ldfld/stfld)
                 var target = outer.Read();
+                if (target.ObjectValue is VmTypeHandle nestedHandle && IsRuntimeTypeHandleField(field))
+                    return VmByRef.OwnedStorage(nestedHandle, TypeHandleFields(nestedHandle), 0,
+                        isReadOnly || outer.IsReadOnly);
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
                     DefinitionOf(sv.StructType) is VmClassType st)
                     return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field),
-                        isReadOnly || outer.IsReadOnly, outer.Owner);
+                        isReadOnly || outer.IsReadOnly, outer.Owner, MemoryOps.FixedBufferStorage(st)?.ElementType);
                 if (target.ObjectValue is VmClassInstance nested)
                     return VmByRef.OwnedStorage(nested, nested.Fields,
                         GetInstanceFieldIndex(nested.ClassType, field), isReadOnly || outer.IsReadOnly);
@@ -240,7 +257,8 @@ internal sealed partial class ObjectEngine {
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&
                 DefinitionOf(direct.StructType) is VmClassType dt:
-                return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field), isReadOnly);
+                return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field), isReadOnly,
+                    owner: null, elementType: MemoryOps.FixedBufferStorage(dt)?.ElementType);
         }
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }

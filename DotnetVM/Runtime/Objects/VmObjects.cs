@@ -396,6 +396,10 @@ public sealed class VmTypeHandle : VmObject {
 
     public required VmType Target { get; init; }
 
+    // The CLI handle is a value containing the RuntimeType reference. Keep
+    // that storage available to ordinary ldfld/ldflda instructions in CoreLib.
+    internal StackSlot[]? ManagedFields;
+
     public override VmType Type => HandleType;
 }
 
@@ -889,6 +893,10 @@ public sealed class VmNativePointer : VmObject {
 /// Interpreter が 1 つ所有する。
 /// </remarks>
 public sealed class ObjectModel {
+    private readonly Action<long>? _chargeInlineStorage;
+
+    public ObjectModel() { }
+    internal ObjectModel(Action<long> chargeInlineStorage) => _chargeInlineStorage = chargeInlineStorage;
     private readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
     private readonly ConditionalWeakTable<VmClassType, InstanceDefaults> _instanceDefaults = new();
     private readonly object _gate = new();
@@ -1076,6 +1084,13 @@ public sealed class ObjectModel {
     /// (構造体自身の実引数は typeArguments として VmStructValue に記録する)。</summary>
     public VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader,
         GenericContext? context, VmType[]? typeArguments) {
+        if (MemoryOps.FixedBufferStorage(structType) is { } fixedStorage) {
+            _chargeInlineStorage?.Invoke(EstimateFieldStorageSize(fixedStorage.Length));
+            var inlineFields = new StackSlot[fixedStorage.Length];
+            var zero = DefaultForType(fixedStorage.ElementType, loader);
+            Array.Fill(inlineFields, zero);
+            return new VmStructValue(structType, inlineFields, typeArguments);
+        }
         var layout = GetLayout(structType);
         var fields = new StackSlot[layout.Count == 0 ? 0 : layout.Values.Max() + 1];
         foreach (var (field, index) in layout)

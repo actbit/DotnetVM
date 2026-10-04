@@ -12,7 +12,6 @@ internal static partial class CoreLibBindings {
         RegisterCrypto(r);
         RegisterCompression(r);
         RegisterHttpClient(r);
-        RegisterTextEncoder(r);
     }
 
     private static void BclFace(IntrinsicRegistry r, string type, string method, bool instance, string[] parameters, IntrinsicImpl impl) =>

@@ -191,8 +191,6 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 5);
         foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.MethodBase" }) Bcl(type, ["get_MemberType"], true, RuntimeRepresentation);
         Bcl("System.Runtime.InteropServices.GCHandle", ["_InternalAlloc", "InternalGet", "InternalSet", "InternalCompareExchange", "_InternalFree"], false, InternalCall);
-        Bcl("System.Text.Encodings.Web.JavaScriptEncoder", ["get_Default", "get_UnsafeRelaxedJsonEscaping"], false);
-        foreach (var type in new[] { "JavaScriptEncoder", "TextEncoder" }) Bcl("System.Text.Encodings.Web." + type, ["FindFirstCharacterToEncode", "FindFirstCharacterToEncodeUtf8", "EncodeUtf8", "Encode", "WillEncode"], true);
 
         // ---- CultureSettings bridge / no-CoreLib fallback ----
         var cultureBridgeJ = CultureOutOfScope +
@@ -750,13 +748,24 @@ internal static class CoreLibSurfaceAudit {
         // ---- CoreLibBindings: 環境 / Marshal lastError / GlobalizationMode (C5.5 探査テスト継続) ----
         var marshalLastErrorJ = InternalCall +
             "。実 CLR も last-error TLS スロットの取得/設定 (ECall 面)。VM はネイティブ呼びを持たないため同一スロットの set/get 対として成立";
-        Add("System.Runtime.InteropServices.Marshal", "SetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
-        Add("System.Runtime.InteropServices.Marshal", "GetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        if (OperatingSystem.IsWindows()) {
+            Add("System.Runtime.InteropServices.Marshal", "<IsBuiltInComSupportedInternal>g____PInvoke|30_0", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する COM capability DllImport。VM は COM を提供しない", hasThis: false, paramCount: 0);
+            Add("Interop+Kernel32", "GetCPInfo", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetCPInfo DllImport。VM は ANSI code page を持たず失敗を返し、元の IL が既定値を選択する", hasThis: false, paramCount: 2);
+            Add("Interop+Kernel32", "SetLastError", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する SetLastError DllImport を VM の last-error スロットに接続する", hasThis: false, paramCount: 1);
+            Add("Interop+Kernel32", "GetLastError", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetLastError DllImport を VM の last-error スロットに接続する", hasThis: false, paramCount: 0);
+        } else {
+            Add("System.Runtime.InteropServices.Marshal", "SetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
+            Add("System.Runtime.InteropServices.Marshal", "GetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        }
         // SystemError/PInvokeError は実 CLR でも同一スロットの alias 面
         Add("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
         Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
-        Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
+        Add("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0", CoreLibSurfaceKind.RuntimeInternal,
+            "pinvoke-replacement: 実在する GetEnvironmentVariableW DllImport が VM の仮想環境を読む。managed マーシャリング wrapper は元の IL を実行する", hasThis: false, paramCount: 3);
         Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
             "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
         Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
@@ -780,7 +789,8 @@ internal static class CoreLibSurfaceAudit {
         // ---- DefaultIntrinsics: Type / MemberInfo / MethodBase ----
         var typeJ = RuntimeRepresentation +
             "。実体が VmRuntimeObject / VmRuntimeMethod (VM 型系ファサード) で CoreLib IL の対象データが VM に存在しない";
-        Add("System.Type", "GetTypeFromHandle", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 1);
+        Add("System.Type", "GetTypeFromHandle", CoreLibSurfaceKind.RealCoreLibIl,
+            "shadowed-legacy: CoreLib をロードした場合は RuntimeTypeHandle.m_type を読む実 IL を実行する。legacy は CoreLib 未ロード時だけ使用する", hasThis: false, paramCount: 1);
         Add("System.Type", "op_Equality", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 2);
         Add("System.Type", "op_Inequality", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 2);
         foreach (var t in new[] { "System.Type", "System.Reflection.MemberInfo" }) {

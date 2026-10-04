@@ -15,6 +15,9 @@ public static class ObjectGraphWalker {
     public static void CollectReferences(VmObject obj, Action<VmObject> visit) {
         foreach (var reference in obj.BclReferences) visit(reference);
         switch (obj) {
+            case VmTypeHandle { ManagedFields: { } fields }:
+                CollectFromSlots(fields, visit);
+                break;
             case VmClassInstance instance:
                 CollectFromSlots(instance.Fields, visit);
                 break;

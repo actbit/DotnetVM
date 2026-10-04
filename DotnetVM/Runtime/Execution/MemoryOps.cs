@@ -38,6 +38,34 @@ internal static class MemoryOps {
     private sealed record ByteField(VmType Type, int Slot, int Offset, int Size);
     private sealed record ByteLayout(int Size, int Alignment, ByteField[] Fields);
     private static readonly ConditionalWeakTable<VmType, ByteLayout> s_byteLayouts = new();
+    private sealed record FixedStorage(VmType? ElementType, int Length);
+    private static readonly ConditionalWeakTable<VmClassType, FixedStorage> s_fixedStorage = new();
+
+    internal static (VmType ElementType, int Length)? FixedBufferStorage(VmClassType type) {
+        var storage = s_fixedStorage.GetValue(type, static definition => {
+            var fields = definition.Fields.Where(field => !field.IsStatic && !field.IsLiteral).ToArray();
+            if (fields is not [{ Name: "FixedElementField", FieldType: { } element }]) return new(null, 0);
+            if (!VmPrimitiveTypes.IsSlotPrimitive(element.FullName)) return new(null, 0);
+            var metadata = s_layoutMetadata.GetValue(definition.Image, static image => LayoutMetadata.Read(image));
+            var size = DeclaredClassSize(definition, metadata);
+            var stride = SizeOfType(element);
+            if (size < stride || size % stride != 0) return new(null, 0);
+            var tables = definition.Image.Tables;
+            for (var rid = 1; rid <= tables.GetRowCount(TableKind.CustomAttribute); rid++) {
+                var parent = tables.DecodeCoded(TableKind.CustomAttribute, rid, 0, CodedIndexKind.HasCustomAttribute);
+                if (parent.Table != TableKind.TypeDef || parent.Rid != definition.TypeDefRid) continue;
+                var constructor = tables.DecodeCoded(TableKind.CustomAttribute, rid, 1, CodedIndexKind.CustomAttributeType);
+                if (constructor.Table != TableKind.MemberRef) continue;
+                var owner = tables.DecodeCoded(TableKind.MemberRef, constructor.Rid, 0, CodedIndexKind.MemberRefParent);
+                if (owner.Table != TableKind.TypeRef) continue;
+                var (ns, name, _) = definition.Image.GetTypeRefName(owner.Rid);
+                if (ns == "System.Runtime.CompilerServices" && name == "UnsafeValueTypeAttribute")
+                    return new(element, size / stride);
+            }
+            return new(null, 0);
+        });
+        return storage.ElementType is { } elementType ? (elementType, storage.Length) : null;
+    }
 
     private static bool IsBlittableStruct(VmType type) => type.IsValueType && !type.IsEnum &&
         !VmPrimitiveTypes.IsSlotPrimitive(type.FullName) && type is VmClassType or VmConstructedType;
@@ -56,6 +84,12 @@ internal static class MemoryOps {
                 var packing = EffectivePackingSize(definition, metadata);
                 var slots = new ObjectModel().GetLayout(definition);
                 var fields = new List<ByteField>();
+                if (FixedBufferStorage(definition) is { } fixedStorage) {
+                    var stride = SizeOfType(fixedStorage.ElementType);
+                    for (var i = 0; i < fixedStorage.Length; i++)
+                        fields.Add(new ByteField(fixedStorage.ElementType, i, checked(i * stride), stride));
+                    return new ByteLayout(checked(stride * fixedStorage.Length), Math.Min(stride, packing), fields.ToArray());
+                }
                 var end = 0; var alignment = 1;
                 foreach (var field in definition.Fields) {
                     if (field.IsStatic || field.IsLiteral) continue;
@@ -266,16 +300,17 @@ internal static class MemoryOps {
             managed = rightReference; displacement = left;
         }
         if (managed is not null) {
-            if (managed.Owner is not VmArray array)
+            var elementType = managed.Owner is VmArray array ? array.ArrayType.ElementType : managed.ElementType;
+            if (elementType is null)
                 throw new UnhandledGuestException("System.NotSupportedException", "Pointer arithmetic requires typed array storage.");
-            var stride = SizeOfRawType(array.ArrayType.ElementType);
+            var stride = SizeOfRawType(elementType);
             if (op == ILOp.Sub && displacement.ObjectValue is VmByRef second && ReferenceEquals(managed.Container, second.Container))
                 return StackSlot.OfNativeInt(checked((long)(managed.Index - second.Index) * stride));
             if (displacement.Kind is not (StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt) || displacement.Int64Value % stride != 0)
                 throw new UnhandledGuestException("System.NotSupportedException", "Pointer displacement must align with array element storage.");
             var index = checked((long)managed.Index + (op == ILOp.Add ? displacement.Int64Value : -displacement.Int64Value) / stride);
             if (index < 0 || index > managed.Container.Length) throw new UnhandledGuestException("System.IndexOutOfRangeException", "Pointer displacement exceeds array storage.");
-            return StackSlot.OfByRef(new VmByRef(managed.Container, (int)index, managed.IsReadOnly, managed.Owner));
+            return StackSlot.OfByRef(new VmByRef(managed.Container, (int)index, managed.IsReadOnly, managed.Owner, managed.ElementType));
         }
         VmNativePointer? pointer;
         StackSlot other;

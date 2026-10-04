@@ -365,6 +365,10 @@ public sealed class BclCompatibilityTests {
         try { Assert.Equal(Clr(method, []), vm.Invoke("BclChecks", method)); }
         catch (Exception ex) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(90)), ex); }
         Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Json");
+        Assert.DoesNotContain(vm.Bindings, binding =>
+            binding.Key.TypeFullName.StartsWith("System.Text.Encodings.Web.", StringComparison.Ordinal));
+        if (method != "JsonRead")
+            Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Encodings.Web");
     }
 
     [Fact]

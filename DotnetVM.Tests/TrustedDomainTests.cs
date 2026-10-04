@@ -39,10 +39,10 @@ public class TrustedDomainTests {
         Assert.Equal(42, result);
     }
 
-    /// <summary>ゲストから実在の特権面 (Marshal.GetLastSystemError) を直接参照しても
-    /// caller が guest のため TrustedCoreLib binding に到達できず OperationNotAllowed になる。</summary>
+    /// <summary>Windows の managed Marshal wrapper は IL を実行して VM の native 境界を呼ぶ。
+    /// body のない InternalCall は引き続き trusted binding の直接呼び出しを拒否する。</summary>
     [Fact]
-    public void GuestDirect_PrivilegedMarshal_IsRejected() {
+    public void MarshalManagedWrappersAndInternalCallsRespectTheirBoundaries() {
         using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
         using var stream = new MemoryStream(TestAssemblyCompiler.CompileToBytes(
             """
@@ -59,6 +59,11 @@ public class TrustedDomainTests {
             }
             """, "TrustPriv"));
         vm.LoadAssembly(stream);
+        if (OperatingSystem.IsWindows()) {
+            Assert.Equal(0, vm.Invoke("Vm.TrustPriv.Ops", "RunGet"));
+            Assert.Equal(123, vm.Invoke("Vm.TrustPriv.Ops", "RunSet"));
+            return;
+        }
         // 特権面へのゲスト直接呼出は domain 遮断で拒否される (InternalCall 未登録とは区別する)。
         var exGet = Assert.Throws<OperationNotAllowedException>(() => vm.Invoke("Vm.TrustPriv.Ops", "RunGet"));
         Assert.Contains("trusted", exGet.Message, StringComparison.OrdinalIgnoreCase);

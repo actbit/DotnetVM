@@ -19,6 +19,7 @@ public class CoreLibTypeTests {
                 public static string TypeOfString() => typeof(string).ToString();
                 public static string TypeOfEnum() => typeof(Color).ToString();
                 public static bool TypeEquality() => typeof(int) == typeof(int) && typeof(int) != typeof(long);
+                public static bool DefaultTypeHandle() => System.Type.GetTypeFromHandle(default) is null;
 
                 // box / unbox / isinst (実型同士の代入可能性)
                 public static bool BoxedIsInt() { object o = 42; return o is int; }
@@ -56,6 +57,17 @@ public class CoreLibTypeTests {
             Assert.Equal(expected, withCoreLib.Invoke("Vm.C2.Entry", method));
         using (var withoutCoreLib = CreateVm(loadCoreLib: false))
             Assert.Equal(expected, withoutCoreLib.Invoke("Vm.C2.Entry", method));
+    }
+
+    [Fact]
+    public void TypeFromHandleExecutesOriginalManagedIl() {
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.Tracer.Start();
+        Assert.Equal(RunClr("TypeOfInt"), vm.Invoke("Vm.C2.Entry", "TypeOfInt"));
+        Assert.Equal(true, vm.Invoke("Vm.C2.Entry", "DefaultTypeHandle"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Type", "GetTypeFromHandle"));
+        Assert.DoesNotContain(vm.Bindings, binding => binding.Key.TypeFullName == "System.Type" &&
+            binding.Key.MethodName == "GetTypeFromHandle");
     }
 
     [Fact]

@@ -3,6 +3,15 @@
 `origin/master` の `10001c1` (PR #32) を基点に、カルチャ・UTF-8・Span と追加 BCL の互換性を拡張しています。
 以下は今回登録した API の範囲です。BCL 全体の互換性を保証するものではありません。
 
+PR #34 は元の managed IL を実行する方針への修正中です。TextEncoder の専用バインドを削除し、
+`System.Text.Encodings.Web` の実 DLL を実行します。C# fixed バッファの値コピー・ポインタ演算・
+生メモリ変換は共通の VM ストレージで処理し、確保量も計上します。
+`Type.GetTypeFromHandle` は `RuntimeTypeHandle.m_type` を読む元の IL を実行します。
+Windows の環境変数取得と Marshal の system-error wrapper も元の IL を実行し、実在する DllImport
+の末端を VM の仮想環境・last-error 状態へ接続します。
+Reflection、CultureInfo、Encoding、Regex、HTTP、Compression、Crypto には managed API の
+専用バインドが残っています。以下の出力互換性テストの成功を、置き換えなしの対応完了とは扱いません。
+
 ## 対応範囲
 
 | 分野 | 対応・検証内容 |
@@ -25,6 +34,7 @@
 `LoadHostCoreLib=true` では、ホストが選んだ Regex / HttpClient / Compression / Crypto / TextEncoder の
 実在アセンブリをロードして、登録した境界を利用します。ゲストが同名 DLL を持ち込んでも
 trusted BCL の印は付きません。CoreLib 専用 caller domain の権限はそのままです。
+TextEncoder については専用境界を登録せず、実 DLL の IL を実行します。
 
 ゲストの現在のカルチャは VM ごとの AsyncLocal に保持し、Task へ引き継ぎます。
 外側のゲスト呼び出しが終わるとホストの CurrentCulture / CurrentUICulture を復元します。

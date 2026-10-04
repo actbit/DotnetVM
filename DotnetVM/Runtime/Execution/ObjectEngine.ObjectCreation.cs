@@ -253,6 +253,8 @@ internal sealed partial class ObjectEngine {
             }
             if (ctor.DeclaringType.FullName == "System.Reflection.Emit.DynamicMethod" && ctor.Name == ".ctor")
                 return NewDynamicMethodInstance(ctor.Signature.ParamTypes.Length, caller);
+            if (ctor.DeclaringType is VmClassType { FullName: "System.String", Loader.IsTrustedCoreLib: true } && ctor.Name == ".ctor")
+                return NewStringFromCtor(ctor.Signature.ParamTypes.Length, caller);
         } else if (table == TableKind.MemberRef) {
             var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
             if (parent.Table == TableKind.TypeSpec)

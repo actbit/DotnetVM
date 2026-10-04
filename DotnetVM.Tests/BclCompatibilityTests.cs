@@ -17,7 +17,10 @@ public sealed class BclCompatibilityTests {
         using System.Text;
         using System.Text.Json;
         using System.Text.Json.Serialization;
+        using System.Text.Json.Serialization.Metadata;
+        using System.Reflection;
         using System.Collections.Generic;
+        using System.Linq;
         using System.Runtime.CompilerServices;
         using System.Runtime.InteropServices;
         using System.Runtime.Intrinsics;
@@ -225,6 +228,19 @@ public sealed class BclCompatibilityTests {
                 var restored = JsonSerializer.Deserialize<JsonModel>(json, options);
                 return json + "|" + restored.Name + "|" + restored.Count + "|" + restored.Items.Count + "|" + restored.Hidden;
             }
+            public static string JsonReflectionResolver() {
+                var options = new JsonSerializerOptions { TypeInfoResolver = new DefaultJsonTypeInfoResolver(), PropertyNameCaseInsensitive = true };
+                var value = new JsonModel { Name = "反射", Count = 7, Items = new List<int> { 8, 9 } };
+                var json = JsonSerializer.Serialize(value, options);
+                var restored = JsonSerializer.Deserialize<JsonModel>(json, options);
+                var properties = typeof(JsonModel).GetProperties(BindingFlags.Instance | BindingFlags.Public);
+                PropertyInfo count = null;
+                foreach (var property in properties) if (property.Name == "Count") { count = property; break; }
+                if (count is null) throw new InvalidOperationException("Count property was not reflected.");
+                var before = count.GetValue(restored);
+                count.SetValue(restored, 99);
+                return json + "|" + before + "|" + restored.Count + "|" + properties.Length + "|" + count.CanRead + "|" + count.CanWrite;
+            }
             public static bool JsonInvalid() {
                 try { JsonSerializer.Deserialize<int>("{}"); return false; } catch (JsonException) { return true; }
             }
@@ -336,6 +352,7 @@ public sealed class BclCompatibilityTests {
     [InlineData("JsonDeserializeInt")]
     [InlineData("JsonCollections")]
     [InlineData("JsonObjects")]
+    [InlineData("JsonReflectionResolver")]
     [InlineData("JsonInvalid")]
     [InlineData("JsonNullable")]
     [InlineData("JsonConstructor")]
@@ -344,10 +361,14 @@ public sealed class BclCompatibilityTests {
     public void SystemTextJsonMatchesClr(string method) {
         using var vm = CreateVm();
         vm.LoadAssembly(typeof(JsonSerializer).Assembly.Location);
-        vm.Tracer.Start();
+        vm.Tracer.Start(new DotnetVM.Diagnostics.ExecutionTraceOptions { MaxFrames = 500_000 });
         try { Assert.Equal(Clr(method, []), vm.Invoke("BclChecks", method)); }
         catch (Exception ex) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(90)), ex); }
         Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Json");
+        Assert.DoesNotContain(vm.Bindings, binding =>
+            binding.Key.TypeFullName.StartsWith("System.Text.Encodings.Web.", StringComparison.Ordinal));
+        if (method != "JsonRead")
+            Assert.Contains(vm.Tracer.Frames, frame => frame.AssemblyName == "System.Text.Encodings.Web");
     }
 
     [Fact]

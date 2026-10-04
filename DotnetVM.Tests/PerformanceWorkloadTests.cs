@@ -1,4 +1,5 @@
 using System.Reflection;
+using Microsoft.CodeAnalysis;
 using DotnetVM.Host;
 using Xunit;
 
@@ -13,7 +14,8 @@ public class PerformanceWorkloadTests {
     private static (byte[], Assembly) Compile(bool optimize, string resourceName, string assemblyName) {
         using var resource = typeof(PerformanceWorkloadTests).Assembly.GetManifestResourceStream(resourceName)!;
         using var reader = new StreamReader(resource);
-        var bytes = TestAssemblyCompiler.CompileToBytes(reader.ReadToEnd(), assemblyName, optimize: optimize);
+        var bytes = TestAssemblyCompiler.CompileToBytes(reader.ReadToEnd(), assemblyName,
+            extraReferences: [MetadataReference.CreateFromFile(typeof(System.Text.Json.JsonSerializer).Assembly.Location)], optimize: optimize);
         return (bytes, Assembly.Load(bytes));
     }
 
@@ -36,7 +38,7 @@ public class PerformanceWorkloadTests {
         vm.LoadAssembly(typeof(Enumerable).Assembly.Location);
         const string typeName = "DotnetVM.Benchmarks.GuestWorkloads";
         foreach (var name in new[] { "Arithmetic", "FieldAccess", "GenericFieldAccess", "MethodCalls", "List", "ListGrowth", "Linq",
-            "DictionaryInt", "DictionaryGrowth", "DictionaryString", "AsyncCompleted", "ValueTaskCompleted", "AsyncWorkers" }) {
+            "DictionaryInt", "DictionaryGrowth", "DictionaryString", "AsyncCompleted", "ValueTaskCompleted", "AsyncWorkers", "ReflectionInvoke" }) {
             var count = name == "AsyncWorkers" ? 8 : 80;
             var expected = (int)guest.Clr.GetType(typeName)!.GetMethod(name)!.Invoke(null, [count])!;
             // Repeat in one VM to exercise warm caches, state machine reuse and

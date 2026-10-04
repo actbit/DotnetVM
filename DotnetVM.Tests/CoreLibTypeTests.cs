@@ -1,4 +1,6 @@
 using DotnetVM.Runtime.Types;
+using DotnetVM.Runtime.Execution;
+using DotnetVM.Runtime.Objects;
 using Xunit;
 
 namespace DotnetVM.Tests;
@@ -12,6 +14,10 @@ public class CoreLibTypeTests {
     private const string Source = """
         namespace Vm.C2 {
             public enum Color { Red, Green, Blue }
+            public sealed class Model {
+                public int Value { get; set; }
+                public static int Global { get; set; }
+            }
 
             public static class Entry {
                 // typeof (ldtoken TypeRef → 統合された実型への解決)
@@ -19,6 +25,18 @@ public class CoreLibTypeTests {
                 public static string TypeOfString() => typeof(string).ToString();
                 public static string TypeOfEnum() => typeof(Color).ToString();
                 public static bool TypeEquality() => typeof(int) == typeof(int) && typeof(int) != typeof(long);
+                public static bool DefaultTypeHandle() => System.Type.GetTypeFromHandle(default) is null;
+                public static int PropertiesViaManagedWrapper() => typeof(Model).GetProperties().Length;
+                public static int NativeAttributes() => (int)typeof(Model).Attributes;
+                public static int NativeToken() => typeof(Model).MetadataToken;
+                public static string NativeModule() => typeof(Model).Module.ScopeName;
+                public static string NativeTypeNames() => typeof(Model).Name + "|" + typeof(Model).FullName;
+                public static string NativeBaseType() => typeof(Model).BaseType.ToString();
+                public static bool NativeCast() => typeof(object).IsAssignableFrom(typeof(Model)) && !typeof(string).IsAssignableFrom(typeof(Model));
+                public static string NativeGenericNames() => typeof(System.Collections.Generic.List<int>).ToString() + "|" + typeof(System.Collections.Generic.List<int>).Name + "|" + typeof(System.Collections.Generic.List<int>).FullName + "|" + typeof(System.Collections.Generic.List<>).ToString() + "|" + typeof(System.Collections.Generic.List<>).FullName;
+                public static string NativeArrayNames() => typeof(int[,]).ToString() + "|" + typeof(int[]).Name;
+                public static string RuntimeTypeOfType() => typeof(Model).GetType().FullName;
+                public static string RuntimeTypeOfString() => "value".GetType().Name;
 
                 // box / unbox / isinst (実型同士の代入可能性)
                 public static bool BoxedIsInt() { object o = 42; return o is int; }
@@ -56,6 +74,99 @@ public class CoreLibTypeTests {
             Assert.Equal(expected, withCoreLib.Invoke("Vm.C2.Entry", method));
         using (var withoutCoreLib = CreateVm(loadCoreLib: false))
             Assert.Equal(expected, withoutCoreLib.Invoke("Vm.C2.Entry", method));
+    }
+
+    [Fact]
+    public void TypeFromHandleExecutesOriginalManagedIl() {
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.Tracer.Start();
+        try { Assert.Equal(RunClr("TypeOfInt"), vm.Invoke("Vm.C2.Entry", "TypeOfInt")); }
+        catch (Exception exception) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(60)), exception); }
+        Assert.Equal(true, vm.Invoke("Vm.C2.Entry", "DefaultTypeHandle"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Type", "GetTypeFromHandle"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.RuntimeType", "ToString"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.RuntimeType", "InitializeCache"));
+        Assert.DoesNotContain(vm.Bindings, binding => binding.Key.TypeFullName == "System.Type" &&
+            binding.Key.MethodName == "GetTypeFromHandle");
+    }
+
+    [Theory]
+    [InlineData("NativeAttributes", "System.RuntimeType", "GetAttributeFlagsImpl")]
+    [InlineData("NativeToken", "System.RuntimeType", "get_MetadataToken")]
+    [InlineData("NativeModule", "System.Reflection.RuntimeModule", "get_ScopeName")]
+    [InlineData("NativeTypeNames", "System.RuntimeType", "get_Name")]
+    [InlineData("NativeBaseType", "System.RuntimeType", "GetBaseType")]
+    [InlineData("NativeCast", "System.Runtime.CompilerServices.CastCache", "TryGet")]
+    [InlineData("NativeGenericNames", "System.RuntimeType", "ToString")]
+    [InlineData("NativeArrayNames", "System.RuntimeType", "ToString")]
+    [InlineData("RuntimeTypeOfType", "System.RuntimeType", "get_FullName")]
+    [InlineData("RuntimeTypeOfString", "System.RuntimeType", "get_Name")]
+    public void NativeMetadataLeavesPreserveOriginalReflectionIl(string method, string type, string member) {
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.Tracer.Start();
+        try { Assert.Equal(RunClr(method), vm.Invoke("Vm.C2.Entry", method)); }
+        catch (Exception exception) { throw new InvalidOperationException(string.Join("\n", vm.Tracer.Frames.TakeLast(60)), exception); }
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", type, member));
+        Assert.DoesNotContain(vm.Bindings, binding => binding.Key.TypeFullName is "System.Type" or "System.RuntimeType" &&
+            binding.Key.MethodName is "GetAttributeFlagsImpl" or "get_Module");
+    }
+
+    [Fact]
+    public void ParameterlessGetPropertiesExecutesOriginalManagedIl() {
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.Tracer.Start();
+        Assert.Equal(RunClr("PropertiesViaManagedWrapper"), vm.Invoke("Vm.C2.Entry", "PropertiesViaManagedWrapper"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Type", "GetProperties"));
+        Assert.DoesNotContain(vm.Bindings, binding =>
+            binding.Key.TypeFullName is "System.Type" or "System.RuntimeType" &&
+            binding.Key.MethodName == "GetProperties" && binding.Key.ParamSignature.Length == 0);
+    }
+
+    [Fact]
+    public void RuntimeTypeCacheCanBeRebuiltAfterVmCollection() {
+        using var vm = CreateVm(loadCoreLib: true);
+        var expected = RunClr("TypeOfInt");
+        Assert.Equal(expected, vm.Invoke("Vm.C2.Entry", "TypeOfInt"));
+        vm.CollectGarbage();
+        vm.Tracer.Start();
+        Assert.Equal(expected, vm.Invoke("Vm.C2.Entry", "TypeOfInt"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.RuntimeType", "InitializeCache"));
+    }
+
+    [Fact]
+    public void NativeStructFieldsUseClrOffsetsAndEnforceBoundsAndReadonly() {
+        using var vm = CreateVm(loadCoreLib: true);
+        var type = vm.Context.FindBySimpleName("System.Private.CoreLib")!
+            .FindTypeByFullName("System.Runtime.CompilerServices.CastCache+CastCacheEntry")!;
+        var hostType = typeof(object).Assembly.GetType(type.FullName)!;
+        var memory = new VmLocallocMemory { Bytes = new byte[MemoryOps.SizeOfRawType(type)] };
+        var pointer = new VmNativePointer { Memory = memory, IsReadOnly = true };
+        foreach (var field in type.Fields.Where(field => !field.IsStatic)) {
+            var address = MemoryOps.RawFieldAddress(pointer, field);
+            Assert.Equal((int)System.Runtime.InteropServices.Marshal.OffsetOf(hostType, field.Name), address.ByteOffset);
+            Assert.Same(memory, address.Memory);
+            Assert.Throws<DotnetVM.Policy.UnhandledGuestException>(() => address.EnsureWritable());
+        }
+        var outside = new VmNativePointer { Memory = memory, ByteOffset = memory.Bytes.Length };
+        Assert.Throws<DotnetVM.Policy.UnhandledGuestException>(() => MemoryOps.RawFieldAddress(outside, type.Fields.First(field => !field.IsStatic)));
+    }
+
+    [Fact]
+    public void RuntimeMetadataHandlesBelongToTheirVm() {
+        using var first = CreateVm(loadCoreLib: true);
+        using var second = CreateVm(loadCoreLib: true);
+        first.Invoke("Vm.C2.Entry", "TypeOfInt"); second.Invoke("Vm.C2.Entry", "TypeOfInt");
+        var firstType = first.Context.FindBySimpleName("System.Private.CoreLib")!.FindTypeByFullName("System.Int32")!;
+        var secondType = second.Context.FindBySimpleName("System.Private.CoreLib")!.FindTypeByFullName("System.Int32")!;
+        var firstMetadata = first.SharedState.RuntimeMetadata;
+        var secondMetadata = second.SharedState.RuntimeMetadata;
+        var firstAddress = firstMetadata.Get(first.SharedState.TypeFacades[firstType].ManagedInstance!, "m_handle").Int64Value;
+        var secondAddress = secondMetadata.Get(second.SharedState.TypeFacades[secondType].ManagedInstance!, "m_handle").Int64Value;
+        Assert.Same(firstType, firstMetadata.Resolve<VmType>(firstAddress));
+        Assert.Same(secondType, secondMetadata.Resolve<VmType>(secondAddress));
+        Assert.NotSame(firstType, secondType);
+        Assert.Throws<DotnetVM.Policy.UnhandledGuestException>(() => firstMetadata.Resolve<VmType>(-1));
+        Assert.Throws<DotnetVM.Policy.UnhandledGuestException>(() => firstMetadata.Resolve<TypeLoader>(firstAddress));
     }
 
     [Fact]

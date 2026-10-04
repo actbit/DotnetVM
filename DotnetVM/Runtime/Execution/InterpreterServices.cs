@@ -32,7 +32,7 @@ internal sealed class InterpreterServices(
     public VmCoreLibSurfaces? CoreLibSurfaces { get; } = coreLibSurfaces;
 
     /// <summary>オブジェクトモデル (レイアウト/静的ストレージ)。VM インスタンスごとの状態。</summary>
-    public ObjectModel Objects { get; } = new();
+    public ObjectModel Objects { get; } = new(heap.ChargeInlineValueStorage);
 
     /// <summary>System.String の実型 (CoreLib TypeDef)。LoadHostCoreLib = true 時のみ
     /// VirtualMachine が値を持ち、Interpreter がエンジン構築時にここへ載せる。

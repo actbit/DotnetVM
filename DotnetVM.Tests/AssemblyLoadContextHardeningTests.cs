@@ -159,6 +159,10 @@ public sealed class AssemblyLoadContextHardeningTests {
 
         using var shared = new VmSharedState();
         var facade = new VmRuntimeObject { Target = type };
+        var metadataMemory = new MemoryPolicy();
+        var metadataContext = CreateIntrinsicContext(new VmHeap(metadataMemory), loader, shared, metadataMemory);
+        var metadataAddress = shared.RuntimeMetadata.Identity(metadataContext, type);
+        Assert.Same(type, shared.RuntimeMetadata.Resolve<VmType>(metadataAddress));
         shared.TypeFacades[type] = facade;
         shared.DefaultEqualityComparers[type] = facade;
         shared.TypeInitialization.Ensure(type, static () => { });
@@ -201,6 +205,7 @@ public sealed class AssemblyLoadContextHardeningTests {
         Assert.True(loadContext.IsUnloaded);
         Assert.Equal(1, unloadActionCount);
         Assert.DoesNotContain(type, shared.TypeFacades.Keys);
+        Assert.Throws<UnhandledGuestException>(() => shared.RuntimeMetadata.Resolve<VmType>(metadataAddress));
         Assert.DoesNotContain(arrayType, shared.TypeFacades.Keys);
         Assert.Same(retainedFacade, shared.TypeFacades[retainedType]);
         Assert.DoesNotContain(type, shared.DefaultEqualityComparers.Keys);

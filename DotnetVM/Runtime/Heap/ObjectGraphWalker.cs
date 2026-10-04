@@ -14,7 +14,11 @@ public static class ObjectGraphWalker {
     /// <summary>ヒープオブジェクトから直接到達する参照を列挙する。</summary>
     public static void CollectReferences(VmObject obj, Action<VmObject> visit) {
         foreach (var reference in obj.BclReferences) visit(reference);
+        if (obj.ManagedInstance is { } managed) visit(managed);
         switch (obj) {
+            case VmTypeHandle { ManagedFields: { } fields }:
+                CollectFromSlots(fields, visit);
+                break;
             case VmClassInstance instance:
                 CollectFromSlots(instance.Fields, visit);
                 break;
@@ -66,6 +70,9 @@ public static class ObjectGraphWalker {
                 // ポインタ → localloc ブロック (バイト列の保持者 + 会計対象) を展開。
                 // 参照中ブロックが回収されメモリ会計から消えることを防ぐ
                 visit(pointer.Memory);
+                break;
+            case VmLocallocMemory memory:
+                foreach (var reference in memory.References.Values) CollectFromSlot(reference, visit);
                 break;
             // VmExceptionObject: Message は VmString (ヒープ管理外)。将来の InnerException 追加時にここへ
             // VmMethodPointer / VmIntrinsicCarrier: 参照フィールドは VM 型系 / ホストメモリ (走査不要)

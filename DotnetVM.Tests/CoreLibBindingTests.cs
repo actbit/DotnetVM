@@ -72,6 +72,7 @@ public class CoreLibBindingTests {
                 private static extern int NativeAdd(int x, int y);
 
                 public static int CallNative() => NativeAdd(1, 2);
+                public static string? ReadVirtualEnvironment() => Environment.GetEnvironmentVariable("VM_ENV_PROBE");
             }
         }
         """;
@@ -128,21 +129,107 @@ public class CoreLibBindingTests {
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "Write"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "WriteLine"));
         Assert.Contains(deviceBindings, b => b.Key == BindingKey.StaticAnyParams("System.Console", "ReadLine"));
-        // P/Invoke 代替バインドは監査表に載った例外面のみ (未登録 P/Invoke は fail-closed のまま、
-        // PInvoke_Is_Rejected_As_OperationNotAllowed が検査)。既定登録の PInvokeReplacement は
-        // Kernel32::GetEnvironmentVariable (CoreLib culture 不変経路の面再現) と
-        // Interop+BCrypt::BCryptGenRandom / Interop+Sys::GetNonCryptographicallySecureRandomBytes
-        // (ホスト暗号乱数 API に限定した代替) の 3 面に限る (いずれも
-        // CoreLibSurfaceAudit に pinvoke-replacement として監査済み)
+        // Pin the registered native boundaries. The separate metadata test
+        // verifies that each import present in the host CoreLib is a DllImport.
         var pinvokeFaces = vm.Bindings
             .Where(b => b.Origin == BindingOrigin.PInvokeReplacement)
             .Select(b => $"{b.Key.TypeFullName}::{b.Key.MethodName}")
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToList();
-        Assert.Equal(new[] {
-            "Interop+BCrypt::BCryptGenRandom",
-            "Interop+Kernel32::GetEnvironmentVariable",
-            "Interop+Sys::GetNonCryptographicallySecureRandomBytes",
-        }, pinvokeFaces);
+        var expected = new List<string>();
+        expected.AddRange([
+            "System.ModuleHandle::GetModuleType",
+            "System.RuntimeTypeHandle::ConstructName",
+            "System.RuntimeTypeHandle::GetRuntimeTypeFromHandleSlow",
+            "System.RuntimeTypeHandle::GetGCHandle",
+            "System.RuntimeTypeHandle::FreeGCHandle",
+            "System.Runtime.CompilerServices.TypeHandle::GetCorElementType",
+            "System.Runtime.CompilerServices.TypeHandle::CanCastTo_NoCacheLookup",
+            "System.Reflection.RuntimeModule::GetScopeName",
+            "System.RuntimeTypeHandle::GetActivationInfo",
+            "System.RuntimeType+BoxCache::GetBoxInfo",
+            "System.RuntimeTypeHandle::GetInstantiation",
+            "System.RuntimeTypeHandle::GetMethodAt",
+            "System.RuntimeMethodHandle::GetIsCollectible",
+            "System.Signature::Init",
+            "System.RuntimeMethodHandle::InvokeMethod",
+            "System.RuntimeMethodHandle::IsCAVisibleFromDecoratedType",
+            "System.Runtime.CompilerServices.CastHelpers::<IsInstanceOf_NoCacheLookup>g____PInvoke|4_0",
+            "System.Reflection.MetadataImport::<Enum>g____PInvoke|8_0",
+            "System.ModuleHandle::ResolveMethod",
+            "System.ModuleHandle::ResolveType",
+            "System.Reflection.CustomAttribute::<CreateCustomAttributeInstance>g____PInvoke|30_0",
+            "System.Reflection.CustomAttribute::<CreatePropertyOrFieldData>g____PInvoke|32_0",
+            "System.Reflection.CustomAttribute::ParseAttributeUsageAttribute",
+            "System.Reflection.Metadata.MetadataUpdater::<IsApplyUpdateSupported>g____PInvoke|1_0",
+            "System.Array::<InternalCreate>g____PInvoke|0_0",
+        ]);
+        if (OperatingSystem.IsWindows()) {
+            expected.Add("Interop+BCrypt::BCryptGenRandom");
+            expected.Add("Interop+Kernel32::<GetEnvironmentVariable>g____PInvoke|296_0");
+            expected.Add("System.Runtime.InteropServices.Marshal::<IsBuiltInComSupportedInternal>g____PInvoke|30_0");
+            expected.Add("Interop+Kernel32::GetCPInfo");
+            expected.Add("Interop+Kernel32::GetLastError");
+            expected.Add("Interop+Kernel32::SetLastError");
+        } else {
+            expected.Add("Interop+Sys::GetNonCryptographicallySecureRandomBytes");
+        }
+        Assert.Equal(expected.OrderBy(name => name, StringComparer.Ordinal), pinvokeFaces);
+    }
+
+    [Fact]
+    public void PInvokeBindingsTargetRealDllImportsOnHost() {
+        using var vm = CreateVm(loadCoreLib: true);
+        foreach (var binding in vm.Bindings.Where(binding => binding.Origin == BindingOrigin.PInvokeReplacement)) {
+            var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName);
+            Assert.NotNull(type);
+            var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
+                method => method.Name == binding.Key.MethodName && string.Join(",", method.GetParameters()
+                    .Select(parameter => NativeTypeName(parameter.ParameterType))) == binding.Key.ParamSignature);
+            Assert.Null(method.GetMethodBody());
+            Assert.NotNull(System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Runtime.InteropServices.DllImportAttribute>(method));
+        }
+    }
+
+    private static string NativeTypeName(Type type) => type.IsFunctionPointer
+        ? NativeTypeName(type.GetFunctionPointerReturnType()) + "(" + string.Join(",", type.GetFunctionPointerParameterTypes().Select(NativeTypeName)) + ")"
+        : type.IsPointer ? NativeTypeName(type.GetElementType()!) + "*"
+        : type.IsByRef ? NativeTypeName(type.GetElementType()!) + "&"
+        : type.FullName!;
+
+    [Fact]
+    public void NativeReflectionBindingsTargetBodylessInternalCalls() {
+        using var vm = CreateVm(loadCoreLib: true);
+        var nativeTypes = new[] { "System.RuntimeTypeHandle", "System.Reflection.MetadataImport" };
+        var nativeMethods = new[] { "GetAttributes", "GetToken", "IsGenericVariable", "GetNumVirtuals", "GetModuleIfExists", "GetMetadataImport" };
+        var bindings = vm.Bindings.Where(binding => binding.Origin == BindingOrigin.InternalCall &&
+            nativeTypes.Contains(binding.Key.TypeFullName) && nativeMethods.Contains(binding.Key.MethodName)).ToArray();
+        Assert.NotEmpty(bindings);
+        foreach (var binding in bindings) {
+            var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName)!;
+            var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
+                method => method.Name == binding.Key.MethodName && string.Join(",", method.GetParameters()
+                    .Select(parameter => parameter.ParameterType.FullName)) == binding.Key.ParamSignature);
+            Assert.Null(method.GetMethodBody());
+            Assert.True((method.MethodImplementationFlags & System.Reflection.MethodImplAttributes.InternalCall) != 0);
+            Assert.Equal(BindingDomain.TrustedCoreLib, binding.Key.Domain);
+        }
+    }
+
+    [Fact]
+    public void WindowsEnvironmentMarshallingExecutesOriginalIl() {
+        if (!OperatingSystem.IsWindows()) return;
+        using var vm = CreateVm(loadCoreLib: true);
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", "value-日本語");
+        vm.Tracer.Start();
+        Assert.Equal("value-日本語", vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        var longValue = new string('日', 180);
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", longValue);
+        Assert.Equal(longValue, vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        vm.SetVirtualEnvironmentVariable("VM_ENV_PROBE", null);
+        Assert.Null(vm.Invoke("Vm.C4.Entry", "ReadVirtualEnvironment"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "Interop+Kernel32", "GetEnvironmentVariable"));
+        Assert.True(vm.Tracer.ContainsFrame("System.Private.CoreLib", "System.Runtime.InteropServices.Marshal", "GetLastSystemError"));
+        Assert.DoesNotContain(vm.Bindings, binding => binding.Key.TypeFullName == "Interop+Kernel32" && binding.Key.MethodName == "GetEnvironmentVariable");
     }
 }

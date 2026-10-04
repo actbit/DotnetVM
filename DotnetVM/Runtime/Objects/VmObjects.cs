@@ -7,6 +7,7 @@ namespace DotnetVM.Runtime.Objects;
 
 /// <summary>VM ヒープ上のオブジェクトの基底。世代別 GC 拡張用の Generation を初段から保持する。</summary>
 public abstract class VmObject {
+    internal VmClassInstance? ManagedInstance { get; set; }
     internal VmObject[] BclReferences { get; set; } = [];
     /// <summary>GC 世代 (0 = 新世代)。世代別戦略 (M6 以降) で利用。</summary>
     public byte Generation { get; internal set; }
@@ -396,6 +397,10 @@ public sealed class VmTypeHandle : VmObject {
 
     public required VmType Target { get; init; }
 
+    // The CLI handle is a value containing the RuntimeType reference. Keep
+    // that storage available to ordinary ldfld/ldflda instructions in CoreLib.
+    internal StackSlot[]? ManagedFields;
+
     public override VmType Type => HandleType;
 }
 
@@ -423,7 +428,7 @@ public sealed class VmRuntimeObject : VmObject {
 
     public required VmType Target { get; init; }
 
-    public override VmType Type => RuntimeTypeFacade;
+    public override VmType Type => ManagedInstance?.Type ?? RuntimeTypeFacade;
 }
 
 /// <summary>MethodBase.GetCurrentMethod() 等の結果 (System.Reflection.MethodBase ファサードの実体)。</summary>
@@ -435,7 +440,7 @@ public sealed class VmRuntimeMethod : VmObject {
     public VmType? ReflectedType { get; init; }
     public VmType[] MethodArguments { get; init; } = [];
 
-    public override VmType Type => MethodBaseFacade;
+    public override VmType Type => ManagedInstance?.Type ?? MethodBaseFacade;
 }
 
 /// <summary>式木や Reflection.Emit から参照される VM の FieldInfo 相当。</summary>
@@ -445,7 +450,7 @@ public sealed class VmRuntimeField : VmObject {
 
     public required VmField Target { get; init; }
 
-    public override VmType Type => FieldInfoFacade;
+    public override VmType Type => ManagedInstance?.Type ?? FieldInfoFacade;
 }
 
 public sealed class VmRuntimeProperty : VmObject {
@@ -453,7 +458,9 @@ public sealed class VmRuntimeProperty : VmObject {
         new() { Namespace = "System.Reflection", Name = "RuntimePropertyInfo", IsValue = false };
     public required string Name { get; init; }
     public required VmMethod Getter { get; init; }
-    public override VmType Type => PropertyInfoFacade;
+    public VmMethod? Setter { get; init; }
+    public VmType? ReflectedType { get; init; }
+    public override VmType Type => ManagedInstance?.Type ?? PropertyInfoFacade;
 }
 
 /// <summary>ゲストの System.Reflection.Assembly を表す VM 側ハンドル。
@@ -467,7 +474,7 @@ public sealed class VmAssemblyObject : VmObject {
     public override VmType Type {
         get {
             Loader.EnsureLive();
-            return (VmType?)Loader.FindTypeByFullName("System.Reflection.Assembly") ?? AssemblyFacade;
+            return ManagedInstance?.Type ?? (VmType?)Loader.FindTypeByFullName("System.Reflection.Assembly") ?? AssemblyFacade;
         }
     }
 }
@@ -682,6 +689,12 @@ public sealed class VmMethodPointer : VmObject {
     public override VmType Type => PointerType;
 }
 
+internal sealed class VmRuntimeCallback : VmObject {
+    internal required VmType OwnerType { get; init; }
+    internal required Func<StackSlot[], StackSlot?> Invoke { get; init; }
+    public override VmType Type => VmMethodPointer.PointerType;
+}
+
 /// <summary>
 /// ゲスト デリゲートインスタンス (System.Delegate / MulticastDelegate ファサード型の実体)。
 /// マルチキャストは呼出エントリのリストで表現する (CLR と同じく Combine/Remove は新しい
@@ -748,6 +761,11 @@ public sealed class VmLocallocMemory : VmObject {
         new() { Namespace = "DotnetVM", Name = "LocallocMemory", IsValue = false };
 
     public required byte[] Bytes { get; init; }
+    internal Dictionary<int, StackSlot> References { get; } = [];
+    internal void ClearReferences(int offset, int size) {
+        if (References.Count == 0 || size == 0) return;
+        foreach (var address in References.Keys.Where(address => (long)address < (long)offset + size && (long)address + VmPrimitiveTypes.NativeIntSizeBytes > offset).ToArray()) References.Remove(address);
+    }
 
     public override VmType Type => MemoryType;
 }
@@ -843,36 +861,42 @@ public sealed class VmNativePointer : VmObject {
     public void WriteInt8(int value) {
         EnsureWritable();
         CheckBounds(1);
+        Memory.ClearReferences(ByteOffset, 1);
         Bytes[ByteOffset] = (byte)value;
     }
 
     public void WriteInt16(int value) {
         EnsureWritable();
         CheckBounds(2);
+        Memory.ClearReferences(ByteOffset, 2);
         System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(Bytes.AsSpan(ByteOffset, 2), (short)value);
     }
 
     public void WriteInt32(int value) {
         EnsureWritable();
         CheckBounds(4);
+        Memory.ClearReferences(ByteOffset, 4);
         System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
 
     public void WriteInt64(long value) {
         EnsureWritable();
         CheckBounds(8);
+        Memory.ClearReferences(ByteOffset, 8);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteDouble(double value) {
         EnsureWritable();
         CheckBounds(8);
+        Memory.ClearReferences(ByteOffset, 8);
         System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Bytes.AsSpan(ByteOffset, 8), value);
     }
 
     public void WriteSingle(float value) {
         EnsureWritable();
         CheckBounds(4);
+        Memory.ClearReferences(ByteOffset, 4);
         System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(Bytes.AsSpan(ByteOffset, 4), value);
     }
 }
@@ -887,6 +911,10 @@ public sealed class VmNativePointer : VmObject {
 /// Interpreter が 1 つ所有する。
 /// </remarks>
 public sealed class ObjectModel {
+    private readonly Action<long>? _chargeInlineStorage;
+
+    public ObjectModel() { }
+    internal ObjectModel(Action<long> chargeInlineStorage) => _chargeInlineStorage = chargeInlineStorage;
     private readonly ConditionalWeakTable<VmType, Dictionary<VmField, int>> Layouts = new();
     private readonly ConditionalWeakTable<VmClassType, InstanceDefaults> _instanceDefaults = new();
     private readonly object _gate = new();
@@ -1074,6 +1102,13 @@ public sealed class ObjectModel {
     /// (構造体自身の実引数は typeArguments として VmStructValue に記録する)。</summary>
     public VmStructValue DefaultStruct(VmClassType structType, TypeLoader loader,
         GenericContext? context, VmType[]? typeArguments) {
+        if (MemoryOps.FixedBufferStorage(structType) is { } fixedStorage) {
+            _chargeInlineStorage?.Invoke(EstimateFieldStorageSize(fixedStorage.Length));
+            var inlineFields = new StackSlot[fixedStorage.Length];
+            for (var i = 0; i < inlineFields.Length; i++)
+                inlineFields[i] = DefaultForType(GenericSubstitutor.Substitute(fixedStorage.ElementType, context), loader);
+            return new VmStructValue(structType, inlineFields, typeArguments);
+        }
         var layout = GetLayout(structType);
         var fields = new StackSlot[layout.Count == 0 ? 0 : layout.Values.Max() + 1];
         foreach (var (field, index) in layout)

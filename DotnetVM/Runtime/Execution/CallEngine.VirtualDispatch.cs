@@ -57,6 +57,7 @@ internal sealed partial class CallEngine {
             StackKind.Object => value.ObjectValue switch {
                 VmClassInstance ci => (VmType)ci.ClassType,
                 VmBoxedValue bv => bv.Type,
+                VmObject { ManagedInstance: { } managed } => managed.RuntimeType,
                 // VmString の仮想ディスパッチ (名前+引数個数) はオーバーロード誤解決の恐れが
                 // あるため実型を与えない (バインド / 置換面 / legacy の従来経路を優先)。
                 // インターフェースキー照合 (署名完全一致) は TryDispatchInterfaceKey で別途解決する
@@ -228,6 +229,14 @@ internal sealed partial class CallEngine {
         var isCountable = declaringTypeName is "System.Collections.ICollection"
             or "System.Collections.Generic.ICollection`1"
             or "System.Collections.Generic.IReadOnlyCollection`1";
+        if (declaringTypeName is "System.Collections.Generic.IList`1" or "System.Collections.Generic.IReadOnlyList`1" && name == "get_Item" && paramCount == 1) {
+            var method = FindSZArrayHelper()?.Methods.Single(m => m.Name == "get_Item" && m.Signature.GenericParamCount == 1);
+            if (method is not null) return invoker.Invoke(method, args, GenericContext.Of(null, [array.ArrayType.ElementType]));
+        }
+        if (declaringTypeName == "System.Collections.Generic.ICollection`1" && name == "CopyTo" && paramCount == 2) {
+            var method = FindSZArrayHelper()?.Methods.Single(m => m.Name == "CopyTo" && m.Signature.GenericParamCount == 1);
+            if (method is not null) return invoker.Invoke(method, args, GenericContext.Of(null, [array.ArrayType.ElementType]));
+        }
         if (name == "GetEnumerator" && paramCount == 0 && isEnumerable) {
             var helper = FindSZArrayHelper();
             if (helper is null)

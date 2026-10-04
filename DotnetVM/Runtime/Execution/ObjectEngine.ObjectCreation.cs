@@ -56,12 +56,20 @@ internal sealed partial class ObjectEngine {
     /// (FastAllocateString 相当の VmStringPool.Allocate) で確保し、char 列をバッファへ
     /// 書き込む。引数検査は CLR と同じ例外分類 (null 配列は ArgumentNullException、
     /// 範囲外は ArgumentOutOfRangeException)。</summary>
-    private StackSlot NewStringFromCtor(int paramCount, InterpreterFrame caller) {
+    private StackSlot NewStringFromCtor(SigType[] parameterTypes, InterpreterFrame caller) {
+        var paramCount = parameterTypes.Length;
         var args = new StackSlot[paramCount];
         for (var i = paramCount; i >= 1; i--)
             args[i - 1] = caller.Stack.Pop();
         gate.ConsumeInstruction();
         gate.CheckSafepoint();
+        // CoreCLR's InternalCall constructor enters the matching managed Ctor helper.
+        if (parameterTypes is [{ Kind: SigKind.Pointer, Inner.Kind: SigKind.Char }, ..] &&
+            _loader.TryResolveTrustedUnifiedType("System.String") is VmClassType stringType) {
+            var helper = stringType.Methods.Single(method => method.Name == "Ctor" && method.IsStatic &&
+                method.Signature.ParamTypes.SequenceEqual(parameterTypes));
+            return invoker.Invoke(helper, args, null);
+        }
         var strings = _intrinsicContext.Strings;
         switch (paramCount) {
             case 1: {
@@ -253,6 +261,8 @@ internal sealed partial class ObjectEngine {
             }
             if (ctor.DeclaringType.FullName == "System.Reflection.Emit.DynamicMethod" && ctor.Name == ".ctor")
                 return NewDynamicMethodInstance(ctor.Signature.ParamTypes.Length, caller);
+            if (ctor.DeclaringType is VmClassType { FullName: "System.String", Loader.IsTrustedCoreLib: true } && ctor.Name == ".ctor")
+                return NewStringFromCtor(ctor.Signature.ParamTypes, caller);
         } else if (table == TableKind.MemberRef) {
             var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0, CodedIndexKind.MemberRefParent);
             if (parent.Table == TableKind.TypeSpec)
@@ -276,7 +286,7 @@ internal sealed partial class ObjectEngine {
                 // 置換面 (DotnetVM.CoreLib の NumberFormatting IL) が使うほか、ゲストの
                 // 直接の new string(...) もここに着地する
                 if (typeName == "System.String" && name == ".ctor")
-                    return NewStringFromCtor(facadeParamCount, caller);
+                    return NewStringFromCtor(signature.ParamTypes, caller);
                 // Guid の構築面 (new Guid(string) / (byte[]) 等):
                 // 本家 .ctor 実 IL は span 16 進解析の生ポインタ演算 (単一スロットへの
                 // バイト単位 Add 等、VM のスロット表現に落ちない) で構成されるため、

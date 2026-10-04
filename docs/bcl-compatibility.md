@@ -1,7 +1,26 @@
 # BCL 互換性と HTTP 制限
 
-`origin/master` の `e42b3e1` を基点に、カルチャ・UTF-8・Span と追加 BCL の互換性を拡張しています。
+`origin/master` の `10001c1` (PR #32) を基点に、カルチャ・UTF-8・Span と追加 BCL の互換性を拡張しています。
 以下は今回登録した API の範囲です。BCL 全体の互換性を保証するものではありません。
+
+PR #34 は元の managed IL を実行する方針への修正中です。TextEncoder の専用バインドを削除し、
+`System.Text.Encodings.Web` の実 DLL を実行します。C# fixed バッファの値コピー・ポインタ演算・
+生メモリ変換は共通の VM ストレージで処理し、確保量も計上します。
+`Type.GetTypeFromHandle` は `RuntimeTypeHandle.m_type` を読む元の IL を実行します。
+`RuntimeType` の型名、属性、トークン、モジュール取得、基底型、型変換の IL も実行します。
+本体を持たない実在の `RuntimeTypeHandle.GetAttributes / GetToken / IsGenericVariable /
+GetNumVirtuals / GetModuleIfExists` と `MetadataImport.GetMetadataImport` を VM メタデータへ接続し、
+型名構築・型変換・モジュール・型キャッシュの実 DllImport 末端を登録します。
+ランタイムのハンドルと MethodTable は VM 内の識別子・検査付きストレージで表現し、
+ホストのポインタを読み書きしません。GC とコンテキストの unload / dispose にも接続します。
+型変換キャッシュは読み取り専用の空テーブルから native leaf の判定へ進み、現時点では
+CLR のキャッシュ更新・Nullable の MethodTable 表現・型記述子の全形式までは実装していません。
+属性データやメソッド呼び出しの元 IL への移行も未完了です。既存の managed バインドは
+宣言元にある面を引き続き受け、今回その専用実装は追加していません。
+Windows の環境変数取得と Marshal の system-error wrapper も元の IL を実行し、実在する DllImport
+の末端を VM の仮想環境・last-error 状態へ接続します。
+Reflection、CultureInfo、Encoding、Regex、HTTP、Compression、Crypto には managed API の
+専用バインドが残っています。以下の出力互換性テストの成功を、置き換えなしの対応完了とは扱いません。
 
 ## 対応範囲
 
@@ -17,13 +36,15 @@
 | Compression | GZip / Deflate / Brotli / ZLib とゲスト MemoryStream、CompressionMode / CompressionLevel、leaveOpen、Read / Write / CopyTo / Flush / Dispose |
 | Crypto | SHA256 / 384 / 512.HashData と TryHashData、HMACSHA256.HashData、FixedTimeEquals、ZeroMemory、RandomNumberGenerator.GetBytes / Fill、AES の Key / IV、CBC / ECB / CFB の配列・Span・Try API、CryptoStream、AesGcm の配列・Span API |
 | HttpClient | HttpClient / HttpMessageInvoker、BaseAddress、要求・応答・各種コンテンツ、標準メソッド、同期・非同期 Send、ResponseHeadersRead の遅延ストリーム、独自 DelegatingHandler / HttpMessageHandler / HttpContent、HttpRequestOptions、CancellationToken、タイムアウト、複数値ヘッダーと trailing headers。全通信は origin / method / header / body / response / timeout の gateway 制限下 |
-| System.Text.Json | 実在 DLL の managed IL を実行。JsonDocument / JsonElement / Utf8JsonWriter に加え JsonSerializer の通常型、属性、命名ポリシー、辞書・リスト、nullable、引数付きコンストラクター、UTF-8 API、独自 JsonConverter を CLR と比較 |
+| System.Reflection | VM 型・メソッド・フィールド・プロパティを反映する Type / MethodInfo / ConstructorInfo / PropertyInfo / FieldInfo、属性、パラメータ既定値、Invoke、PropertyInfo.GetValue / SetValue、FieldInfo.GetValue / SetValue、Activator、ジェネリック型・メソッド |
+| System.Text.Json | 実在 DLL の managed IL を実行。JsonDocument / JsonElement / Utf8JsonWriter に加え、既定の reflection resolver (`DefaultJsonTypeInfoResolver`) を使う JsonSerializer の通常型、属性、命名ポリシー、辞書・リスト、nullable、引数付きコンストラクター、UTF-8 API、独自 JsonConverter を CLR と比較 |
 
 ホスト BCL の状態は VM オブジェクトをキーにした内部の weak table に保持します。
 ゲストオブジェクトをホストの任意の IFormatProvider やネイティブポインタとして渡しません。
 `LoadHostCoreLib=true` では、ホストが選んだ Regex / HttpClient / Compression / Crypto / TextEncoder の
 実在アセンブリをロードして、登録した境界を利用します。ゲストが同名 DLL を持ち込んでも
 trusted BCL の印は付きません。CoreLib 専用 caller domain の権限はそのままです。
+TextEncoder については専用境界を登録せず、実 DLL の IL を実行します。
 
 ゲストの現在のカルチャは VM ごとの AsyncLocal に保持し、Task へ引き継ぎます。
 外側のゲスト呼び出しが終わるとホストの CurrentCulture / CurrentUICulture を復元します。
@@ -95,7 +116,7 @@ Crypto の乱数は `VmHostOptions.RandomFill` を通します。HTTP worker は
 ハードウェア ISA の IsSupported / IsHardwareAccelerated は false を維持します。
 参照を含む構造体の raw memory 解釈、任意のホストアドレス、独自 ICustomFormatter のゲストコールバック、
 Encoding の pointer overload / 独自 fallback、Regex の evaluator / Matches collection、RSA、HTTP の proxy / cookie / redirect / auto-decompression は追加していません。
-JSON は一般的な JsonSerializer の型・属性・コンバーター面を対象にしていますが、source generator、unsafe pointer overload、複雑な polymorphic resolver など未登録の framework surface は拒否します。
+JSON は一般的な JsonSerializer の reflection 型・属性・コンバーター面を対象にしていますが、source generator、unsafe pointer overload、複雑な polymorphic resolver など未登録の framework surface は拒否します。
 
 ## テストと性能
 

@@ -21,7 +21,7 @@ internal static partial class CoreLibBindings {
 
     /// <summary>VM ごとの仮想環境変数ストアは VmSharedState.VirtualEnvironment を使う
     /// (static 共有にしない。VM ごとに分離する)。
-    /// Kernel32.GetEnvironmentVariable 面は host の Environment.GetEnvironmentVariable を
+    /// Kernel32.GetEnvironmentVariableW の実 DllImport は host の Environment.GetEnvironmentVariable を
     /// 直接呼ばず、この VM ごとの仮想環境のみを参照する (host 環境の読み替えを遮断し、
     /// trusted CoreLib domain 呼出でのみ到達する特権面に)。
     /// 既定は空 (GlobalizationMode::get_Invariant を true 固定にする呼出経路が
@@ -29,15 +29,16 @@ internal static partial class CoreLibBindings {
 
     /// <summary>本家 CultureInfo::.cctor → CultureData.get_Invariant → GlobalizationMode の
     /// IL は AppContextConfigHelper → Environment.GetEnvironmentVariableCore を辿り、その
-    /// Kernel32.GetEnvironmentVariable(name, buffer, size) が P/Invoke 面。
+    /// Kernel32.GetEnvironmentVariable の managed wrapper を実行し、生成された
+    /// GetEnvironmentVariableW DllImport の末端だけをバインドする。
     /// タスク 2 hardening: この面は trusted CoreLib (TrustedCoreLib domain) からの呼出のみ
     /// 到達する特権面 (BindingDomain.TrustedCoreLib) とし、VM ごとの仮想環境変数ストアを
     /// 読む (host Environment.GetEnvironmentVariable への直接委譲を廃止)。
     /// バッファへは Win32 規約 (戻り = 終端 null 除くコピー文字数 / 不足時は終端含む
     /// 必要文字数を返すのみ、未定義なら 0 + lastError = 203) で書き込む。
-    /// Marshal の 4 面は IL 実体が下請け P/Invoke shim 呼びのみのため
-    /// internal-call リーフで VM lastError に代替する (trusted CoreLib 限定。
-    /// 状態は ctx.Shared の VM インスタンス状態)。</summary>
+    /// Windows の Marshal.GetLastSystemError / SetLastSystemError も元の IL を実行する。
+    /// バインドは Kernel32.GetLastError / SetLastError の実 DllImport と、本体のない
+    /// PInvokeError InternalCall に限定する。状態は ctx.Shared の VM インスタンス状態。</summary>
     private static void RegisterEnvironmentAndMarshal(IntrinsicRegistry r) {
         r.RegisterBinding(BindingKey.TrustedStatic("System.Environment", "GetProcessorCount"), static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static("System.Environment", "get_CurrentManagedThreadId"),
@@ -48,17 +49,27 @@ internal static partial class CoreLibBindings {
         r.RegisterBinding(BindingKey.TrustedStatic("System.Diagnostics.Debugger", "IsManagedDebuggerAttached"),
             static (_, _) => StackSlot.OfInt32(0), BindingOrigin.InternalCall);
         const string MarshalType = "System.Runtime.InteropServices.Marshal";
-        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastSystemError", "System.Int32"),
+        if (OperatingSystem.IsWindows()) {
+            // These are actual native imports reached by Marshal's original
+            // static initializer. The VM has no COM or process ANSI code page.
+            r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "<IsBuiltInComSupportedInternal>g____PInvoke|30_0"),
+                static (_, _) => StackSlot.OfInt32(0), BindingOrigin.PInvokeReplacement);
+            r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "GetCPInfo", "System.UInt32", "Interop+Kernel32+CPINFO*"),
+                static (_, _) => StackSlot.OfInt32(0), BindingOrigin.PInvokeReplacement);
+        }
+        var systemErrorType = OperatingSystem.IsWindows() ? "Interop+Kernel32" : MarshalType;
+        var systemErrorOrigin = OperatingSystem.IsWindows() ? BindingOrigin.PInvokeReplacement : BindingOrigin.InternalCall;
+        r.RegisterBinding(BindingKey.TrustedStatic(systemErrorType, OperatingSystem.IsWindows() ? "SetLastError" : "SetLastSystemError", "System.Int32"),
             static (ctx, a) => {
                 ctx.Shared.LastSystemError = a[0].AsInt32;
                 return null;
             },
-            BindingOrigin.InternalCall);
-        r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "GetLastSystemError"),
+            systemErrorOrigin);
+        r.RegisterBinding(BindingKey.TrustedStatic(systemErrorType, OperatingSystem.IsWindows() ? "GetLastError" : "GetLastSystemError"),
             static (ctx, _) => StackSlot.OfInt32(ctx.Shared.LastSystemError),
-            BindingOrigin.InternalCall);
-        // SystemError/PInvokeError は実 CLR でも同一 TLS スロットの alias 面
-        // (SetLastSystemError/GetLastSystemError の IL 実体が呼ぶ下請け)
+            systemErrorOrigin);
+        // PInvokeError is a bodyless runtime InternalCall. Keep the existing
+        // VM error slot; no managed Marshal wrapper is substituted on Windows.
         r.RegisterBinding(BindingKey.TrustedStatic(MarshalType, "SetLastPInvokeError", "System.Int32"),
             static (ctx, a) => {
                 ctx.Shared.LastSystemError = a[0].AsInt32;
@@ -72,14 +83,14 @@ internal static partial class CoreLibBindings {
         // 起動面としてのみ有効な特権面。BindingDomain.TrustedCoreLib で鍵化し、
         // 呼出元 loader 基準 (CallEngine.CallerDomainOf) で trusted CoreLib IL からの
         // 呼出のみ照合する
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "GetEnvironmentVariable",
-                "System.String", "System.Char&", "System.UInt32"),
+        if (OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0",
+                "System.UInt16*", "System.Char*", "System.UInt32"),
             static (ctx, a) => GetEnvironmentVariableImpl(ctx, a),
             BindingOrigin.PInvokeReplacement);
         // Interop+BCrypt.BCryptGenRandom (Random / Marvin ハッシュ種等の乱数源 P/Invoke)。
         // 任意の native import は実行せず、ホスト暗号乱数 API に限定して委譲する。
         // P/Invoke 呼出元は TrustedCoreLib domain に限定し、ゲストからの直接呼出は拒否する。
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
+        if (OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
                 "System.IntPtr", "System.Byte*", "System.Int32", "System.Int32"),
             static (ctx, a) => {
                 var count = a[2].AsInt32;
@@ -89,7 +100,7 @@ internal static partial class CoreLibBindings {
         // Unix CoreLib は同じ乱数源を Interop+Sys.GetNonCryptographicallySecureRandomBytes
         // (SystemNative) 経由で呼ぶ。ネイティブ import は実行せず、Windows 側の
         // BCrypt 代替と同じく VM のホスト RNG に委譲する。
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys", "GetNonCryptographicallySecureRandomBytes",
+        if (!OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys", "GetNonCryptographicallySecureRandomBytes",
                 "System.Byte*", "System.Int32"),
             static (ctx, a) => {
                 var count = a[1].AsInt32;
@@ -126,16 +137,6 @@ internal static partial class CoreLibBindings {
         // culture 機構スコープ外のため代替実装を持たない (fail-closed を維持)
         r.RegisterBinding(BindingKey.TrustedStatic("System.Globalization.GlobalizationMode+Settings", "get_Invariant"),
             static (_, _) => StackSlot.OfInt32(1), BindingOrigin.InternalCall);
-        // Type::GetTypeFromHandle: 本家 IL 本体は RuntimeType.GetTypeFromHandle (runtime
-        // intrinsic = IL なし) の呼び出しを含むため ② IL 実行に落とせない (ldfld
-        // RuntimeTypeHandle::m_type が VM 表現境界外)。実 CLR もこの面は IL を実行しない
-        // (監査表 (c) runtime-representation)。VmTypeHandle → VmRuntimeObject ファサード変換
-        // として同等面を提供する
-        r.RegisterBinding(BindingKey.Static("System.Type", "GetTypeFromHandle", "System.RuntimeTypeHandle"),
-            static (ctx, a) => a[0].ObjectValue is VmTypeHandle handle
-                ? DefaultIntrinsics.MakeRuntimeObject(ctx, handle.Target)
-                : throw new InvalidOperationException("GetTypeFromHandle の引数が RuntimeTypeHandle ではありません。"),
-            BindingOrigin.InternalCall);
     }
 
     private static StackSlot FillRandomBytes(IntrinsicContext ctx, StackSlot buffer, int count,
@@ -185,9 +186,29 @@ internal static partial class CoreLibBindings {
 
 
     private static StackSlot GetEnvironmentVariableImpl(IntrinsicContext ctx, StackSlot[] a) {
-        var name = (a[0].ObjectValue as VmString)?.Value;
+        var (namePointer, nameReference) = ResolvePointerBase(a[0], "GetEnvironmentVariableW name");
+        namePointer?.EnsureBounds(0);
+        var available = namePointer is not null ? (namePointer.Bytes.Length - namePointer.ByteOffset) / 2
+            : nameReference is not null ? nameReference.Container.Length - nameReference.Index : 0;
+        var length = 0;
+        while (length < available) {
+            ctx.Heap.ChargeHostWork(1);
+            var character = namePointer is not null
+                ? BinaryPrimitives.ReadUInt16LittleEndian(namePointer.Bytes.AsSpan(checked(namePointer.ByteOffset + length * 2), 2))
+                : nameReference!.Container[nameReference.Index + length].AsInt32;
+            if (character == 0) break;
+            length++;
+        }
+        if (length == available)
+            throw new UnhandledGuestException("System.ArgumentException", "Environment variable name is not terminated.");
+        ctx.Heap.ChargeHostBuffer(checked(length * 2));
+        var name = string.Create(length, (namePointer, nameReference), static (chars, state) => {
+            for (var i = 0; i < chars.Length; i++) chars[i] = state.namePointer is not null
+                ? (char)BinaryPrimitives.ReadUInt16LittleEndian(state.namePointer.Bytes.AsSpan(state.namePointer.ByteOffset + i * 2, 2))
+                : (char)state.nameReference!.Container[state.nameReference.Index + i].AsInt32;
+        });
         var (native, slotRef) = ResolvePointerBase(a[1], "Interop+Kernel32.GetEnvironmentVariable");
-        if (name is null || (native is null && slotRef is null))
+        if (native is null && slotRef is null)
             throw new UnhandledGuestException("System.NullReferenceException", null);
         // host Environment への直接委譲を廃止: VM ごとの仮想環境変数ストア (ctx.Shared) を読む
         var value = ctx.Shared.VirtualEnvironment.TryGetValue(name, out var found) ? found : null;
@@ -200,6 +221,7 @@ internal static partial class CoreLibBindings {
         if (value.Length + 1 > a[2].AsInt32)
             return StackSlot.OfInt32(value.Length + 1);
         if (native is not null) {
+            native.EnsureWritable();
             var offset = native.ByteOffset;
             if (offset < 0 || (long)offset + value.Length * 2 + 2 > native.Bytes.Length)
                 throw new InvalidOperationException(
@@ -209,6 +231,9 @@ internal static partial class CoreLibBindings {
                 System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(offset + i * 2, 2), (short)value[i]);
             System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(offset + value.Length * 2, 2), (short)'\0');
         } else {
+            slotRef!.EnsureWritable();
+            if (slotRef.Index < 0 || (long)slotRef.Index + value.Length + 1 > slotRef.Container.Length)
+                throw new UnhandledGuestException("System.IndexOutOfRangeException", null);
             for (var i = 0; i < value.Length; i++)
                 slotRef!.Container[slotRef.Index + i] = StackSlot.OfInt32(value[i]);
             slotRef!.Container[slotRef.Index + value.Length] = StackSlot.OfInt32('\0');

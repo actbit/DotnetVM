@@ -17,8 +17,12 @@ public sealed class VmByRef {
     public readonly int Index;
     /// <summary>配列/オブジェクトの storage owner。ByRef 自体が GC root になった場合も所有物を保持する。</summary>
     public readonly VmObject? Owner;
+    internal readonly VmType? ElementType;
 
-    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false, VmObject? owner = null) {
+    public VmByRef(StackSlot[] container, int index, bool isReadOnly = false, VmObject? owner = null)
+        : this(container, index, isReadOnly, owner, null) { }
+
+    internal VmByRef(StackSlot[] container, int index, bool isReadOnly, VmObject? owner, VmType? elementType) {
         ArgumentNullException.ThrowIfNull(container);
         if ((uint)index > (uint)container.Length)
             throw new ArgumentOutOfRangeException(nameof(index));
@@ -26,6 +30,7 @@ public sealed class VmByRef {
         Index = index;
         IsReadOnly = isReadOnly;
         Owner = owner;
+        ElementType = elementType;
     }
 
     /// <summary>フレームの引数/ローカル storage への参照を作る。</summary>

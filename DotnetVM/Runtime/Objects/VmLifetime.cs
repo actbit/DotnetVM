@@ -59,6 +59,9 @@ internal static class VmLifetime {
             case VmMethodPointer methodPointer:
                 EnsureLive(methodPointer.Target);
                 break;
+            case VmRuntimeCallback callback:
+                EnsureLive(callback.OwnerType);
+                break;
             case VmDelegate @delegate:
                 foreach (var invocation in @delegate.Invocations) {
                     EnsureLive(invocation.Target);
@@ -113,6 +116,10 @@ internal static class VmLifetime {
                 break;
             case VmByRefType byRef:
                 EnsureLive(byRef.ElementType);
+                break;
+            case VmFunctionPointerType function:
+                EnsureLive(function.ReturnType);
+                foreach (var parameter in function.ParameterTypes) EnsureLive(parameter);
                 break;
         }
     }

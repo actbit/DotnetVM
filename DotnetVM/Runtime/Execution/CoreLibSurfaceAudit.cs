@@ -91,6 +91,12 @@ internal static class CoreLibSurfaceAudit {
         void Bcl(string type, string[] methods, bool? hasThis = null, string? justification = null) {
             foreach (var method in methods) Add(type, method, CoreLibSurfaceKind.RuntimeInternal, justification ?? bclJ, hasThis);
         }
+        foreach (var import in Intrinsics.Builtins.CoreLibBindings.NativeReflectionImports)
+            Add(import.Key.TypeFullName, import.Key.MethodName, CoreLibSurfaceKind.RuntimeInternal,
+                import.Origin == Intrinsics.BindingOrigin.InternalCall
+                    ? InternalCall + "。実 CoreLib の本体 IL を持たない metadata / runtime リーフを VM 型系に接続する"
+                    : "pinvoke-replacement: 実 CoreLib の DllImport metadata / runtime リーフを VM 型系に接続する",
+                hasThis: false, paramCount: import.Key.ParamSignature.Length == 0 ? 0 : import.Key.ParamSignature.Split(',').Length);
         foreach (var type in Intrinsics.Builtins.CoreLibBindings.HttpBoundaryTypes)
             foreach (var member in Intrinsics.Builtins.CoreLibBindings.BoundaryMembers(type))
                 Bcl(type.FullName!, [member.Name], member is System.Reflection.ConstructorInfo || !member.IsStatic, DeviceFace + "。標準 HTTP BCL 状態を VM 表現に正規化し、通信は制限付き gateway に限定");
@@ -171,28 +177,18 @@ internal static class CoreLibSurfaceAudit {
         Bcl("System.Net.Http.HttpClient", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを client に渡す");
         Bcl("System.Net.Http.HttpMessageInvoker", [".ctor"], true, DeviceFace + "。制限付き gateway handler のみを invoker に渡す");
         Bcl("System.Runtime.DependentHandle", ["InternalAlloc", "InternalGetTarget", "InternalGetDependent", "InternalGetTargetAndDependent", "InternalSetDependent", "InternalSetTargetToNull", "InternalFree"], false, InternalCall + "。VM GC の ephemeron 到達性と連携する");
-        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetProperties", "GetFields", "get_Module", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "GetAttributeFlagsImpl", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Type", "System.RuntimeType" }) Bcl(type, ["GetArrayRank", "GetElementType", "get_IsGenericType", "get_IsGenericTypeDefinition", "get_ContainsGenericParameters", "get_IsConstructedGenericType", "GetGenericArguments", "GetGenericTypeDefinition", "MakeGenericType", "GetConstructors", "GetInterfaces", "get_Namespace", "GetFields", "GetConstructorImpl", "get_Assembly", "get_IsByRefLike", "IsPointerImpl", "IsByRefImpl", "IsArrayImpl", "HasElementTypeImpl", "IsPrimitiveImpl", "IsCOMObjectImpl"], true, RuntimeRepresentation);
         Bcl("System.Enum", ["GetHashCode"], true, JitIntrinsic);
         Bcl("System.ComAwareWeakReference", ["PossiblyComObject"], false, RuntimeRepresentation + "。VM object は COM object を保持しない");
         Bcl("System.Exception", ["set_Source", "get_Source", "CaptureDispatchState", "RestoreDispatchState"], true, RuntimeRepresentation + "。例外の guest identity を維持し、VM tracer がスタックを管理する");
         Bcl("System.Reflection.Assembly", ["Equals", "GetHashCode"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.Assembly", "System.Reflection.MemberInfo", "System.Type", "System.RuntimeType", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributes", "IsDefined"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.ParameterInfo", "System.Reflection.MemberInfo", "System.Reflection.Assembly", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetCustomAttributesData"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.CustomAttributeData", ["get_AttributeType", "get_Constructor", "get_ConstructorArguments"], true, RuntimeRepresentation);
         foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo" }) Bcl(type, ["get_DeclaringType"], true, RuntimeRepresentation);
-        foreach (var type in new[] { "System.Reflection.MethodBase", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["GetParameters", "get_Attributes", "GetMethodImplementationFlags"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.ConstructorInfo", ["Invoke"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.MethodBase", ["Invoke"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod", "get_ReturnParameter"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.ParameterInfo", ["get_ParameterType", "get_Position", "get_Attributes", "get_Name", "get_Member", "get_HasDefaultValue", "get_DefaultValue", "get_RawDefaultValue"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.PropertyInfo", ["get_PropertyType", "GetIndexParameters", "GetGetMethod", "GetSetMethod"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes"], true, RuntimeRepresentation);
+        foreach (var type in new[] { "System.Reflection.MethodBase", "System.Reflection.MethodInfo", "System.Reflection.ConstructorInfo" }) Bcl(type, ["get_Attributes", "GetMethodImplementationFlags"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes", "GetValue", "SetValue"], true, RuntimeRepresentation);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 2);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 5);
-        foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.MethodBase" }) Bcl(type, ["get_MemberType"], true, RuntimeRepresentation);
         Bcl("System.Runtime.InteropServices.GCHandle", ["_InternalAlloc", "InternalGet", "InternalSet", "InternalCompareExchange", "_InternalFree"], false, InternalCall);
-        Bcl("System.Text.Encodings.Web.JavaScriptEncoder", ["get_Default", "get_UnsafeRelaxedJsonEscaping"], false);
-        foreach (var type in new[] { "JavaScriptEncoder", "TextEncoder" }) Bcl("System.Text.Encodings.Web." + type, ["FindFirstCharacterToEncode", "FindFirstCharacterToEncodeUtf8", "EncodeUtf8", "Encode", "WillEncode"], true);
 
         // ---- CultureSettings bridge / no-CoreLib fallback ----
         var cultureBridgeJ = CultureOutOfScope +
@@ -689,6 +685,7 @@ internal static class CoreLibSurfaceAudit {
         Add("System.Runtime.CompilerServices.Unsafe", "Add", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "AddByteOffset", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "As", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
+        Add("System.Runtime.CompilerServices.Unsafe", "AsPointer", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false, paramCount: 1);
         Add("System.Runtime.CompilerServices.Unsafe", "AreSame", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "AsRef", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
         Add("System.Runtime.CompilerServices.Unsafe", "SizeOf", CoreLibSurfaceKind.RuntimeInternal, unsafeJ, hasThis: false);
@@ -750,17 +747,31 @@ internal static class CoreLibSurfaceAudit {
         // ---- CoreLibBindings: 環境 / Marshal lastError / GlobalizationMode (C5.5 探査テスト継続) ----
         var marshalLastErrorJ = InternalCall +
             "。実 CLR も last-error TLS スロットの取得/設定 (ECall 面)。VM はネイティブ呼びを持たないため同一スロットの set/get 対として成立";
-        Add("System.Runtime.InteropServices.Marshal", "SetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
-        Add("System.Runtime.InteropServices.Marshal", "GetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        if (OperatingSystem.IsWindows()) {
+            Add("System.Runtime.InteropServices.Marshal", "<IsBuiltInComSupportedInternal>g____PInvoke|30_0", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する COM capability DllImport。VM は COM を提供しない", hasThis: false, paramCount: 0);
+            Add("Interop+Kernel32", "GetCPInfo", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetCPInfo DllImport。VM は ANSI code page を持たず失敗を返し、元の IL が既定値を選択する", hasThis: false, paramCount: 2);
+            Add("Interop+Kernel32", "SetLastError", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する SetLastError DllImport を VM の last-error スロットに接続する", hasThis: false, paramCount: 1);
+            Add("Interop+Kernel32", "GetLastError", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetLastError DllImport を VM の last-error スロットに接続する", hasThis: false, paramCount: 0);
+        } else {
+            Add("System.Runtime.InteropServices.Marshal", "SetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
+            Add("System.Runtime.InteropServices.Marshal", "GetLastSystemError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
+        }
         // SystemError/PInvokeError は実 CLR でも同一スロットの alias 面
         Add("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
         Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
-        Add("Interop+Kernel32", "GetEnvironmentVariable", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: Kernel32 P/Invoke の代替実装をホスト環境変数取得へ委譲 (面の再現 + プロキシ委譲規約。ネイティブ実行はしない)", hasThis: false, paramCount: 3);
-        Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
-        Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
+        if (OperatingSystem.IsWindows()) {
+            Add("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetEnvironmentVariableW DllImport が VM の仮想環境を読む。managed マーシャリング wrapper は元の IL を実行する", hasThis: false, paramCount: 3);
+            Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
+        } else {
+            Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
+        }
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
             InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 
@@ -780,7 +791,8 @@ internal static class CoreLibSurfaceAudit {
         // ---- DefaultIntrinsics: Type / MemberInfo / MethodBase ----
         var typeJ = RuntimeRepresentation +
             "。実体が VmRuntimeObject / VmRuntimeMethod (VM 型系ファサード) で CoreLib IL の対象データが VM に存在しない";
-        Add("System.Type", "GetTypeFromHandle", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 1);
+        Add("System.Type", "GetTypeFromHandle", CoreLibSurfaceKind.RealCoreLibIl,
+            "shadowed-legacy: CoreLib をロードした場合は RuntimeTypeHandle.m_type を読む実 IL を実行する。legacy は CoreLib 未ロード時だけ使用する", hasThis: false, paramCount: 1);
         Add("System.Type", "op_Equality", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 2);
         Add("System.Type", "op_Inequality", CoreLibSurfaceKind.RuntimeInternal, typeJ, hasThis: false, paramCount: 2);
         foreach (var t in new[] { "System.Type", "System.Reflection.MemberInfo" }) {

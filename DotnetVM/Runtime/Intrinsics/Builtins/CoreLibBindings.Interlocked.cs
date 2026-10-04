@@ -18,7 +18,17 @@ internal static partial class CoreLibBindings {
     /// VM の共有 atomic gate と参照スロットロックで比較と交換を原子的に行う (CLR と同じ意味論)。</summary>
     private static void RegisterInterlockedBindings(IntrinsicRegistry r) {
         foreach (var primitive in new[] { "System.Boolean", "System.Byte", "System.SByte", "System.Int16", "System.UInt16", "System.Int32", "System.UInt32", "System.Int64", "System.UInt64", "System.Single", "System.Double", "System.IntPtr", "System.UIntPtr" }) {
-            r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Read", primitive + "&"), static (_, a) => {
+            r.RegisterBinding(BindingKey.Static("System.Threading.Volatile", "Read", primitive + "&"), (ctx, a) => {
+                if (a[0].ObjectValue is VmNativePointer pointer) {
+                    var size = primitive is "System.Int64" or "System.UInt64" or "System.Double" or "System.IntPtr" or "System.UIntPtr" ? 8
+                        : primitive is "System.Int32" or "System.UInt32" or "System.Single" ? 4
+                        : primitive is "System.Int16" or "System.UInt16" ? 2 : 1;
+                    lock (pointer.Memory) {
+                        pointer.EnsureBounds(size);
+                        return MemoryOps.ValueFromBytes(pointer.Bytes.AsSpan(pointer.ByteOffset, size),
+                            FindAnyType(ctx, primitive)!, size);
+                    }
+                }
                 var location = a[0].ObjectValue as VmByRef ?? throw new UnhandledGuestException("System.InvalidProgramException", "Volatile location is unavailable.");
                 lock (location.Container) return location.Read();
             }, BindingOrigin.InternalCall);
@@ -43,6 +53,11 @@ internal static partial class CoreLibBindings {
                 $"Interlocked.{method} の第 1 引数は ref フィールド (ByRef) である必要があります。");
         // 比較対象の等価判定 (プリミティブは値、参照は同一性)
         static bool SlotEquals(in StackSlot x, in StackSlot y) {
+            // Unsafe.As<nint, long> is a view of the same 64-bit storage.
+            // The managed nint overload calls the long intrinsic through this view.
+            if (IntPtr.Size == 8 && (x.Kind == StackKind.NativeInt && y.Kind == StackKind.Int64 ||
+                x.Kind == StackKind.Int64 && y.Kind == StackKind.NativeInt))
+                return x.Int64Value == y.Int64Value;
             if (x.Kind != y.Kind)
                 return false;
             return x.Kind switch {
@@ -126,7 +141,8 @@ internal static partial class CoreLibBindings {
             var original = loc.Read();
             var equal = SlotEquals(original, a[2]);
             if (equal)
-                loc.Write(a[1]);
+                loc.Write(original.Kind == StackKind.NativeInt && a[1].Kind == StackKind.Int64
+                    ? StackSlot.OfNativeInt(a[1].Int64Value) : a[1]);
             if (a.Length >= 4 && a[3].ObjectValue is VmByRef succeeded)
                 succeeded.Write(StackSlot.OfInt32(equal ? 1 : 0));
             return original;

@@ -11,6 +11,7 @@ var enableJit = false;
 var legacy = false;
 string? output = null;
 string? filter = null;
+string? revision = null;
 int? size = null;
 var trace = false;
 for (var i = 0; i < args.Length; i++) {
@@ -21,6 +22,7 @@ for (var i = 0; i < args.Length; i++) {
         case "--warmups": warmups = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--output": output = args[++i]; break;
         case "--filter": filter = args[++i]; break;
+        case "--revision": revision = args[++i]; break;
         case "--size": size = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--trace": trace = true; break;
         default: throw new ArgumentException($"Unknown option: {args[i]}");
@@ -40,6 +42,9 @@ var workloads = new (string Name, Type GuestType, int Count)[] {
     (nameof(GuestWorkloads.IntegerFormatting), mixedGuest, 1000),
     (nameof(GuestWorkloads.IntegerParsing), mixedGuest, 1000),
     (nameof(GuestWorkloads.StringCopies), mixedGuest, 1000),
+    (nameof(GuestWorkloads.ReflectionInvoke), mixedGuest, 100),
+    (nameof(GuestWorkloads.ReflectionAttributes), mixedGuest, 50),
+    (nameof(GuestWorkloads.JsonRoundTrip), mixedGuest, 10),
     (nameof(GuestWorkloads.Arithmetic), mixedGuest, 5000),
     (nameof(DotnetVM.BenchmarkGuest.Workloads.ArithmeticLoop), loopGuest, 100000),
     (nameof(DotnetVM.BenchmarkGuest.Workloads.BranchLoop), loopGuest, 100000),
@@ -120,9 +125,9 @@ if (output is not null) {
     var path = Path.GetFullPath(output);
     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
     File.WriteAllText(path, JsonSerializer.Serialize(new { Runtime = Environment.Version.ToString(),
-        MeasuredAt = DateTimeOffset.UtcNow, OS = Environment.OSVersion.ToString(),
+        MeasuredAt = DateTimeOffset.UtcNow, OS = Environment.OSVersion.ToString(), SourceRevision = revision,
         HostTieredCompilation = Environment.GetEnvironmentVariable("DOTNET_TieredCompilation") ?? "default",
-        Protocol = "unified-22", LoadHostCoreLib = true, JitPromotionThreshold = 2,
+        Protocol = "unified-25", LoadHostCoreLib = true, JitPromotionThreshold = 2,
         EnableJit = enableJit, Warmups = warmups, Samples = samples, Results = results },
         new JsonSerializerOptions { WriteIndented = true }));
 }

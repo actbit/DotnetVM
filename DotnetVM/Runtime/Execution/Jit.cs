@@ -579,8 +579,7 @@ internal struct JitFrame {
             var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
             var size = MemoryOps.SizeOfType(type);
             EnsureNativeRange(native, size, "ldobj");
-            _frame.Stack.Push(MemoryOps.ValueFromBytes(
-                native.Bytes.AsSpan(native.ByteOffset, size), type, size));
+            _frame.Stack.Push(MemoryOps.ReadPointerValue(native, type));
         } else if (address.ObjectValue is VmByRef byRef) {
             _frame.Stack.Push(SlotOps.PushCopyOfValue(byRef.Slot));
         } else {
@@ -597,9 +596,7 @@ internal struct JitFrame {
             var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
             var size = MemoryOps.SizeOfType(type);
             EnsureNativeRange(native, size, "stobj", writable: true);
-            Span<byte> bytes = stackalloc byte[8];
-            MemoryOps.BytesOfValue(value, type, size, bytes);
-            bytes[..size].CopyTo(native.Bytes.AsSpan(native.ByteOffset, size));
+            MemoryOps.WritePointerValue(native, type, value);
         } else if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(SlotOps.StoreCopyOfValue(value));
         } else {
@@ -613,26 +610,17 @@ internal struct JitFrame {
         var source = _frame.Stack.Pop();
         var destination = _frame.Stack.Pop();
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
-        var size = MemoryOps.SizeOfType(type);
         if (source.ObjectValue is VmNativePointer sourceNative &&
             destination.ObjectValue is VmNativePointer destinationNative) {
-            EnsureNativeRange(sourceNative, size, "cpobj");
-            EnsureNativeRange(destinationNative, size, "cpobj", writable: true);
-            sourceNative.Bytes.AsSpan(sourceNative.ByteOffset, size)
-                .CopyTo(destinationNative.Bytes.AsSpan(destinationNative.ByteOffset, size));
+            MemoryOps.CopyMemoryBlock(destination, source, MemoryOps.SizeOfRawType(type));
         } else if (source.ObjectValue is VmNativePointer sourceOnly) {
-            EnsureNativeRange(sourceOnly, size, "cpobj");
             if (destination.ObjectValue is not VmByRef destinationByRef)
                 throw InvalidAddress("cpobj", destination);
-            destinationByRef.Write(SlotOps.StoreCopyOfValue(MemoryOps.ValueFromBytes(
-                sourceOnly.Bytes.AsSpan(sourceOnly.ByteOffset, size), type, size)));
+            destinationByRef.Write(SlotOps.StoreCopyOfValue(MemoryOps.ReadPointerValue(sourceOnly, type)));
         } else if (destination.ObjectValue is VmNativePointer destinationOnly) {
-            EnsureNativeRange(destinationOnly, size, "cpobj", writable: true);
             if (source.ObjectValue is not VmByRef sourceByRef)
                 throw InvalidAddress("cpobj", source);
-            Span<byte> bytes = stackalloc byte[8];
-            MemoryOps.BytesOfValue(sourceByRef.Read(), type, size, bytes);
-            bytes[..size].CopyTo(destinationOnly.Bytes.AsSpan(destinationOnly.ByteOffset, size));
+            MemoryOps.WritePointerValue(destinationOnly, type, sourceByRef.Read());
         } else if (source.ObjectValue is VmByRef sourceByRef &&
                    destination.ObjectValue is VmByRef destinationByRef) {
             destinationByRef.Write(SlotOps.StoreCopyOfValue(sourceByRef.Read()));
@@ -650,6 +638,7 @@ internal struct JitFrame {
             var size = MemoryOps.SizeOfType(type);
             EnsureNativeRange(native, size, "initobj", writable: true);
             Array.Clear(native.Bytes, native.ByteOffset, size);
+            native.Memory.ClearReferences(native.ByteOffset, size);
         } else if (address.ObjectValue is VmByRef byRef) {
             byRef.Write(_services.Objects.DefaultForType(type, _services.Loader));
         } else {

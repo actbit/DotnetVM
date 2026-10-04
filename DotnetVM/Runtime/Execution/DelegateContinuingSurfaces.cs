@@ -62,7 +62,8 @@ internal static class DelegateContinuingSurfaces {
             new[] { "ToBoolean", "ToChar", "ToSByte", "ToByte", "ToInt16", "ToUInt16",
                     "ToInt32", "ToUInt32", "ToInt64", "ToUInt64", "ToString",
                     "ToSingle", "ToDouble" }
-                .Select(name => ("System.Convert", name, "System.Object")));
+                    .Select(name => ("System.Convert", name, "System.Object"))
+                .Append(("System.Type", "GetTypeFromHandle", "System.RuntimeTypeHandle")));
             // (string, string, string) の既定等値比較は要素ごとの ordinal string 比較なので
             // 明示的な comparer は不要
 

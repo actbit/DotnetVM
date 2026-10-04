@@ -343,6 +343,10 @@ internal static partial class CoreLibBindings {
             // GetRawData バインド側で受ける)
             static (_, a) => a[0],
             BindingOrigin.InternalCall);
+        // CLR recognizes this method as a compiler intrinsic; its managed
+        // fallback throws. Preserve the VM address and its owning storage.
+        r.RegisterBinding(BindingKey.Static(UnsafeType, "AsPointer", "!!0&"),
+            static (_, a) => a[0], BindingOrigin.InternalCall);
         r.RegisterBinding(BindingKey.Static(UnsafeType, "As", "!!0&"),
             // static TTo Unsafe.As<TFrom, TTo>(ref TFrom source): 参照の型視点再解釈
             // (アドレス不変)。バイト実体ポインタは素通り、スロット列参照 (string 内部 char
@@ -545,6 +549,10 @@ internal static partial class CoreLibBindings {
         if (slot.Kind == StackKind.ByRef && slot.ObjectValue is VmByRef outer) {
             if (outer.IsNullOrOnePast) return (null, outer);
             var target = outer.Read(); // 指し先スロットの値
+            if (target.ObjectValue is VmStructValue inline && inline.StructType is VmClassType definition &&
+                MemoryOps.FixedBufferStorage(definition) is { } storage)
+                return (null, new VmByRef(inline.Fields, 0, outer.IsReadOnly, outer.Owner,
+                    GenericSubstitutor.Substitute(storage.ElementType, GenericContext.Of(inline.TypeArguments, null))));
             if (target.Kind == StackKind.ByRef && target.ObjectValue is VmByRef inner)
                 return (null, outer.IsReadOnly
                     ? new VmByRef(inner.Container, inner.Index, isReadOnly: true, owner: inner.Owner)
@@ -776,11 +784,14 @@ internal static partial class CoreLibBindings {
         // インデックスの移動として表現する (1 要素 = 1 スロット)。バイトオフセット面
         // (AddByteOffset) はスロット列では表現できないため fail-closed
         if (slotRef is not null) {
-            if (!elementStride) {
-                var slotStride = SlotStride(ctx.MethodTypeArgAt(0));
-                if (offset % slotStride != 0) throw new UnhandledGuestException("System.NotSupportedException", "Byte offset must align with VM slot storage.");
-                offset /= slotStride;
-            }
+            var actualType = slotRef.ElementType ?? (slotRef.Owner as VmArray)?.ArrayType.ElementType ?? (slotRef.Owner as VmBoxedValue)?.Type;
+            var requestedType = ctx.MethodTypeArguments.FirstOrDefault() ?? FindAnyType(ctx, ctx.MethodTypeArgAt(0));
+            var requestedSize = requestedType is null ? SlotStride(ctx.MethodTypeArgAt(0)) : MemoryOps.SizeOfType(requestedType);
+            var requestedStride = elementStride ? requestedSize : 1;
+            var actualStride = actualType is null ? requestedSize : MemoryOps.SizeOfType(actualType);
+            var byteDisplacement = checked(offset * requestedStride);
+            if (byteDisplacement % actualStride != 0) throw new UnhandledGuestException("System.NotSupportedException", "Byte offset must align with VM slot storage.");
+            offset = byteDisplacement / actualStride;
             long target;
             try {
                 target = checked((long)slotRef.Index + offset);
@@ -793,9 +804,12 @@ internal static partial class CoreLibBindings {
                 throw new UnhandledGuestException("System.IndexOutOfRangeException",
                     $"Unsafe.Add の結果がスロット列の範囲外です (index {target}, 要素数 {slotRef.Container.Length})。");
             }
-            return StackSlot.OfByRef(new VmByRef(slotRef.Container, (int)target, slotRef.IsReadOnly, slotRef.Owner));
+            return StackSlot.OfByRef(new VmByRef(slotRef.Container, (int)target, slotRef.IsReadOnly, slotRef.Owner, actualType));
         }
-        var stride = elementStride ? SlotStride(ctx.ParamAt(0)) : 1;
+        var elementType = ctx.MethodTypeArguments.FirstOrDefault()
+            ?? FindAnyType(ctx, ctx.ParamAt(0).TrimEnd('&'));
+        var stride = elementStride ? elementType is null ? SlotStride(ctx.ParamAt(0))
+            : MemoryOps.SizeOfRawType(elementType) : 1;
         long byteOffset;
         try {
             byteOffset = checked((long)native!.ByteOffset + checked(offset * stride));

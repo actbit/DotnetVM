@@ -28,6 +28,8 @@ public sealed partial class TypeLoader {
         SigKind.Array => ArrayWithBase(new VmMultiDimArrayType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth), Rank = sigType.Rank }),
         SigKind.ByRef => new VmByRefType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) },
         SigKind.Pointer => new VmByRefType { ElementType = ResolveTokenWithDepth(sigType.Inner!, genericDepth) }, // ポインタは ByRef と同様に扱う (未対応扱い)
+        SigKind.FunctionPointer => new VmFunctionPointerType { ReturnType = ResolveTokenWithDepth(sigType.FunctionSignature!.ReturnType, genericDepth),
+            ParameterTypes = sigType.FunctionSignature.ParamTypes.Select(type => ResolveTokenWithDepth(type, genericDepth)).ToArray() },
         SigKind.GenericVar => new VmGenericParameterType { IsMethodParameter = false, Number = sigType.VarNumber },
         SigKind.GenericMethodVar => new VmGenericParameterType { IsMethodParameter = true, Number = sigType.VarNumber },
         SigKind.Boolean => RequiredIntrinsic("System.Boolean"),

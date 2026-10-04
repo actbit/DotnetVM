@@ -6,7 +6,8 @@ namespace DotnetVM.Tests;
 
 /// <summary>
 /// trusted domain 遮断の回帰テスト集:
-/// - ゲストから実 CoreLib の特権面 (Marshal) を直接参照しても binding が拒否される
+/// - body のない InternalCall の特権 binding はゲスト直接呼び出しを拒否する
+/// - managed Marshal wrapper は元の IL と VM の native 境界で実行する
 /// - fake 型は trusted 面に到達せず自実装が実行される (厳格な成功条件)
 /// - 同一 FullName 型を別 assembly 2 個に定義しても静的ストレージを共有しない
 /// - VM ごとの仮想環境ストア分離

@@ -136,16 +136,16 @@ public class CoreLibBindingTests {
             .Select(b => $"{b.Key.TypeFullName}::{b.Key.MethodName}")
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToList();
-        var expected = new List<string> {
-            "Interop+BCrypt::BCryptGenRandom",
-            "Interop+Kernel32::<GetEnvironmentVariable>g____PInvoke|296_0",
-            "Interop+Sys::GetNonCryptographicallySecureRandomBytes",
-        };
+        var expected = new List<string>();
         if (OperatingSystem.IsWindows()) {
+            expected.Add("Interop+BCrypt::BCryptGenRandom");
+            expected.Add("Interop+Kernel32::<GetEnvironmentVariable>g____PInvoke|296_0");
             expected.Add("System.Runtime.InteropServices.Marshal::<IsBuiltInComSupportedInternal>g____PInvoke|30_0");
             expected.Add("Interop+Kernel32::GetCPInfo");
             expected.Add("Interop+Kernel32::GetLastError");
             expected.Add("Interop+Kernel32::SetLastError");
+        } else {
+            expected.Add("Interop+Sys::GetNonCryptographicallySecureRandomBytes");
         }
         Assert.Equal(expected.OrderBy(name => name, StringComparer.Ordinal), pinvokeFaces);
     }
@@ -155,7 +155,7 @@ public class CoreLibBindingTests {
         using var vm = CreateVm(loadCoreLib: true);
         foreach (var binding in vm.Bindings.Where(binding => binding.Origin == BindingOrigin.PInvokeReplacement)) {
             var type = typeof(object).Assembly.GetType(binding.Key.TypeFullName);
-            if (type is null) continue; // OS-specific imports absent from this CoreLib.
+            Assert.NotNull(type);
             var method = Assert.Single(type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static),
                 method => method.Name == binding.Key.MethodName);
             Assert.Null(method.GetMethodBody());

@@ -83,14 +83,14 @@ internal static partial class CoreLibBindings {
         // 起動面としてのみ有効な特権面。BindingDomain.TrustedCoreLib で鍵化し、
         // 呼出元 loader 基準 (CallEngine.CallerDomainOf) で trusted CoreLib IL からの
         // 呼出のみ照合する
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0",
+        if (OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0",
                 "System.UInt16*", "System.Char*", "System.UInt32"),
             static (ctx, a) => GetEnvironmentVariableImpl(ctx, a),
             BindingOrigin.PInvokeReplacement);
         // Interop+BCrypt.BCryptGenRandom (Random / Marvin ハッシュ種等の乱数源 P/Invoke)。
         // 任意の native import は実行せず、ホスト暗号乱数 API に限定して委譲する。
         // P/Invoke 呼出元は TrustedCoreLib domain に限定し、ゲストからの直接呼出は拒否する。
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
+        if (OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+BCrypt", "BCryptGenRandom",
                 "System.IntPtr", "System.Byte*", "System.Int32", "System.Int32"),
             static (ctx, a) => {
                 var count = a[2].AsInt32;
@@ -100,7 +100,7 @@ internal static partial class CoreLibBindings {
         // Unix CoreLib は同じ乱数源を Interop+Sys.GetNonCryptographicallySecureRandomBytes
         // (SystemNative) 経由で呼ぶ。ネイティブ import は実行せず、Windows 側の
         // BCrypt 代替と同じく VM のホスト RNG に委譲する。
-        r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys", "GetNonCryptographicallySecureRandomBytes",
+        if (!OperatingSystem.IsWindows()) r.RegisterBinding(BindingKey.TrustedStatic("Interop+Sys", "GetNonCryptographicallySecureRandomBytes",
                 "System.Byte*", "System.Int32"),
             static (ctx, a) => {
                 var count = a[1].AsInt32;

@@ -764,12 +764,15 @@ internal static class CoreLibSurfaceAudit {
         // SystemError/PInvokeError は実 CLR でも同一スロットの alias 面
         Add("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 1);
         Add("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError", CoreLibSurfaceKind.RuntimeInternal, marshalLastErrorJ, hasThis: false, paramCount: 0);
-        Add("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: 実在する GetEnvironmentVariableW DllImport が VM の仮想環境を読む。managed マーシャリング wrapper は元の IL を実行する", hasThis: false, paramCount: 3);
-        Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
-        Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
-            "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
+        if (OperatingSystem.IsWindows()) {
+            Add("Interop+Kernel32", "<GetEnvironmentVariable>g____PInvoke|296_0", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 実在する GetEnvironmentVariableW DllImport が VM の仮想環境を読む。managed マーシャリング wrapper は元の IL を実行する", hasThis: false, paramCount: 3);
+            Add("Interop+BCrypt", "BCryptGenRandom", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 4);
+        } else {
+            Add("Interop+Sys", "GetNonCryptographicallySecureRandomBytes", CoreLibSurfaceKind.RuntimeInternal,
+                "pinvoke-replacement: Unix 乱数源 P/Invoke をホスト暗号乱数 API に限定して委譲 (任意 native import は実行しない)", hasThis: false, paramCount: 2);
+        }
         Add("System.Globalization.GlobalizationMode+Settings", "get_Invariant", CoreLibSurfaceKind.RuntimeInternal,
             InternalCall + "。本家もネイティブ状態参照。VM 規約 (culture 不変固定) により true 固定 = DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 起動と同一意味論", hasThis: false, paramCount: 0);
 

@@ -185,8 +185,8 @@ internal static class CoreLibSurfaceAudit {
         Bcl("System.Reflection.MethodBase", ["Invoke"], true, RuntimeRepresentation);
         Bcl("System.Reflection.MethodInfo", ["MakeGenericMethod", "get_ReturnParameter"], true, RuntimeRepresentation);
         Bcl("System.Reflection.ParameterInfo", ["get_ParameterType", "get_Position", "get_Attributes", "get_Name", "get_Member", "get_HasDefaultValue", "get_DefaultValue", "get_RawDefaultValue"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.PropertyInfo", ["get_PropertyType", "GetIndexParameters", "GetGetMethod", "GetSetMethod"], true, RuntimeRepresentation);
-        Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.PropertyInfo", ["get_PropertyType", "GetIndexParameters", "GetGetMethod", "GetSetMethod", "get_CanRead", "get_CanWrite", "GetValue", "SetValue", "get_GetMethod", "get_SetMethod"], true, RuntimeRepresentation);
+        Bcl("System.Reflection.FieldInfo", ["get_FieldType", "get_Attributes", "GetValue", "SetValue"], true, RuntimeRepresentation);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 2);
         Add("System.Activator", "CreateInstance", CoreLibSurfaceKind.RuntimeInternal, RuntimeRepresentation, false, 5);
         foreach (var type in new[] { "System.Reflection.MemberInfo", "System.Type", "System.Reflection.PropertyInfo", "System.Reflection.FieldInfo", "System.Reflection.MethodInfo", "System.Reflection.MethodBase" }) Bcl(type, ["get_MemberType"], true, RuntimeRepresentation);

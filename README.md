@@ -345,41 +345,57 @@ foreach (var frame in vm.Tracer.Frames)
 
 ## ベンチマーク
 
-### 最新の CoreCLR 比較（2026-10-03）
+### 最新の CoreCLR 比較（2026-10-04、PR #34）
 
-`origin/master` の `f19f436` を取り込み、IL 実行経路の最適化と互換性修正を適用した実測値です。
-AMD Ryzen 9 3900 / Windows x64（build 26200）/ .NET SDK 10.0.401 / runtime 10.0.12、
-Release、host tiered compilation 無効。同じゲストコードと入力を CoreCLR / VM で実行し、戻り値を照合しています。
-時間は **1 呼び出しあたりの ms**、中央値です。ロード・初回準備・JIT コンパイルは含みません。
+PRのランタイム `92304de`、測定項目追加 `e277241` を再測定した値です。
+AMD Ryzen 9 3900 / Windows x64（build 26200）/ SDK 10.0.401 / runtime 10.0.12、
+Release、host tiered compilation無効。warmup 3回、7 samples、VM JIT昇格閾値2です。
 
-**全18項目を同じ測定手順に統一**しました。すべて実在 CoreLib / System.Linq の IL をロードし、
-warmup 3 回、測定 7 回、VM JIT の昇格閾値は 2 回です。
-各 VM モードは別プロセスで順番に測定し、CoreCLR 列は JIT 比較時の値です。
+既存22項目にReflectionのInvoke・属性取得・属性付きDTOのJSON往復を加えた**25項目**です。
+成功項目の戻り値をCoreCLRと照合しました。時間は表の入力を処理するゲストメソッド**1呼び出し全体のms中央値**で、
+ロード・初回準備・JITコンパイルを含みません。CoreCLR列はPR JIT測定プロセスの値です。
+`ERROR` はVMの実行失敗、`—` は比較値未取得です。
 
 | ワークロード | 入力 | CoreCLR ms | VM インタプリタ ms | VM JIT ms |
 |---|---:|---:|---:|---:|
-| 算術・シフト (`Arithmetic`) | 5,000 | 0.002739 | 4.894 | 3.107 |
-| 算術・剰余 (`ArithmeticLoop`) | 100,000 | 0.144354 | 111.588 | 77.326 |
-| 条件分岐 (`BranchLoop`) | 100,000 | 0.369590 | 110.385 | 76.358 |
-| 配列の作成・走査 (`ArraySum`) | 10,000 | 0.010492 | 18.322 | 15.421 |
-| フィールド (`FieldAccess`) | 5,000 | 0.002773 | 6.377 | 4.803 |
-| ジェネリックフィールド (`GenericFieldAccess`) | 5,000 | 0.002770 | 6.738 | 6.558 |
-| メソッド呼び出し (`MethodCalls`) | 1,000 | 0.001413 | 2.317 | 1.099 |
-| メソッド呼び出しループ (`CallLoop`) | 100,000 | 0.094261 | 207.202 | 81.542 |
-| オブジェクト確保 (`ObjectLoop`) | 10,000 | 0.033652 | 65.107 | 49.001 |
-| List 更新・interface 列挙 (`List`) | 500 | 0.005021 | 9.972 | 10.300 |
-| List 拡張・通常列挙 (`ListGrowth`) | 500 | 0.001392 | 6.512 | 6.612 |
-| LINQ Where / Select / Sum (`Linq`) | 500 | 0.004108 | 14.163 | 13.408 |
-| 整数 Dictionary (`DictionaryInt`) | 200 | 0.003526 | 21.503 | 22.975 |
-| Dictionary 拡張 (`DictionaryGrowth`) | 200 | 0.003588 | 18.240 | 17.019 |
-| 文字列 Dictionary (`DictionaryString`) | 200 | 0.005784 | 19.282 | 17.057 |
-| 完了済み Task の await (`AsyncCompleted`) | 200 | 0.001239 | 1.666 | 1.639 |
-| 完了済み ValueTask の await (`ValueTaskCompleted`) | 200 | 0.000437 | 1.896 | 1.813 |
-| Task.Run / Delay / WhenAll (`AsyncWorkers`) | 8 | 14.875600 | 12.448 | 11.797 |
+| SpanCopies | 1,000 | 0.016299 | 38.087 | 37.227 |
+| IntegerFormatting | 1,000 | 0.021503 | 8.389 | 7.877 |
+| IntegerParsing | 1,000 | 0.017297 | 5.598 | 5.534 |
+| StringCopies | 1,000 | 0.007951 | 4.715 | 4.314 |
+| ReflectionInvoke | 100 | — | ERROR | ERROR |
+| ReflectionAttributes | 50 | 0.062117 | 81.739 | 74.064 |
+| JsonRoundTrip | 10 | 0.015210 | 46.270 | 48.238 |
+| Arithmetic | 5,000 | 0.002732 | 4.981 | 3.555 |
+| ArithmeticLoop | 100,000 | 0.145068 | 116.378 | 79.534 |
+| BranchLoop | 100,000 | 0.372634 | 109.991 | 75.691 |
+| ArraySum | 10,000 | 0.010953 | 18.796 | 13.170 |
+| FieldAccess | 5,000 | 0.002735 | 6.775 | 5.332 |
+| GenericFieldAccess | 5,000 | 0.002735 | 7.071 | 7.268 |
+| MethodCalls | 1,000 | 0.001417 | 2.887 | 1.486 |
+| CallLoop | 100,000 | 0.093573 | 211.475 | 81.840 |
+| ObjectLoop | 10,000 | 0.029752 | 67.762 | 49.403 |
+| List | 500 | 0.005083 | 11.018 | 11.406 |
+| ListGrowth | 500 | 0.001341 | 7.077 | 7.336 |
+| Linq | 500 | 0.004280 | 16.165 | 15.283 |
+| DictionaryInt | 200 | 0.003590 | 26.689 | 23.392 |
+| DictionaryGrowth | 200 | 0.003718 | 19.933 | 19.332 |
+| DictionaryString | 200 | 0.005034 | 20.350 | 18.378 |
+| AsyncCompleted | 200 | 0.001348 | 1.997 | 1.993 |
+| ValueTaskCompleted | 200 | 0.000439 | 2.058 | 2.280 |
+| AsyncWorkers | 8 | 14.413925 | 12.174 | 11.249 |
 
-`AsyncWorkers` は `Task.Delay(1)` の待機時間を含み、タイマー精度とスケジューリングで変動します。
-`DotnetVM.Benchmarks` の通常実行で全18項目、`--jit` で VM JIT を測定します。
-再現手順、サンプル JSON、過去の記録との比較、互換性の検証は [性能計測ガイド](docs/performance.md) にまとめています。
+最新master `2950044` と比べ、属性取得はinterpreterで51.45倍、JITで50.83倍の時間がかかりました。
+Spanコピーの時間は12.5%／8.6%、確保量は28.4%／27.1%増加し、Dictionaryにも増加があります。
+**このPRの全体的な高速化や性能回帰がないことは主張しません。**
+
+Invokeの追加項目はPR側で `RuntimeMethodHandle.GetUtf8NameInternal` の未登録により失敗しました。
+JSONはPR側で測定できましたが、master側は `IList<T>.get_Item` の未対応で失敗し、速度比はありません。
+`AsyncWorkers` は待機時間を含むため速度改善の評価から除外します。
+JSONの初回メタデータ構築はwarmupに含まれ、上表には含みません。
+
+[最新masterとの全25項目の比較・確保量・命令数・生データ・再現手順](docs/performance-pr34.md)を参照してください。
+[2026-10-03の測定](docs/performance.md)と[BCLの初回測定](docs/performance-bcl.md)は過去の記録として保持し、
+そこでの改善率を現在のPRの効果としては扱いません。
 
 ## プロジェクト構成
 

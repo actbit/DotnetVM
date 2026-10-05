@@ -8,6 +8,8 @@ using DotnetVM.Host;
 var samples = 7;
 var warmups = 3;
 var enableJit = false;
+var instructionCharging = true;
+var instructionChargeBatchSize = 256;
 var legacy = false;
 string? output = null;
 string? filter = null;
@@ -17,6 +19,8 @@ var trace = false;
 for (var i = 0; i < args.Length; i++) {
     switch (args[i]) {
         case "--jit": enableJit = true; break;
+        case "--no-instruction-charging": instructionCharging = false; break;
+        case "--charge-batch-size": instructionChargeBatchSize = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--legacy": legacy = true; break;
         case "--samples": samples = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--warmups": warmups = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -65,7 +69,7 @@ var workloads = new (string Name, Type GuestType, int Count)[] {
     (nameof(GuestWorkloads.AsyncWorkers), mixedGuest, 8),
 };
 var results = new List<object>();
-Console.WriteLine($"{Environment.Version}; JIT={enableJit}; warmups={warmups}; samples={samples}");
+Console.WriteLine($"{Environment.Version}; JIT={enableJit}; instruction-charging={instructionCharging}; charge-batch-size={instructionChargeBatchSize}; warmups={warmups}; samples={samples}");
 Console.WriteLine("Workload                 CoreCLR ms      VM ms   VM / CLR    Alloc bytes    Instructions");
 foreach (var workload in workloads) {
     if (filter is not null && !workload.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
@@ -77,7 +81,12 @@ foreach (var workload in workloads) {
         LoadHostCoreLib = true,
         EnableJit = enableJit,
         JitPromotionThreshold = 2,
-        Memory = new MemoryPolicy { InstructionQuota = long.MaxValue, HostWorkBudget = long.MaxValue },
+        Memory = new MemoryPolicy {
+                InstructionQuota = long.MaxValue,
+                InstructionChargingEnabled = instructionCharging,
+                InstructionChargeBatchSize = instructionChargeBatchSize,
+                HostWorkBudget = long.MaxValue,
+        },
     });
     vm.LoadAssembly(workload.GuestType.Assembly.Location);
     vm.LoadAssembly(typeof(Enumerable).Assembly.Location);
@@ -94,8 +103,6 @@ foreach (var workload in workloads) {
         var allocated = new long[samples];
         var instructions = new long[samples];
         for (var i = 0; i < samples; i++) {
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
             var allocationBefore = GC.GetTotalAllocatedBytes(precise: true);
             var instructionBefore = vm.InstructionCount;
             var start = Stopwatch.GetTimestamp();
@@ -152,8 +159,6 @@ static CoreClrMeasurement MeasureCoreClr(Func<int, int> run, int count, int expe
     var elapsed = new double[samples];
     var allocated = new double[samples];
     for (var i = 0; i < samples; i++) {
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
         var allocationBefore = GC.GetTotalAllocatedBytes(precise: true);
         var start = Stopwatch.GetTimestamp();
         var actual = RunBatch(run, count, iterations);

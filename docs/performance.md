@@ -54,7 +54,8 @@ CoreLib、System.Linq、async の生成 IL に使われます。List / LINQ / Di
 Release の同じゲストメソッドと入力を CoreCLR の型付きデリゲートと VM の公開呼び出しで実行し、戻り値を照合します。
 
 短い CoreCLR 呼び出しは約50 msのバッチに調整し、1呼び出しあたりへ換算します（最大1,000,000回）。
-VM は各サンプル1回です。ロード、初回準備・JIT 昇格、サンプル前の host GC は時間に含みません。
+VM は各サンプル1回です。ロード、初回準備・JIT 昇格は時間に含みません。
+測定前の強制 GC は CoreCLR／VM のどちらにも行わず、各ランタイムの通常の GC 発生を時間に含めます。
 CoreCLR の結果確認はバッチ後、VM の確認は各呼び出しで行います。
 確保量は `GC.GetTotalAllocatedBytes(true)` の差分で、async worker を含むプロセス全体の値です。
 VM のメモリクォータ会計とは別の指標で、実行中の GC は計測時間に含みます。

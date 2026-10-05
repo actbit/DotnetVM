@@ -34,6 +34,11 @@ public sealed class InstructionQuotaExceededException : ResourceExhaustedExcepti
     public InstructionQuotaExceededException(string message) : base(message) { }
 }
 
+/// <summary>1 回のトップレベルゲスト実行が実時間上限を超過した。</summary>
+public sealed class ExecutionTimeoutException : ResourceExhaustedException {
+    public ExecutionTimeoutException(string message) : base(message) { }
+}
+
 /// <summary>guest Thread / Task worker / pending Timer の VM 上限を超過した。</summary>
 public sealed class GuestConcurrencyLimitExceededException : ResourceExhaustedException {
     public GuestConcurrencyLimitExceededException(string message) : base(message) { }

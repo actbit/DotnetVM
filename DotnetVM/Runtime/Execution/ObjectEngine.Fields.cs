@@ -305,6 +305,12 @@ internal sealed partial class ObjectEngine {
         throw new BadImageFormatException($"フィールド {field.DeclaringType.FullName}::{field.Name} が {type.FullName} のレイアウトにありません。");
     }
 
+    // JIT call sites cache the receiver type and use this resolver only when
+    // that type changes. Keep the normal field API unchanged for polymorphic
+    // and byref receivers.
+    internal int GetInstanceFieldIndexForJit(VmClassType type, VmField field) =>
+        GetInstanceFieldIndex(type, field);
+
     /// <summary>静的フィールドの位置を解決する (.cctor 起動を含む)。intrinsic 型 (TypeRef 親) の静的フィールドも解決する。</summary>
     public VmByRef StaticFieldLocation(int token, GenericContext? context = null,
         IReadOnlyDictionary<uint, object>? dynamicTokens = null, bool isReadOnly = false) {

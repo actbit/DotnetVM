@@ -99,6 +99,8 @@ public sealed class VmByRef {
 /// 深さは MemoryPolicy.MaxRecursionDepth で事前拒否する。
 /// </summary>
 public sealed class InterpreterFrame {
+    private List<StackSlot[]>? _callArgumentBuffers;
+    private int _callArgumentDepth;
     public required VmMethod Method { get; init; }
     public required DecodedInstruction[] Code { get; init; }
     /// <summary>IL オフセット → 命令インデックス (分岐ジャンプ用)。</summary>
@@ -153,6 +155,55 @@ public sealed class InterpreterFrame {
 
     /// <summary>readonly. プレフィックスが次の ldelema に適用されるか。</summary>
     public bool PendingReadonly;
+
+    /// <summary>
+    /// 一時的な call 引数バッファ。IL 呼出しは戻りまでしか引数配列を
+    /// 必要としないため、フレーム単位で再利用してホットな intrinsic/IL
+    /// 呼出しごとの配列確保を避ける。再入時は深さ別バッファを使う。
+    /// </summary>
+    internal IEnumerable<StackSlot[]> ActiveCallArgumentRoots {
+        get {
+            if (_callArgumentBuffers is null)
+                yield break;
+            for (var i = 0; i < _callArgumentDepth; i++)
+                yield return _callArgumentBuffers[i];
+        }
+    }
+
+    internal CallArgumentLease BorrowCallArguments(int arity) {
+        if (arity < 0)
+            throw new ArgumentOutOfRangeException(nameof(arity));
+        _callArgumentBuffers ??= [];
+        if (_callArgumentDepth == _callArgumentBuffers.Count)
+            _callArgumentBuffers.Add(new StackSlot[arity]);
+        // The array is passed across the VM/host call boundary, so its
+        // Length is observable (delegate and intrinsic binders use it as the
+        // argument count). Reusing a larger buffer would turn a two-argument
+        // call into a three-argument call. Keep one exact-length buffer per
+        // active depth; different arities pay only the first allocation for
+        // that depth.
+        else if (_callArgumentBuffers[_callArgumentDepth].Length != arity)
+            _callArgumentBuffers[_callArgumentDepth] = new StackSlot[arity];
+        var buffer = _callArgumentBuffers[_callArgumentDepth++];
+        Stack.ArgumentSlots(arity).CopyTo(buffer);
+        Stack.DropArguments(arity);
+        return new CallArgumentLease(this, buffer);
+    }
+
+    internal readonly struct CallArgumentLease : IDisposable {
+        private readonly InterpreterFrame _frame;
+        public readonly StackSlot[] Arguments;
+
+        internal CallArgumentLease(InterpreterFrame frame, StackSlot[] arguments) {
+            _frame = frame;
+            Arguments = arguments;
+        }
+
+        public void Dispose() {
+            Array.Clear(Arguments);
+            _frame._callArgumentDepth--;
+        }
+    }
 
     public static InterpreterFrame Create(VmMethod method, StackSlot[] arguments, SigType[] localTypes, int maxStack,
         DecodedInstruction[]? preparedCode = null) {

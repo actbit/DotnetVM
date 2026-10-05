@@ -378,8 +378,21 @@ internal sealed partial class CallEngine {
         gate.ConsumeInstruction();
         gate.CheckSafepoint();
         _intrinsicContext.ParameterTypeNames = paramNames;
-        using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+        using var roots = RegisterTransientRootsIfNeeded(args);
         return impl(_intrinsicContext, args);
+    }
+
+    private IDisposable? RegisterTransientRootsIfNeeded(StackSlot[] args) {
+        // Primitive-only intrinsic calls cannot expose a VM object to a
+        // collection. Avoid allocating an ActionLease for those calls while
+        // retaining the root registration for references, byrefs and value
+        // types that may contain references.
+        foreach (var argument in args) {
+            if (argument.Kind is StackKind.ByRef or StackKind.ValueType ||
+                argument.Kind == StackKind.Object && argument.ObjectValue is not null)
+                return _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+        }
+        return null;
     }
 
     /// <summary>プリミティブ等の instance 面 (ByRef レシーバ) を値に読み替える。可変状態を

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DotnetVM.Devices;
 using DotnetVM.IL;
 using DotnetVM.Host;
@@ -68,6 +69,10 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         public readonly List<StackSlot[]> TemporaryRoots = [];
         public int Depth;
         public long InstructionCount;
+        public int UnchargedInstructions;
+        public int InstructionChargeRemaining;
+        public int ChargedSinceSafepoint;
+        public long DeadlineTimestamp;
         public bool Registered;
     }
     private readonly ThreadLocal<ExecutionState> _currentExecution;
@@ -80,7 +85,10 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly Func<IEnumerable<StackSlot[]>> _frameRootSource;
 
     public long InstructionCount => Interlocked.Read(ref _instructionCount);
-    internal bool HasInstructionBudget => Interlocked.Read(ref _instructionCount) < _memory.InstructionQuota;
+    internal bool InstructionChargingEnabled => _memory.InstructionChargingEnabled;
+    internal bool HasInstructionBudget => !InstructionChargingEnabled ||
+        CurrentState.InstructionChargeRemaining > 0 ||
+        Interlocked.Read(ref _instructionCount) < _memory.InstructionQuota;
 
     internal long CurrentThreadInstructionCount => CurrentState.InstructionCount;
 
@@ -111,20 +119,81 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
     private void ConsumeInstruction() => ConsumeInstruction(CurrentState);
 
-    private void ConsumeInstruction(ExecutionState state) {
+    private void ConsumeInstruction(ExecutionState state) => ConsumeInstruction(state, 1);
+
+    private void ConsumeInstruction(ExecutionState state, int cost) {
+        if (cost < 1)
+            throw new ArgumentOutOfRangeException(nameof(cost));
         _shared.ThrowIfDisposed();
-        var count = Interlocked.Increment(ref _instructionCount);
-        if (count > _memory.InstructionQuota)
+        if (!InstructionChargingEnabled) {
+            // Keep periodic cancellation/GC observation without maintaining a
+            // quota counter in the no-charge execution mode.
+            if (++state.UnchargedInstructions >= SafepointInterval) {
+                state.UnchargedInstructions = 0;
+                CheckSafepoint();
+            }
+            return;
+        }
+        if (state.InstructionChargeRemaining < cost) {
+            try {
+                ReserveInstructionCharge(state, Math.Max(_memory.InstructionChargeBatchSize, cost));
+            } catch (InstructionQuotaExceededException) {
+                ThrowAfterInstructionChargeReservation(state, cost);
+                throw;
+            }
+        }
+        if (state.InstructionChargeRemaining < cost) {
+            ThrowAfterInstructionChargeReservation(state, cost);
             throw new InstructionQuotaExceededException(
-                $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {count:N0})。");
-        state.InstructionCount++;
-        if (count % SafepointInterval == 0)
+                $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました。");
+        }
+        state.InstructionChargeRemaining -= cost;
+        state.InstructionCount += cost;
+        state.ChargedSinceSafepoint += cost;
+        if (state.ChargedSinceSafepoint >= SafepointInterval) {
+            state.ChargedSinceSafepoint %= SafepointInterval;
             CheckSafepoint();
+        }
+    }
+
+    private void ReserveInstructionCharge(ExecutionState state, int requested) {
+        while (true) {
+            var current = Volatile.Read(ref _instructionCount);
+            var available = _memory.InstructionQuota - current;
+            if (available <= 0)
+                throw new InstructionQuotaExceededException(
+                    $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {current:N0})。");
+            var grant = (int)Math.Min((long)requested, available);
+            if (Interlocked.CompareExchange(ref _instructionCount, current + grant, current) == current) {
+                state.InstructionChargeRemaining += grant;
+                return;
+            }
+        }
+    }
+
+    private void ThrowAfterInstructionChargeReservation(ExecutionState state, int cost) {
+        var reserved = state.InstructionChargeRemaining;
+        state.InstructionChargeRemaining = 0;
+        if (reserved > 0)
+            Interlocked.Add(ref _instructionCount, -reserved);
+        var count = Interlocked.Add(ref _instructionCount, cost);
+        state.InstructionCount += cost;
+        throw new InstructionQuotaExceededException(
+            $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {count:N0})。");
+    }
+
+    internal void ReleaseInstructionCharge(ExecutionState state) {
+        var reserved = Interlocked.Exchange(ref state.InstructionChargeRemaining, 0);
+        if (reserved > 0)
+            Interlocked.Add(ref _instructionCount, -reserved);
     }
 
     /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
     /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
     private void CheckSafepoint() {
+        var deadline = CurrentState.DeadlineTimestamp;
+        if (deadline != 0 && Stopwatch.GetTimestamp() >= deadline)
+            throw new ExecutionTimeoutException("ゲスト実行が設定された実時間上限を超過しました。");
         _shared.ShutdownToken.ThrowIfCancellationRequested();
         _shared.ThrowIfDisposed();
         // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
@@ -142,9 +211,44 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     // JIT frames use the same quota and coordinator gates as interpreter
     // instructions.  These narrow wrappers keep the coordinator private while
     // allowing the generated delegate to bracket each instruction safely.
-    internal void ConsumeJitInstruction() => ConsumeInstruction();
-    internal void ConsumeJitInstructionForState(ExecutionState state) => ConsumeInstruction(state);
+    internal void ConsumeJitInstruction(int cost) => ConsumeInstruction(CurrentState, cost);
+    internal void ConsumeJitInstructionForState(ExecutionState state, int cost) => ConsumeInstruction(state, cost);
+    internal int ReserveJitInstructionChunk(int requested) {
+        if (requested < 1)
+            throw new ArgumentOutOfRangeException(nameof(requested));
+        _shared.ThrowIfDisposed();
+        if (!InstructionChargingEnabled)
+            return requested;
+        while (true) {
+            var current = Volatile.Read(ref _instructionCount);
+            var available = _memory.InstructionQuota - current;
+            if (available <= 0)
+                throw new InstructionQuotaExceededException(
+                    $"命令数クォータ {_memory.InstructionQuota:N0} を超過しました (実行命令数: {current:N0})。");
+            var grant = (int)Math.Min((long)requested, available);
+            if (Interlocked.CompareExchange(ref _instructionCount, current + grant, current) == current)
+                return grant;
+        }
+    }
+    internal void RefundJitInstructionChunk(int amount) {
+        if (InstructionChargingEnabled && amount > 0)
+            Interlocked.Add(ref _instructionCount, -amount);
+    }
     internal void CheckJitSafepoint() => CheckSafepoint();
+
+    private bool BeginExecutionTimeout(ExecutionState state) {
+        if (state.Depth != 0 || _memory.ExecutionTimeout is not { } timeout)
+            return false;
+        var now = Stopwatch.GetTimestamp();
+        var seconds = timeout.TotalSeconds;
+        var delta = seconds >= long.MaxValue / (double)Stopwatch.Frequency
+            ? long.MaxValue
+            : Math.Max(1L, (long)Math.Ceiling(seconds * Stopwatch.Frequency));
+        state.UnchargedInstructions = 0;
+        state.DeadlineTimestamp = delta >= long.MaxValue - now ? long.MaxValue : now + delta;
+        return true;
+    }
+
     internal VmExecutionCoordinator.InstructionLease EnterJitInstruction() => _coordinator.EnterInstruction();
     internal VmExecutionCoordinator.InstructionLease EnterJitInstructionInBatch() =>
         _coordinator.EnterInstructionInBatch();
@@ -182,9 +286,14 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 CheckSafepoint();
                 batchInstructions++;
                 using var instructionLease = _coordinator.EnterInstructionInBatch();
-                ConsumeInstruction(state);
                 var instruction = frame.Code[frame.Ip];
+                ConsumeInstruction(state, instruction.InstructionCost);
                 ObserveInstruction(frame, instruction);
+            if (instruction.Fusion.Kind != IlFusionKind.None) {
+                IlFusionRuntime.Execute(frame, instruction.Fusion);
+                frame.Ip++;
+                continue;
+            }
             var isPrefix = IsPrefix(instruction.Op);
             var volatileAccess = frame.PendingVolatile && !isPrefix && IsVolatileMemoryAccess(instruction.Op);
             var readonlyAddress = frame.PendingReadonly && !isPrefix &&
@@ -295,15 +404,30 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
                 // ---- 分岐 ----
                 case ILOp.Br or ILOp.Br_S:
-                    eh.JumpTo(frame, instruction.IntOperand);
+                    if (instruction.BranchTargetIndex >= 0)
+                        frame.Ip = instruction.BranchTargetIndex;
+                    else
+                        eh.JumpTo(frame, instruction.IntOperand);
                     continue;
                 case ILOp.BrFalse or ILOp.BrFalse_S:
                     if (!SlotOps.IsTrue(frame.Stack.Pop()))
-                        { eh.JumpTo(frame, instruction.IntOperand); continue; }
+                        {
+                            if (instruction.BranchTargetIndex >= 0)
+                                frame.Ip = instruction.BranchTargetIndex;
+                            else
+                                eh.JumpTo(frame, instruction.IntOperand);
+                            continue;
+                        }
                     break;
                 case ILOp.BrTrue or ILOp.BrTrue_S:
                     if (SlotOps.IsTrue(frame.Stack.Pop()))
-                        { eh.JumpTo(frame, instruction.IntOperand); continue; }
+                        {
+                            if (instruction.BranchTargetIndex >= 0)
+                                frame.Ip = instruction.BranchTargetIndex;
+                            else
+                                eh.JumpTo(frame, instruction.IntOperand);
+                            continue;
+                        }
                     break;
                 case ILOp.Beq or ILOp.Beq_S or ILOp.Bne_Un or ILOp.Bne_Un_S
                     or ILOp.Bge or ILOp.Bge_S or ILOp.Bgt or ILOp.Bgt_S or ILOp.Ble or ILOp.Ble_S
@@ -312,14 +436,23 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     var right = frame.Stack.Pop();
                     var left = frame.Stack.Pop();
                     if (SlotOps.CompareBranch(instruction.Op, left, right))
-                        { eh.JumpTo(frame, instruction.IntOperand); continue; }
+                        {
+                            if (instruction.BranchTargetIndex >= 0)
+                                frame.Ip = instruction.BranchTargetIndex;
+                            else
+                                eh.JumpTo(frame, instruction.IntOperand);
+                            continue;
+                        }
                     break;
                 }
                 case ILOp.Switch: {
                     var index = frame.Stack.Pop().AsInt32;
-                    var targets = instruction.SwitchTargets!;
+                    var targets = instruction.SwitchTargetIndices ?? instruction.SwitchTargets!;
                     if ((uint)index < (uint)targets.Length) {
-                        eh.JumpTo(frame, targets[index]);
+                        if (instruction.SwitchTargetIndices is { } indices)
+                            frame.Ip = indices[index];
+                        else
+                            eh.JumpTo(frame, targets[index]);
                         continue;
                     }
                     break;

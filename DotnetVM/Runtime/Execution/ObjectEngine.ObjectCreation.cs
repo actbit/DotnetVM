@@ -240,15 +240,14 @@ internal sealed partial class ObjectEngine {
 
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
         if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var reflectedReference) == true && reflectedReference is VmRuntimeMethod reflectedCtor) {
-            var values = caller.Stack.PopArguments(reflectedCtor.Target.Signature.ParamTypes.Length);
-            return StackSlot.OfObject(CreateInstanceByCtor(reflectedCtor.ReflectedType ?? reflectedCtor.Target.DeclaringType, reflectedCtor.Target, values, null));
+            using var argumentLease = caller.BorrowCallArguments(reflectedCtor.Target.Signature.ParamTypes.Length);
+            return StackSlot.OfObject(CreateInstanceByCtor(reflectedCtor.ReflectedType ?? reflectedCtor.Target.DeclaringType,
+                reflectedCtor.Target, argumentLease.Arguments, null));
         }
         if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmMethod dynamicCtor) {
-            var values = new StackSlot[dynamicCtor.Signature.ParamTypes.Length];
-            for (var i = values.Length - 1; i >= 0; i--)
-                values[i] = caller.Stack.Pop();
-            return ConstructExpression(dynamicCtor, values);
+            using var argumentLease = caller.BorrowCallArguments(dynamicCtor.Signature.ParamTypes.Length);
+            return ConstructExpression(dynamicCtor, argumentLease.Arguments);
         }
         VmMethod ctor;
         var table = (TableKind)(token >> 24);

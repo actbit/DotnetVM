@@ -73,6 +73,8 @@ public sealed partial class Interpreter {
             foreach (var frame in frames) {
                 yield return frame.Arguments;
                 yield return frame.Locals;
+                foreach (var callArguments in frame.ActiveCallArgumentRoots)
+                    yield return callArguments;
                 if (frame.Stack.Count > 0)
                     yield return frame.Stack.RootSlots;
                 if (frame.CurrentThrow is { } throwing)

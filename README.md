@@ -111,6 +111,10 @@ VM ヒープの確保量は `VmHeap` で計上し、実行中の参照を GC ル
 マネージ参照（ByRef）は参照先の所有オブジェクトを保持し、読み取り専用の制約もフィールド参照へ伝播します。
 コンパイルとアンロードが競合した場合は、生成したデリゲートを破棄します。
 
+整数スロットだけで閉じるメソッドには、IL の基本ブロックを直接実行するスカラー JIT を使用できます。
+純粋な `int32` static メソッド呼出しは検証後に式木へインライン化し、ローカル値の算術更新は IL 融合でまとめます。
+トップレベルのスカラー呼出しではフレームを省略できますが、命令課金、クォータ、セーフポイント、例外時の後始末は維持します。
+
 コンパイルには `JitCompilationBudget`、`HostWorkBudget`、`HostTempAllocationByteLimit` を適用します。
 保持数と複雑度は `MaxJitCompiledMethods`、`MaxJitCacheEntries`、`MaxJitExpressionNodes`、`MaxJitMethodBodyBytes` で制限し、
 上限を超えたメソッドはインタプリタへフォールバックします。
@@ -140,6 +144,23 @@ GC 要求がない命令境界では停止処理を省き、要求がある場�
 | ネットワーク | `NetworkGateway` と `NetworkPolicy` で要求ごと・累計の転送量を計上 |
 | ストレージ | `StorageGateway` と `StoragePolicy` で操作ごと・累計の転送量を計上 |
 | 並行実行 | `MaxGuestThreads`、`MaxTaskWorkers`、`MaxGuestWorkers`、`MaxPendingTaskTimers`、`MaxTaskCombinatorInputs` |
+
+信頼済みコードの性能測定などで命令数課金を外す場合は、`MemoryPolicy.InstructionChargingEnabled = false` を指定します。
+この場合、`InstructionCount` は増加せず `InstructionQuota` も判定されませんが、Dispose・キャンセル・GC のセーフポイントと、
+ヒープ・ホスト作業・再帰など他の制限は有効です。停止性も必要な場合は、例えば次のように実時間上限を併用します。
+
+```csharp
+Memory = new MemoryPolicy {
+    InstructionChargingEnabled = false,
+    ExecutionTimeout = TimeSpan.FromSeconds(2),
+};
+```
+
+上限超過時は `ExecutionTimeoutException` がホストへ伝播します。タイムアウトは安全な命令境界で検出されるため、
+信頼しないゲストでは既定の命令課金 (`InstructionChargingEnabled = true`) も併用してください。
+
+課金処理は既定で `InstructionChargeBatchSize = 256` 命令ずつ予約します。未使用分は実行終了時に返却され、
+完了後の `InstructionCount` は実際に実行した命令数です。厳密な命令単位の予約が必要な場合は `1` を指定してください。
 
 ### GC
 
@@ -393,6 +414,13 @@ AsyncWorkersは待機時間を含むため高速化の評価から除外しま�
 [最新masterとの全25項目の比較・確保量・命令数・生データ・再現手順](docs/performance-pr34.md)を参照してください。
 [2026-10-03の測定](docs/performance.md)と[BCLの初回測定](docs/performance-bcl.md)は過去の記録として保持し、
 そこでの改善率を現在のPRの効果としては扱いません。
+
+### CallLoop の IL/JIT 再測定（2026-10-06）
+
+`CallLoop(100_000)` は、純粋な整数メソッド呼出しの IL インライン化とスカラー JIT の命令課金ホットパス改善後、
+CoreCLR `0.096263 ms`、VM JIT `2.902 ms`、比率 `30.1倍`（warmup 3回、7サンプルの中央値）でした。
+戻り値は毎回 CoreCLR と照合しています。CoreCLR／VM のどちらにも測定前の強制 GC は行わず、実行中の自然 GC を時間へ含めています。
+単発サンプルはGCやホスト負荷の影響を受けるため、性能判断には中央値を使用します。
 
 ## プロジェクト構成
 

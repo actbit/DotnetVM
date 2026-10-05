@@ -370,6 +370,52 @@ public sealed class JitTests {
     }
 
     [Fact]
+    public void InstructionChargingCanBeDisabledWithoutChangingGuestResult() {
+        foreach (var enableJit in new[] { false, true }) {
+            using var vm = new VirtualMachine(new VmHostOptions {
+                EnableJit = enableJit,
+                JitPromotionThreshold = 1,
+                Memory = new MemoryPolicy {
+                    InstructionQuota = 0,
+                    InstructionChargingEnabled = false,
+                },
+            });
+            vm.LoadAssembly(new MemoryStream(Compiled.Bytes));
+
+            Assert.Equal(49_995_000,
+                Assert.IsType<int>(vm.Invoke("Vm.Calc", nameof(CalcNames.Sum), 10_000)));
+            Assert.Equal(0, vm.InstructionCount);
+        }
+    }
+
+    [Fact]
+    public void ExecutionTimeoutStopsUnchargedInterpreterAndJit() {
+        foreach (var enableJit in new[] { false, true }) {
+            using var vm = new VirtualMachine(new VmHostOptions {
+                EnableJit = enableJit,
+                JitPromotionThreshold = 1,
+                Memory = new MemoryPolicy {
+                    InstructionQuota = 0,
+                    InstructionChargingEnabled = false,
+                    ExecutionTimeout = TimeSpan.FromMilliseconds(100),
+                },
+            });
+            vm.LoadAssembly(new MemoryStream(Compiled.Bytes));
+
+            Assert.Throws<ExecutionTimeoutException>(() =>
+                vm.Invoke("Vm.Calc", nameof(CalcNames.Infinite)));
+            Assert.Equal(0, vm.InstructionCount);
+        }
+    }
+
+    [Fact]
+    public void NonPositiveExecutionTimeoutIsRejected() {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
+            Memory = new MemoryPolicy { ExecutionTimeout = TimeSpan.Zero },
+        }));
+    }
+
+    [Fact]
     public void InvalidPromotionThresholdIsRejected() {
         Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
             EnableJit = true,

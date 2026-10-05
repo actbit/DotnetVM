@@ -30,6 +30,8 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
             return cached;
 
         var code = method.Body is null ? [] : DecodeIl(method);
+        if (method.Body is { } ilBody)
+            code = IlOptimizer.Optimize(code, ilBody.ExceptionClauses);
         SigType[] localTypes = method.Body?.DynamicLocalTypes ?? [];
         if (method.Body is { } body && body.DynamicLocalTypes is null && body.LocalVarSigToken != 0) {
             var table = (TableKind)(body.LocalVarSigToken >> 24);
@@ -173,20 +175,45 @@ internal sealed class PreparedMethod {
 
     public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
         LocalTypes = localTypes;
-        Code = code;
         OffsetMap = new Dictionary<int, int>(code.Length * 2);
         for (var i = 0; i < code.Length; i++)
             OffsetMap[code[i].Offset] = i;
+
+        Code = ResolveBranchIndices(code, OffsetMap);
 
         InitialLocals = new StackSlot[localTypes.Length];
         for (var i = 0; i < localTypes.Length; i++)
             InitialLocals[i] = InterpreterFrame.DefaultValue(localTypes[i]);
 
-        EstimatedBytes = EstimateBytes(localTypes, code, OffsetMap, InitialLocals, null);
+        EstimatedBytes = EstimateBytes(localTypes, Code, OffsetMap, InitialLocals, null);
     }
 
     internal void SetEstimatedBytes(PreparedClause[]? clauses) {
         EstimatedBytes = EstimateBytes(LocalTypes, Code, OffsetMap, InitialLocals, clauses);
+    }
+
+    private static DecodedInstruction[] ResolveBranchIndices(
+        DecodedInstruction[] code, Dictionary<int, int> offsetMap) {
+        if (code.Length == 0)
+            return code;
+
+        var resolved = (DecodedInstruction[])code.Clone();
+        for (var i = 0; i < resolved.Length; i++) {
+            var instruction = resolved[i];
+            if (instruction.OperandKind is IlOperandKind.ShortBrTarget or IlOperandKind.BrTarget) {
+                if (offsetMap.TryGetValue(instruction.IntOperand, out var target))
+                    resolved[i] = instruction with { BranchTargetIndex = target };
+            } else if (instruction.SwitchTargets is { } targets) {
+                var indices = new int[targets.Length];
+                for (var targetIndex = 0; targetIndex < targets.Length; targetIndex++)
+                    if (offsetMap.TryGetValue(targets[targetIndex], out var target))
+                        indices[targetIndex] = target;
+                    else
+                        return code; // 検証が正規化された BadImageFormatException を報告する
+                resolved[i] = instruction with { SwitchTargetIndices = indices };
+            }
+        }
+        return resolved;
     }
 
     private static long EstimateBytes(SigType[] localTypes, DecodedInstruction[] code,
@@ -200,7 +227,8 @@ internal sealed class PreparedMethod {
         foreach (var localType in localTypes)
             bytes = checked(bytes + EstimateSigType(localType));
         foreach (var instruction in code)
-            bytes = checked(bytes + (instruction.SwitchTargets?.LongLength ?? 0) * sizeof(int));
+            bytes = checked(bytes + ((instruction.SwitchTargets?.LongLength ?? 0) +
+                (instruction.SwitchTargetIndices?.LongLength ?? 0)) * sizeof(int));
         return bytes;
     }
 

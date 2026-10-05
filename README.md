@@ -366,59 +366,61 @@ foreach (var frame in vm.Tracer.Frames)
 
 ## ベンチマーク
 
-### 最新の CoreCLR 比較（2026-10-04、PR #34）
+### 最新の CoreCLR 比較（2026-10-06、今回のPR）
 
-反復Invoke修正後のPR `8455575` を再測定した値です。25項目すべてが成功しました。
+コミット `fd4dd97` のIL最適化・スカラーJITを測定した値です。25項目すべてが成功しました。
 AMD Ryzen 9 3900 / Windows x64（build 26200）/ SDK 10.0.401 / runtime 10.0.12、
-Release、host tiered compilation無効。warmup 3回、7 samples、VM JIT昇格閾値2です。
+Release、host tiered compilation無効。warmup 3回、7 samples、VM JIT昇格閾値2、命令課金有効です。
 
 既存22項目にReflectionのInvoke・属性取得・属性付きDTOのJSON往復を加えた**25項目**です。
 成功項目の戻り値をCoreCLRと照合しました。時間は表の入力を処理するゲストメソッド**1呼び出し全体のms中央値**で、
-ロード・初回準備・JITコンパイルを含みません。CoreCLR列はPR JIT測定プロセスの値です。
+ロード・初回準備・JITコンパイルを含みません。CoreCLR列は同一条件のJIT測定プロセスで取得し、
+VMインタプリタ列とVM JIT列はそれぞれ別条件で取得しています。測定前の強制GCは行わず、自然GCは時間に含めます。
 
 | ワークロード | 入力 | CoreCLR ms | VM インタプリタ ms | VM JIT ms |
 |---|---:|---:|---:|---:|
-| SpanCopies | 1,000 | 0.016525 | 38.085 | 37.736 |
-| IntegerFormatting | 1,000 | 0.022379 | 9.693 | 8.540 |
-| IntegerParsing | 1,000 | 0.019425 | 6.976 | 5.700 |
-| StringCopies | 1,000 | 0.008226 | 5.088 | 4.380 |
-| ReflectionInvoke | 100 | 0.002530 | 21.145 | 17.972 |
-| ReflectionAttributes | 50 | 0.066028 | 88.644 | 85.419 |
-| JsonRoundTrip | 10 | 0.015998 | 50.680 | 55.874 |
-| Arithmetic | 5,000 | 0.002841 | 5.265 | 3.955 |
-| ArithmeticLoop | 100,000 | 0.147011 | 121.068 | 88.663 |
-| BranchLoop | 100,000 | 0.371290 | 116.104 | 84.277 |
-| ArraySum | 10,000 | 0.011865 | 19.613 | 14.153 |
-| FieldAccess | 5,000 | 0.002769 | 6.905 | 5.501 |
-| GenericFieldAccess | 5,000 | 0.002785 | 7.062 | 7.464 |
-| MethodCalls | 1,000 | 0.001230 | 2.634 | 1.400 |
-| CallLoop | 100,000 | 0.093954 | 219.183 | 89.319 |
-| ObjectLoop | 10,000 | 0.030545 | 71.454 | 53.497 |
-| List | 500 | 0.005116 | 11.693 | 11.924 |
-| ListGrowth | 500 | 0.001472 | 7.182 | 8.223 |
-| Linq | 500 | 0.004511 | 23.316 | 16.262 |
-| DictionaryInt | 200 | 0.003782 | 29.127 | 25.092 |
-| DictionaryGrowth | 200 | 0.003783 | 21.086 | 20.770 |
-| DictionaryString | 200 | 0.005340 | 21.416 | 20.159 |
-| AsyncCompleted | 200 | 0.001292 | 2.124 | 2.475 |
-| ValueTaskCompleted | 200 | 0.000464 | 2.228 | 2.308 |
-| AsyncWorkers | 8 | 14.853875 | 11.073 | 10.873 |
+| SpanCopies | 1,000 | 0.014127 | 108.399 | 108.967 |
+| IntegerFormatting | 1,000 | 0.024833 | 7.147 | 7.233 |
+| IntegerParsing | 1,000 | 0.020799 | 4.311 | 5.263 |
+| StringCopies | 1,000 | 0.014147 | 4.137 | 4.160 |
+| ReflectionInvoke | 100 | 0.001729 | 12.202 | 13.020 |
+| ReflectionAttributes | 50 | 0.062841 | 63.374 | 62.464 |
+| JsonRoundTrip | 10 | 0.019203 | 37.349 | 39.544 |
+| Arithmetic | 5,000 | 0.002768 | 3.441 | 0.466 |
+| ArithmeticLoop | 100,000 | 0.146822 | 36.983 | 1.168 |
+| BranchLoop | 100,000 | 0.373139 | 57.043 | 2.343 |
+| ArraySum | 10,000 | 0.011578 | 12.639 | 11.665 |
+| FieldAccess | 5,000 | 0.002772 | 4.482 | 3.572 |
+| GenericFieldAccess | 5,000 | 0.002768 | 4.649 | 4.655 |
+| MethodCalls | 1,000 | 0.001306 | 1.708 | 0.453 |
+| CallLoop | 100,000 | 0.094699 | 139.643 | 1.002 |
+| ObjectLoop | 10,000 | 0.030129 | 48.253 | 39.673 |
+| List | 500 | 0.002109 | 7.286 | 7.514 |
+| ListGrowth | 500 | 0.001596 | 4.711 | 4.949 |
+| Linq | 500 | 0.001920 | 11.843 | 11.511 |
+| DictionaryInt | 200 | 0.002030 | 17.400 | 18.322 |
+| DictionaryGrowth | 200 | 0.002346 | 14.606 | 13.348 |
+| DictionaryString | 200 | 0.002791 | 14.857 | 13.537 |
+| AsyncCompleted | 200 | 0.001193 | 1.382 | 1.387 |
+| ValueTaskCompleted | 200 | 0.000424 | 1.536 | 1.572 |
+| AsyncWorkers | 8 | 14.162750 | 15.678 | 15.055 |
 
-最新master `2950044` と比較すると、属性取得はInterpreter 50.60×／JIT 61.98×の時間がかかりました。
-SpanやDictionaryにも時間・確保量の増加があります。**このPRの全体的な高速化や性能回帰がないことは主張しません。**
+CallLoopはCoreCLR比でインタプリタ `1493.1倍` からVM JIT `10.6倍` へ改善しました。
+ArithmeticLoopは `8.0倍`、BranchLoopは `6.3倍` で、スカラー整数ループは100倍以下です。
+一方、Span・Reflection・コレクション系には100倍を超える項目が残っており、全ワークロードが同じ倍率になったことは主張しません。
 
-ReflectionInvokeの反復呼び出しを修正し、100回のInvokeは21.145／17.972 msでした。
+ReflectionInvokeの反復呼び出しを修正し、100回のInvokeは12.202／13.020 msでした。
 CoreLib標準のForceInterpretedInvokeを設定し、元のBCL ILとネイティブ境界で実行します。生成Invokeスタブの完全対応は含みません。
-JSONはPRで成功しましたが、masterはIList<T>.get_Itemの未対応で失敗し、速度比はありません。
-AsyncWorkersは待機時間を含むため高速化の評価から除外します。ロード、VM起動設定、初回準備、JIT昇格、JSON初回メタデータ構築は測定時間から除外しました。
-[最新masterとの全25項目の比較・確保量・命令数・生データ・再現手順](docs/performance-pr34.md)を参照してください。
+JSONは今回のPRで成功しました。ロード、VM起動設定、初回準備、JIT昇格、JSON初回メタデータ構築は測定時間から除外しました。
+AsyncWorkersは待機時間を含むため高速化の評価から除外します。
+[PR #34時点の比較・確保量・命令数・生データ・再現手順](docs/performance-pr34.md)は過去記録として参照できます。
 [2026-10-03の測定](docs/performance.md)と[BCLの初回測定](docs/performance-bcl.md)は過去の記録として保持し、
 そこでの改善率を現在のPRの効果としては扱いません。
 
 ### CallLoop の IL/JIT 再測定（2026-10-06）
 
 `CallLoop(100_000)` は、純粋な整数メソッド呼出しの IL インライン化とスカラー JIT の命令課金ホットパス改善後、
-CoreCLR `0.096263 ms`、VM JIT `2.902 ms`、比率 `30.1倍`（warmup 3回、7サンプルの中央値）でした。
+CoreCLR `0.094699 ms`、VM JIT `1.002 ms`、比率 `10.6倍`（warmup 3回、7サンプルの中央値）でした。
 戻り値は毎回 CoreCLR と照合しています。CoreCLR／VM のどちらにも測定前の強制 GC は行わず、実行中の自然 GC を時間へ含めています。
 単発サンプルはGCやホスト負荷の影響を受けるため、性能判断には中央値を使用します。
 

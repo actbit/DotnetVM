@@ -30,8 +30,6 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
             return cached;
 
         var code = method.Body is null ? [] : DecodeIl(method);
-        if (method.Body is { } ilBody)
-            code = IlOptimizer.Optimize(code, ilBody.ExceptionClauses);
         SigType[] localTypes = method.Body?.DynamicLocalTypes ?? [];
         if (method.Body is { } body && body.DynamicLocalTypes is null && body.LocalVarSigToken != 0) {
             var table = (TableKind)(body.LocalVarSigToken >> 24);
@@ -49,6 +47,17 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
                 throw new BadImageFormatException(
                     $"ローカル変数署名 0x{body.LocalVarSigToken:X8} の構造が不正です。", ex);
             }
+        }
+
+        // Verify the source representation before any optimizer is allowed to
+        // remove evidence of malformed IL. The optimized representation is
+        // verified again below because it is the one that every runtime tier
+        // will actually execute.
+        if (method.Body is { } ilBody) {
+            var sourceClauses = ResolveExceptionClauses(method, code);
+            IlVerifier.Verify(loader, method, code, localTypes, sourceClauses);
+            _ = IlStackVerifier.Verify(method, loader, localTypes, code, sourceClauses);
+            code = IlOptimizer.Optimize(code, ilBody.ExceptionClauses);
         }
 
         var prepared = new PreparedMethod(localTypes, code) {

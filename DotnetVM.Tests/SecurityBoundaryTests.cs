@@ -19,6 +19,13 @@ namespace DotnetVM.Tests;
 /// </summary>
 public sealed class SecurityBoundaryTests {
     [Fact]
+    public void HostImplementationExceptionsAreNotVmManagementExceptions() {
+        Assert.True(HostExceptionBoundary.IsNormalizable(new IndexOutOfRangeException()));
+        Assert.False(HostExceptionBoundary.IsNormalizable(new InstructionQuotaExceededException("quota")));
+        Assert.False(HostExceptionBoundary.IsNormalizable(new OperationNotAllowedException("denied")));
+    }
+
+    [Fact]
     public void MemoryPolicy_RejectsInvalidValuesBeforeVmConstruction() {
         Assert.Throws<ArgumentOutOfRangeException>(() => new VirtualMachine(new VmHostOptions {
             Memory = new MemoryPolicy { MaxRecursionDepth = 0 },

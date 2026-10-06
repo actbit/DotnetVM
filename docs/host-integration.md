@@ -180,6 +180,8 @@ JIT は非 EH のスカラー、呼出、`newobj`、配列、フィールド、b
 CLR の値・ゲストオブジェクト・任意のゲスト delegate を生成コードへ渡さず、未対応命令や上限超過時は同じメソッドをインタプリタへ
 フォールバックします。JIT の命令実行も通常の命令クォータ、
 セーフポイント、GC ルート登録を通ります。
+準備順序は元の IL の verifier、最適化、最適化後の verifier で固定されます。整数式 JIT が inline する
+callee も `MethodPreparer` を通った準備済みコードだけを対象にするため、callee の検証を省略しません。
 
 一方、`System.Linq.Expressions.Compile` はホスト側でコードを生成するため、JIT 実装とその
 依存ライブラリは TCB の一部です。ゲストに式木コンパイルを許可する設定ではありません。
@@ -226,7 +228,11 @@ var options = new VmHostOptions {
 ホスト側で巨大な応答を作ってから VM に拒否させる増幅を避けてください。
 
 HttpClient には `IHttpNetworkBridge` と `NetworkPolicy.Http` の両方を設定します。
-標準の `HttpNetworkBridge` は応答を上限付きで読み、自動リダイレクト・Cookie・自動展開を無効にします。
+標準の `HttpNetworkBridge` は応答を上限付きで読み、自動リダイレクト・Cookie・自動展開・proxy を無効にします。
+さらに DNS 解決直後の接続先について loopback、private、link-local、unique-local、multicast、
+予約済みアドレスを拒否します。origin allowlist だけでは DNS rebinding を防げないため、
+独自の `HttpMessageHandler` または `IHttpNetworkBridge` を渡す場合は、同等の接続先IP検査を
+ブリッジ側で実装してください。独自 transport は VM の TCB に含まれます。
 origin / method / header の許可と要求数・通信量・タイムアウトの設定例は
 [BCL 互換性と HTTP 制限](bcl-compatibility.md) を参照してください。
 
@@ -234,6 +240,10 @@ origin / method / header の許可と要求数・通信量・タイムアウト�
 
 `IStorageBridge` はパスの正規化、許可ルート、シンボリックリンク、実ファイルへのアクセスを
 担当します。VM はファイルシステムへ直接触れません。
+`StorageGateway` が強制するのはバイトクォータだけなので、ブリッジを単純な
+`File.ReadAllBytes(path)` のラッパーにすると、許可していないホストFSをゲストへ公開します。
+`Read` の `maxBytes` はファイルを開く前の上限として使い、正規化後の実パスと symlink を
+許可ルート内で再確認してください。
 
 ```csharp
 sealed class WorkspaceStorage : IStorageBridge
@@ -243,7 +253,7 @@ sealed class WorkspaceStorage : IStorageBridge
     public byte[] Read(string path, long maxBytes)
     {
         if (!IsUnderWorkspace(path))
-            throw new UnauthorizedAccessException(path);
+            throw new OperationNotAllowedException("path is not allowlisted");
         // 実装では maxBytes を使ったストリーム読み取りを行う。
         return ReadAtMost(path, maxBytes);
     }
@@ -251,14 +261,14 @@ sealed class WorkspaceStorage : IStorageBridge
     public void Write(string path, ReadOnlyMemory<byte> contents)
     {
         if (!IsUnderWorkspace(path))
-            throw new UnauthorizedAccessException(path);
+            throw new OperationNotAllowedException("path is not allowlisted");
         WriteAtomically(path, contents);
     }
 
     public void Delete(string path)
     {
         if (!IsUnderWorkspace(path))
-            throw new UnauthorizedAccessException(path);
+            throw new OperationNotAllowedException("path is not allowlisted");
         File.Delete(path);
     }
 
@@ -402,6 +412,7 @@ guest Thread と Task worker は VM の共有予算で管理されます。ゲ�
 
 - [ ] `InstructionQuota`、メモリ、PE/メタデータ、再帰、並行性の上限を用途ごとに設定した
 - [ ] `NetworkBridge` / `StorageBridge` は必要な場合だけ設定し、allowlist と入力検証を実装した
+- [ ] HTTP の独自 transport は redirect / cookie / auto-decompression を無効化し、DNS 解決後の private / loopback / link-local IP を拒否する
 - [ ] ブリッジは `MaxResponseBytes` / `maxBytes` を取得前に適用する
 - [ ] `RegisterIntrinsic`、`RegisterBinding`、`CoreLibBindingProviders` に信頼済みコードだけを渡した
 - [ ] P/Invoke、ネイティブ依存、未登録面をエラーとして監視している

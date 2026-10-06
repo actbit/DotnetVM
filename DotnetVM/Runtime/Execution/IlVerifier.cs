@@ -75,6 +75,7 @@ internal static class IlVerifier {
             ValidateLocalSignatureToken();
             ValidateExceptionRegions();
             ValidateStaticInstructions();
+            ValidateFusions();
 
             Enqueue(0, new AbstractState(_argumentTypes, _localAbstractTypes));
             AddExceptionEntries();
@@ -209,6 +210,18 @@ internal static class IlVerifier {
                         FailAt(_code[index], "unaligned. の直後はメモリアクセス命令でなければなりません。");
                         break;
                 }
+            }
+        }
+
+        private void ValidateFusions() {
+            for (var index = 0; index < _code.Length; index++) {
+                var fusion = _code[index].Fusion;
+                if (fusion.Kind == IlFusionKind.None)
+                    continue;
+                if (_code[index].Op != ILOp.Nop)
+                    FailAt(_code[index], "IL 融合命令のオペコードが Nop ではありません。");
+                if (!IlFusionValidation.IsValid(fusion, _localTypes.Length, out var reason))
+                    FailAt(_code[index], $"IL 融合命令が不正です: {reason}");
             }
         }
 

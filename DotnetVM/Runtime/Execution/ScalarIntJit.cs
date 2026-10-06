@@ -14,16 +14,16 @@ namespace DotnetVM.Runtime.Execution;
 /// </summary>
 internal static class ScalarIntJit {
     internal static JitScalarDirect? TryCreateDirect(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code) {
+        DecodedInstruction[] code, MethodPreparer preparer) {
         if (!IsScalarMethodEligible(method, prepared, code, out _))
             return null;
         var returnsValue = method.Signature.ReturnType.Kind != SigKind.Void;
-        var result = ScalarIntExpressionJit.TryCreateDirect(method, prepared, code, returnsValue);
+        var result = ScalarIntExpressionJit.TryCreateDirect(method, prepared, code, returnsValue, preparer);
         return result;
     }
 
     internal static JitScalar? TryCreate(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code) {
+        DecodedInstruction[] code, MethodPreparer preparer) {
         if (!IsScalarMethodEligible(method, prepared, code, out var hasCalls))
             return null;
 
@@ -45,7 +45,7 @@ internal static class ScalarIntJit {
 
         var (blockCosts, blockEnds) = BuildBlocks(code, prepared.OffsetMap);
         var returnsValue = method.Signature.ReturnType.Kind != SigKind.Void;
-        if (ScalarIntExpressionJit.TryCreate(method, prepared, code, returnsValue) is { } expression)
+        if (ScalarIntExpressionJit.TryCreate(method, prepared, code, returnsValue, preparer) is { } expression)
             return expression;
         if (hasCalls)
             return null;
@@ -60,7 +60,9 @@ internal static class ScalarIntJit {
             !IsInt32Like(method.Signature.ReturnType) ||
             method.Signature.ParamTypes.Any(type => !IsInt32Like(type)) ||
             prepared.LocalTypes.Any(type => !IsInt32Like(type)) || code.Length == 0 ||
-            prepared.LocalTypes.Length == 0 && !code.Any(IsControlFlow))
+            prepared.LocalTypes.Length == 0 && !code.Any(IsControlFlow) ||
+            code.Any(instruction => instruction.Fusion.Kind != IlFusionKind.None &&
+                !IlFusionValidation.IsValid(instruction.Fusion, prepared.LocalTypes.Length, out _)))
             return false;
         return code.Length <= Interpreter.SafepointInterval;
     }
@@ -240,6 +242,8 @@ internal static class ScalarIntJit {
     }
 
     private static void ExecuteFusion(StackSlot[] locals, IlFusion fusion) {
+        if (!IlFusionValidation.IsValid(fusion, locals.Length, out var reason))
+            throw new InvalidOperationException($"不正な IL 融合命令です: {reason}");
         var left = locals[fusion.LocalA].AsInt32;
         var result = fusion.Kind switch {
             IlFusionKind.LocalConstantOperationStore =>

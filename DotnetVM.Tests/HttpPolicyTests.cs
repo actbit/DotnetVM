@@ -114,4 +114,22 @@ public sealed class HttpPolicyTests {
         var response = bridge.RequestHttp(new NetworkRequest { Url = new("https://example.test"), MaxResponseBytes = 5 });
         Assert.Equal(302, response.StatusCode); Assert.Equal(5, response.Body.Length);
     }
+
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("10.0.0.1")]
+    [InlineData("172.16.0.1")]
+    [InlineData("192.168.1.1")]
+    [InlineData("169.254.1.1")]
+    [InlineData("::1")]
+    [InlineData("fc00::1")]
+    [InlineData("fe80::1")]
+    public void StandardTransportClassifiesNonPublicAddressesAsUnsafe(string address) {
+        Assert.True(HttpNetworkBridge.IsPrivateOrLocal(IPAddress.Parse(address)));
+    }
+
+    [Fact]
+    public void StandardTransportAllowsARegularPublicAddress() {
+        Assert.False(HttpNetworkBridge.IsPrivateOrLocal(IPAddress.Parse("8.8.8.8")));
+    }
 }

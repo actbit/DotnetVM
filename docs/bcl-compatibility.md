@@ -96,7 +96,10 @@ gateway は 1 VM の HTTP 要求を直列化し、通信中にも同じ gateway 
 
 標準 HttpNetworkBridge は response headers を先に取得し、Content-Length が上限を超えれば body を読みません。
 長さ不明の応答もチャンクで読み、上限を超える 1 バイトを検出して拒否します。
-自動リダイレクト・Cookie・自動展開は無効です。3xx は応答として返すため、転送先へ自動接続しません。
+自動リダイレクト・Cookie・自動展開・proxy は無効です。3xx は応答として返すため、転送先へ自動接続しません。
+標準 transport は DNS 解決直後にも接続先IPを検査し、loopback / private / link-local / unique-local /
+予約済みアドレスを拒否します。origin allowlist だけでは DNS rebinding を防げないため、独自の
+`IHttpNetworkBridge` / `HttpMessageHandler` は同等の検査を実装する信頼済み TCB として扱ってください。
 標準 handler の応答ヘッダー上限は 16 KiB で、policy に小さい値を設定するとさらに制限します。
 独自 IHttpNetworkBridge / HttpMessageHandler は MaxResponseBytes / MaxResponseHeaderBytes、token と
 リダイレクト無効化を守る信頼済みホスト実装として扱います。ホストが transport を所有し、破棄します。

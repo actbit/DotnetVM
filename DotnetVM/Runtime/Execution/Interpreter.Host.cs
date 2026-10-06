@@ -87,7 +87,7 @@ public sealed partial class Interpreter {
                     // the execution state and quota/safepoint guards still
                     // remain active in ScalarIntJitContext.
                     var compiled = CanUseJit && engines.Preparer.IsCached(method)
-                        ? engines.Jit.TryGetCompiled(method, prepared, prepared.Code)
+                        ? engines.Jit.TryGetCompiled(method, prepared, prepared.Code, engines.Preparer)
                         : null;
                     if (state.Depth == 1 && context is null && compiled is { HasDirectScalar: true }) {
                         if (_tracer is { } directTracer)
@@ -236,7 +236,7 @@ public sealed partial class Interpreter {
         var prepared = engines.Preparer.Prepare(method);
         if (prepared.LocalTypes.Length != 0 || !prepared.Code.Any(instruction => instruction.Op == ILOp.Stfld))
             return null;
-        var compiled = engines.Jit.TryGetCompiled(method, prepared, prepared.Code);
+        var compiled = engines.Jit.TryGetCompiled(method, prepared, prepared.Code, engines.Preparer);
         return compiled is { HasLeaf: true } ? compiled : null;
     }
 

@@ -100,6 +100,28 @@ public sealed class IlOptimizationTests {
         Assert.Equal(6, optimized[0].InstructionCost);
     }
 
+    [Fact]
+    public void DoesNotEraseDupPopThatMayBeInvalidAtTheOriginalStackHeight() {
+        var code = new[] {
+            Instruction(0, ILOp.Dup),
+            Instruction(1, ILOp.Pop),
+            Instruction(2, ILOp.Ret),
+        };
+
+        var optimized = IlOptimizer.Optimize(code, null);
+
+        Assert.Equal([ILOp.Dup, ILOp.Pop, ILOp.Ret], optimized.Select(i => i.Op));
+    }
+
+    [Fact]
+    public void RejectsFusionOperandsOutsideThePreparedLocalArray() {
+        var fusion = new IlFusion(
+            IlFusionKind.LocalConstantOperationStore, 0, 0, 1, 1, 0, ILOp.Add, default);
+
+        Assert.False(IlFusionValidation.IsValid(fusion, localCount: 1, out var reason));
+        Assert.Contains("範囲外", reason);
+    }
+
     private static DecodedInstruction Instruction(int offset, ILOp op) =>
         new(offset, op, IlOperandKind.None, 1, 0, 0, 0, null);
 }

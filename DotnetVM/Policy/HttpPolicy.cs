@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 
 namespace DotnetVM.Policy;
 
@@ -48,13 +49,84 @@ public interface IStreamingHttpNetworkBridge : IHttpNetworkBridge {
 /// <summary>Host HTTP transport with bounded response reads. Gateway policy is mandatory.</summary>
 public sealed class HttpNetworkBridge : IStreamingHttpNetworkBridge, IDisposable {
     private readonly HttpClient _client;
-    public HttpNetworkBridge() : this(new SocketsHttpHandler {
-        AllowAutoRedirect = false, UseCookies = false, AutomaticDecompression = DecompressionMethods.None,
-        MaxResponseHeadersLength = 16,
-    }) { }
+    public HttpNetworkBridge() : this(CreateDefaultHandler()) { }
 
-    /// <summary>The host-supplied handler must disable automatic redirects and honor cancellation.</summary>
+    /// <summary>
+    /// The host-supplied handler is part of the VM TCB. It must disable
+    /// automatic redirects, cookies, and decompression, honor cancellation,
+    /// and enforce any DNS/IP policy required by the host.
+    /// </summary>
     public HttpNetworkBridge(HttpMessageHandler handler) => _client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+
+    private static SocketsHttpHandler CreateDefaultHandler() => new() {
+        AllowAutoRedirect = false,
+        UseCookies = false,
+        UseProxy = false,
+        AutomaticDecompression = DecompressionMethods.None,
+        MaxResponseHeadersLength = 16,
+        ConnectCallback = ConnectOnlyToPublicAddressAsync,
+    };
+
+    private static async ValueTask<Stream> ConnectOnlyToPublicAddressAsync(
+        SocketsHttpConnectionContext context, CancellationToken cancellationToken) {
+        var addresses = await Dns.GetHostAddressesAsync(
+            context.DnsEndPoint.Host, cancellationToken).ConfigureAwait(false);
+        foreach (var address in addresses) {
+            if (IsPrivateOrLocal(address))
+                continue;
+
+            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            try {
+                await socket.ConnectAsync(
+                    new IPEndPoint(address, context.DnsEndPoint.Port), cancellationToken).ConfigureAwait(false);
+                return new NetworkStream(socket, ownsSocket: true);
+            } catch (SocketException) {
+                socket.Dispose();
+            } catch {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        throw new HttpRequestException(
+            $"HTTP 接続先 {context.DnsEndPoint.Host} が private/loopback/link-local アドレスに解決されました。");
+    }
+
+    /// <summary>
+    /// Checks the address actually returned by DNS immediately before the
+    /// socket is connected. The origin allowlist alone is not sufficient when
+    /// an allowed hostname can be controlled by an attacker.
+    /// </summary>
+    internal static bool IsPrivateOrLocal(IPAddress address) {
+        if (address.IsIPv4MappedToIPv6)
+            return IsPrivateOrLocal(address.MapToIPv4());
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.None) ||
+            address.Equals(IPAddress.IPv6None) || address.IsIPv6LinkLocal ||
+            address.IsIPv6SiteLocal || address.IsIPv6Multicast)
+            return true;
+
+        var bytes = address.GetAddressBytes();
+        if (address.AddressFamily == AddressFamily.InterNetwork) {
+            var first = bytes[0];
+            var second = bytes[1];
+            return first == 0 || first == 10 || first == 127 ||
+                first == 169 && second == 254 ||
+                first == 172 && second is >= 16 and <= 31 ||
+                first == 192 && second == 168 ||
+                first == 100 && second is >= 64 and <= 127 ||
+                first == 192 && second == 0 ||
+                first == 198 && second is 18 or 19 ||
+                first >= 224;
+        }
+
+        // IPv6 unique-local (fc00::/7), documentation (2001:db8::/32),
+        // and unspecified addresses are not valid public transport targets.
+        return address.AddressFamily == AddressFamily.InterNetworkV6 &&
+            ((bytes[0] & 0xfe) == 0xfc ||
+             bytes[0] == 0x20 && bytes[1] == 0x01 &&
+             bytes[2] == 0x0d && bytes[3] == 0xb8 ||
+             bytes.All(static value => value == 0));
+    }
 
     public byte[] Request(NetworkRequest request) => RequestHttp(request).Body;
 

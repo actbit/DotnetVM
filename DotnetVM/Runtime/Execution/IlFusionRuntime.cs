@@ -4,6 +4,8 @@ namespace DotnetVM.Runtime.Execution;
 
 internal static class IlFusionRuntime {
     internal static void Execute(InterpreterFrame frame, IlFusion fusion) {
+        if (!IlFusionValidation.IsValid(fusion, frame.Locals.Length, out var reason))
+            throw new InvalidOperationException($"不正な IL 融合命令です: {reason}");
         var left = SlotOps.PushCopyOfValue(frame.Locals[fusion.LocalA]);
         StackSlot result;
         switch (fusion.Kind) {

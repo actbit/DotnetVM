@@ -35,23 +35,37 @@ internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot>? entry,
     internal bool HasLeaf => _leaf is not null;
     internal bool HasDirectScalar => _scalarDirect is not null;
 
-    internal StackSlot InvokeDirectScalar(Interpreter interpreter, StackSlot[] arguments) =>
-        _scalarDirect is { } scalar ? scalar(interpreter, arguments) :
-            throw new InvalidOperationException("ダイレクト整数 JIT が存在しません。");
+    internal StackSlot InvokeDirectScalar(Interpreter interpreter, StackSlot[] arguments) {
+        try {
+            return _scalarDirect is { } scalar ? scalar(interpreter, arguments) :
+                throw new InvalidOperationException("ダイレクト整数 JIT が存在しません。");
+        } catch (Exception host) when (HostExceptionBoundary.IsNormalizable(host)) {
+            throw HostExceptionBoundary.InvalidProgram(host);
+        }
+    }
 
     internal bool TryInvokeLeaf(Interpreter interpreter, ReadOnlySpan<StackSlot> arguments, out StackSlot result) {
         if (_leaf is null) {
             result = default;
             return false;
         }
-        result = _leaf(interpreter, arguments);
+        try {
+            result = _leaf(interpreter, arguments);
+        } catch (Exception host) when (HostExceptionBoundary.IsNormalizable(host)) {
+            throw HostExceptionBoundary.InvalidProgram(host);
+        }
         return true;
     }
 
-    public StackSlot Invoke(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) =>
-        _scalar is { } scalar
-            ? scalar(interpreter, services, frame)
-            : _entry!(new JitFrame(interpreter, services, frame));
+    public StackSlot Invoke(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) {
+        try {
+            return _scalar is { } scalar
+                ? scalar(interpreter, services, frame)
+                : _entry!(new JitFrame(interpreter, services, frame));
+        } catch (Exception host) when (HostExceptionBoundary.IsNormalizable(host)) {
+            throw HostExceptionBoundary.InvalidProgram(host);
+        }
+    }
 }
 
 /// <summary>
@@ -124,7 +138,7 @@ internal sealed class JitCodeCache(
     private readonly object _gate = new();
 
     public JitCompiledMethod? TryGetCompiled(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code) {
+        DecodedInstruction[] code, MethodPreparer preparer) {
         if (!_enabled)
             return null;
 
@@ -164,7 +178,7 @@ internal sealed class JitCodeCache(
             if (_heap.TryChargeJitCompilation(cost.WorkUnits, cost.HostMemoryBytes)) {
                 reservedCompiled = true;
                 try {
-                    compiled = JitMethodCompiler.TryCompile(method, prepared, code);
+                    compiled = JitMethodCompiler.TryCompile(method, prepared, code, preparer);
                 } catch (Exception) {
                     compiled = null;
                 }
@@ -983,7 +997,7 @@ internal static class JitMethodCompiler {
     }
 
     public static JitCompiledMethod? TryCompile(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code) {
+        DecodedInstruction[] code, MethodPreparer preparer) {
         if (!CanCompile(method, prepared, code))
             return null;
 
@@ -992,8 +1006,8 @@ internal static class JitMethodCompiler {
             // safe only at the outer host boundary, while a nested call must
             // still have a frame-backed entry so its arguments/locals remain
             // visible to GC and the normal execution state.
-            if (ScalarIntJit.TryCreate(method, prepared, code) is { } scalar) {
-                var directScalar = ScalarIntJit.TryCreateDirect(method, prepared, code);
+            if (ScalarIntJit.TryCreate(method, prepared, code, preparer) is { } scalar) {
+                var directScalar = ScalarIntJit.TryCreateDirect(method, prepared, code, preparer);
                 JitLeaf? scalarLeaf = null;
                 try {
                     scalarLeaf = TryCompileLeaf(method, prepared, code);
@@ -1086,6 +1100,9 @@ internal static class JitMethodCompiler {
         var offsets = new HashSet<int>(code.Select(instruction => instruction.Offset));
         for (var i = 0; i < code.Length; i++) {
             var instruction = code[i];
+            if (instruction.Fusion.Kind != IlFusionKind.None &&
+                !IlFusionValidation.IsValid(instruction.Fusion, prepared.LocalTypes.Length, out _))
+                return false;
             if (!IsSupported(instruction.Op))
                 return false;
             if (instruction.Op is ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3

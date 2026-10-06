@@ -222,6 +222,25 @@ public sealed partial class Interpreter {
     }
 
     /// <summary>
+    /// Promote only a constructor candidate reached by newobj.  Unlike a
+    /// regular nested call, this promotion is restricted to the constructor
+    /// leaf compiler, so it cannot recursively promote an arbitrary BCL call
+    /// graph while a JIT frame is running.
+    /// </summary>
+    internal JitCompiledMethod? GetNestedConstructorLeaf(VmMethod method) {
+        if (!CanUseJit || method.Body is null || method.Signature.GenericParamCount != 0 ||
+            method.Name != ".ctor" || !method.Signature.HasThis ||
+            method.Signature.ReturnType.Kind != SigKind.Void)
+            return null;
+        var engines = EnginesFor(method);
+        var prepared = engines.Preparer.Prepare(method);
+        if (prepared.LocalTypes.Length != 0 || !prepared.Code.Any(instruction => instruction.Op == ILOp.Stfld))
+            return null;
+        var compiled = engines.Jit.TryGetCompiled(method, prepared, prepared.Code);
+        return compiled is { HasLeaf: true } ? compiled : null;
+    }
+
+    /// <summary>
     /// Execute an already promoted guest method without repeating the public
     /// invocation plumbing on every nested call. This is only a fast path for
     /// a delegate already present in the loader-local JIT cache; unpromoted
@@ -290,13 +309,7 @@ public sealed partial class Interpreter {
     }
 
     internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
-        var objects = JitObjectsFor(method);
-        var field = objects.ResolveFieldToken(token, null, method.DynamicTokens);
-        if (!method.CanWriteInitOnly(field))
-            throw new UnhandledGuestException("System.FieldAccessException",
-                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
-        if (!objects.TryStoreStringField(receiver, field, value))
-            objects.WriteField(receiver, field, value);
+        JitObjectsFor(method).StoreLeafField(method, token, receiver, value);
     }
 
     /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>

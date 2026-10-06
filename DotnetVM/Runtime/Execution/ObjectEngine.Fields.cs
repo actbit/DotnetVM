@@ -192,6 +192,16 @@ internal sealed partial class ObjectEngine {
             storage.Slots[storage.Index] = SlotOps.StoreCopyOfValue(value);
     }
 
+    internal void StoreLeafField(VmMethod method, int token, in StackSlot receiver,
+        in StackSlot value) {
+        var field = ResolveFieldToken(token, null, method.DynamicTokens);
+        if (!method.CanWriteInitOnly(field))
+            throw new UnhandledGuestException("System.FieldAccessException",
+                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
+        if (!TryStoreStringField(receiver, field, value))
+            WriteField(receiver, field, value);
+    }
+
     private (StackSlot[] Slots, int Index, bool IsReadOnly) FindFieldStorage(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
             case StackKind.NativeInt when _intrinsicContext.Shared.RuntimeMetadata.TryStorage(objSlot.Int64Value, out var native):

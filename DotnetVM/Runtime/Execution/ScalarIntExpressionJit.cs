@@ -590,6 +590,8 @@ internal sealed class ScalarIntJitContext : IDisposable {
     public void Charge(int cost, int instructionCount) {
         if (!_interpreter.InstructionChargingEnabled) {
             _batchInstructions += instructionCount;
+            if (_batchInstructions >= Interpreter.SafepointInterval)
+                ChargeSlow(cost, instructionCount);
             return;
         }
         if (_batchInstructions < Interpreter.SafepointInterval && _remaining >= cost) {

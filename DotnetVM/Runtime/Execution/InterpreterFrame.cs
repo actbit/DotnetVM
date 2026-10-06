@@ -190,6 +190,29 @@ public sealed class InterpreterFrame {
         return new CallArgumentLease(this, buffer);
     }
 
+    /// <summary>
+    /// Borrow a constructor argument buffer.  The receiver occupies slot zero;
+    /// constructor operands are copied from the evaluation stack into the
+    /// remaining slots.  This keeps the leaf-constructor path allocation-free
+    /// after the first use while preserving the exact argument-array shape
+    /// required by the guest call boundary.
+    /// </summary>
+    internal CallArgumentLease BorrowConstructorArguments(int arity, in StackSlot receiver) {
+        if (arity < 0)
+            throw new ArgumentOutOfRangeException(nameof(arity));
+        _callArgumentBuffers ??= [];
+        var length = arity + 1;
+        if (_callArgumentDepth == _callArgumentBuffers.Count)
+            _callArgumentBuffers.Add(new StackSlot[length]);
+        else if (_callArgumentBuffers[_callArgumentDepth].Length != length)
+            _callArgumentBuffers[_callArgumentDepth] = new StackSlot[length];
+        var buffer = _callArgumentBuffers[_callArgumentDepth++];
+        buffer[0] = receiver;
+        Stack.ArgumentSlots(arity).CopyTo(buffer.AsSpan(1));
+        Stack.DropArguments(arity);
+        return new CallArgumentLease(this, buffer);
+    }
+
     internal readonly struct CallArgumentLease : IDisposable {
         private readonly InterpreterFrame _frame;
         public readonly StackSlot[] Arguments;

@@ -471,6 +471,12 @@ internal struct JitFrame {
 
         var target = _cachedDirectCallTarget;
         if (target is null || target.Body is null || target.Signature.GenericParamCount != 0) {
+            if (_calls.TryInvokeJitStaticIntrinsic(token, _frame, out var intrinsicValue)) {
+                if (intrinsicValue is { } intrinsicResultValue)
+                    _frame.Stack.Push(intrinsicResultValue);
+                _frame.Ip = next;
+                return;
+            }
             Call(token, isCallvirt: false, next);
             return;
         }
@@ -507,6 +513,11 @@ internal struct JitFrame {
     }
 
     public void NewObject(int token, int next) {
+        if (_objects.TryNewObjectLeaf(token, _frame, _interpreter, out var leafValue)) {
+            _frame.Stack.Push(leafValue);
+            _frame.Ip = next;
+            return;
+        }
         if (_objects.NewObject(token, _frame) is { } value)
             _frame.Stack.Push(value);
         _frame.Ip = next;

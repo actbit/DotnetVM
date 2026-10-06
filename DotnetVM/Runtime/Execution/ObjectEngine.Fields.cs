@@ -192,6 +192,16 @@ internal sealed partial class ObjectEngine {
             storage.Slots[storage.Index] = SlotOps.StoreCopyOfValue(value);
     }
 
+    internal void StoreLeafField(VmMethod method, int token, in StackSlot receiver,
+        in StackSlot value) {
+        var field = ResolveFieldToken(token, null, method.DynamicTokens);
+        if (!method.CanWriteInitOnly(field))
+            throw new UnhandledGuestException("System.FieldAccessException",
+                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
+        if (!TryStoreStringField(receiver, field, value))
+            WriteField(receiver, field, value);
+    }
+
     private (StackSlot[] Slots, int Index, bool IsReadOnly) FindFieldStorage(in StackSlot objSlot, VmField field) {
         switch (objSlot.Kind) {
             case StackKind.NativeInt when _intrinsicContext.Shared.RuntimeMetadata.TryStorage(objSlot.Int64Value, out var native):
@@ -304,6 +314,12 @@ internal sealed partial class ObjectEngine {
         }
         throw new BadImageFormatException($"フィールド {field.DeclaringType.FullName}::{field.Name} が {type.FullName} のレイアウトにありません。");
     }
+
+    // JIT call sites cache the receiver type and use this resolver only when
+    // that type changes. Keep the normal field API unchanged for polymorphic
+    // and byref receivers.
+    internal int GetInstanceFieldIndexForJit(VmClassType type, VmField field) =>
+        GetInstanceFieldIndex(type, field);
 
     /// <summary>静的フィールドの位置を解決する (.cctor 起動を含む)。intrinsic 型 (TypeRef 親) の静的フィールドも解決する。</summary>
     public VmByRef StaticFieldLocation(int token, GenericContext? context = null,

@@ -102,6 +102,15 @@ VM オブジェクトです。VM オブジェクトは CLR のオブジェクト
 クォータを超えると `ResourceExhaustedException` 系の管理例外になり、ゲストの `catch` では
 握りつぶせません。
 
+命令数の計測・上限を外す必要がある信頼済みコードでは、`MemoryPolicy.InstructionChargingEnabled = false`
+を指定できます。命令数の加算と `InstructionQuota` の判定だけを省略し、Dispose・キャンセル・GC のセーフポイント、
+ヒープやホスト作業など他の制限は維持します。停止性も必要な場合は、`ExecutionTimeout = TimeSpan.FromSeconds(2)`
+を併用してください。上限超過時は `ExecutionTimeoutException` がホストへ伝播します。
+タイムアウトは安全な命令境界で検出されます。信頼しないゲストには命令課金を無効化しないでください。
+
+命令課金は既定で `InstructionChargeBatchSize = 256` 命令ずつ予約し、未使用分を実行終了時に返却します。
+完了後の `InstructionCount` は実行命令数のままで、命令単位の予約に戻す場合は `InstructionChargeBatchSize = 1` を指定します。
+
 ```csharp
 var options = new VmHostOptions {
     Memory = new MemoryPolicy {

@@ -13,20 +13,31 @@ using DotnetVM.Runtime.Types;
 namespace DotnetVM.Runtime.Execution;
 
 internal delegate StackSlot JitLeaf(Interpreter interpreter, ReadOnlySpan<StackSlot> arguments);
+internal delegate StackSlot JitScalar(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame);
+internal delegate StackSlot JitScalarDirect(Interpreter interpreter, StackSlot[] arguments);
 
 /// <summary>
 /// A compiled entry point for the small JIT.  The delegate deliberately receives
 /// a VM frame instead of exposing CLR values to generated code; all values still
 /// cross the VM boundary as <see cref="StackSlot"/> instances.
 /// </summary>
-internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry,
+internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot>? entry,
     PreparedMethod prepared,
-    JitLeaf? leaf = null) {
-    private readonly Func<JitFrame, StackSlot> _entry = entry;
+    JitLeaf? leaf = null,
+    JitScalar? scalar = null,
+    JitScalarDirect? scalarDirect = null) {
+    private readonly Func<JitFrame, StackSlot>? _entry = entry;
     private readonly JitLeaf? _leaf = leaf;
+    private readonly JitScalar? _scalar = scalar;
+    private readonly JitScalarDirect? _scalarDirect = scalarDirect;
 
     internal PreparedMethod Prepared { get; } = prepared;
     internal bool HasLeaf => _leaf is not null;
+    internal bool HasDirectScalar => _scalarDirect is not null;
+
+    internal StackSlot InvokeDirectScalar(Interpreter interpreter, StackSlot[] arguments) =>
+        _scalarDirect is { } scalar ? scalar(interpreter, arguments) :
+            throw new InvalidOperationException("ダイレクト整数 JIT が存在しません。");
 
     internal bool TryInvokeLeaf(Interpreter interpreter, ReadOnlySpan<StackSlot> arguments, out StackSlot result) {
         if (_leaf is null) {
@@ -38,7 +49,9 @@ internal sealed class JitCompiledMethod(Func<JitFrame, StackSlot> entry,
     }
 
     public StackSlot Invoke(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) =>
-        _entry(new JitFrame(interpreter, services, frame));
+        _scalar is { } scalar
+            ? scalar(interpreter, services, frame)
+            : _entry!(new JitFrame(interpreter, services, frame));
 }
 
 /// <summary>
@@ -217,16 +230,30 @@ internal struct JitFrame {
     private readonly Interpreter.ExecutionState _executionState;
     private readonly InterpreterServices _services;
     private readonly InterpreterFrame _frame;
+    private readonly ObjectEngine _objects;
+    private readonly CallEngine _calls;
     private VmExecutionCoordinator.InstructionBatchLease _instructionBatch;
     private VmExecutionCoordinator.InstructionLease _instructionLease;
     private int _batchInstructions;
     private bool _instructionActive;
+    private int _cachedDirectCallToken;
+    private VmMethod? _cachedDirectCallTarget;
+    private JitCompiledMethod? _cachedDirectCallLeaf;
+    private bool _hasCachedDirectCall;
+    private int _cachedFieldToken;
+    private VmField? _cachedField;
+    private bool _hasCachedField;
+    private VmClassType? _cachedFieldReceiverType;
+    private VmField? _cachedFieldIndexField;
+    private int _cachedFieldIndex;
 
     public JitFrame(Interpreter interpreter, InterpreterServices services, InterpreterFrame frame) {
         _interpreter = interpreter;
         _executionState = interpreter.CurrentExecutionState;
         _services = services;
         _frame = frame;
+        _objects = interpreter.JitObjectsFor(frame.Method);
+        _calls = interpreter.JitCallsFor(frame.Method);
     }
 
     public int InstructionPointer => _frame.Ip;
@@ -248,7 +275,7 @@ internal struct JitFrame {
 
     // These two methods bracket every generated instruction.  The try/finally
     // in the generated expression makes the coordinator lease exception-safe.
-    public void BeginInstruction() {
+    public void BeginInstruction(int cost) {
         if (_batchInstructions >= Interpreter.SafepointInterval) {
             _instructionBatch.Dispose();
             _instructionBatch = default;
@@ -260,7 +287,7 @@ internal struct JitFrame {
         _instructionLease = _interpreter.EnterJitInstructionInBatch();
         _instructionActive = true;
         try {
-            _interpreter.ConsumeJitInstructionForState(_executionState);
+            _interpreter.ConsumeJitInstructionForState(_executionState, cost);
         } catch {
             _instructionLease.Dispose();
             _instructionLease = default;
@@ -345,6 +372,18 @@ internal struct JitFrame {
         _frame.Ip = next;
     }
 
+    public void FusedLocalOperation(IlFusion fusion, int next) {
+        IlFusionRuntime.Execute(_frame, fusion);
+        _frame.Ip = next;
+    }
+
+    public void BranchAlways(int target) => _frame.Ip = target;
+
+    public void BranchUnary(bool branchIfTrue, int target, int next) {
+        var condition = SlotOps.IsTrue(_frame.Stack.Pop());
+        _frame.Ip = condition == branchIfTrue ? target : next;
+    }
+
     public void Branch(ILOp op, int target, int next) {
         var branch = op switch {
             ILOp.Br or ILOp.Br_S => true,
@@ -401,7 +440,7 @@ internal struct JitFrame {
     }
 
     public void Call(int token, bool isCallvirt, int next) {
-        var result = _interpreter.JitCallsFor(_frame.Method).Call(token, _frame, isCallvirt,
+        var result = _calls.Call(token, _frame, isCallvirt,
             constrainedToken: 0, tailCallAllowed: false, out _);
         if (result is { } value)
             _frame.Stack.Push(value);
@@ -420,21 +459,48 @@ internal struct JitFrame {
             return;
         }
 
-        var target = _services.Loader.GetMethodByToken((uint)token);
+        if (!_hasCachedDirectCall || _cachedDirectCallToken != token) {
+            _cachedDirectCallToken = token;
+            _cachedDirectCallTarget = _services.Loader.GetMethodByToken((uint)token);
+            _cachedDirectCallLeaf = _cachedDirectCallTarget is { Body: not null,
+                Signature.GenericParamCount: 0 } targetForLeaf
+                ? _interpreter.GetNestedLeaf(targetForLeaf)
+                : null;
+            _hasCachedDirectCall = true;
+        }
+
+        var target = _cachedDirectCallTarget;
         if (target is null || target.Body is null || target.Signature.GenericParamCount != 0) {
+            if (_calls.TryInvokeJitStaticIntrinsic(token, _frame, out var intrinsicValue)) {
+                if (intrinsicValue is { } intrinsicResultValue)
+                    _frame.Stack.Push(intrinsicResultValue);
+                _frame.Ip = next;
+                return;
+            }
             Call(token, isCallvirt: false, next);
             return;
         }
 
+        // The first iteration can reach this site before the callee crosses
+        // its promotion threshold. Probe again on later iterations so a
+        // newly published primitive leaf is not hidden by the initial null
+        // cache result. Once found, the leaf remains valid for this JIT frame.
+        if (_cachedDirectCallLeaf is null) {
+            _cachedDirectCallLeaf = _interpreter.GetNestedLeaf(target);
+        }
+
         var arity = target.Signature.ParamTypes.Length + (target.Signature.HasThis ? 1 : 0);
-        if (_interpreter.TryInvokeCompiledLeaf(target, _frame.Stack.ArgumentSlots(arity), out var leafValue)) {
+        if (_cachedDirectCallLeaf is { } leaf &&
+            _interpreter.TryInvokeCompiledLeafNested(target, leaf,
+                _frame.Stack.ArgumentSlots(arity), out var leafValue)) {
             _frame.Stack.DropArguments(arity);
             if (SlotOps.SignatureReturnsValue(target.Signature))
                 _frame.Stack.Push(leafValue);
             _frame.Ip = next;
             return;
         }
-        var arguments = _frame.Stack.PopArguments(arity);
+        using var argumentLease = _frame.BorrowCallArguments(arity);
+        var arguments = argumentLease.Arguments;
         if (!_interpreter.TryInvokeCompiled(target, arguments, null, out var value)) {
             for (var i = 0; i < arguments.Length; i++)
                 _frame.Stack.Push(arguments[i]);
@@ -447,7 +513,12 @@ internal struct JitFrame {
     }
 
     public void NewObject(int token, int next) {
-        if (_interpreter.JitObjectsFor(_frame.Method).NewObject(token, _frame) is { } value)
+        if (_objects.TryNewObjectLeaf(token, _frame, _interpreter, out var leafValue)) {
+            _frame.Stack.Push(leafValue);
+            _frame.Ip = next;
+            return;
+        }
+        if (_objects.NewObject(token, _frame) is { } value)
             _frame.Stack.Push(value);
         _frame.Ip = next;
     }
@@ -456,7 +527,7 @@ internal struct JitFrame {
         var count = _frame.Stack.Pop().AsInt32;
         if (count < 0)
             throw new UnhandledGuestException("System.OverflowException", null);
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var elementType = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         using var reservation = _services.Heap.ReserveArray(count);
         var elements = new StackSlot[count];
@@ -483,7 +554,7 @@ internal struct JitFrame {
     }
 
     public void LoadArrayByType(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         _frame.Stack.Push(MemoryOps.ArrayLoad(_frame,
             MemoryOps.ElementKindFromType(objects.ResolveTypeToken(token, _frame.Context,
                 _frame.Method.DynamicTokens))));
@@ -496,7 +567,7 @@ internal struct JitFrame {
     }
 
     public void StoreArrayByType(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         MemoryOps.ArrayStore(_frame,
             MemoryOps.ElementKindFromType(objects.ResolveTypeToken(token, _frame.Context,
                 _frame.Method.DynamicTokens)), _services.StringType);
@@ -509,26 +580,30 @@ internal struct JitFrame {
     }
 
     public void LoadField(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
-        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
-        _frame.Stack.Push(SlotOps.PushCopyOfValue(objects.ReadField(_frame.Stack.Pop(), field)));
+        var objects = _objects;
+        var field = ResolveField(token);
+        var receiver = _frame.Stack.Pop();
+        var value = TryReadCachedClassField(receiver, field, out var cachedValue)
+            ? cachedValue : objects.ReadField(receiver, field);
+        _frame.Stack.Push(SlotOps.PushCopyOfValue(value));
         _frame.Ip = next;
     }
 
     public void StoreField(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
-        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var objects = _objects;
+        var field = ResolveField(token);
         EnsureFieldWritable(field);
         var value = _frame.Stack.Pop();
         var receiver = _frame.Stack.Pop();
-        if (!objects.TryStoreStringField(receiver, field, value))
+        if (!objects.TryStoreStringField(receiver, field, value) &&
+            !TryWriteCachedClassField(receiver, field, value))
             objects.WriteField(receiver, field, value);
         _frame.Ip = next;
     }
 
     public void LoadFieldAddress(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
-        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var objects = _objects;
+        var field = ResolveField(token);
         var isReadOnly = _frame.PendingReadonly;
         _frame.PendingReadonly = false;
         _frame.Stack.Push(objects.FieldAddress(_frame.Stack.Pop(), field, isReadOnly));
@@ -536,15 +611,15 @@ internal struct JitFrame {
     }
 
     public void LoadStaticField(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         _frame.Stack.Push(SlotOps.PushCopyOfValue(objects.StaticFieldLocation(token, _frame.Context,
             _frame.Method.DynamicTokens).Read()));
         _frame.Ip = next;
     }
 
     public void StoreStaticField(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
-        var field = objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        var objects = _objects;
+        var field = ResolveField(token);
         EnsureFieldWritable(field);
         objects.StaticFieldLocation(token, _frame.Context, _frame.Method.DynamicTokens)
             .Write(_frame.Stack.Pop());
@@ -552,7 +627,7 @@ internal struct JitFrame {
     }
 
     public void LoadStaticFieldAddress(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var isReadOnly = _frame.PendingReadonly;
         _frame.PendingReadonly = false;
         _frame.Stack.Push(objects.TryGetStaticFieldRvaAddress(token) ??
@@ -573,7 +648,7 @@ internal struct JitFrame {
     }
 
     public void LoadObject(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var address = _frame.Stack.Pop();
         if (address.ObjectValue is VmNativePointer native) {
             var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
@@ -589,7 +664,7 @@ internal struct JitFrame {
     }
 
     public void StoreObject(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var value = _frame.Stack.Pop();
         var address = _frame.Stack.Pop();
         if (address.ObjectValue is VmNativePointer native) {
@@ -606,7 +681,7 @@ internal struct JitFrame {
     }
 
     public void CopyObject(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var source = _frame.Stack.Pop();
         var destination = _frame.Stack.Pop();
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
@@ -631,7 +706,7 @@ internal struct JitFrame {
     }
 
     public void InitObject(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var address = _frame.Stack.Pop();
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         if (address.ObjectValue is VmNativePointer native) {
@@ -659,7 +734,7 @@ internal struct JitFrame {
             $"{operation} のアドレスがマネージ参照または有効な unmanaged ポインタではありません: {SlotOps.Describe(address)}");
 
     public void Unbox(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
         if (value.ObjectValue is not VmBoxedValue boxed || !TypeChecks.IsExactUnboxType(boxed.Type, target))
@@ -678,8 +753,58 @@ internal struct JitFrame {
                 $"readonly フィールド {field} はコンストラクター外から書き込めません。");
     }
 
+    private VmField ResolveField(int token) {
+        // A generated frame is tied to one method/loader. Cache the resolved
+        // field at the call site so repeated field access in a hot loop does
+        // not repeat the metadata cache lookup. Contextual/dynamic tokens are
+        // deliberately excluded because their target can vary per invocation.
+        if (_frame.Context is null && _frame.Method.DynamicTokens is null &&
+            _hasCachedField && _cachedFieldToken == token)
+            return _cachedField!;
+        var field = _objects.ResolveFieldToken(token, _frame.Context, _frame.Method.DynamicTokens);
+        if (_frame.Context is null && _frame.Method.DynamicTokens is null) {
+            _cachedFieldToken = token;
+            _cachedField = field;
+            _hasCachedField = true;
+        }
+        return field;
+    }
+
+    private bool TryReadCachedClassField(in StackSlot receiver, VmField field, out StackSlot value) {
+        if (receiver.ObjectValue is not VmClassInstance instance) {
+            value = default;
+            return false;
+        }
+        var type = instance.ClassType;
+        if (!ReferenceEquals(type, _cachedFieldReceiverType) ||
+            !ReferenceEquals(field, _cachedFieldIndexField)) {
+            _cachedFieldReceiverType = type;
+            _cachedFieldIndexField = field;
+            _cachedFieldIndex = _objects.GetInstanceFieldIndexForJit(type, field);
+        }
+        lock (instance.Fields)
+            value = instance.Fields[_cachedFieldIndex];
+        return true;
+    }
+
+    private bool TryWriteCachedClassField(in StackSlot receiver, VmField field, in StackSlot value) {
+        if (receiver.ObjectValue is not VmClassInstance instance) {
+            return false;
+        }
+        var type = instance.ClassType;
+        if (!ReferenceEquals(type, _cachedFieldReceiverType) ||
+            !ReferenceEquals(field, _cachedFieldIndexField)) {
+            _cachedFieldReceiverType = type;
+            _cachedFieldIndexField = field;
+            _cachedFieldIndex = _objects.GetInstanceFieldIndexForJit(type, field);
+        }
+        lock (instance.Fields)
+            instance.Fields[_cachedFieldIndex] = SlotOps.StoreCopyOfValue(value);
+        return true;
+    }
+
     public void Box(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var type = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
         if (!type.IsValueType) {
@@ -695,7 +820,7 @@ internal struct JitFrame {
     }
 
     public void UnboxAny(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
         if (target.IsValueType) {
@@ -742,7 +867,7 @@ internal struct JitFrame {
                 var rva = loader.Image.GetFieldRva(tokenRid);
                 if (rva == 0)
                     throw new BadImageFormatException($"Field rid {tokenRid} に FieldRVA エントリがありません。");
-                var field = _interpreter.JitObjectsFor(_frame.Method).ResolveFieldToken(
+                var field = _objects.ResolveFieldToken(
                     token, _frame.Context, _frame.Method.DynamicTokens);
                 var fieldType = field.FieldType
                     ?? throw new BadImageFormatException($"FieldRVA {field} の型を解決できません。");
@@ -758,7 +883,7 @@ internal struct JitFrame {
                 break;
             }
             case TableKind.TypeDef or TableKind.TypeRef or TableKind.TypeSpec: {
-                var type = _interpreter.JitObjectsFor(_frame.Method).ResolveTypeToken(
+                var type = _objects.ResolveTypeToken(
                     token, _frame.Context, _frame.Method.DynamicTokens);
                 _frame.Stack.Push(StackSlot.OfObject(
                     _services.Heap.Allocate(new VmTypeHandle { Target = type })));
@@ -779,7 +904,7 @@ internal struct JitFrame {
     }
 
     public void Cast(int token, bool isInst, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         var target = objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens);
         var value = _frame.Stack.Pop();
         var ok = value.ObjectValue is null ||
@@ -804,7 +929,7 @@ internal struct JitFrame {
     }
 
     public void SizeOf(int token, int next) {
-        var objects = _interpreter.JitObjectsFor(_frame.Method);
+        var objects = _objects;
         _frame.Stack.Push(StackSlot.OfInt32(MemoryOps.SizeOfType(
             objects.ResolveTypeToken(token, _frame.Context, _frame.Method.DynamicTokens))));
         _frame.Ip = next;
@@ -863,6 +988,23 @@ internal static class JitMethodCompiler {
             return null;
 
         try {
+            // Keep both entries for scalar methods: the frame-free entry is
+            // safe only at the outer host boundary, while a nested call must
+            // still have a frame-backed entry so its arguments/locals remain
+            // visible to GC and the normal execution state.
+            if (ScalarIntJit.TryCreate(method, prepared, code) is { } scalar) {
+                var directScalar = ScalarIntJit.TryCreateDirect(method, prepared, code);
+                JitLeaf? scalarLeaf = null;
+                try {
+                    scalarLeaf = TryCompileLeaf(method, prepared, code);
+                } catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                    or NotSupportedException or PlatformNotSupportedException) {
+                    // Scalar/frame execution remains valid when the optional
+                    // allocation-free leaf expression is unavailable.
+                }
+                return new JitCompiledMethod(null, prepared, scalarLeaf, scalar, directScalar);
+            }
+
             var frame = Expression.Parameter(typeof(JitFrame), "frame");
             var cases = new SwitchCase[code.Length];
             var offsets = new Dictionary<int, int>(code.Length * 2);
@@ -875,7 +1017,8 @@ internal static class JitMethodCompiler {
                 var operation = BuildOperation(frame, instruction, next, offsets,
                     SlotOps.SignatureReturnsValue(method.Signature));
                 var instructionBody = Expression.TryFinally(
-                    Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginInstruction))), operation),
+                    Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginInstruction)),
+                            Constant(instruction.InstructionCost)), operation),
                     Expression.Call(frame, Method(nameof(JitFrame.EndInstruction))));
                 cases[i] = Expression.SwitchCase(instructionBody, Expression.Constant(i));
             }
@@ -887,7 +1030,8 @@ internal static class JitMethodCompiler {
                 };
                 for (var i = 0; i < code.Length; i++) {
                     var instructionBody = Expression.TryFinally(
-                        Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginInstruction))),
+                        Expression.Block(Expression.Call(frame, Method(nameof(JitFrame.BeginInstruction)),
+                                Constant(code[i].InstructionCost)),
                             BuildOperation(frame, code[i], i + 1, offsets,
                                 SlotOps.SignatureReturnsValue(method.Signature))),
                         Expression.Call(frame, Method(nameof(JitFrame.EndInstruction))));
@@ -1007,7 +1151,7 @@ internal static class JitMethodCompiler {
         var statements = new List<Expression>(code.Length + 1);
         var stack = new List<Expression>();
         var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
-            BindingFlags.Instance | BindingFlags.NonPublic)!;
+            BindingFlags.Instance | BindingFlags.NonPublic, [typeof(int)])!;
         var binary = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafBinaryArithmetic))!;
         var unary = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafUnaryArithmetic))!;
         var convert = typeof(SlotOps).GetMethod(nameof(SlotOps.LeafConvertValue))!;
@@ -1016,10 +1160,16 @@ internal static class JitMethodCompiler {
         var ofInt64 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt64), [typeof(long)])!;
         var ofFloat = typeof(StackSlot).GetMethod(nameof(StackSlot.OfFloat), [typeof(double)])!;
         var nullProperty = typeof(StackSlot).GetProperty(nameof(StackSlot.Null))!;
+        var aggregateQuota = CanAggregateLeafQuota(code);
+        if (aggregateQuota)
+            statements.Add(Expression.Call(interpreter, consume,
+                Expression.Constant(code.Sum(instruction => instruction.InstructionCost))));
 
         for (var i = 0; i < code.Length; i++) {
             var instruction = code[i];
-            statements.Add(Expression.Call(interpreter, consume));
+            if (!aggregateQuota)
+                statements.Add(Expression.Call(interpreter, consume,
+                    Expression.Constant(instruction.InstructionCost)));
             switch (instruction.Op) {
                 case ILOp.Nop or ILOp.Break:
                     break;
@@ -1118,6 +1268,22 @@ internal static class JitMethodCompiler {
         IsLeafType(method.Signature.ReturnType) &&
         method.Signature.ParamTypes.All(IsLeafType);
 
+    // A straight-line primitive leaf containing only non-throwing operations
+    // can charge its original IL cost once.  Division/remainder and checked
+    // arithmetic remain instruction-granular so quota exhaustion and guest
+    // exceptions keep their original ordering.
+    private static bool CanAggregateLeafQuota(DecodedInstruction[] code) => code.All(instruction =>
+        instruction.Op is ILOp.Nop or ILOp.Break or
+        ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3 or ILOp.Ldarg_S or ILOp.Ldarg or
+        ILOp.Ldnull or ILOp.Ldc_I4_M1 or ILOp.Ldc_I4_0 or ILOp.Ldc_I4_1 or ILOp.Ldc_I4_2 or
+        ILOp.Ldc_I4_3 or ILOp.Ldc_I4_4 or ILOp.Ldc_I4_5 or ILOp.Ldc_I4_6 or ILOp.Ldc_I4_7 or
+        ILOp.Ldc_I4_8 or ILOp.Ldc_I4_S or ILOp.Ldc_I4 or ILOp.Ldc_I8 or ILOp.Ldc_R4 or ILOp.Ldc_R8 or
+        ILOp.Pop or ILOp.Neg or ILOp.Not or ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.And or ILOp.Or or
+        ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un or ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or
+        ILOp.Clt or ILOp.Clt_Un or ILOp.Conv_I1 or ILOp.Conv_I2 or ILOp.Conv_I4 or ILOp.Conv_I8 or
+        ILOp.Conv_R4 or ILOp.Conv_R8 or ILOp.Conv_U1 or ILOp.Conv_U2 or ILOp.Conv_U4 or ILOp.Conv_U8 or
+        ILOp.Conv_I or ILOp.Conv_U or ILOp.Conv_R_Un or ILOp.Ret);
+
     // Capture-free instance lambdas use only primitive parameters. A leaf
     // must not load the receiver or derive an address from it.
     private static bool LoadsReceiver(DecodedInstruction instruction) => instruction.Op == ILOp.Ldarg_0 ||
@@ -1138,7 +1304,7 @@ internal static class JitMethodCompiler {
         var statements = new List<Expression>(code.Length + 1);
         var stack = new List<Expression>();
         var consume = typeof(Interpreter).GetMethod(nameof(Interpreter.ConsumeJitInstruction),
-            BindingFlags.Instance | BindingFlags.NonPublic)!;
+            BindingFlags.Instance | BindingFlags.NonPublic, [typeof(int)])!;
         var storeField = typeof(Interpreter).GetMethod(nameof(Interpreter.StoreLeafField),
             BindingFlags.Instance | BindingFlags.NonPublic)!;
         var ofInt32 = typeof(StackSlot).GetMethod(nameof(StackSlot.OfInt32), [typeof(int)])!;
@@ -1147,7 +1313,8 @@ internal static class JitMethodCompiler {
 
         for (var i = 0; i < code.Length; i++) {
             var instruction = code[i];
-            statements.Add(Expression.Call(interpreter, consume));
+            statements.Add(Expression.Call(interpreter, consume,
+                Expression.Constant(instruction.InstructionCost)));
             switch (instruction.Op) {
                 case ILOp.Nop or ILOp.Break:
                     break;
@@ -1250,6 +1417,9 @@ internal static class JitMethodCompiler {
     private static Expression BuildOperation(ParameterExpression frame, DecodedInstruction instruction,
         int next, IReadOnlyDictionary<int, int> offsets, bool hasReturnValue) {
         var op = instruction.Op;
+        if (instruction.Fusion.Kind != IlFusionKind.None)
+            return Call(frame, nameof(JitFrame.FusedLocalOperation),
+                Expression.Constant(instruction.Fusion), Constant(next));
         if (op is ILOp.Nop or ILOp.Break)
             return Call(frame, nameof(JitFrame.NoOp), Constant(next));
         if (op is ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3)
@@ -1292,11 +1462,20 @@ internal static class JitMethodCompiler {
             or ILOp.Beq or ILOp.Beq_S or ILOp.Bge or ILOp.Bge_S or ILOp.Bgt or ILOp.Bgt_S
             or ILOp.Ble or ILOp.Ble_S or ILOp.Blt or ILOp.Blt_S or ILOp.Bne_Un or ILOp.Bne_Un_S
             or ILOp.Bge_Un or ILOp.Bge_Un_S or ILOp.Bgt_Un or ILOp.Bgt_Un_S or ILOp.Ble_Un or ILOp.Ble_Un_S
-            or ILOp.Blt_Un or ILOp.Blt_Un_S)
-            return Call(frame, nameof(JitFrame.Branch), Constant(op), Constant(offsets[instruction.IntOperand]), Constant(next));
+            or ILOp.Blt_Un or ILOp.Blt_Un_S) {
+            var target = instruction.BranchTargetIndex >= 0
+                ? instruction.BranchTargetIndex : offsets[instruction.IntOperand];
+            if (op is ILOp.Br or ILOp.Br_S)
+                return Call(frame, nameof(JitFrame.BranchAlways), Constant(target));
+            if (op is ILOp.BrTrue or ILOp.BrTrue_S or ILOp.BrFalse or ILOp.BrFalse_S)
+                return Call(frame, nameof(JitFrame.BranchUnary),
+                    Constant(op is ILOp.BrTrue or ILOp.BrTrue_S), Constant(target), Constant(next));
+            return Call(frame, nameof(JitFrame.Branch), Constant(op), Constant(target), Constant(next));
+        }
         if (op == ILOp.Switch)
             return Call(frame, nameof(JitFrame.Switch),
-                Expression.Constant(instruction.SwitchTargets!.Select(target => offsets[target]).ToArray()), Constant(next));
+                Expression.Constant(instruction.SwitchTargetIndices ??
+                    instruction.SwitchTargets!.Select(target => offsets[target]).ToArray()), Constant(next));
         if (op is ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un)
             return Call(frame, nameof(JitFrame.Compare), Constant(op), Constant(next));
         if (IsIndirectLoad(op))

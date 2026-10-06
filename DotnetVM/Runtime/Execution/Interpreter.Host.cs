@@ -62,6 +62,7 @@ public sealed partial class Interpreter {
             VmLifetime.EnsureLiveForGuest(argument);
         var state = CurrentState;
         RegisterExecutionState(state);
+        var timeoutStarted = BeginExecutionTimeout(state);
         using var cultureScope = state.Depth == 0 ? new GuestCultureScope(_shared) : null;
         if (Interlocked.Exchange(ref _running, 1) == 0) {
             _services.Intrinsics.Seal(); // 実行開始後の intrinsic 登録を禁止
@@ -74,14 +75,27 @@ public sealed partial class Interpreter {
             if (state.Depth >= _memory.MaxRecursionDepth)
                 throw new UnhandledGuestException("System.StackOverflowException",
                     $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
-            state.Depth++;
-            entered = true;
-            try {
-                var engines = EnginesFor(method);
-                CloneStructArgs(method, arguments);
-                var prepared = engines.Preparer.Prepare(method);
-                var frame = InterpreterFrame.Create(method, arguments, prepared, prepared.MaxStack);
-                frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
+                state.Depth++;
+                entered = true;
+                try {
+                    var engines = EnginesFor(method);
+                    CloneStructArgs(method, arguments);
+                    var prepared = engines.Preparer.Prepare(method);
+                    // Primitive control-flow methods do not contain managed
+                    // references or byrefs. Let their specialized JIT run
+                    // without allocating/registering an InterpreterFrame;
+                    // the execution state and quota/safepoint guards still
+                    // remain active in ScalarIntJitContext.
+                    var compiled = CanUseJit && engines.Preparer.IsCached(method)
+                        ? engines.Jit.TryGetCompiled(method, prepared, prepared.Code)
+                        : null;
+                    if (state.Depth == 1 && context is null && compiled is { HasDirectScalar: true }) {
+                        if (_tracer is { } directTracer)
+                            directTracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                        return compiled.InvokeDirectScalar(this, arguments);
+                    }
+                    var frame = InterpreterFrame.Create(method, arguments, prepared, prepared.MaxStack);
+                    frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
                 using (_coordinator.EnterRead()) {
                     lock (state.Gate)
                         state.Frames.Add(frame);
@@ -97,9 +111,6 @@ public sealed partial class Interpreter {
                     // guest instruction.  Do not perform it after the guest has
                     // already exhausted its instruction budget; the first
                     // interpreter instruction will report the normal quota error.
-                    var compiled = CanUseJit && engines.Preparer.IsCached(method)
-                        ? engines.Jit.TryGetCompiled(method, prepared, frame.Code)
-                        : null;
                     return compiled is null
                         ? RunFrameWithTailCalls(ref frame, state)
                         : compiled.Invoke(this, engines.Services, frame);
@@ -125,6 +136,10 @@ public sealed partial class Interpreter {
                 }
             }
         } finally {
+            if (timeoutStarted)
+                state.DeadlineTimestamp = 0;
+            if (state.Depth == 0)
+                ReleaseInstructionCharge(state);
             // Preparation/type initialization can fail before Depth is entered.
             // Those failed attempts must not leave an otherwise idle state behind.
             if (!entered && state.Depth == 0) {
@@ -172,6 +187,57 @@ public sealed partial class Interpreter {
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Execute a leaf from an already active JIT frame.  The caller has
+    /// already entered the guest execution state and owns the instruction
+    /// batch, so repeating invocation registration and recursion bookkeeping
+    /// here would only add overhead to every direct call in a hot loop.
+    /// </summary>
+    internal bool TryInvokeCompiledLeafNested(VmMethod method, JitCompiledMethod compiled,
+        Span<StackSlot> arguments, out StackSlot result) {
+        result = default;
+        VmLifetime.EnsureLiveForGuest(method);
+        foreach (ref readonly var argument in arguments)
+            VmLifetime.EnsureLiveForGuest(argument);
+        if (!CanUseJit || !compiled.HasLeaf)
+            return false;
+        compiled.TryInvokeLeaf(this, arguments, out result);
+        return true;
+    }
+
+    /// <summary>
+    /// Resolve a leaf once for a generated direct-call site.  CoreLib surface
+    /// substitutions stay on the normal call path because they may rewrite
+    /// the target and normalize the receiver.
+    /// </summary>
+    internal JitCompiledMethod? GetNestedLeaf(VmMethod method) {
+        if (!CanUseJit || method.Body is null || method.Signature.GenericParamCount != 0)
+            return null;
+        if (_services.CoreLibSurfaces?.Substitute(method) is not null)
+            return null;
+        var compiled = EnginesFor(method).Jit.GetCompiled(method);
+        return compiled is { HasLeaf: true } ? compiled : null;
+    }
+
+    /// <summary>
+    /// Promote only a constructor candidate reached by newobj.  Unlike a
+    /// regular nested call, this promotion is restricted to the constructor
+    /// leaf compiler, so it cannot recursively promote an arbitrary BCL call
+    /// graph while a JIT frame is running.
+    /// </summary>
+    internal JitCompiledMethod? GetNestedConstructorLeaf(VmMethod method) {
+        if (!CanUseJit || method.Body is null || method.Signature.GenericParamCount != 0 ||
+            method.Name != ".ctor" || !method.Signature.HasThis ||
+            method.Signature.ReturnType.Kind != SigKind.Void)
+            return null;
+        var engines = EnginesFor(method);
+        var prepared = engines.Preparer.Prepare(method);
+        if (prepared.LocalTypes.Length != 0 || !prepared.Code.Any(instruction => instruction.Op == ILOp.Stfld))
+            return null;
+        var compiled = engines.Jit.TryGetCompiled(method, prepared, prepared.Code);
+        return compiled is { HasLeaf: true } ? compiled : null;
     }
 
     /// <summary>
@@ -243,13 +309,7 @@ public sealed partial class Interpreter {
     }
 
     internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
-        var objects = JitObjectsFor(method);
-        var field = objects.ResolveFieldToken(token, null, method.DynamicTokens);
-        if (!method.CanWriteInitOnly(field))
-            throw new UnhandledGuestException("System.FieldAccessException",
-                $"readonly フィールド {field} はコンストラクター外から書き込めません。");
-        if (!objects.TryStoreStringField(receiver, field, value))
-            objects.WriteField(receiver, field, value);
+        JitObjectsFor(method).StoreLeafField(method, token, receiver, value);
     }
 
     /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>

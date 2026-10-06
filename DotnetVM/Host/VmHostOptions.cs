@@ -23,6 +23,25 @@ public sealed class MemoryPolicy {
     /// <summary>命令数クォータ (停止性保証)。既定 = 実用上ほぼ無制限。</summary>
     public long InstructionQuota { get; init; } = 1_000_000_000;
 
+    /// <summary>
+    /// 命令数の加算とクォータ超過判定を有効にするか。既定 = true。
+    /// false にすると命令数課金だけを省略し、Dispose、キャンセル、GC の
+    /// セーフポイントなど、命令課金とは独立した実行制御は維持する。
+    /// </summary>
+    public bool InstructionChargingEnabled { get; init; } = true;
+
+    /// <summary>
+    /// 命令課金をまとめて予約する単位。実行終了時に未使用分は返却されるため、
+    /// 最終的な命令数は変わらない。1 を指定すると命令単位課金になる。
+    /// </summary>
+    public int InstructionChargeBatchSize { get; init; } = 256;
+
+    /// <summary>
+    /// 1 回のトップレベルゲスト実行に許す実時間。null = 無制限。
+    /// 命令課金を無効にする場合の停止性を確保する用途にも使用できる。
+    /// </summary>
+    public TimeSpan? ExecutionTimeout { get; init; }
+
     /// <summary>ゲスト呼出の最大深さ (深い再帰によるホスト StackOverflow の事前拒否)。</summary>
     public int MaxRecursionDepth { get; init; } = 512;
 
@@ -108,6 +127,12 @@ public sealed class MemoryPolicy {
         if (MaxRegexInputLength < 0) throw new ArgumentOutOfRangeException(nameof(MaxRegexInputLength));
         if (MaxRegexMatchTimeoutMilliseconds < 1) throw new ArgumentOutOfRangeException(nameof(MaxRegexMatchTimeoutMilliseconds));
         if (InstructionQuota < 0) throw new ArgumentOutOfRangeException(nameof(InstructionQuota));
+        if (InstructionChargeBatchSize < 1 || InstructionChargeBatchSize > 1_000_000)
+            throw new ArgumentOutOfRangeException(nameof(InstructionChargeBatchSize),
+                "InstructionChargeBatchSize は 1..1,000,000 の範囲で指定してください。");
+        if (ExecutionTimeout is { } executionTimeout && executionTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(ExecutionTimeout),
+                "ExecutionTimeout は null または正の値で指定してください。");
         if (MaxRecursionDepth < 1 || MaxRecursionDepth > MaxAllowedRecursionDepth)
             throw new ArgumentOutOfRangeException(nameof(MaxRecursionDepth),
                 $"MaxRecursionDepth は 1..{MaxAllowedRecursionDepth} の範囲で指定してください。");

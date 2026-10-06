@@ -238,17 +238,62 @@ internal sealed partial class ObjectEngine {
         target.Bytes[offset + 1] = (byte)((ushort)value >> 8);
     }
 
+    /// <summary>
+    /// Try the common, side-effect-free portion of <c>newobj</c> through a
+    /// promoted constructor leaf while an outer JIT frame is already active.
+    /// Only MethodDef constructors with a compatible leaf are accepted here;
+    /// all dynamic tokens, value types, delegates and runtime-backed
+    /// constructors continue through <see cref="NewObject"/>.
+    /// </summary>
+    internal bool TryNewObjectLeaf(int token, InterpreterFrame caller, Interpreter interpreter,
+        out StackSlot value) {
+        value = default;
+        if (caller.Context is not null ||
+            caller.Method.DynamicTokens?.ContainsKey(unchecked((uint)token)) == true ||
+            (TableKind)(token >> 24) != TableKind.MethodDef)
+            return false;
+
+        if (!_methodDefConstructors.TryGetValue(token, out var ctor)) {
+            ctor = _loader.GetMethodByToken(unchecked((uint)token));
+            if (ctor is null)
+                return false;
+            ctor = _methodDefConstructors.GetOrAdd(token, ctor);
+        }
+
+        if (ctor.Body is null || ctor.Signature.GenericParamCount != 0 ||
+            ctor.DeclaringType is not VmClassType owner || owner.IsValueType ||
+            TypeChecks.IsDelegateType(owner) ||
+            (owner.FullName == "System.Reflection.Emit.DynamicMethod" && ctor.Name == ".ctor") ||
+            (owner.FullName == "System.String" && ctor.Name == ".ctor") ||
+            (owner.FullName == "System.Guid" && ctor.Name == ".ctor") ||
+            _loader.IsTrustedCoreLib && owner.FullName == "System.Threading.Tasks.ValueTask")
+            return false;
+
+        var leaf = interpreter.GetNestedConstructorLeaf(ctor);
+        if (leaf is null)
+            return false;
+
+        EnsureInitialized(owner);
+        var instance = _heap.Allocate(new VmClassInstance(owner,
+            _objects.CreateInstanceStorage(owner, _loader)));
+        var receiver = StackSlot.OfObject(instance);
+        using var arguments = caller.BorrowConstructorArguments(ctor.Signature.ParamTypes.Length, receiver);
+        if (!interpreter.TryInvokeCompiledLeafNested(ctor, leaf, arguments.Arguments, out _))
+            throw new InvalidOperationException("コンストラクターleaf JITの実行条件が途中で失われました。");
+        value = receiver;
+        return true;
+    }
+
     public StackSlot? NewObject(int token, InterpreterFrame caller) {
         if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var reflectedReference) == true && reflectedReference is VmRuntimeMethod reflectedCtor) {
-            var values = caller.Stack.PopArguments(reflectedCtor.Target.Signature.ParamTypes.Length);
-            return StackSlot.OfObject(CreateInstanceByCtor(reflectedCtor.ReflectedType ?? reflectedCtor.Target.DeclaringType, reflectedCtor.Target, values, null));
+            using var argumentLease = caller.BorrowCallArguments(reflectedCtor.Target.Signature.ParamTypes.Length);
+            return StackSlot.OfObject(CreateInstanceByCtor(reflectedCtor.ReflectedType ?? reflectedCtor.Target.DeclaringType,
+                reflectedCtor.Target, argumentLease.Arguments, null));
         }
         if (caller.Method.DynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true &&
             dynamicReference is VmMethod dynamicCtor) {
-            var values = new StackSlot[dynamicCtor.Signature.ParamTypes.Length];
-            for (var i = values.Length - 1; i >= 0; i--)
-                values[i] = caller.Stack.Pop();
-            return ConstructExpression(dynamicCtor, values);
+            using var argumentLease = caller.BorrowCallArguments(dynamicCtor.Signature.ParamTypes.Length);
+            return ConstructExpression(dynamicCtor, argumentLease.Arguments);
         }
         VmMethod ctor;
         var table = (TableKind)(token >> 24);

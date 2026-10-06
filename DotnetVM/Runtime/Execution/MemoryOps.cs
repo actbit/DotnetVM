@@ -244,6 +244,10 @@ internal static class MemoryOps {
         var index = frame.Stack.Pop().AsInt32;
         var array = GetArray(frame.Stack.Pop());
         CheckArrayBounds(array, index);
+        if (kind == ArrayElementKind.Int32) {
+            lock (array.Elements)
+                return StackSlot.OfInt32((int)array.Elements[index].Int64Value);
+        }
         StackSlot slot;
         lock (array.Elements)
             slot = array.Elements[index];
@@ -274,6 +278,12 @@ internal static class MemoryOps {
             !TypeChecks.IsAssignableToType(value.ObjectValue, array.ArrayType.ElementType, stringType))
             throw new UnhandledGuestException("System.ArrayTypeMismatchException",
                 $"{SlotOps.Describe(value)} を {array.ArrayType.ElementType.FullName}[] に格納できません。");
+
+        if (kind == ArrayElementKind.Int32) {
+            lock (array.Elements)
+                array.Elements[index] = StackSlot.OfInt32((int)value.Int64Value);
+            return;
+        }
 
         lock (array.Elements)
             array.Elements[index] = kind switch {

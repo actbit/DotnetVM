@@ -16,7 +16,22 @@ public readonly record struct DecodedInstruction(
     /// <summary>R4/R8 オペランド (R4 も double に正規化)。</summary>
     double DoubleOperand,
     /// <summary>switch の絶対ターゲット列 (Switch のみ)。</summary>
-    int[]? SwitchTargets);
+    int[]? SwitchTargets) {
+    /// <summary>
+    /// 準備段階でこの命令へ畳み込まれた元 IL 命令数。通常は 1。
+    /// 実行時の命令クォータは最適化前の命令数で課金する。
+    /// </summary>
+    public int InstructionCost { get; init; } = 1;
+
+    /// <summary>準備済み分岐先の命令インデックス。未準備のデコード結果では -1。</summary>
+    public int BranchTargetIndex { get; init; } = -1;
+
+    /// <summary>準備済み switch 分岐先の命令インデックス列。未準備では null。</summary>
+    public int[]? SwitchTargetIndices { get; init; }
+
+    /// <summary>準備段階で生成されたローカル更新融合命令。</summary>
+    public IlFusion Fusion { get; init; }
+}
 
 /// <summary>
 /// IL バイト列の事前デコーダ。1 パスで命令列に変換し、分岐ターゲットを絶対オフセットに解決する。

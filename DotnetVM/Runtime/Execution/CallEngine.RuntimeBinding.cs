@@ -11,6 +11,45 @@ using DotnetVM.Runtime.Types;
 namespace DotnetVM.Runtime.Execution;
 
 internal sealed partial class CallEngine {
+    /// <summary>
+    /// JITフレーム内の静的 intrinsic 用の直通経路。通常の Call は仮想 dispatch、
+    /// 動的トークン、未解決面、ゲスト override まで扱う必要があるため、そこを
+    /// 省略できる確定済み static 面だけをここで処理する。
+    /// </summary>
+    internal bool TryInvokeJitStaticIntrinsic(int token, InterpreterFrame caller,
+        out StackSlot? result) {
+        result = null;
+        if (caller.Context is not null ||
+            caller.Method.DynamicTokens?.ContainsKey(unchecked((uint)token)) == true)
+            return false;
+
+        var target = ResolveCallTarget(token, null, throwOnMissingIntrinsic: false);
+        if (target.Intrinsic is not { } intrinsic || target.HasThis)
+            return false;
+
+        using var argumentLease = caller.BorrowCallArguments(target.Arity);
+        var args = argumentLease.Arguments;
+        foreach (var argument in args)
+            VmLifetime.EnsureLiveForGuest(argument);
+
+        gate.ConsumeInstruction();
+        gate.CheckSafepoint();
+        _intrinsicContext.ParameterTypeNames = target.ParamTypeNames ?? [];
+        _intrinsicContext.MethodTypeArgumentNames =
+            target.MethodArgs?.Select(type => type.FullName).ToArray() ?? [];
+        _intrinsicContext.ClassTypeArgumentNames =
+            target.ClassArgs?.Select(type => type.FullName).ToArray() ?? [];
+        _intrinsicContext.MethodTypeArguments = target.MethodArgs ?? [];
+        _intrinsicContext.ClassTypeArguments = target.ClassArgs ?? [];
+        using var roots = RegisterTransientRootsIfNeeded(args);
+        result = target.DeclaringType == "System.Threading.Interlocked"
+            ? InvokeInterlocked(intrinsic, target.ParamTypeNames ?? [], args, alreadyGated: true)
+            : intrinsic(_intrinsicContext, args);
+        if (target.ReturnsValue == false)
+            result = null;
+        return true;
+    }
+
     // ---- ランタイムバインド (優先順位 ① / legacy 救済 ③) ----
 
     /// <summary>呼出元フレームの loader から caller domain を求める。
@@ -378,8 +417,21 @@ internal sealed partial class CallEngine {
         gate.ConsumeInstruction();
         gate.CheckSafepoint();
         _intrinsicContext.ParameterTypeNames = paramNames;
-        using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+        using var roots = RegisterTransientRootsIfNeeded(args);
         return impl(_intrinsicContext, args);
+    }
+
+    private IDisposable? RegisterTransientRootsIfNeeded(StackSlot[] args) {
+        // Primitive-only intrinsic calls cannot expose a VM object to a
+        // collection. Avoid allocating an ActionLease for those calls while
+        // retaining the root registration for references, byrefs and value
+        // types that may contain references.
+        foreach (var argument in args) {
+            if (argument.Kind is StackKind.ByRef or StackKind.ValueType ||
+                argument.Kind == StackKind.Object && argument.ObjectValue is not null)
+                return _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+        }
+        return null;
     }
 
     /// <summary>プリミティブ等の instance 面 (ByRef レシーバ) を値に読み替える。可変状態を

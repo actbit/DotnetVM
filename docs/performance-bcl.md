@@ -41,7 +41,8 @@ Span コピーは時間差約 4% にとどまりますが、確保量は約 40% 
 raw struct layout cache、UTF-8、JSON、Regex、Crypto、HTTP の性能をこの表から推定しません。
 
 確保量は GC.GetTotalAllocatedBytes(true) の差分で、プロセス全体のホスト確保です。
-VM のクォータ会計のバイト数とは別です。ロード・初回準備・JIT 昇格・sample 前の host GC を時間から除きます。
+VM のクォータ会計のバイト数とは別です。ロード・初回準備・JIT 昇格を時間から除きます。
+測定前の強制 GC は CoreCLR／VM のどちらにも行わず、実行中の通常の GC は時間に含めます。
 実行中の GC は時間に含めます。各 sample の時間、CLR 比較、設定は
 [変更前 JSON](benchmarks/2026-10-04/bcl-before-jit.json) と
 [変更後 JSON](benchmarks/2026-10-04/bcl-after-jit.json) に保存しています。

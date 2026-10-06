@@ -40,7 +40,8 @@ internal sealed partial class CallEngine {
         // 特権判定は callee ではなく実際の呼出元 loader 基準 (caller.Method.Loader)。
         var callerDomain = CallerDomainOf(caller);
 
-        var args = caller.Stack.PopArguments(target.Arity);
+        using var argumentLease = caller.BorrowCallArguments(target.Arity);
+        var args = argumentLease.Arguments;
 
         // constrained. 付けた値型レシーバの前処理 (ECMA III.2.2): 値型レシーバを同値型で
         // ボックス化しておく。仮想ディスパッチ (レシーバ実行時型) と constrained. 多重面の
@@ -171,7 +172,7 @@ internal sealed partial class CallEngine {
                 target.ClassArgs?.Select(t => t.FullName).ToArray() ?? [];
             _intrinsicContext.MethodTypeArguments = target.MethodArgs ?? [];
             _intrinsicContext.ClassTypeArguments = target.ClassArgs ?? [];
-            using var roots = _intrinsicContext.RegisterTransientRoots?.Invoke(args);
+            using var roots = RegisterTransientRootsIfNeeded(args);
             var intrinsicResult = target.DeclaringType == "System.Threading.Interlocked"
                 ? InvokeInterlocked(intrinsic, target.ParamTypeNames ?? [], args, alreadyGated: true)
                 : intrinsic(_intrinsicContext, args);

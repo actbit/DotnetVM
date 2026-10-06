@@ -15,20 +15,20 @@ internal static class ScalarIntExpressionJit {
         VmMethod Method, DecodedInstruction[] Code, int ArgumentCount, int Cost);
 
     internal static JitScalar? TryCreate(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code, bool returnsValue) =>
-        TryCreateCore(method, prepared, code, returnsValue, direct: false) as JitScalar;
+        DecodedInstruction[] code, bool returnsValue, MethodPreparer preparer) =>
+        TryCreateCore(method, prepared, code, returnsValue, preparer, direct: false) as JitScalar;
 
     internal static JitScalarDirect? TryCreateDirect(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code, bool returnsValue) =>
-        TryCreateCore(method, prepared, code, returnsValue, direct: true) as JitScalarDirect;
+        DecodedInstruction[] code, bool returnsValue, MethodPreparer preparer) =>
+        TryCreateCore(method, prepared, code, returnsValue, preparer, direct: true) as JitScalarDirect;
 
     private static Delegate? TryCreateCore(VmMethod method, PreparedMethod prepared,
-        DecodedInstruction[] code, bool returnsValue, bool direct) {
+        DecodedInstruction[] code, bool returnsValue, MethodPreparer preparer, bool direct) {
         var inlineCalls = new Dictionary<int, InlineCall>();
         for (var i = 0; i < code.Length; i++) {
             if (code[i].Op != ILOp.Call)
                 continue;
-            if (!TryCreateInlineCall(method, code[i], out var inlineCall))
+            if (!TryCreateInlineCall(method, code[i], preparer, out var inlineCall))
                 return null;
             inlineCalls[i] = inlineCall;
         }
@@ -137,20 +137,26 @@ internal static class ScalarIntExpressionJit {
     }
 
     private static bool TryCreateInlineCall(VmMethod caller, DecodedInstruction instruction,
-        out InlineCall call) {
+        MethodPreparer preparer, out InlineCall call) {
         call = default;
         if ((TableKind)((uint)instruction.IntOperand >> 24) != TableKind.MethodDef ||
             caller.Loader?.GetMethodByToken((uint)instruction.IntOperand) is not { } target ||
             !target.IsStatic || target.Body is null || target.Signature.GenericParamCount != 0 ||
             target.Body.ExceptionClauses is { Length: > 0 } ||
-            target.Body.DynamicLocalTypes is { Length: > 0 } ||
             target.Signature.ReturnType.Kind != SigKind.I4 ||
             target.Signature.ParamTypes.Any(type => type.Kind != SigKind.I4))
             return false;
 
         DecodedInstruction[] targetCode;
         try {
-            targetCode = IlDecoder.Decode(target.Body.IlCode);
+            // Inline only the same prepared representation that the normal
+            // invocation path executes. This forces the callee through its
+            // source verifier, optimizer, and final verifier before its IL is
+            // embedded into the caller expression tree.
+            var targetPrepared = preparer.Prepare(target);
+            if (targetPrepared.Clauses is { Length: > 0 } || targetPrepared.LocalTypes.Length != 0)
+                return false;
+            targetCode = targetPrepared.Code;
         } catch (BadImageFormatException) {
             return false;
         }

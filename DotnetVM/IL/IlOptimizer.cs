@@ -258,7 +258,7 @@ internal static class IlOptimizer {
         ILOp.Ldnull or ILOp.Ldc_I4_M1 or ILOp.Ldc_I4_0 or ILOp.Ldc_I4_1 or ILOp.Ldc_I4_2 or
         ILOp.Ldc_I4_3 or ILOp.Ldc_I4_4 or ILOp.Ldc_I4_5 or ILOp.Ldc_I4_6 or ILOp.Ldc_I4_7 or
         ILOp.Ldc_I4_8 or ILOp.Ldc_I4_S or ILOp.Ldc_I4 or ILOp.Ldc_I8 or ILOp.Ldc_R4 or
-        ILOp.Ldc_R8 or ILOp.Dup;
+        ILOp.Ldc_R8;
 
     private static bool IsFusableOperation(ILOp op) => op is
         ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Div or ILOp.Div_Un or ILOp.Rem or ILOp.Rem_Un or

@@ -43,7 +43,9 @@ internal sealed class ExceptionDispatcher(
             // host implementation exception.  The verifier catches normal
             // cases; this remains a defensive normalization for handles and
             // other guest-controlled values introduced by host APIs.
-            return UnwindAndContinue(frame, SynthesizeCarrier(InvalidProgram(invalid)));
+            return UnwindAndContinue(frame, SynthesizeCarrier(HostExceptionBoundary.InvalidProgram(invalid)));
+        } catch (Exception host) when (HostExceptionBoundary.IsNormalizable(host)) {
+            return UnwindAndContinue(frame, SynthesizeCarrier(HostExceptionBoundary.InvalidProgram(host)));
         }
     }
 
@@ -59,13 +61,12 @@ internal sealed class ExceptionDispatcher(
             } catch (UnhandledGuestException uge) {
                 current = SynthesizeCarrier(uge);
             } catch (InvalidOperationException invalid) {
-                current = SynthesizeCarrier(InvalidProgram(invalid));
+                current = SynthesizeCarrier(HostExceptionBoundary.InvalidProgram(invalid));
+            } catch (Exception host) when (HostExceptionBoundary.IsNormalizable(host)) {
+                current = SynthesizeCarrier(HostExceptionBoundary.InvalidProgram(host));
             }
         }
     }
-
-    private static UnhandledGuestException InvalidProgram(InvalidOperationException exception) =>
-        new("System.InvalidProgramException", $"ゲスト実行状態が不正です: {exception.Message}");
 
     /// <summary>VM 内部例外を例外ファサード型のインスタンスとしてヒープに実体化する。</summary>
     private VmGuestThrow SynthesizeCarrier(UnhandledGuestException uge) {

@@ -6,6 +6,17 @@ internal static class IlFusionRuntime {
     internal static void Execute(InterpreterFrame frame, IlFusion fusion) {
         if (!IlFusionValidation.IsValid(fusion, frame.Locals.Length, out var reason))
             throw new InvalidOperationException($"不正な IL 融合命令です: {reason}");
+        ExecuteVerified(frame, fusion);
+    }
+
+    /// <summary>
+    /// Execute a fusion that came from a <see cref="PreparedMethod"/> after
+    /// its final verifier pass. The interpreter and generated JIT entry points
+    /// use this path so local-index validation is not repeated for every loop
+    /// iteration. Keep <see cref="Execute"/> for callers that do not already
+    /// hold the verifier invariant.
+    /// </summary>
+    internal static void ExecuteVerified(InterpreterFrame frame, IlFusion fusion) {
         var left = SlotOps.PushCopyOfValue(frame.Locals[fusion.LocalA]);
         StackSlot result;
         switch (fusion.Kind) {

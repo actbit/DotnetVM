@@ -290,7 +290,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                 ConsumeInstruction(state, instruction.InstructionCost);
                 ObserveInstruction(frame, instruction);
             if (instruction.Fusion.Kind != IlFusionKind.None) {
-                IlFusionRuntime.Execute(frame, instruction.Fusion);
+                IlFusionRuntime.ExecuteVerified(frame, instruction.Fusion);
                 frame.Ip++;
                 continue;
             }

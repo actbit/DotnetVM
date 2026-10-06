@@ -387,7 +387,7 @@ internal struct JitFrame {
     }
 
     public void FusedLocalOperation(IlFusion fusion, int next) {
-        IlFusionRuntime.Execute(_frame, fusion);
+        IlFusionRuntime.ExecuteVerified(_frame, fusion);
         _frame.Ip = next;
     }
 

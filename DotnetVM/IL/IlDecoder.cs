@@ -103,12 +103,12 @@ public static class IlDecoder {
             case IlOperandKind.ShortBrTarget: {
                 var relative = (sbyte)reader.ReadByte();
                 return new DecodedInstruction(offset, op, info.Operand, info.Size,
-                    offset + info.Size + relative, 0, 0, null);
+                    checked(offset + info.Size + relative), 0, 0, null);
             }
             case IlOperandKind.BrTarget: {
                 var relative = reader.ReadInt32();
                 return new DecodedInstruction(offset, op, info.Operand, info.Size,
-                    offset + info.Size + relative, 0, 0, null);
+                    checked(offset + info.Size + relative), 0, 0, null);
             }
             case IlOperandKind.Switch: {
                 var count = reader.ReadUInt32();
@@ -116,11 +116,11 @@ public static class IlDecoder {
                     throw new BadImageFormatException(
                         $"switch のターゲット数 {count:N0} が IL の残りサイズに対して不正です。");
                 var countInt = (int)count;
-                var size = checked(5 + 4 * countInt);
+                var size = checked(5 + checked(4 * countInt));
                 var targets = new int[countInt];
                 var baseOffset = checked(offset + size);
                 for (var i = 0; i < countInt; i++)
-                    targets[i] = baseOffset + reader.ReadInt32();
+                    targets[i] = checked(baseOffset + reader.ReadInt32());
                 return new DecodedInstruction(offset, op, info.Operand,
                     size, targets.Length, 0, 0, targets);
             }

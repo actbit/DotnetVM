@@ -22,7 +22,11 @@ public sealed class MetadataRoot {
     /// limits を渡すと各ストリームを受理する前に MaxMetadataStreamBytes を強制する
     /// (巨大 #Blob / #Strings 等を丸ごと受理する前に拒否する)。</summary>
     public static MetadataRoot Parse(PEImage pe, CliHeader cli, Host.MemoryPolicy? limits = null) {
-        var root = pe.GetSegment(cli.MetadataRva, cli.MetadataSize);
+        // Keep one bounded copy of the metadata root. Individual streams are
+        // represented as slices of it below, avoiding one extra copy per
+        // attacker-controlled stream.
+        var rootMemory = pe.GetSegment(cli.MetadataRva, cli.MetadataSize).ToArray().AsMemory();
+        var root = rootMemory.Span;
 
         if (root.Length < 16 || root[0] != (byte)'B' || root[1] != (byte)'S'
             || root[2] != (byte)'J' || root[3] != (byte)'B')
@@ -44,11 +48,12 @@ public sealed class MetadataRoot {
         var userStrings = default(ReadOnlyMemory<byte>);
         var blob = default(ReadOnlyMemory<byte>);
         var guid = default(ReadOnlyMemory<byte>);
+        var seenNames = new HashSet<string>(StringComparer.Ordinal);
 
         // ストリームヘッダ: オフセット (u4, ルート先頭からの相対) + サイズ (u4) + 名前 (null 終端 ASCII, 4 バイト整列)
         var p = versionEnd + 4;
         for (var i = 0; i < streamCount; i++) {
-            if (p + 8 > root.Length)
+            if (p < 0 || p > root.Length - 8)
                 throw new BadImageFormatException("ストリームヘッダが範囲外です。");
             var streamOffset = BinaryPrimitives.ReadInt32LittleEndian(root[p..]);
             var streamSize = BinaryPrimitives.ReadInt32LittleEndian(root[(p + 4)..]);
@@ -71,7 +76,11 @@ public sealed class MetadataRoot {
             if (limits is not null && streamSize > limits.MaxMetadataStreamBytes)
                 throw new BadImageFormatException(
                     $"メタデータストリーム '{name}' のサイズ {streamSize:N0} が上限 {limits.MaxMetadataStreamBytes:N0} を超えています。");
-            var data = root.Slice(streamOffset, streamSize).ToArray();
+            if (!seenNames.Add(name))
+                throw new BadImageFormatException($"メタデータストリーム '{name}' が重複しています。");
+            // PEImage already retains the complete input image. Keep a slice
+            // instead of making another attacker-controlled copy per stream.
+            var data = rootMemory.Slice(streamOffset, streamSize);
 
             switch (name) {
                 case "#~":

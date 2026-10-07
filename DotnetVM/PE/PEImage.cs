@@ -75,6 +75,8 @@ public sealed class PEImage {
     /// <summary>RVA 位置から始まるデータ全体 (メタデータルート等の可変長データ用)。</summary>
     public ReadOnlyMemory<byte> GetSegmentToEnd(int rva) {
         var offset = GetOffset(rva);
+        if (offset < 0 || offset > _image.Length)
+            throw new BadImageFormatException($"RVA 0x{rva:X} のファイルオフセットが範囲外です。");
         return _image[offset..];
     }
 }

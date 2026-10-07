@@ -91,7 +91,10 @@ public sealed class MethodBodyBlock {
 
                 ExceptionClause[]? clauses = null;
                 if ((flagsAndSize & CorILMethodMoreSects) != 0) {
-                    var sectionOffset = Align(headerSize + codeSize, 4);
+                    if (codeSize > int.MaxValue - headerSize)
+                        throw new BadImageFormatException("メソッド本体の終端位置がオーバーフローしました。");
+                    var bodyEnd = headerSize + codeSize;
+                    var sectionOffset = Align(bodyEnd, 4);
                     clauses = ParseExceptionSections(span, sectionOffset, codeSize);
                 }
 
@@ -119,8 +122,11 @@ public sealed class MethodBodyBlock {
         var kindByte = image[sectionOffset];
         const int CorILMethodSectEHTable = 0x01;
         const int CorILMethodSectFatFormat = 0x40;
+        const int CorILMethodSectMoreSects = 0x80;
         if ((kindByte & CorILMethodSectEHTable) == 0)
             throw new BadImageFormatException($"EH セクション以外が指定されました (種別バイト 0x{kindByte:X2})。");
+        if ((kindByte & CorILMethodSectMoreSects) != 0)
+            throw new BadImageFormatException("複数の EH セクションはサポートしていません。");
         var isFat = (kindByte & CorILMethodSectFatFormat) != 0;
 
         int dataSize, clauseSize, clausesOffset;
@@ -170,10 +176,17 @@ public sealed class MethodBodyBlock {
                 throw new BadImageFormatException("EH 句の try/handler 範囲が IL 本体外です。");
 
             // COR_ILEXCEPTION_CLAUSE_FILTER = 0x0001, FINALLY = 0x0002, FAULT = 0x0004
+            if ((flags & ~0x0007) != 0 ||
+                ((flags & 0x0001) != 0 && (flags & 0x0006) != 0) ||
+                ((flags & 0x0002) != 0 && (flags & 0x0004) != 0))
+                throw new BadImageFormatException($"EH 句のフラグが不正です (0x{flags:X8})。");
             var (kind, classTokenOrFilter) = (flags & 0x0002) != 0 ? (ExceptionClauseKind.Finally, 0)
                 : (flags & 0x0004) != 0 ? (ExceptionClauseKind.Fault, 0)
                 : (flags & 0x0001) != 0 ? (ExceptionClauseKind.Filter, tokenOrFilter)
                 : (ExceptionClauseKind.Catch, tokenOrFilter);
+
+            if (kind == ExceptionClauseKind.Filter && (uint)classTokenOrFilter >= (uint)codeSize)
+                throw new BadImageFormatException("EH filter の IL オフセットが本体外です。");
 
             clauses[i] = new ExceptionClause(tryOffset, tryLength, handlerOffset, handlerLength, kind, classTokenOrFilter);
         }
@@ -184,5 +197,9 @@ public sealed class MethodBodyBlock {
         (uint)(data[baseOffset + relative] | (data[baseOffset + relative + 1] << 8)
                | (data[baseOffset + relative + 2] << 16) | (data[baseOffset + relative + 3] << 24));
 
-    private static int Align(int value, int alignment) => checked((value + alignment - 1) & ~(alignment - 1));
+    private static int Align(int value, int alignment) {
+        if (value < 0 || value > int.MaxValue - (alignment - 1))
+            throw new BadImageFormatException("メソッド本体の整列位置がオーバーフローしました。");
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
 }

@@ -63,37 +63,46 @@ public sealed class AssemblyImage {
     /// hostile 画像は実行の前にここで落ちる (タスク 2 hardening)。</summary>
     public static AssemblyImage Parse(ReadOnlyMemory<byte> image, MemoryPolicy? limits) {
         limits?.Validate();
-        var pe = PEImage.Parse(image);
-        var cli = CliHeader.ParseFrom(pe);
-        var root = MetadataRoot.Parse(pe, cli, limits);
-        var tables = new MetadataTables(root.TablesStream);
-        var strings = new StringHeap(root.StringsStream);
-        var userStrings = new UserStringHeap(root.UserStringsStream);
-        var blobs = new BlobHeap(root.BlobStream);
-        var guids = new GuidHeap(root.GuidStream);
+        try {
+            var pe = PEImage.Parse(image);
+            var cli = CliHeader.ParseFrom(pe);
+            var root = MetadataRoot.Parse(pe, cli, limits);
+            var tables = new MetadataTables(root.TablesStream);
+            var strings = new StringHeap(root.StringsStream);
+            var userStrings = new UserStringHeap(root.UserStringsStream);
+            var blobs = new BlobHeap(root.BlobStream);
+            var guids = new GuidHeap(root.GuidStream);
 
-        if (limits is not null) {
-            // ロード時検証 (実行前拒否): メタデータ総行数 / ストリームサイズ
-            long rowTotal = 0;
-            foreach (TableKind table in Enum.GetValues<TableKind>()) {
-                var rows = (long)tables.GetRowCount(table);
-                rowTotal += rows;
-                if (rows > limits.MaxMetadataRows)
+            if (limits is not null) {
+                // ロード時検証 (実行前拒否): メタデータ総行数 / ストリームサイズ
+                long rowTotal = 0;
+                foreach (TableKind table in Enum.GetValues<TableKind>()) {
+                    var rows = (long)tables.GetRowCount(table);
+                    rowTotal += rows;
+                    if (rows > limits.MaxMetadataRows)
+                        throw new BadImageFormatException(
+                            $"メタデータテーブル {table} の行数 {rows:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
+                }
+                if (rowTotal > limits.MaxMetadataRows)
                     throw new BadImageFormatException(
-                        $"メタデータテーブル {table} の行数 {rows:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
+                        $"メタデータ行の合計 {rowTotal:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
             }
-            if (rowTotal > limits.MaxMetadataRows)
-                throw new BadImageFormatException(
-                    $"メタデータ行の合計 {rowTotal:N0} が上限 {limits.MaxMetadataRows:N0} を超えています。");
+
+            string name;
+            if (tables.GetRowCount(TableKind.Assembly) > 0)
+                name = strings.GetString(tables.GetRowIndex(TableKind.Assembly, 1, 7));
+            else
+                name = strings.GetString(tables.GetRowIndex(TableKind.Module, 1, 1));
+
+            return new AssemblyImage(pe, cli, root, tables, strings, userStrings, blobs, guids, name, limits);
+        } catch (BadImageFormatException) {
+            throw;
+        } catch (Exception ex) when (ex is EndOfStreamException or ArgumentOutOfRangeException or
+            OverflowException or IndexOutOfRangeException or InvalidOperationException or KeyNotFoundException) {
+            // Malformed external images must not leak parser implementation
+            // exceptions through the public image boundary.
+            throw new BadImageFormatException("PE/メタデータの構造が不正です。", ex);
         }
-
-        string name;
-        if (tables.GetRowCount(TableKind.Assembly) > 0)
-            name = strings.GetString(tables.GetRowIndex(TableKind.Assembly, 1, 7));
-        else
-            name = strings.GetString(tables.GetRowIndex(TableKind.Module, 1, 1));
-
-        return new AssemblyImage(pe, cli, root, tables, strings, userStrings, blobs, guids, name, limits);
     }
 
     // ---- 文字列/ブロブ/ボディ取得ヘルパー ----

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Collections.Concurrent;
 using DotnetVM.Devices;
 using DotnetVM.Host;
 using DotnetVM.Policy;
@@ -35,6 +36,8 @@ public sealed class IntrinsicContext {
     }
     private readonly ThreadLocal<InvocationMetadata> _metadata = new(() => new InvocationMetadata());
     private readonly object _arrayTypeGate = new();
+    private readonly ConcurrentDictionary<string, VmType> _resolvedTypeCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(VmType Definition, VmType Argument), VmConstructedType> _constructedTypeCache = new();
 
     /// <summary>仮想コンソールデバイス (ホスト物理 I/O ではなくここへ出る)。</summary>
     public required VmConsole Console { get; init; }
@@ -95,6 +98,29 @@ public sealed class IntrinsicContext {
 
     internal VmType[] MethodTypeArguments { get => _metadata.Value!.MethodTypes; set => _metadata.Value!.MethodTypes = value; }
     internal VmType[] ClassTypeArguments { get => _metadata.Value!.ClassTypes; set => _metadata.Value!.ClassTypes = value; }
+
+    /// <summary>
+    /// Cache the positive result of a stable CoreLib/facade type lookup. The
+    /// metadata loader protects its lazy type tables with a process-wide lock;
+    /// intrinsic value wrappers can otherwise reacquire that lock once per
+    /// await/collection element even after the type is fully resolved.
+    /// </summary>
+    internal VmType? FindResolvedType(string fullName) {
+        if (_resolvedTypeCache.TryGetValue(fullName, out var cached))
+            return cached;
+        var resolved = Types.IsTrustedCoreLib
+            ? (VmType?)Types.FindTypeByFullName(fullName) ?? Types.FindIntrinsicType(fullName)
+            : (VmType?)Types.FindIntrinsicType(fullName) ?? Types.FindTypeByFullName(fullName);
+        if (resolved is not null)
+            _resolvedTypeCache.TryAdd(fullName, resolved);
+        return resolved;
+    }
+
+    internal VmConstructedType ConstructedType(VmType definition, VmType argument) =>
+        _constructedTypeCache.GetOrAdd((definition, argument), static key => new VmConstructedType {
+            Definition = key.Definition,
+            TypeArguments = [key.Argument],
+        });
 
     /// <summary>クラス型実引数のインデックス名 (範囲外は空文字列)。</summary>
     public string ClassTypeArgAt(int i) =>

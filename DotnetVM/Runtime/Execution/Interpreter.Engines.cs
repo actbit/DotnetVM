@@ -132,7 +132,12 @@ public sealed partial class Interpreter {
         intrinsicContext.InvokeGuestDelegate = (guestDelegate, arguments) => calls.InvokeDelegate(guestDelegate, arguments);
         intrinsicContext.InvokeGuestInstanceMethod = (receiver, name, arguments) =>
             calls.InvokeGuestInstanceMethod(receiver, name, arguments);
-        intrinsicContext.InvokeGuestMethod = Invoke;
+        // Intrinsics commonly call back into guest IL while an outer guest
+        // instruction batch is already active. Keep that callback on the
+        // compiled nested path when possible instead of re-entering the full
+        // public host invocation boundary. The CallEngine owns the same
+        // loader-local compiled-target cache as ordinary call sites.
+        intrinsicContext.InvokeGuestMethod = calls.InvokeGuestMethod;
         intrinsicContext.ResolveVirtualMethod = (method, receiver) => GetOrCreateEngines(method.Loader ?? loader).Calls.DispatchVirtual(method, receiver);
         intrinsicContext.ResolveReflectionMethod = (module, token, context) => {
             var target = GetOrCreateEngines(module).Calls.ResolveCallTarget(token, context, throwOnMissingIntrinsic: false);
@@ -168,8 +173,10 @@ public sealed partial class Interpreter {
             }
             var container = byRef?.Container ?? [value];
             var index = byRef?.Index ?? 0;
-            Invoke(moveNext, [StackSlot.OfByRef(new VmByRef(container, index,
-                byRef?.IsReadOnly ?? false, byRef?.Owner))],
+            var receiver = byRef is { IsFrameStorage: true }
+                ? VmByRef.Frame(container, index, byRef.IsReadOnly)
+                : new VmByRef(container, index, byRef?.IsReadOnly ?? false, byRef?.Owner);
+            Invoke(moveNext, [StackSlot.OfByRef(receiver)],
                 GenericContext.Of(structMachine.TypeArguments, null));
         };
         // Activator.CreateInstance 等が .ctor を実行するためのフック
@@ -203,15 +210,18 @@ public sealed partial class Interpreter {
         }
         Func<IEnumerable<StackSlot[]>> staticStorageRoots = services.Objects.EnumerateStaticStorage;
         Func<IEnumerable<StackSlot[]>> intrinsicStaticRoots = () => objects.IntrinsicStaticFields.ToArray();
+        Func<IEnumerable<VmObject?>> typeHandleRoots = () => objects.TypeHandleRoots.ToArray();
         _heap.AddRootSlotSource(staticStorageRoots);
         _heap.AddRootSlotSource(intrinsicStaticRoots);
+        _heap.AddRootObjectSource(typeHandleRoots);
         return new LoaderEngines {
             Services = services,
             Preparer = preparer,
             Objects = objects,
             Calls = calls,
             Exceptions = exceptions,
-            Jit = new JitCodeCache(_enableJit, _jitPromotionThreshold, _heap, _memory, _jitResourceBudget),
+            Jit = new JitCodeCache(_enableJit, _jitPromotionThreshold, _heap, _memory,
+                _jitResourceBudget, services),
             StaticStorageRoots = staticStorageRoots,
             IntrinsicStaticRoots = intrinsicStaticRoots,
         };

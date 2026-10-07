@@ -13,10 +13,23 @@ namespace DotnetVM.Runtime.Execution;
 internal sealed partial class CallEngine {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(VmType Type, string Name, int Parameters), VmMethod>
         _virtualTargets = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(VmMethod Declared, VmType ReceiverType), VmMethod>
+        _declaredTargets = new();
+    // Static interface implementations are immutable once the intrinsic
+    // registry is sealed. Keep the positive result beside the virtual cache;
+    // unresolved entries are intentionally not cached because type loading can
+    // still complete a dispatch map later.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (VmMethod Declared, VmType ImplementingType, VmType[]? InterfaceArgs), VmMethod>
+        _staticInterfaceTargets = new();
     private readonly object _virtualTargetGate = new();
     private long _virtualTargetVersion;
 
     private VmMethod? TryDispatchStaticInterface(VmMethod declared, VmType implementingType, VmType[]? interfaceArgs) {
+        if (_intrinsics.IsSealed && _staticInterfaceTargets.TryGetValue(
+                (declared, implementingType, interfaceArgs), out var cached))
+            return cached;
+
         var definition = implementingType is VmConstructedType constructed ? constructed.Definition : implementingType;
         if (definition is not VmClassType implementingClass)
             return null;
@@ -25,16 +38,29 @@ internal sealed partial class CallEngine {
             return null;
         var maps = (implementingClass.Loader ?? _loader).EnsureDispatchMaps(implementingClass);
         var key = VmSlotKeys.InterfaceSlotKey(declared.DeclaringType.FullName, declared.Name, parameters);
-        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } explicitMethod)
+        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } explicitMethod) {
+            CacheStaticInterfaceTarget(declared, implementingType, interfaceArgs, explicitMethod);
             return explicitMethod;
+        }
         var context = GenericContext.Of(interfaceArgs, null);
         var concrete = parameters.Select(parameter => GenericSubstitutor.Substitute(parameter, context)).ToArray();
         key = VmSlotKeys.InterfaceSlotKey(declared.DeclaringType.FullName, declared.Name, concrete);
-        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } concreteMethod)
+        if (maps.InterfaceMap.GetValueOrDefault(key) is { IsStatic: true } concreteMethod) {
+            CacheStaticInterfaceTarget(declared, implementingType, interfaceArgs, concreteMethod);
             return concreteMethod;
+        }
         // Public static interface implementations have no MethodImpl row.
         var expectedKey = VmSlotKeys.Of(declared.Name, concrete);
-        return implementingClass.Methods.FirstOrDefault(method => method.IsStatic && method.SlotKey == expectedKey);
+        var publicMethod = implementingClass.Methods.FirstOrDefault(method => method.IsStatic && method.SlotKey == expectedKey);
+        if (publicMethod is not null)
+            CacheStaticInterfaceTarget(declared, implementingType, interfaceArgs, publicMethod);
+        return publicMethod;
+    }
+
+    private void CacheStaticInterfaceTarget(VmMethod declared, VmType implementingType,
+        VmType[]? interfaceArgs, VmMethod target) {
+        if (_intrinsics.IsSealed)
+            _staticInterfaceTargets.TryAdd((declared, implementingType, interfaceArgs), target);
     }
 
     // ---- 仮想ディスパッチ ----
@@ -78,6 +104,8 @@ internal sealed partial class CallEngine {
         var receiverType = constrainedType ?? ReceiverRuntimeType(receiver) ?? InterfaceReceiverType(receiver);
         if (receiverType is null || declared.DeclaringType is not VmClassType declaringClass)
             return null;
+        if (_intrinsics.IsSealed && _declaredTargets.TryGetValue((declared, receiverType), out var cached))
+            return cached;
         var definition = receiverType is VmConstructedType constructed ? constructed.Definition : receiverType;
         if (definition is not VmClassType receiverClass)
             return null;
@@ -86,9 +114,13 @@ internal sealed partial class CallEngine {
         if (declaringClass.IsInterface) {
             // インターフェース呼出: 宣言スロットはインターフェース定義文脈のキーでそのまま照合する
             var parameters = (declared.Loader ?? _loader).TryResolveSlotParams(declared.Signature.ParamTypes);
-            return parameters is null
-                ? null
-                : maps.InterfaceMap.GetValueOrDefault(VmSlotKeys.InterfaceSlotKey(declaringClass.FullName, declared.Name, parameters));
+            if (parameters is null)
+                return null;
+            var interfaceTarget = maps.InterfaceMap.GetValueOrDefault(
+                VmSlotKeys.InterfaceSlotKey(declaringClass.FullName, declared.Name, parameters));
+            if (interfaceTarget is not null && _intrinsics.IsSealed)
+                _declaredTargets.TryAdd((declared, receiverType), interfaceTarget);
+            return interfaceTarget;
         }
 
         // 仮想呼出: 宣言型文脈のスロットキーを継承パスの型引数でレシーバ文脈へ置換して照合する
@@ -101,7 +133,10 @@ internal sealed partial class CallEngine {
         var substitution = pathArgs.Length > 0 ? new GenericContext { ClassArgs = pathArgs } : null;
         var query = substitution is null ? declaredParams
             : [.. declaredParams.Select(p => GenericSubstitutor.Substitute(p, substitution))];
-        return maps.VTable.GetValueOrDefault(VmSlotKeys.Of(declared.Name, query))?.Method;
+        var virtualTarget = maps.VTable.GetValueOrDefault(VmSlotKeys.Of(declared.Name, query))?.Method;
+        if (virtualTarget is not null && _intrinsics.IsSealed)
+            _declaredTargets.TryAdd((declared, receiverType), virtualTarget);
+        return virtualTarget;
     }
 
     /// <summary>receiverType から targetClass (宣言型) までの継承パスで、targetClass の

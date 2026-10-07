@@ -170,9 +170,20 @@ internal sealed partial class ObjectEngine {
             var size = MemoryOps.SizeOfRawType(field.FieldType!);
             return MemoryOps.ReadPointerValue(address, field.FieldType!);
         }
+        // Normal guest field races follow CLR relaxed-field semantics. The
+        // coordinator protects object lifetime from collection, so direct
+        // object/value storage does not need a monitor per field access.
+        if (objSlot.ObjectValue is VmClassInstance instance)
+            return instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)];
+        if (objSlot.ObjectValue is VmBoxedValue boxed) {
+            var boxedType = DefinitionOf(boxed.Type);
+            return boxed.Fields[boxedType is null ? 0 : GetInstanceFieldIndex(boxedType, field)];
+        }
+        if (objSlot.Kind == StackKind.ValueType && objSlot.ObjectValue is VmStructValue direct &&
+            DefinitionOf(direct.StructType) is { } directType)
+            return direct.Fields[GetInstanceFieldIndex(directType, field)];
         var storage = FindFieldStorage(objSlot, field);
-        lock (storage.Slots)
-            return storage.Slots[storage.Index];
+        return storage.Slots[storage.Index];
     }
 
     /// <summary>stfld の直接書込経路。参照の readonly とスロット同期を保つ。</summary>
@@ -184,22 +195,49 @@ internal sealed partial class ObjectEngine {
             MemoryOps.WritePointerValue(address, field.FieldType!, value);
             return;
         }
+        if (objSlot.ObjectValue is VmClassInstance instance) {
+            instance.Fields[GetInstanceFieldIndex(instance.ClassType, field)] =
+                SlotOps.StoreCopyOfValue(value);
+            return;
+        }
+        if (objSlot.ObjectValue is VmBoxedValue boxed) {
+            var boxedType = DefinitionOf(boxed.Type);
+            boxed.Fields[boxedType is null ? 0 : GetInstanceFieldIndex(boxedType, field)] =
+                SlotOps.StoreCopyOfValue(value);
+            return;
+        }
+        if (objSlot.Kind == StackKind.ValueType && objSlot.ObjectValue is VmStructValue direct &&
+            DefinitionOf(direct.StructType) is { } directType) {
+            direct.Fields[GetInstanceFieldIndex(directType, field)] =
+                SlotOps.StoreCopyOfValue(value);
+            return;
+        }
         var storage = FindFieldStorage(objSlot, field);
         if (storage.IsReadOnly)
             throw new UnhandledGuestException("System.InvalidProgramException",
                 "readonly. で作られたマネージ参照には書き込めません。");
-        lock (storage.Slots)
-            storage.Slots[storage.Index] = SlotOps.StoreCopyOfValue(value);
+        storage.Slots[storage.Index] = SlotOps.StoreCopyOfValue(value);
     }
 
     internal void StoreLeafField(VmMethod method, int token, in StackSlot receiver,
         in StackSlot value) {
-        var field = ResolveFieldToken(token, null, method.DynamicTokens);
+        StoreLeafField(method, null, token, receiver, value);
+    }
+
+    internal void StoreLeafField(VmMethod method, GenericContext? context, int token,
+        in StackSlot receiver, in StackSlot value) {
+        var field = ResolveFieldToken(token, context, method.DynamicTokens);
         if (!method.CanWriteInitOnly(field))
             throw new UnhandledGuestException("System.FieldAccessException",
                 $"readonly フィールド {field} はコンストラクター外から書き込めません。");
         if (!TryStoreStringField(receiver, field, value))
             WriteField(receiver, field, value);
+    }
+
+    internal StackSlot ReadLeafField(VmMethod method, GenericContext? context, int token,
+        in StackSlot receiver) {
+        var field = ResolveFieldToken(token, context, method.DynamicTokens);
+        return ReadField(receiver, field);
     }
 
     private (StackSlot[] Slots, int Index, bool IsReadOnly) FindFieldStorage(in StackSlot objSlot, VmField field) {
@@ -244,6 +282,13 @@ internal sealed partial class ObjectEngine {
         return Interlocked.CompareExchange(ref handle.ManagedFields, initialized, null) ?? initialized;
     }
 
+    /// <summary>
+    /// Return the managed m_type view of a RuntimeTypeHandle.  This is the
+    /// observable result of the CoreLib GetTypeFromHandle shim; keeping it on
+    /// the object-model side also preserves the per-handle facade identity.
+    /// </summary>
+    internal StackSlot RuntimeTypeFromHandle(VmTypeHandle handle) => TypeHandleFields(handle)[0];
+
     /// <summary>レシーバ (インスタンス/ByRef/構造体値) からフィールドスロットへの書き込み可能参照を得る。
     /// 構築ジェネリック型は定義に解いてレイアウトを取る (VmClassInstance/ボックス/構造体の全経路)。</summary>
     public VmByRef FieldLocation(in StackSlot objSlot, VmField field, bool isReadOnly = false) {
@@ -279,18 +324,21 @@ internal sealed partial class ObjectEngine {
                     return VmByRef.OwnedStorage(nestedHandle, TypeHandleFields(nestedHandle), 0,
                         isReadOnly || outer.IsReadOnly);
                 if (target.Kind == StackKind.ValueType && target.ObjectValue is VmStructValue sv &&
-                    DefinitionOf(sv.StructType) is VmClassType st)
+                    DefinitionOf(sv.StructType) is VmClassType st) {
                     return new VmByRef(sv.Fields, GetInstanceFieldIndex(st, field),
-                        isReadOnly || outer.IsReadOnly, outer.Owner, MemoryOps.FixedBufferStorage(st)?.ElementType);
+                        isReadOnly || outer.IsReadOnly, outer.Owner,
+                        MemoryOps.FixedBufferStorage(st)?.ElementType, outer.IsFrameStorage);
+                }
                 if (target.ObjectValue is VmClassInstance nested)
                     return VmByRef.OwnedStorage(nested, nested.Fields,
                         GetInstanceFieldIndex(nested.ClassType, field), isReadOnly || outer.IsReadOnly);
                 break;
             }
             case StackKind.ValueType when objSlot.ObjectValue is VmStructValue direct &&
-                DefinitionOf(direct.StructType) is VmClassType dt:
+                DefinitionOf(direct.StructType) is VmClassType dt: {
                 return new VmByRef(direct.Fields, GetInstanceFieldIndex(dt, field), isReadOnly,
                     owner: null, elementType: MemoryOps.FixedBufferStorage(dt)?.ElementType);
+            }
         }
         throw new InvalidOperationException($"フィールド {field.DeclaringType.FullName}::{field.Name} のレシーバが不正です: {SlotOps.Describe(objSlot)}");
     }

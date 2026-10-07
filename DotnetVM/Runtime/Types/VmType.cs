@@ -254,9 +254,17 @@ public sealed class VmConstructedType : VmType {
     public required VmType[] TypeArguments { get; init; }
 
     private VmType? _baseType;
+    private string? _fullName;
+    private VmType[]? _interfaces;
 
-    public override string FullName =>
-        $"{Definition.FullName}<{string.Join(", ", TypeArguments.Select(t => t.FullName))}>";
+    public override string FullName {
+        get {
+            if (Volatile.Read(ref _fullName) is { } cached)
+                return cached;
+            var value = $"{Definition.FullName}<{string.Join(", ", TypeArguments.Select(t => t.FullName))}>";
+            return Interlocked.CompareExchange(ref _fullName, value, null) ?? value;
+        }
+    }
 
     /// <summary>Type.Name は構築型の型引数を含まず、ジェネリック定義名を返す。</summary>
     public override string Name => Definition.Name;
@@ -275,9 +283,9 @@ public sealed class VmConstructedType : VmType {
     private bool _baseResolved;
 
     /// <summary>定義の実装インターフェースに型引数を適用したもの。</summary>
-    public override IReadOnlyList<VmType> Interfaces => Definition.Interfaces
-        .Select(i => SubstituteOwn(i))
-        .ToArray();
+    public override IReadOnlyList<VmType> Interfaces =>
+        Volatile.Read(ref _interfaces) ?? Interlocked.CompareExchange(
+            ref _interfaces, Definition.Interfaces.Select(SubstituteOwn).ToArray(), null) ?? _interfaces!;
 
     public override bool IsValueType => Definition.IsValueType;
     public override uint Flags => Definition.Flags;

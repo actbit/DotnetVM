@@ -1,5 +1,6 @@
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.IL;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
@@ -58,6 +59,15 @@ internal sealed partial class ObjectEngine {
     /// 範囲外は ArgumentOutOfRangeException)。</summary>
     private StackSlot NewStringFromCtor(SigType[] parameterTypes, InterpreterFrame caller) {
         var paramCount = parameterTypes.Length;
+        if (parameterTypes is [{ Kind: SigKind.SzArray, Inner.Kind: SigKind.Char }]) {
+            var argument = caller.Stack.Pop();
+            gate.ConsumeInstruction();
+            gate.CheckSafepoint();
+            var array = RequireCharArray(argument);
+            var result = _intrinsicContext.Strings.Allocate(array.Length);
+            CopyChars(result, 0, array, 0, array.Length);
+            return StackSlot.OfObject(result);
+        }
         var args = new StackSlot[paramCount];
         for (var i = paramCount; i >= 1; i--)
             args[i - 1] = caller.Stack.Pop();
@@ -107,6 +117,54 @@ internal sealed partial class ObjectEngine {
             default:
                 throw new NotSupportedException($"string::.ctor (引数 {paramCount} 個) は対応していません。");
         }
+    }
+
+    internal bool TryGetStringConstructorSignature(int token, out SigType[] parameterTypes) {
+        parameterTypes = null!;
+        var table = (TableKind)(token >> 24);
+        var rid = (int)(token & 0xFFFFFF);
+        if (table == TableKind.MethodDef) {
+            if (!_methodDefConstructors.TryGetValue(token, out var ctor)) {
+                ctor = _loader.GetMethodByToken((uint)token);
+                if (ctor is null)
+                    return false;
+                _methodDefConstructors.TryAdd(token, ctor);
+            }
+            if (ctor.DeclaringType is not VmClassType {
+                    FullName: "System.String", Loader.IsTrustedCoreLib: true } ||
+                ctor.Name != ".ctor")
+                return false;
+            parameterTypes = ctor.Signature.ParamTypes;
+        } else if (table == TableKind.MemberRef) {
+            if (_stringConstructorSignatures.TryGetValue(token, out var cachedParameters)) {
+                parameterTypes = cachedParameters;
+            } else {
+                var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0,
+                    CodedIndexKind.MemberRefParent);
+                if (parent.Table == TableKind.TypeSpec)
+                    return false;
+                var typeName = _loader.GetMemberRefParentTypeName(rid);
+                if (typeName != "System.String" || _loader.GetMemberRefName(rid) != ".ctor")
+                    return false;
+                parameterTypes = _loader.DecodeMemberRefMethodSignature(rid).ParamTypes;
+                _stringConstructorSignatures.TryAdd(token, parameterTypes);
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    internal StackSlot NewStringFromCtorJit(SigType[] parameterTypes, InterpreterFrame caller) =>
+        NewStringFromCtor(parameterTypes, caller);
+
+    internal bool TryNewStringFromCtorJit(int token, InterpreterFrame caller, out StackSlot value) {
+        value = default;
+        if (caller.Method.DynamicTokens?.ContainsKey(unchecked((uint)token)) == true ||
+            !TryGetStringConstructorSignature(token, out var parameterTypes))
+            return false;
+        value = NewStringFromCtor(parameterTypes, caller);
+        return true;
     }
 
     /// <summary>Guid::.ctor の構築面。該当 overload のみホスト解析 + Guid 構造体値で受け、
@@ -269,11 +327,36 @@ internal sealed partial class ObjectEngine {
             _loader.IsTrustedCoreLib && owner.FullName == "System.Threading.Tasks.ValueTask")
             return false;
 
+        // The overwhelmingly common guest constructor shape is a field store
+        // (optionally followed by the parameterless System.Object constructor).
+        // It is safe to execute structurally: allocation, field initialization,
+        // init-only validation and the original IL charge are all preserved,
+        // while avoiding a nested frame for every tiny object in a hot loop.
+        if (ctor.Loader?.IsTrustedCoreLib != true &&
+            ctor.Loader?.IsTrustedVmCoreLib != true &&
+            ctor.Loader?.IsTrustedBcl != true &&
+            ctor.Signature.ParamTypes.Length == 1 &&
+            caller.Stack.Count > 0 &&
+            TryGetSimpleFieldConstructor(ctor, out var simple) &&
+            ctor.CanWriteInitOnly(simple.Field)) {
+            EnsureInitializedForAllocation(owner);
+            var storage = simple.CanSkipDefaultStorage
+                ? new StackSlot[1]
+                : _objects.CreateInstanceStorage(owner, _loader);
+            var simpleInstance = _heap.Allocate(new VmClassInstance(owner, storage));
+            simpleInstance.Fields[simple.FieldIndex] =
+                SlotOps.StoreCopyOfValue(caller.Stack.Peek());
+            caller.Stack.DropArguments(1);
+            interpreter.ConsumeJitInstruction(simple.InstructionCost);
+            value = StackSlot.OfObject(simpleInstance);
+            return true;
+        }
+
         var leaf = interpreter.GetNestedConstructorLeaf(ctor);
         if (leaf is null)
             return false;
 
-        EnsureInitialized(owner);
+        EnsureInitializedForAllocation(owner);
         var instance = _heap.Allocate(new VmClassInstance(owner,
             _objects.CreateInstanceStorage(owner, _loader)));
         var receiver = StackSlot.OfObject(instance);
@@ -281,6 +364,249 @@ internal sealed partial class ObjectEngine {
         if (!interpreter.TryInvokeCompiledLeafNested(ctor, leaf, arguments.Arguments, out _))
             throw new InvalidOperationException("コンストラクターleaf JITの実行条件が途中で失われました。");
         value = receiver;
+        return true;
+    }
+
+    /// <summary>
+    /// Elide an immediately consumed object when the constructor and getter
+    /// are both pure structural accessors.  This is a general escape-analysis
+    /// fast path for <c>newobj; call get_Field</c>, not a type-specific route:
+    /// the constructor must be a one-field store and the getter must load that
+    /// same field.  No guest-visible object can escape between the two IL
+    /// instructions, so retaining only the value is semantically equivalent.
+    /// </summary>
+    internal bool TryNewObjectAndGetField(int constructorToken, int getterToken,
+        InterpreterFrame caller, Interpreter interpreter, out StackSlot value,
+        out int instructionCost) {
+        value = default;
+        instructionCost = 0;
+        if (caller.Context is not null || caller.Method.DynamicTokens is not null ||
+            (TableKind)(constructorToken >> 24) is not (TableKind.MethodDef or TableKind.MemberRef) ||
+            (TableKind)(getterToken >> 24) != TableKind.MethodDef || caller.Stack.Count == 0)
+            return false;
+
+        var constructor = ResolveConstructor(constructorToken, caller);
+        var getter = ResolveMethodDef(getterToken);
+        if (constructor is null || getter is null ||
+            constructor.DeclaringType is not VmClassType owner || owner.IsValueType ||
+            constructor.Loader?.IsTrustedCoreLib == true ||
+            constructor.Loader?.IsTrustedVmCoreLib == true ||
+            constructor.Loader?.IsTrustedBcl == true ||
+            constructor.Signature.ParamTypes.Length != 1 ||
+            getter.DeclaringType != owner || getter.IsStatic || getter.Signature.HasThis == false ||
+            getter.Signature.ParamTypes.Length != 0 || getter.Signature.ReturnType.Kind == SigKind.Void)
+            return false;
+        if (!TryGetSimpleFieldConstructor(constructor, out var simple) ||
+            !constructor.CanWriteInitOnly(simple.Field) ||
+            !TryGetSimpleFieldGetter(getter, out var getterField) ||
+            getterField != simple.Field)
+            return false;
+
+        EnsureInitializedForAllocation(owner);
+        value = SlotOps.StoreCopyOfValue(caller.Stack.Peek());
+        caller.Stack.DropArguments(1);
+        var getterCost = _constructorInstructionCosts.GetOrAdd(getter,
+            static method => method.DecodeIl().Sum(static instruction => instruction.InstructionCost));
+        instructionCost = simple.InstructionCost + getterCost;
+        interpreter.ConsumeJitInstruction(instructionCost);
+        return true;
+    }
+
+    private VmMethod? ResolveMethodDef(int token) {
+        if (_methodDefConstructors.TryGetValue(token, out var cached))
+            return cached;
+        var method = _loader.GetMethodByToken(unchecked((uint)token));
+        return method is null ? null : _methodDefConstructors.GetOrAdd(token, method);
+    }
+
+    private VmMethod? ResolveConstructor(int token, InterpreterFrame caller) {
+        if ((TableKind)(token >> 24) == TableKind.MethodDef)
+            return ResolveMethodDef(token);
+        var rid = token & 0xFFFFFF;
+        var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, rid, 0,
+            CodedIndexKind.MemberRefParent);
+        var signature = _loader.DecodeMemberRefMethodSignature(rid);
+        var name = _loader.GetMemberRefName(rid);
+        VmClassType? owner = parent.Table switch {
+            TableKind.TypeRef => _loader.ResolveTypeRefType(parent.Rid) as VmClassType,
+            TableKind.TypeSpec => ResolveConstructedParent(parent.Rid, caller.Context).Definition as VmClassType,
+            _ => null,
+        };
+        return owner is null ? null : FindCtorThroughChain(owner, name, signature.ParamTypes.Length,
+            signature.ParamTypes);
+    }
+
+    private bool TryGetSimpleFieldGetter(VmMethod getter, out VmField field) {
+        if (_simpleFieldGetters.TryGetValue(getter, out field!))
+            return true;
+        if (_nonSimpleFieldGetters.ContainsKey(getter)) {
+            field = null!;
+            return false;
+        }
+        var code = getter.DecodeIl();
+        if (code.Length != 3 || code[0].Op != ILOp.Ldarg_0 ||
+            code[1].Op != ILOp.Ldfld || code[2].Op != ILOp.Ret)
+            return RejectSimpleFieldGetter(getter, out field);
+        field = ResolveFieldToken(code[1].IntOperand);
+        if (field.IsStatic || !ReferenceEquals(field.DeclaringType, getter.DeclaringType))
+            return RejectSimpleFieldGetter(getter, out field);
+        _simpleFieldGetters.TryAdd(getter, field);
+        return true;
+    }
+
+    private bool RejectSimpleFieldGetter(VmMethod getter, out VmField field) {
+        _nonSimpleFieldGetters.TryAdd(getter, 0);
+        field = null!;
+        return false;
+    }
+
+    private bool TryGetSimpleFieldConstructor(VmMethod ctor, out SimpleFieldConstructor info) {
+        if (_simpleFieldConstructors.TryGetValue(ctor, out info!))
+            return true;
+        if (_nonSimpleFieldConstructors.ContainsKey(ctor)) {
+            info = null!;
+            return false;
+        }
+
+        var code = ctor.DecodeIl();
+        var hasOnlyFieldStore = code.Length == 4 &&
+            code[0].Op == ILOp.Ldarg_0 &&
+            code[1].Op == ILOp.Ldarg_1 &&
+            code[2].Op == ILOp.Stfld &&
+            code[3].Op == ILOp.Ret;
+        var hasObjectBaseCall = code.Length is 6 or 7 &&
+            code[0].Op == ILOp.Ldarg_0 &&
+            code[1].Op == ILOp.Ldarg_1 &&
+            code[2].Op == ILOp.Stfld &&
+            code[3].Op == ILOp.Ldarg_0 &&
+            code[4].Op == ILOp.Call &&
+            code[^1].Op == ILOp.Ret &&
+            (code.Length == 6 || code[5].Op == ILOp.Nop) &&
+            IsObjectParameterlessConstructor(code[4].IntOperand, ctor.DeclaringType);
+        if (!hasOnlyFieldStore && !hasObjectBaseCall)
+            return RejectSimpleFieldConstructor(ctor, out info);
+
+        var field = ResolveFieldToken(code[2].IntOperand);
+        if (field.IsStatic)
+            return RejectSimpleFieldConstructor(ctor, out info);
+        var layout = _objects.GetLayout((VmClassType)ctor.DeclaringType);
+        if (!layout.TryGetValue(field, out var fieldIndex))
+            return RejectSimpleFieldConstructor(ctor, out info);
+
+        info = new SimpleFieldConstructor(field, fieldIndex, layout.Count == 1,
+            code.Sum(static instruction => instruction.InstructionCost));
+        _simpleFieldConstructors.TryAdd(ctor, info);
+        return true;
+    }
+
+    private bool RejectSimpleFieldConstructor(VmMethod ctor, out SimpleFieldConstructor info) {
+        _nonSimpleFieldConstructors.TryAdd(ctor, 0);
+        info = null!;
+        return false;
+    }
+
+    private bool IsObjectParameterlessConstructor(int token, VmType declaringType) {
+        if (declaringType is not VmClassType owner || owner.BaseType?.FullName != "System.Object")
+            return false;
+        var table = (TableKind)(token >> 24);
+        var rid = token & 0xFFFFFF;
+        if (table == TableKind.MemberRef)
+            return _loader.GetMemberRefName(rid) == ".ctor" &&
+                _loader.GetMemberRefParentTypeName(rid) == "System.Object" &&
+                _loader.DecodeMemberRefMethodSignature(rid) is { HasThis: true, ParamTypes.Length: 0 };
+        if (table == TableKind.MethodDef &&
+            _loader.GetMethodByToken(unchecked((uint)token)) is { } method)
+            return method.Name == ".ctor" && method.Signature.HasThis &&
+                method.Signature.ParamTypes.Length == 0 &&
+                method.DeclaringType.FullName == "System.Object";
+        return false;
+    }
+
+    /// <summary>
+    /// Construct the common array-backed value-type shape without entering a
+    /// nested interpreter frame.  This is deliberately structural: it covers
+    /// trusted CoreLib wrappers whose instance is exactly a managed reference
+    /// plus a length, while leaving user-defined types and all other .ctors on
+    /// the normal IL path.
+    /// </summary>
+    internal bool TryNewArrayBackedValueType(int token, InterpreterFrame caller,
+        out StackSlot value, out int nestedInstructionCost) {
+        value = default;
+        nestedInstructionCost = 0;
+        if ((TableKind)(token >> 24) != TableKind.MemberRef)
+            return false;
+
+        if (caller.Stack.Count == 0 || caller.Stack.Peek().ObjectValue is not VmArray array)
+            return false;
+
+        var cacheable = caller.Context is null &&
+            caller.Method.DynamicTokens?.ContainsKey(unchecked((uint)token)) != true;
+        if (!cacheable || !_arrayBackedValueTypes.TryGetValue(token, out var info)) {
+            var memberRefRid = token & 0xFFFFFF;
+            var parent = _loader.Image.Tables.DecodeCoded(TableKind.MemberRef, memberRefRid, 0,
+                CodedIndexKind.MemberRefParent);
+            if (parent.Table != TableKind.TypeSpec)
+                return false;
+
+            var constructed = ResolveConstructedParent(parent.Rid, caller.Context);
+            if (constructed.Definition is not VmClassType definition ||
+                !definition.IsValueType ||
+                definition.Loader?.IsTrustedCoreLib != true ||
+                constructed.TypeArguments.Length != 1)
+                return false;
+
+            var signature = _loader.DecodeMemberRefMethodSignature(memberRefRid);
+            if (signature.ParamTypes is not [{ Kind: SigKind.SzArray, Inner: { } }])
+                return false;
+
+            var elementType = constructed.TypeArguments[0];
+            var layout = _objects.GetLayout(definition);
+            if (layout.Count != 2)
+                return false;
+            VmField? referenceField = null;
+            VmField? lengthField = null;
+            var referenceIndex = -1;
+            var lengthIndex = -1;
+            foreach (var (field, index) in layout) {
+                if (field.Name == "_reference") {
+                    referenceField = field;
+                    referenceIndex = index;
+                } else if (field.Name == "_length") {
+                    lengthField = field;
+                    lengthIndex = index;
+                }
+            }
+            if (referenceField is null || lengthField is null || referenceIndex < 0 || lengthIndex < 0 ||
+                referenceField.FieldType is not VmByRefType ||
+                !string.Equals(lengthField.FieldType?.FullName, "System.Int32", StringComparison.Ordinal))
+                return false;
+
+            var ctorName = _loader.GetMemberRefName(memberRefRid);
+            var ctor = FindCtorThroughChain(definition, ctorName, 1, signature.ParamTypes);
+            if (ctor?.Body is null)
+                return false;
+
+            var instructionCost = _constructorInstructionCosts.GetOrAdd(ctor,
+                static method => method.DecodeIl().Sum(static instruction => instruction.InstructionCost));
+            info = new ArrayBackedValueTypeInfo(constructed, definition, elementType, ctor,
+                referenceIndex, lengthIndex, instructionCost);
+            if (cacheable)
+                info = _arrayBackedValueTypes.GetOrAdd(token, info);
+        }
+
+        var actualElementType = array.ArrayType.ElementType;
+        if (!ReferenceEquals(actualElementType, info.ElementType) &&
+            !string.Equals(actualElementType.FullName, info.ElementType.FullName,
+                StringComparison.Ordinal))
+            return false;
+
+        EnsureInitializedForAllocation(info.Definition);
+        _ = caller.Stack.Pop();
+        var fields = new StackSlot[2];
+        fields[info.ReferenceIndex] = StackSlot.OfByRef(VmByRef.ArrayElement(array, 0));
+        fields[info.LengthIndex] = StackSlot.OfInt32(array.Length);
+        value = StackSlot.OfValueType(new VmStructValue(info.Constructed, fields, info.Constructed.TypeArguments));
+        nestedInstructionCost = info.InstructionCost;
         return true;
     }
 
@@ -537,6 +863,21 @@ internal sealed partial class ObjectEngine {
                 return ValueTaskRuntime.FromSource(_intrinsicContext, generic: true, resultType: resultType,
                     sourceSlot: sourceValue, token: valueTaskToken);
             }
+
+            // ValueTask<T>(T) and ValueTask<T>(Task<T>) share the same arity but
+            // have completely different representations.  The former is the
+            // overwhelmingly common completed-value path.  Do not normalize a
+            // primitive T into a newly allocated completed Task<T>; preserve the
+            // direct ValueTask representation used by the intrinsic binding.
+            if (signature.ParamTypes[0].Kind == SigKind.GenericVar) {
+                var directResult = caller.Stack.Pop();
+                return directResult.Kind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt
+                    or StackKind.IntPtr or StackKind.Float
+                    ? StackSlot.OfInlineValue(constructed, directResult)
+                    : StackSlot.OfValueType(new VmStructValue(constructed,
+                        [directResult, default], [resultType]));
+            }
+
             var sourceValueForTask = caller.Stack.Pop();
             VmTaskObject task;
             if (sourceValueForTask.ObjectValue is VmTaskObject existing) {
@@ -544,7 +885,7 @@ internal sealed partial class ObjectEngine {
             } else {
                 var taskDefinition = _loader.FindIntrinsicType("System.Threading.Tasks.Task`1")!
                     ?? throw new InvalidOperationException("Task<T> intrinsic type が見つかりません。");
-                var taskType = new VmConstructedType { Definition = taskDefinition, TypeArguments = [resultType] };
+                var taskType = _intrinsicContext.ConstructedType(taskDefinition, resultType);
                 task = _heap.Allocate(_intrinsicContext.Shared.GuestTasks.Create(taskType, completed: true, result: sourceValueForTask));
             }
             return StackSlot.OfValueType(new VmStructValue(constructed, [StackSlot.OfObject(task)], [resultType]));

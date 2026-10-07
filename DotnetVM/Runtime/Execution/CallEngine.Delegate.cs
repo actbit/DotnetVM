@@ -16,7 +16,15 @@ internal sealed partial class CallEngine {
     /// <summary>デリゲート呼出 (callvirt Invoke/BeginInvoke のデリゲート実体ディスパッチ)。
     /// マルチキャストは全エントリを順に実行し、最後の戻り値を返す (CLR 規約)。
     /// 各呼出は通常の Invoke ゲート経由 (クォータ/セーフポイント/EH 機構を共有)。</summary>
-    public StackSlot? InvokeDelegate(VmDelegate @delegate, StackSlot[] args) {
+    public StackSlot? InvokeDelegate(VmDelegate @delegate, StackSlot[] args) =>
+        InvokeDelegate(caller: null, @delegate, args);
+
+    /// <summary>
+    /// Delegate invocation reached from a guest call keeps the owning frame so
+    /// the target can use the nested compiled-call boundary. The public
+    /// overload remains the host entry point for callbacks that have no frame.
+    /// </summary>
+    private StackSlot? InvokeDelegate(InterpreterFrame? caller, VmDelegate @delegate, StackSlot[] args) {
         VmLifetime.EnsureLiveForGuest(@delegate);
         foreach (var argument in args)
             VmLifetime.EnsureLiveForGuest(argument);
@@ -56,12 +64,16 @@ internal sealed partial class CallEngine {
                 callArgs[0] = invocation.Target;
                 for (var i = 0; i < argCount; i++)
                     callArgs[i + 1] = args[i + 1];
-                last = InvokeResolvedMethod(method, callArgs, context);
+                last = caller is not null
+                    ? InvokeResolvedMethod(caller, method, callArgs, context)
+                    : InvokeResolvedMethod(method, callArgs, context);
             } else {
                 var callArgs = new StackSlot[argCount];
                 for (var i = 0; i < argCount; i++)
                     callArgs[i] = args[i + 1];
-                last = InvokeResolvedMethod(method, callArgs, context);
+                last = caller is not null
+                    ? InvokeResolvedMethod(caller, method, callArgs, context)
+                    : InvokeResolvedMethod(method, callArgs, context);
             }
         }
         return SlotOps.SignatureReturnsValue(lastMethod.Signature) ? last : null;

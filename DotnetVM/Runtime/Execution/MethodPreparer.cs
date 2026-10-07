@@ -1,6 +1,7 @@
 using DotnetVM.IL;
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
+using DotnetVM.Policy;
 using DotnetVM.Runtime.Types;
 using System.Collections.Concurrent;
 
@@ -60,7 +61,7 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
             code = IlOptimizer.Optimize(code, ilBody.ExceptionClauses);
         }
 
-        var prepared = new PreparedMethod(localTypes, code) {
+        var prepared = new PreparedMethod(localTypes, code, loader) {
             Clauses = ResolveExceptionClauses(method, code),
         };
         prepared.SetEstimatedBytes(prepared.Clauses);
@@ -174,6 +175,8 @@ internal sealed class MethodPreparer(TypeLoader loader, int maxPreparedMethods, 
 /// <summary>メソッドの事前準備結果 (ローカル型 + 解決済み EH 句)。</summary>
 internal sealed class PreparedMethod {
     public readonly SigType[] LocalTypes;
+    /// <summary>Generic/type-token locals that may need runtime value-type materialization.</summary>
+    public readonly bool RequiresStructLocalFixup;
     public readonly DecodedInstruction[] Code;
     public readonly Dictionary<int, int> OffsetMap;
     public readonly StackSlot[] InitialLocals;
@@ -182,8 +185,9 @@ internal sealed class PreparedMethod {
     /// <summary>prepared cache budget に使う保守的な host representation の概算サイズ。</summary>
     public long EstimatedBytes { get; private set; }
 
-    public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code) {
+    public PreparedMethod(SigType[] localTypes, DecodedInstruction[] code, TypeLoader loader) {
         LocalTypes = localTypes;
+        RequiresStructLocalFixup = localTypes.Any(type => RequiresStructLocalFixupFor(type, loader));
         OffsetMap = new Dictionary<int, int>(code.Length * 2);
         for (var i = 0; i < code.Length; i++)
             OffsetMap[code[i].Offset] = i;
@@ -195,6 +199,25 @@ internal sealed class PreparedMethod {
             InitialLocals[i] = InterpreterFrame.DefaultValue(localTypes[i]);
 
         EstimatedBytes = EstimateBytes(localTypes, Code, OffsetMap, InitialLocals, null);
+    }
+
+    private static bool RequiresStructLocalFixupFor(SigType type, TypeLoader loader) {
+        if (type.Kind is SigKind.GenericVar or SigKind.GenericMethodVar)
+            return true;
+        if (type.Kind is not (SigKind.TypeToken or SigKind.GenericInst))
+            return false;
+        try {
+            // Reference locals are already represented by null and never need
+            // a runtime slot materialization. Resolve concrete signatures
+            // once during preparation instead of repeating this check for
+            // every nested frame invocation.
+            return loader.ResolveToken(type).IsValueType;
+        } catch (Exception ex) when (ex is NotSupportedException or BadImageFormatException
+            or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
+            // An open/deferred signature may become a value type under a
+            // caller context; retain the conservative runtime fixup path.
+            return true;
+        }
     }
 
     internal void SetEstimatedBytes(PreparedClause[]? clauses) {

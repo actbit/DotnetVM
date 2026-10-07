@@ -1,4 +1,5 @@
 using DotnetVM.Metadata;
+using DotnetVM.Metadata.Signatures;
 using System.Collections.Concurrent;
 using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
@@ -26,11 +27,47 @@ internal sealed partial class ObjectEngine(
     private readonly MetadataResolutionCache<VmField> _fieldTokens = new();
     private readonly ConcurrentDictionary<int, VmField> _fieldDefTokens = new();
     private readonly MetadataResolutionCache<VmType> _typeTokens = new();
+    private readonly ConcurrentDictionary<int, VmTypeHandle> _typeHandles = new();
+    private readonly ConcurrentDictionary<GenericContext, ConcurrentDictionary<int, VmTypeHandle>> _genericTypeHandles = new();
+    // Resolved type identity is the semantic key for RuntimeTypeHandle. A
+    // generic call can produce equivalent short-lived contexts/constructed
+    // type objects, so caching by those object references misses repeatedly.
+    private readonly ConcurrentDictionary<string, VmTypeHandle> _resolvedTypeHandles = new();
+
+    internal VmTypeHandle GetCachedTypeHandle(int token, GenericContext? context,
+        IReadOnlyDictionary<uint, object>? dynamicTokens) {
+        if (dynamicTokens?.TryGetValue(unchecked((uint)token), out var dynamicReference) == true) {
+            if (dynamicReference is not VmType dynamicType)
+                throw new NotSupportedException("動的 ldtoken の型ハンドルが不正です。");
+            return GetCachedResolvedTypeHandle(dynamicType);
+        }
+
+        var type = ResolveTypeToken(token, context, dynamicTokens);
+        return GetCachedResolvedTypeHandle(type);
+    }
+
+    internal VmTypeHandle GetCachedDynamicTypeHandle(VmType type) =>
+        GetCachedResolvedTypeHandle(type);
+
+    private VmTypeHandle GetCachedResolvedTypeHandle(VmType type) {
+        return _resolvedTypeHandles.GetOrAdd(type.FullName,
+            static (_, state) => state.Heap.Allocate(new VmTypeHandle { Target = state.Type }),
+            (Heap: _heap, Type: type));
+    }
+
+    internal IEnumerable<VmObject?> TypeHandleRoots =>
+        _typeHandles.Values.Cast<VmObject?>().Concat(
+            _genericTypeHandles.Values.SelectMany(static cache => cache.Values))
+            .Concat(_resolvedTypeHandles.Values);
 
     internal void ClearOperandCaches() {
         _fieldTokens.Clear();
         _fieldDefTokens.Clear();
         _typeTokens.Clear();
+        _typeHandles.Clear();
+        _genericTypeHandles.Clear();
+        _resolvedTypeHandles.Clear();
+        _arrayBackedValueTypes.Clear();
     }
     /// <summary>VM 単位で共有する静的ストレージ (ユニフィケーションされた実型の静的フィールドは CLR と同じく 1 つ)。
     /// null = 単一画像実行 (既定動作の ObjectModel ローカル辞書に統一)。</summary>
@@ -45,6 +82,40 @@ internal sealed partial class ObjectEngine(
     // resolved objects beside the object engine so hot newobj/ldfld paths do
     // not re-enter TypeLoader.MetadataGate on every iteration.
     private readonly ConcurrentDictionary<int, VmMethod> _methodDefConstructors = new();
+    private readonly ConcurrentDictionary<int, SigType[]> _stringConstructorSignatures = new();
+    private readonly ConcurrentDictionary<VmMethod, int> _constructorInstructionCosts = new();
+    private readonly ConcurrentDictionary<VmMethod, SimpleFieldConstructor> _simpleFieldConstructors = new();
+    private readonly ConcurrentDictionary<VmMethod, byte> _nonSimpleFieldConstructors = new();
+    private readonly ConcurrentDictionary<VmMethod, VmField> _simpleFieldGetters = new();
+    private readonly ConcurrentDictionary<VmMethod, byte> _nonSimpleFieldGetters = new();
+    private readonly ConcurrentDictionary<VmClassType, bool> _typesWithStaticConstructor = new();
+
+    private sealed record SimpleFieldConstructor(
+        VmField Field,
+        int FieldIndex,
+        bool CanSkipDefaultStorage,
+        int InstructionCost);
+
+    // Array-backed CoreLib value wrappers (Span<T>, ReadOnlySpan<T>, etc.) have
+    // immutable layout/constructor metadata. Cache only successful structural
+    // matches; misses continue through the normal IL path.
+    private readonly ConcurrentDictionary<int, ArrayBackedValueTypeInfo> _arrayBackedValueTypes = new();
+
+    private sealed record ArrayBackedValueTypeInfo(
+        VmConstructedType Constructed,
+        VmClassType Definition,
+        VmType ElementType,
+        VmMethod Constructor,
+        int ReferenceIndex,
+        int LengthIndex,
+        int InstructionCost);
+
+    private void EnsureInitializedForAllocation(VmClassType type) {
+        if (_typesWithStaticConstructor.GetOrAdd(type,
+                static candidate => candidate.Methods.Any(method =>
+                    method.Name == ".cctor" && method.Body is not null)))
+            EnsureInitialized(type);
+    }
 
     /// <summary>intrinsic 静的フィールドのストレージ一覧 (GC ルート源として Interpreter が登録する)。</summary>
     public IEnumerable<StackSlot[]> IntrinsicStaticFields => _intrinsicStaticFields.Values;

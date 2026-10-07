@@ -42,6 +42,12 @@ public static partial class DefaultIntrinsics {
         if (type is VmIntrinsicType && ctx.Types.TryResolveTrustedUnifiedType(type.FullName) is
             VmClassType { Loader.IsTrustedCoreLib: true } realType)
             type = realType;
+        // RuntimeType facades are interned for the lifetime of the VM. The
+        // common path only needs a concurrent read; take the construction
+        // lock after the miss so repeated typeof()/GetTypeFromHandle calls do
+        // not serialize on an already-published facade.
+        if (ctx.Shared.TypeFacades.TryGetValue(type, out var cached))
+            return StackSlot.OfObject(cached);
         lock (ctx.Shared.TypeFacadeGate) {
         if (!ctx.Shared.TypeFacades.TryGetValue(type, out var facade)) {
             facade = ctx.Heap.Allocate(new VmRuntimeObject { Target = type });

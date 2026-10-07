@@ -1,6 +1,7 @@
 using DotnetVM.Runtime.Types;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Policy;
+using System.Runtime.CompilerServices;
 
 namespace DotnetVM.Runtime.Objects;
 
@@ -10,8 +11,9 @@ namespace DotnetVM.Runtime.Objects;
 /// boundary fails closed instead of reviving a loader/JIT cache.
 /// </summary>
 internal static class VmLifetime {
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void EnsureLive(in StackSlot slot) {
-        if (slot.ObjectValue is { } value)
+        if (slot.Kind is (StackKind.Object or StackKind.ByRef) && slot.ObjectValue is { } value)
             EnsureLive(value);
     }
 
@@ -85,8 +87,9 @@ internal static class VmLifetime {
     /// ObjectDisposedException を使うが、それをそのまま投げると host exception が guest
     /// 実行から漏れるため、常に VM の guest exception carrier に変換する。
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void EnsureLiveForGuest(in StackSlot slot) {
-        if (slot.ObjectValue is { } value)
+        if (slot.Kind is (StackKind.Object or StackKind.ByRef) && slot.ObjectValue is { } value)
             EnsureLiveForGuest(value);
     }
 

@@ -1,5 +1,7 @@
 using DotnetVM.Metadata;
+using DotnetVM.Metadata.Signatures;
 using DotnetVM.Runtime.Objects;
+using System.Runtime.CompilerServices;
 
 namespace DotnetVM.Runtime.Types;
 
@@ -48,6 +50,12 @@ public sealed partial class TypeLoader {
     private readonly Dictionary<string, VmType> _unifiedTypes = [];
     /// <summary>仮想/インターフェースディスパッチ表の構築担当 (遅延生成)。</summary>
     private DispatchMapBuilder? _dispatchBuilder;
+    /// <summary>
+    /// Signature が保持する同一の SigType 配列からスロット比較用の VmType 配列を
+    /// 何度も作り直さないための loader-local cache。キーを弱参照にして、収集可能な
+    /// 型グラフをこの補助キャッシュが延命しないようにする。
+    /// </summary>
+    private readonly ConditionalWeakTable<SigType[], VmType[]> _resolvedSlotParams = new();
 
     /// <summary>この loader が trusted System.Private.CoreLib 実装画像か (LoadHostCoreLib の
     /// 取得した loader 参照に対して VM 構築時に確定する。タスク 2 hardening:
@@ -67,4 +75,5 @@ public sealed partial class TypeLoader {
         _image = image;
         InitializeIntrinsicTypes();
     }
+
 }

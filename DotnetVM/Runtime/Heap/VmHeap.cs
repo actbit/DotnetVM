@@ -2,6 +2,7 @@ using DotnetVM.Host;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Objects;
+using System.Collections.Concurrent;
 
 namespace DotnetVM.Runtime.Heap;
 
@@ -21,6 +22,8 @@ public sealed class VmHeap {
     private readonly IGcStrategy _strategy;
     private readonly object _gate = new();
     private readonly List<VmObject> _objects = [];
+    private readonly ConcurrentDictionary<AllocationBatch, byte> _pendingAllocationBatches = new();
+    [ThreadStatic] private static Stack<AllocationBatch>? s_guestAllocationScopes;
     private readonly List<Func<IEnumerable<VmObject?>>> _rootObjectSources = [];
     private readonly List<Func<IEnumerable<StackSlot[]>>> _rootSlotSources = [];
     private long _totalAllocated;
@@ -38,10 +41,72 @@ public sealed class VmHeap {
     private bool _collectionDue;
     private bool _collecting;
 
+    private sealed class AllocationBatch(VmHeap heap) {
+        internal readonly VmHeap Heap = heap;
+        internal readonly List<VmObject> Objects = [];
+        internal int Depth = 1;
+    }
+
+    private sealed class GuestAllocationLease(VmHeap heap, AllocationBatch batch) : IDisposable {
+        private VmHeap? _heap = heap;
+        private readonly AllocationBatch _batch = batch;
+
+        public void Dispose() {
+            var heap = Interlocked.Exchange(ref _heap, null);
+            if (heap is null)
+                return;
+            if (--_batch.Depth != 0)
+                return;
+            heap.FlushAllocationBatch(_batch);
+            heap._pendingAllocationBatches.TryRemove(_batch, out _);
+            var scopes = s_guestAllocationScopes
+                ?? throw new InvalidOperationException("guest allocation scope がありません。");
+            if (!ReferenceEquals(scopes.Peek(), _batch))
+                throw new InvalidOperationException("guest allocation scope の終了順序が不正です。");
+            scopes.Pop();
+        }
+    }
+
     public VmHeap(MemoryPolicy memory, IGcStrategy? strategy = null) {
         _memory = memory;
         _memory.Validate();
         _strategy = strategy ?? new MarkSweepStrategy();
+    }
+
+    /// <summary>Guest instruction batches can stage object registration without
+    /// taking the heap lock for every object. Quota-limited paths retain the
+    /// ordinary locked allocator.</summary>
+    internal IDisposable EnterGuestAllocationScope() {
+        var scopes = s_guestAllocationScopes ??= new Stack<AllocationBatch>();
+        if (scopes.Count > 0 && ReferenceEquals(scopes.Peek().Heap, this)) {
+            var existing = scopes.Peek();
+            existing.Depth++;
+            return new GuestAllocationLease(this, existing);
+        }
+        var batch = new AllocationBatch(this);
+        scopes.Push(batch);
+        _pendingAllocationBatches.TryAdd(batch, 0);
+        return new GuestAllocationLease(this, batch);
+    }
+
+    private AllocationBatch? CurrentGuestAllocationBatch() {
+        var scopes = s_guestAllocationScopes;
+        return scopes is { Count: > 0 } && ReferenceEquals(scopes.Peek().Heap, this)
+            ? scopes.Peek() : null;
+    }
+
+    private void FlushAllocationBatch(AllocationBatch batch) {
+        if (batch.Objects.Count == 0)
+            return;
+        lock (_gate) {
+            _objects.AddRange(batch.Objects);
+            batch.Objects.Clear();
+        }
+    }
+
+    private void FlushPendingAllocationBatches() {
+        foreach (var batch in _pendingAllocationBatches.Keys)
+            FlushAllocationBatch(batch);
     }
 
     /// <summary>GC 戦略名。</summary>
@@ -299,6 +364,17 @@ public sealed class VmHeap {
         AllocateCore(obj, ObjectModel.EstimateFieldStorageSize(obj.State.Length));
 
     private T AllocateCore<T>(T obj, long size) where T : VmObject {
+        var batch = CurrentGuestAllocationBatch();
+        if (batch is not null &&
+            _memory.TotalAllocationByteLimit == long.MaxValue &&
+            _memory.LiveObjectByteLimit == long.MaxValue) {
+            Interlocked.Add(ref _totalAllocated, size);
+            Interlocked.Add(ref _liveBytes, size);
+            if (Interlocked.Add(ref _allocatedSinceGc, size) >= _memory.GcTriggerAllocationInterval)
+                Volatile.Write(ref _collectionDue, true);
+            batch.Objects.Add(obj);
+            return obj;
+        }
         lock (_gate) {
             CheckQuota(size);
             Charge(size);
@@ -323,6 +399,7 @@ public sealed class VmHeap {
     /// <summary>セーフポイントから呼ぶ。回収要求が溜まっていれば Collect を起動する。</summary>
     public void CollectIfDue() {
         lock (_gate) {
+            FlushPendingAllocationBatches();
             if (_collectionDue && !_collecting)
                 Collect();
         }
@@ -331,6 +408,7 @@ public sealed class VmHeap {
     /// <summary>GC を起動する (IGcStrategy にルートとヒープを渡し、到達不能オブジェクトを sweep)。</summary>
     public GcStatistics Collect() {
         lock (_gate) {
+            FlushPendingAllocationBatches();
             if (_collecting)
                 return Snapshot(); // 再入 (セーフポイントとホスト呼出の同時起動) は 1 回に潰す
             _collecting = true;

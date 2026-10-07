@@ -492,6 +492,48 @@ internal static class MemoryOps {
             $"ldind のアドレスがポインタではありません: {SlotOps.Describe(address)}");
     }
 
+    /// <summary>
+    /// JIT guest execution already has a bounded read lease. Primitive boxes
+    /// that have never exposed an unbox address are immutable, so their single
+    /// field can be read without taking the per-storage monitor. Mutable boxes
+    /// and every other address kind retain the complete checked path.
+    /// </summary>
+    public static StackSlot LoadIndirectJit(ILOp op, in StackSlot address) {
+        if (address.ObjectValue is VmByRef byRef) {
+            var slot = byRef.Slot;
+            return op switch {
+                ILOp.Ldind_I when slot.ObjectValue is VmByRef or VmNativePointer or VmMethodPointer or VmRuntimeCallback => slot,
+                ILOp.Ldind_I8 or ILOp.Ldind_I => StackSlot.OfInt64(slot.Int64Value),
+                ILOp.Ldind_R4 => StackSlot.OfFloat((float)slot.DoubleValue),
+                ILOp.Ldind_R8 => StackSlot.OfFloat(slot.DoubleValue),
+                ILOp.Ldind_Ref => slot,
+                _ => StackSlot.OfInt32((int)slot.Int64Value),
+            };
+        }
+        return LoadIndirect(op, address);
+    }
+
+    /// <summary>
+    /// JIT frames execute under the guest read boundary and already use
+    /// lock-free class/array slot access. Apply the same rule to managed
+    /// byrefs while retaining the checked/locked interpreter path.
+    /// </summary>
+    public static void StoreIndirectJit(ILOp op, in StackSlot address, in StackSlot value) {
+        if (address.ObjectValue is VmByRef byRef) {
+            byRef.EnsureWritable();
+            byRef.Slot = op switch {
+                ILOp.Stind_I => value,
+                ILOp.Stind_I8 => StackSlot.OfInt64(value.Int64Value),
+                ILOp.Stind_R4 => StackSlot.OfFloat((float)value.DoubleValue),
+                ILOp.Stind_R8 => StackSlot.OfFloat(value.DoubleValue),
+                ILOp.Stind_Ref => StackSlot.OfObject(value.ObjectValue),
+                _ => StackSlot.OfInt32((int)value.Int64Value),
+            };
+            return;
+        }
+        StoreIndirect(op, address, value);
+    }
+
     /// <summary>stind: アドレスの参照先へ書き込む (LoadIndirect の書き込み版)。</summary>
     public static void StoreIndirect(ILOp op, in StackSlot address, in StackSlot value) {
         if (address.ObjectValue is VmNativePointer ptr) {

@@ -31,6 +31,14 @@ internal static partial class CoreLibBindings {
             var type = NativeTarget(NativeStackHandle(ctx, a[1]).Read());
             var method = RuntimeMethodInfo(ctx, NativeStackHandle(ctx, a[2]).Read());
             var start = ((VmByRef)a[3].ObjectValue!).Read();
+            var pointer = start.ObjectValue as VmNativePointer
+                ?? throw new UnhandledGuestException("System.CustomAttributeFormatException", "Invalid custom attribute pointer.");
+            var cacheKey = new CustomAttributeInstanceKey(method.Target, method.Target, type,
+                pointer.Bytes, pointer.ByteOffset);
+            if (ctx.Shared.CustomAttributeInstances.TryGetValue(cacheKey, out var cached)) {
+                NativeStackHandle(ctx, a[6]).Write(StackSlot.OfObject(cached));
+                return null;
+            }
             var reader = new SpanReader(AttributeBytes(start, a[4]));
             if (reader.ReadUInt16() != 1) throw new UnhandledGuestException("System.CustomAttributeFormatException", "Invalid attribute prolog.");
             var context = GenericContext.Of((method.ReflectedType as VmConstructedType)?.TypeArguments, method.MethodArguments);
@@ -40,6 +48,8 @@ internal static partial class CoreLibBindings {
             for (var i = 0; i < values.Length; i++) values[i] = AttributeValue(ctx, scope, (target.Loader ?? scope).ResolveToken(target.Signature.ParamTypes[i], context), ref reader);
             var named = reader.ReadUInt16();
             var instance = ctx.NewInstanceHook!(type, target, values, context);
+            if (instance is not null)
+                ctx.Shared.CustomAttributeInstances.TryAdd(cacheKey, instance);
             NativeWrite(a[3], NativeOffset(start, reader.Offset));
             NativeWrite(a[5], StackSlot.OfInt32(named));
             NativeStackHandle(ctx, a[6]).Write(StackSlot.OfObject(instance));

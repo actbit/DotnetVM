@@ -220,8 +220,18 @@ internal sealed partial class CallEngine {
     /// 場合は開いた名 (!n / !!n) のままキー化する (登録側の開いたキーと一致)。
     /// callerDomain は呼出元フレームの loader から明示的に渡す (callee 基準にしない)。</summary>
     private bool TryInvokeBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args, out StackSlot? result,
-        BindingDomain callerDomain, VmType[]? classArgs = null) {
+        BindingDomain callerDomain, VmType[]? classArgs = null, CallTarget? callTarget = null) {
         result = null;
+        if (!TryResolveBinding(method, methodArgs, args, callerDomain, classArgs, out var resolution))
+            return false;
+        result = InvokeBindingResolution(method, methodArgs, classArgs, resolution, args);
+        if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
+        return true;
+    }
+
+    private bool TryResolveBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args,
+        BindingDomain callerDomain, VmType[]? classArgs, out BindingResolution resolution) {
+        resolution = null!;
         if (!CanAttemptRuntimeBinding(method.DeclaringType) ||
             !_intrinsics.HasBindingForType(method.DeclaringType.FullName))
             return false;
@@ -236,13 +246,7 @@ internal sealed partial class CallEngine {
                 : BindingKey.StaticAnyParams(method.DeclaringType.FullName, method.Name);
             if (!TryGetBindingWithCaller(anyKey, callerDomain, out var anyImpl))
                 return false;
-            NormalizeByRefReceiver(method, args);
-            _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
-            _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
-            _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
-            _intrinsicContext.ClassTypeArguments = classArgs ?? [];
-            result = InvokeDelegated(anyImpl, [], args);
-            if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
+            resolution = new BindingResolution(anyImpl, [], UseMethodDelegated: false);
             return true;
         }
         var declaringName = method.DeclaringType.FullName;
@@ -278,13 +282,7 @@ internal sealed partial class CallEngine {
         if (!hasBinding && TryGetBindingWithCaller(method.Signature.HasThis
                 ? BindingKey.InstanceAnyParams(declaringName, method.Name)
                 : BindingKey.StaticAnyParams(declaringName, method.Name), callerDomain, out impl)) {
-            NormalizeByRefReceiver(method, args);
-            _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
-            _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
-            _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
-            _intrinsicContext.ClassTypeArguments = classArgs ?? [];
-            result = InvokeMethodDelegated(method, impl, names, args);
-        if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
+            resolution = new BindingResolution(impl, names, UseMethodDelegated: true);
             return true;
         }
         if (!hasBinding) {
@@ -295,18 +293,25 @@ internal sealed partial class CallEngine {
                     $"面 {declaringName}::{method.Name} は trusted CoreLib 専用の特権面であり、ゲストからの直接呼出は許可されていません。");
             return false;
         }
+        resolution = new BindingResolution(impl, names, UseMethodDelegated: true);
+        return true;
+    }
+
+    private StackSlot? InvokeBindingResolution(VmMethod method, VmType[]? methodArgs,
+        VmType[]? classArgs, BindingResolution resolution, StackSlot[] args,
+        bool alreadyGated = false) {
         NormalizeByRefReceiver(method, args);
-        // メソッド型実引数 (MethodSpec の T 等) を intrinsic 側に渡す (値パラメータ 0 個の
-        // ジェネリック面でも T を判別できるようにする)。クラス型実引数 (!0 等) も同様に
-        // 渡す (EqualityComparer<T>.get_Default 等のクラスジェネリック面のため)
         _intrinsicContext.MethodTypeArgumentNames = methodArgs?.Select(t => t.FullName).ToArray() ?? [];
         _intrinsicContext.ClassTypeArgumentNames = classArgs?.Select(t => t.FullName).ToArray() ?? [];
         _intrinsicContext.MethodTypeArguments = methodArgs ?? [];
         _intrinsicContext.ClassTypeArguments = classArgs ?? [];
-        result = InvokeMethodDelegated(method, impl, names, args);
-        if (method.Signature.ReturnType.Kind == SigKind.Void) result = null;
-        return true;
+        return resolution.UseMethodDelegated
+            ? InvokeMethodDelegated(method, resolution.Implementation, resolution.ParameterNames, args, alreadyGated)
+            : InvokeDelegated(resolution.Implementation, resolution.ParameterNames, args, alreadyGated);
     }
+
+    internal sealed record BindingResolution(
+        IntrinsicImpl Implementation, string[] ParameterNames, bool UseMethodDelegated);
 
     /// <summary>guest から呼ばれたが trusted 特権面が存在するかを調べる
     /// (fail-closed の監査性: 未登録 InternalCall と特権遮断を区別する)。</summary>
@@ -393,10 +398,11 @@ internal sealed partial class CallEngine {
         return true;
     }
 
-    private StackSlot? InvokeMethodDelegated(VmMethod method, IntrinsicImpl impl, string[] paramNames, StackSlot[] args) {
+    private StackSlot? InvokeMethodDelegated(VmMethod method, IntrinsicImpl impl, string[] paramNames,
+        StackSlot[] args, bool alreadyGated = false) {
         if (method.DeclaringType.FullName == "System.Threading.Interlocked")
-            return InvokeInterlocked(impl, paramNames, args);
-        return InvokeDelegated(impl, paramNames, args);
+            return InvokeInterlocked(impl, paramNames, args, alreadyGated);
+        return InvokeDelegated(impl, paramNames, args, alreadyGated);
     }
 
     private StackSlot? InvokeInterlocked(IntrinsicImpl impl, string[] paramNames, StackSlot[] args, bool alreadyGated = false) {
@@ -413,15 +419,25 @@ internal sealed partial class CallEngine {
     /// <summary>委譲実装 (ランタイムバインド / legacy intrinsic) を intrinsic 呼出ゲート経由で実行する。
     /// IL 実行と完全に等価な制約 (① 追加クォータ消費 ② セーフポイント検査 ③ 値は VM オブジェクト
     /// モデルに正規化) を受ける。</summary>
-    private StackSlot? InvokeDelegated(IntrinsicImpl impl, string[] paramNames, StackSlot[] args) {
-        gate.ConsumeInstruction();
-        gate.CheckSafepoint();
+    private StackSlot? InvokeDelegated(IntrinsicImpl impl, string[] paramNames, StackSlot[] args,
+        bool alreadyGated = false) {
+        if (!alreadyGated) {
+            gate.ConsumeInstruction();
+            gate.CheckSafepoint();
+        }
         _intrinsicContext.ParameterTypeNames = paramNames;
         using var roots = RegisterTransientRootsIfNeeded(args);
         return impl(_intrinsicContext, args);
     }
 
     private IDisposable? RegisterTransientRootsIfNeeded(StackSlot[] args) {
+        // Call/CallVirt keeps the exact argument buffer active in its caller
+        // frame until the intrinsic returns. While the guest read lease is
+        // held, a collector cannot run, so registering the same buffer in the
+        // temporary-root list would only add a monitor and an ActionLease to
+        // every object-bearing CoreLib call.
+        if (invoker is Interpreter interpreter && interpreter.IsInsideGuestInstruction)
+            return null;
         // Primitive-only intrinsic calls cannot expose a VM object to a
         // collection. Avoid allocating an ActionLease for those calls while
         // retaining the root registration for references, byrefs and value

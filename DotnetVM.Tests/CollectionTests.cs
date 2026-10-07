@@ -114,4 +114,28 @@ public class CollectionTests {
     [Fact]
     public void Array_GenericCollectionInterfaces_MatchClr() =>
         AssertMatchesClr("ArrayInterfaces", "3:3:10");
+
+    [Fact]
+    public void CollectionImplementations_UseCommonIlExecutionPath() {
+        using var vm = new VirtualMachine(new VmHostOptions { LoadHostCoreLib = true });
+        using var stream = new MemoryStream(Compiled.Bytes);
+        vm.LoadAssembly(stream);
+        vm.Tracer.Start();
+        try {
+            Assert.Equal("3:True:True:1:4,2,5", vm.Invoke("Vm.Collections", "ListMutations"));
+            Assert.Equal("1:False:2:True:2:False:0:True",
+                vm.Invoke("Vm.Collections", "DictionaryLookupAndMutation"));
+        } finally {
+            vm.Tracer.Stop();
+        }
+
+        Assert.Contains(vm.Tracer.Frames, frame =>
+            frame.AssemblyName == "System.Private.CoreLib" &&
+            frame.TypeFullName.StartsWith("System.Collections.Generic.List`1", StringComparison.Ordinal) &&
+            frame.MethodName == "Add");
+        Assert.Contains(vm.Tracer.Frames, frame =>
+            frame.AssemblyName == "System.Private.CoreLib" &&
+            frame.TypeFullName.StartsWith("System.Collections.Generic.Dictionary`2", StringComparison.Ordinal) &&
+            frame.MethodName == "TryGetValue");
+    }
 }

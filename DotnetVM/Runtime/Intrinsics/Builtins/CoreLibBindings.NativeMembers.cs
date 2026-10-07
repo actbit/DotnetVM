@@ -115,4 +115,59 @@ internal static partial class CoreLibBindings {
         NativeStackHandle(ctx, a[4]).Write(result);
         return null;
     }
+
+    /// <summary>
+    /// The ordinary MethodBase.Invoke surface eventually reaches the same
+    /// RuntimeMethodHandle shim as NativeInvokeMethod.  Once the VM already
+    /// has a VmRuntimeMethod and an object[] there is no additional metadata
+    /// decision for that shim to make, so keep this general reflection
+    /// boundary on the intrinsic side and enter the target method directly.
+    /// The method itself still goes through the normal guest invocation hook;
+    /// only the repeated CoreLib argument/pointer plumbing is removed.
+    /// </summary>
+    internal static bool TryInvokeReflectedMethod(IntrinsicContext ctx,
+        VmRuntimeMethod value, StackSlot receiver, VmArray? parameterArray,
+        out StackSlot result) {
+        var target = value.Target;
+        var parameters = target.Signature.ParamTypes;
+        if (parameterArray is null) {
+            if (parameters.Length != 0)
+                throw new UnhandledGuestException("System.Reflection.TargetParameterCountException", null);
+        } else if (parameterArray.Length != parameters.Length) {
+            throw new UnhandledGuestException("System.Reflection.TargetParameterCountException", null);
+        }
+
+        var loader = target.Loader ?? ctx.Types;
+        var context = value.InvocationContext;
+        var resolvedParameters = value.InvocationParameterTypes;
+        if (resolvedParameters is null) {
+            context = GenericContext.Of((value.ReflectedType as VmConstructedType)?.TypeArguments,
+                value.MethodArguments);
+            resolvedParameters = parameters.Select(parameter => loader.ResolveToken(parameter, context)).ToArray();
+            value.InvocationContext = context;
+            value.InvocationParameterTypes = resolvedParameters;
+            value.InvocationReturnType = loader.ResolveToken(target.Signature.ReturnType, context);
+        }
+        var arguments = new StackSlot[parameters.Length];
+        for (var i = 0; i < arguments.Length; i++) {
+            var argument = parameterArray!.Elements[i];
+            arguments[i] = ReflectionArgument(ctx, argument, resolvedParameters[i]);
+        }
+
+        if (target.IsConstructor) {
+            result = StackSlot.OfObject(ctx.NewInstanceHook!(
+                value.ReflectedType ?? target.DeclaringType, target, arguments, context));
+            return true;
+        }
+
+        var implementation = target.IsVirtual ? ctx.ResolveVirtualMethod!(target, receiver) : target;
+        result = ctx.InvokeGuestMethod!(implementation,
+            target.IsStatic ? arguments : [receiver, .. arguments], context);
+        var returnType = value.InvocationReturnType!;
+        if (returnType.FullName == "System.Void")
+            result = StackSlot.Null;
+        else
+            result = BoxReflectionResult(ctx, result, returnType);
+        return true;
+    }
 }

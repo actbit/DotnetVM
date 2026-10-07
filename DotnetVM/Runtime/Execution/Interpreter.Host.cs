@@ -60,6 +60,7 @@ public sealed partial class Interpreter {
         VmLifetime.EnsureLiveForGuest(method);
         foreach (var argument in arguments)
             VmLifetime.EnsureLiveForGuest(argument);
+        using var allocationScope = _heap.EnterGuestAllocationScope();
         var state = CurrentState;
         RegisterExecutionState(state);
         var timeoutStarted = BeginExecutionTimeout(state);
@@ -86,7 +87,7 @@ public sealed partial class Interpreter {
                     // without allocating/registering an InterpreterFrame;
                     // the execution state and quota/safepoint guards still
                     // remain active in ScalarIntJitContext.
-                    var compiled = CanUseJit && engines.Preparer.IsCached(method)
+                    var compiled = CanUseJit && !IsMethodActive(method) && engines.Preparer.IsCached(method)
                         ? engines.Jit.TryGetCompiled(method, prepared, prepared.Code, engines.Preparer)
                         : null;
                     if (state.Depth == 1 && context is null && compiled is { HasDirectScalar: true }) {
@@ -94,19 +95,25 @@ public sealed partial class Interpreter {
                             directTracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
                         return compiled.InvokeDirectScalar(this, arguments);
                     }
-                    var frame = InterpreterFrame.Create(method, arguments, prepared, prepared.MaxStack);
-                    frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
-                using (_coordinator.EnterRead()) {
-                    lock (state.Gate)
-                        state.Frames.Add(frame);
-                }
+                var frame = RentFrame(method, arguments, prepared, prepared.MaxStack);
+                frame.Context = context; // FixupStructLocals が !n ローカルを実引数で初期化する
+                if (!_coordinator.IsInsideGuestInstruction)
+                    using (_coordinator.EnterRead())
+                        AddFrameRoot(state, frame);
+                else
+                    AddFrameRoot(state, frame);
                 // 実行トレース: IL 本体を実行したフレームのみ記録する
                 // (intrinsic / ランタイムバインドへの委譲は IL フレームを持たないため記録されない)
                 if (_tracer is { } tracer)
                     tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
                 try {
-                    using (_coordinator.EnterRead())
-                        FixupStructLocals(frame);
+                    if (prepared.RequiresStructLocalFixup) {
+                        if (_coordinator.IsInsideGuestInstruction)
+                            FixupStructLocals(frame);
+                        else
+                            using (_coordinator.EnterRead())
+                                FixupStructLocals(frame);
+                    }
                     // Dynamic expression compilation is host work rather than a
                     // guest instruction.  Do not perform it after the guest has
                     // already exhausted its instruction budget; the first
@@ -115,10 +122,12 @@ public sealed partial class Interpreter {
                         ? RunFrameWithTailCalls(ref frame, state)
                         : compiled.Invoke(this, engines.Services, frame);
                 } finally {
-                    using (_coordinator.EnterRead()) {
-                        lock (state.Gate)
-                            state.Frames.Remove(frame);
-                    }
+                    if (!_coordinator.IsInsideGuestInstruction)
+                        using (_coordinator.EnterRead())
+                            RemoveFrameRoot(state, frame);
+                    else
+                        RemoveFrameRoot(state, frame);
+                    ReturnFrame(frame);
                     _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
                 }
             } finally {
@@ -150,6 +159,26 @@ public sealed partial class Interpreter {
 
     }
 
+    /// <summary>
+    /// Execute a guest callback requested by an intrinsic. The callback is
+    /// already inside an active guest instruction batch, so a promoted method
+    /// can skip the public host-boundary setup. Uncompiled methods and static
+    /// methods still use the normal path so preparation and type initialization
+    /// semantics remain unchanged.
+    /// </summary>
+    private StackSlot InvokeGuestFromIntrinsic(VmMethod method, StackSlot[] arguments,
+        GenericContext? context) {
+        if (IsInsideGuestInstruction) {
+            if (TryInvokeCompiledNestedResolved(method, arguments, context,
+                    allowStatic: true, out var nestedResult))
+                return nestedResult;
+            if (TryInvokeCompiled(method, arguments, context, argumentsAlreadyValidated: true,
+                    out var compiledResult))
+                return compiledResult;
+        }
+        return Invoke(method, arguments, context);
+    }
+
     /// <summary>Borrow caller slots for an already promoted synchronous leaf.</summary>
     internal bool TryInvokeCompiledLeaf(VmMethod method, Span<StackSlot> arguments, out StackSlot result) {
         result = default;
@@ -157,6 +186,8 @@ public sealed partial class Interpreter {
         foreach (ref readonly var argument in arguments)
             VmLifetime.EnsureLiveForGuest(argument);
         if (!CanUseJit)
+            return false;
+        if (IsMethodActive(method))
             return false;
         var compiled = EnginesFor(method).Jit.GetCompiled(method);
         if (compiled is not { HasLeaf: true })
@@ -174,7 +205,7 @@ public sealed partial class Interpreter {
             // retained in the caller's active stack throughout the invocation.
             if (_tracer is { } tracer)
                 tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
-            compiled.TryInvokeLeaf(this, arguments, out result);
+            compiled.TryInvokeLeaf(this, null, arguments, out result);
             return true;
         } finally {
             state.Depth--;
@@ -196,14 +227,24 @@ public sealed partial class Interpreter {
     /// here would only add overhead to every direct call in a hot loop.
     /// </summary>
     internal bool TryInvokeCompiledLeafNested(VmMethod method, JitCompiledMethod compiled,
-        Span<StackSlot> arguments, out StackSlot result) {
+        Span<StackSlot> arguments, out StackSlot result) =>
+        TryInvokeCompiledLeafNested(method, compiled, null, arguments, out result);
+
+    internal bool TryInvokeCompiledLeafNested(VmMethod method, JitCompiledMethod compiled,
+        GenericContext? context, Span<StackSlot> arguments, out StackSlot result) {
         result = default;
-        VmLifetime.EnsureLiveForGuest(method);
-        foreach (ref readonly var argument in arguments)
-            VmLifetime.EnsureLiveForGuest(argument);
-        if (!CanUseJit || !compiled.HasLeaf)
+        // The caller is already executing under the bounded guest read lease;
+        // the loader/context cannot be unloaded until that lease is released.
+        // Repeating the recursive lifetime walk for every primitive leaf call
+        // only adds boundary overhead on the common JIT path.
+        if (!IsInsideGuestInstruction) {
+            VmLifetime.EnsureLiveForGuest(method);
+            foreach (ref readonly var argument in arguments)
+                VmLifetime.EnsureLiveForGuest(argument);
+        }
+        if (!CanUseJit || IsMethodActive(method) || !compiled.HasLeaf)
             return false;
-        compiled.TryInvokeLeaf(this, arguments, out result);
+        compiled.TryInvokeLeaf(this, context, arguments, out result);
         return true;
     }
 
@@ -217,9 +258,44 @@ public sealed partial class Interpreter {
             return null;
         if (_services.CoreLibSurfaces?.Substitute(method) is not null)
             return null;
-        var compiled = EnginesFor(method).Jit.GetCompiled(method);
+        var compiled = GetNestedCompiled(method);
         return compiled is { HasLeaf: true } ? compiled : null;
     }
+
+    /// <summary>
+    /// Use a method that has already crossed the normal JIT promotion
+    /// threshold.  Nested calls use the established promotion path so the
+    /// normal CoreLib surface and receiver checks remain in control.
+    /// </summary>
+    internal JitCompiledMethod? GetNestedCompiled(VmMethod method) {
+        if (!CanUseJit || IsMethodActive(method) || method.Body is null)
+            return null;
+        var engines = EnginesFor(method);
+        return engines.Jit.GetCompiled(method);
+    }
+
+    /// <summary>
+    /// Resolve a CoreLib helper reached from an already compiled frame. The
+    /// helper still uses the same loader-local cache and resource budget; this
+    /// only allows the first compiled caller to promote a trusted IL target
+    /// before falling back through the full interpreter boundary. Guest
+    /// methods retain the normal invocation-count promotion policy.
+    /// </summary>
+    internal JitCompiledMethod? GetOrPromoteNestedCompiled(VmMethod method) {
+        if (!CanUseJit || IsMethodActive(method) || method.Body is null)
+            return null;
+        var engines = EnginesFor(method);
+        if (engines.Jit.GetCompiled(method) is { } existing)
+            return existing;
+        if (method.Loader?.IsTrustedCoreLib != true &&
+            method.Loader?.IsTrustedVmCoreLib != true &&
+            method.Loader?.IsTrustedBcl != true)
+            return null;
+        var prepared = engines.Preparer.Prepare(method);
+        return engines.Jit.TryGetCompiled(method, prepared, prepared.Code, engines.Preparer,
+            promoteImmediately: true);
+    }
+
 
     /// <summary>
     /// Promote only a constructor candidate reached by newobj.  Unlike a
@@ -248,11 +324,20 @@ public sealed partial class Interpreter {
     /// </summary>
     internal bool TryInvokeCompiled(VmMethod method, StackSlot[] arguments,
         GenericContext? context, out StackSlot result) {
+        return TryInvokeCompiled(method, arguments, context, argumentsAlreadyValidated: false, out result);
+    }
+
+    internal bool TryInvokeCompiled(VmMethod method, StackSlot[] arguments,
+        GenericContext? context, bool argumentsAlreadyValidated, out StackSlot result) {
         result = default;
-        VmLifetime.EnsureLiveForGuest(method);
-        foreach (var argument in arguments)
-            VmLifetime.EnsureLiveForGuest(argument);
+        if (!argumentsAlreadyValidated) {
+            VmLifetime.EnsureLiveForGuest(method);
+            foreach (var argument in arguments)
+                VmLifetime.EnsureLiveForGuest(argument);
+        }
         if (!CanUseJit)
+            return false;
+        if (IsMethodActive(method))
             return false;
         var engines = EnginesFor(method);
         var compiled = engines.Jit.GetCompiled(method);
@@ -274,24 +359,25 @@ public sealed partial class Interpreter {
             if (context is null && compiled.HasLeaf) {
                 if (_tracer is { } leafTracer)
                     leafTracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
-                compiled.TryInvokeLeaf(this, arguments, out result);
+                compiled.TryInvokeLeaf(this, context, arguments, out result);
                 return true;
             }
-            var frame = InterpreterFrame.Create(method, arguments, compiled.Prepared, compiled.Prepared.MaxStack);
+            var frame = RentFrame(method, arguments, compiled.Prepared, compiled.Prepared.MaxStack);
             frame.Context = context;
             // The caller is executing under an instruction-batch read lease,
-            // so a collector cannot observe this half-registered frame.
-            lock (state.Gate)
-                state.Frames.Add(frame);
+            // so a collector cannot observe this half-registered frame. The
+            // root list therefore needs no monitor on the hot nested path.
+            AddFrameRoot(state, frame);
             if (_tracer is { } tracer)
                 tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
             try {
-                FixupStructLocals(frame);
+                if (compiled.Prepared.RequiresStructLocalFixup)
+                    FixupStructLocals(frame);
                 result = compiled.Invoke(this, engines.Services, frame);
                 return true;
             } finally {
-                lock (state.Gate)
-                    state.Frames.Remove(frame);
+                RemoveFrameRoot(state, frame);
+                ReturnFrame(frame);
                 _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
             }
         } finally {
@@ -308,9 +394,169 @@ public sealed partial class Interpreter {
         }
     }
 
-    internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
-        JitObjectsFor(method).StoreLeafField(method, token, receiver, value);
+    /// <summary>
+    /// Execute a promoted instance method from an already active guest frame.
+    /// The caller has resolved the exact method and performed the dispatch and
+    /// binding checks, so repeating host-boundary preparation on every small
+    /// instance helper is unnecessary. Static methods are excluded because
+    /// their type initializer must still be checked at each ordinary entry.
+    /// CoreLib surface substitutions also stay on the full preparation path.
+    /// </summary>
+    internal bool TryInvokeCompiledNestedResolved(VmMethod method, StackSlot[] arguments,
+        GenericContext? context, out StackSlot result) {
+        return TryInvokeCompiledNestedResolved(method, arguments, context,
+            allowStatic: false, out result);
     }
+
+    internal bool TryInvokeCompiledNestedResolved(VmMethod method, StackSlot[] arguments,
+        GenericContext? context, bool allowStatic, out StackSlot result) {
+        result = default;
+        if (!CanUseJit || IsMethodActive(method) || !IsInsideGuestInstruction ||
+            (!allowStatic && method.IsStatic) || method.Body is null ||
+            _services.CoreLibSurfaces?.Substitute(method) is not null)
+            return false;
+
+        var engines = EnginesFor(method);
+        var compiled = engines.Jit.GetCompiled(method);
+        if (compiled is null)
+            return false;
+
+        return TryInvokeCompiledNestedResolved(method, compiled, arguments, context,
+            allowStatic, out result);
+    }
+
+    internal bool TryInvokeCompiledNestedResolved(VmMethod method, JitCompiledMethod compiled,
+        StackSlot[] arguments, GenericContext? context, out StackSlot result) {
+        return TryInvokeCompiledNestedResolved(method, compiled, arguments, context,
+            allowStatic: false, out result);
+    }
+
+    internal bool TryInvokeCompiledNestedResolved(VmMethod method, JitCompiledMethod compiled,
+        StackSlot[] arguments, GenericContext? context, bool allowStatic, out StackSlot result) {
+        result = default;
+        if (!CanUseJit || IsMethodActive(method) || !IsInsideGuestInstruction ||
+            (!allowStatic && method.IsStatic) || method.Body is null ||
+            _services.CoreLibSurfaces?.Substitute(method) is not null)
+            return false;
+
+        if (allowStatic && method.IsStatic)
+            EnsureStaticMethodTypeInitialized(method, context);
+        if (context is null && compiled.HasDirectScalar) {
+            result = compiled.InvokeDirectScalar(this, arguments);
+            return true;
+        }
+        if (context is null && compiled.HasLeaf) {
+            if (_tracer is { } leafTracer)
+                leafTracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+            compiled.TryInvokeLeaf(this, context, arguments, out result);
+            return true;
+        }
+        var state = CurrentState;
+        if (state.Depth >= _memory.MaxRecursionDepth)
+            throw new UnhandledGuestException("System.StackOverflowException",
+                $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
+        state.Depth++;
+        var activeJitCount = state.ActiveJitMethods.Count;
+        state.ActiveJitMethods.Add(method);
+        try {
+            CloneStructArgs(method, arguments);
+            var frame = RentFrame(method, arguments, compiled.Prepared, compiled.Prepared.MaxStack);
+            frame.Context = context;
+            if (_tracer is { } tracer)
+                tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+            try {
+                if (compiled.Prepared.RequiresStructLocalFixup)
+                    FixupStructLocals(frame);
+                result = compiled.Invoke(this, compiled.Services ?? EnginesFor(method).Services, frame);
+                return true;
+            } finally {
+                ReturnFrame(frame);
+                _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
+            }
+        } finally {
+            state.ActiveJitMethods.RemoveAt(activeJitCount);
+            state.Depth--;
+        }
+    }
+
+    /// <summary>
+    /// Execute a promoted nested method while its arguments remain on the
+    /// caller's evaluation stack. The child frame aliases that argument span,
+    /// so ordinary CoreLib helper calls avoid copying a small StackSlot array.
+    /// </summary>
+    internal bool TryInvokeCompiledNestedResolvedFromStack(VmMethod method,
+        JitCompiledMethod compiled, InterpreterFrame caller, int arity,
+        GenericContext? context, bool allowStatic, out StackSlot result) {
+        return TryInvokeCompiledNestedResolvedFromStack(method, compiled, caller,
+            caller.Stack.Count - arity, arity, arity, context, allowStatic, out result);
+    }
+
+    /// <summary>
+    /// Invoke a compiled target from an arbitrary contiguous range at the top
+    /// of the caller stack. Delegate Invoke has one extra dispatcher object on
+    /// that stack, so its static target arguments start one slot later while
+    /// the complete dispatcher call still drops all operands on success.
+    /// </summary>
+    internal bool TryInvokeCompiledNestedResolvedFromStack(VmMethod method,
+        JitCompiledMethod compiled, InterpreterFrame caller, int argumentOffset,
+        int arity, int dropCount, GenericContext? context, bool allowStatic,
+        out StackSlot result) {
+        result = default;
+        if (!CanUseJit || IsMethodActive(method) || !IsInsideGuestInstruction ||
+            (!allowStatic && method.IsStatic) || method.Body is null ||
+            _services.CoreLibSurfaces?.Substitute(method) is not null ||
+            compiled.HasDirectScalar || arity < 0 || dropCount < arity ||
+            argumentOffset < 0 || argumentOffset + arity > caller.Stack.Count ||
+            dropCount > caller.Stack.Count)
+            return false;
+
+        if (allowStatic && method.IsStatic)
+            EnsureStaticMethodTypeInitialized(method, context);
+
+        var arguments = caller.Stack.RootSlots.AsSpan(argumentOffset, arity);
+        CloneStructArgs(method, arguments);
+        if (compiled.HasLeaf) {
+            compiled.TryInvokeLeaf(this, context, arguments, out result);
+            caller.Stack.DropArguments(arity);
+            return true;
+        }
+
+        var state = CurrentState;
+        if (state.Depth >= _memory.MaxRecursionDepth)
+            throw new UnhandledGuestException("System.StackOverflowException",
+                $"再帰深さが上限 {_memory.MaxRecursionDepth} を超えました。");
+
+        state.Depth++;
+        var activeJitCount = state.ActiveJitMethods.Count;
+        state.ActiveJitMethods.Add(method);
+        var frame = RentAliasedFrame(method, caller.Stack.RootSlots,
+            argumentOffset, arity, compiled.Prepared, compiled.Prepared.MaxStack);
+        frame.Context = context;
+        try {
+            if (compiled.Prepared.RequiresStructLocalFixup)
+                FixupStructLocals(frame);
+            result = compiled.Invoke(this, compiled.Services ?? EnginesFor(method).Services, frame);
+            caller.Stack.DropArguments(dropCount);
+            return true;
+        } finally {
+            ReturnAliasedFrame(frame);
+            _debugger?.FrameExited(Environment.CurrentManagedThreadId, state.Depth);
+            state.ActiveJitMethods.RemoveAt(activeJitCount);
+            state.Depth--;
+        }
+    }
+
+    internal void StoreLeafField(VmMethod method, int token, StackSlot receiver, StackSlot value) {
+        StoreLeafField(method, null, token, receiver, value);
+    }
+
+    internal void StoreLeafField(VmMethod method, GenericContext? context, int token,
+        StackSlot receiver, StackSlot value) {
+        JitObjectsFor(method).StoreLeafField(method, context, token, receiver, value);
+    }
+
+    internal StackSlot ReadLeafField(VmMethod method, GenericContext? context, int token, StackSlot receiver) =>
+        JitObjectsFor(method).ReadLeafField(method, context, token, receiver);
 
     /// <summary>命令トレース/ブレークポイント有効時は JIT を迂回して可観測性を保つ。</summary>
     private bool CanUseJit => _enableJit && HasInstructionBudget &&
@@ -369,23 +615,33 @@ public sealed partial class Interpreter {
                     var engines = EnginesFor(method);
                     CloneStructArgs(method, request.Arguments);
                     var nextPrepared = engines.Preparer.Prepare(method);
-                    var nextFrame = InterpreterFrame.Create(method, request.Arguments,
+                    var nextFrame = RentFrame(method, request.Arguments,
                         nextPrepared, nextPrepared.MaxStack);
                     nextFrame.Context = request.Context;
-
-                    using (_coordinator.EnterRead()) {
-                        lock (state.Gate) {
-                            var index = state.Frames.IndexOf(frame);
-                            if (index < 0)
-                                throw new InvalidOperationException("末尾呼出で置き換える実行フレームが見つかりません。");
-                            state.Frames[index] = nextFrame;
+                    var replaced = false;
+                    try {
+                        using (_coordinator.EnterRead()) {
+                            lock (state.Gate) {
+                                var index = state.Frames.IndexOf(frame);
+                                if (index < 0)
+                                    throw new InvalidOperationException("末尾呼出で置き換える実行フレームが見つかりません。");
+                                state.Frames[index] = nextFrame;
+                            }
                         }
+                        var previousFrame = frame;
+                        frame = nextFrame;
+                        replaced = true;
+                        ReturnFrame(previousFrame);
+                    } finally {
+                        if (!replaced)
+                            ReturnFrame(nextFrame);
                     }
-                    frame = nextFrame;
-                    using (_coordinator.EnterRead())
-                        FixupStructLocals(frame);
-                    if (_tracer is { } tracer)
-                        tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                    using (_coordinator.EnterRead()) {
+                        if (nextPrepared.RequiresStructLocalFixup)
+                            FixupStructLocals(frame);
+                        if (_tracer is { } tracer)
+                            tracer.Record(method.Loader?.Image.Name ?? "", method.DeclaringType.FullName, method.Name);
+                    }
                 } finally {
                     using (_coordinator.EnterRead()) {
                         lock (state.Gate)

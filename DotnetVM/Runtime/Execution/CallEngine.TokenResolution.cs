@@ -625,4 +625,18 @@ internal sealed class CallTarget {
     public VmType[]? MethodArgs;
     /// <summary>宣言上のパラメータ型名 (i4 統合面のオーバーロード判別用。intrinsic 経路のみ)。</summary>
     public string[]? ParamTypeNames;
+    // Runtime binding is security-domain sensitive, but stable for a resolved
+    // call target after the intrinsic registry is sealed. Keep one positive
+    // result for each permitted caller domain so hot binding sites do not
+    // rebuild a BindingCacheKey and probe the shared dictionary every time.
+    internal CallEngine.BindingResolution? GuestBinding;
+    internal CallEngine.BindingResolution? TrustedBinding;
+
+    private string[]? _methodTypeArgumentNames;
+    private string[]? _classTypeArgumentNames;
+    internal string[] MethodTypeArgumentNames =>
+        _methodTypeArgumentNames ??= MethodArgs?.Select(static type => type.FullName).ToArray() ?? [];
+    internal string[] ClassTypeArgumentNames =>
+        _classTypeArgumentNames ??= ClassArgs?.Select(static type => type.FullName).ToArray() ?? [];
+
 }

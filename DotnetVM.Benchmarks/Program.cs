@@ -81,12 +81,12 @@ foreach (var workload in workloads) {
         LoadHostCoreLib = true,
         EnableJit = enableJit,
         JitPromotionThreshold = 2,
-        Memory = new MemoryPolicy {
+            Memory = new MemoryPolicy {
                 InstructionQuota = long.MaxValue,
                 InstructionChargingEnabled = instructionCharging,
                 InstructionChargeBatchSize = instructionChargeBatchSize,
                 HostWorkBudget = long.MaxValue,
-        },
+            },
     });
     vm.LoadAssembly(workload.GuestType.Assembly.Location);
     vm.LoadAssembly(typeof(Enumerable).Assembly.Location);

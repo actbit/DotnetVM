@@ -143,7 +143,9 @@ internal sealed class VmRuntimeMetadata {
     internal StackSlot Get(VmClassInstance instance, string name) => instance.Fields[FieldIndex(instance.ClassType, name)];
     internal StackSlot Get(VmStructValue value, string name) => value.Fields[FieldIndex((VmClassType)value.StructType, name)];
     internal void Set(VmClassInstance instance, string name, StackSlot value) => instance.Fields[FieldIndex(instance.ClassType, name)] = value;
-    internal void Set(VmStructValue instance, string name, StackSlot value) => instance.Fields[FieldIndex((VmClassType)instance.StructType, name)] = value;
+    internal void Set(VmStructValue instance, string name, StackSlot value) {
+        instance.Fields[FieldIndex((VmClassType)instance.StructType, name)] = value;
+    }
 
     internal VmClassInstance Instance(IntrinsicContext ctx, string name) {
         var type = CoreType(ctx, name);

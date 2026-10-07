@@ -53,6 +53,8 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private readonly ObjectEngine _objectEngine;
     private readonly CallEngine _callEngine;
     private readonly ExceptionDispatcher _exceptionDispatcher;
+
+    internal InterpreterServices Services => _services;
     /// <summary>loader ごとのエンジンセット (多アセンブリ実行: メソッドの所属画像で token 解決する)。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<TypeLoader, LoaderEngines> _engines = new();
     private readonly object _enginesGate = new();
@@ -66,16 +68,26 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     internal sealed class ExecutionState {
         public readonly object Gate = new();
         public readonly List<InterpreterFrame> Frames = [];
+        // Nested compiled frames execute under the outer guest read lease, so
+        // they do not need to be published to the stop-the-world root list.
+        // Keep only their method identities here for recursion detection.
+        public readonly List<VmMethod> ActiveJitMethods = [];
         public readonly List<StackSlot[]> TemporaryRoots = [];
         public int Depth;
         public long InstructionCount;
         public int UnchargedInstructions;
         public int InstructionChargeRemaining;
         public int ChargedSinceSafepoint;
+        public long UnboundedInstructionCount;
         public long DeadlineTimestamp;
         public bool Registered;
     }
     private readonly ThreadLocal<ExecutionState> _currentExecution;
+    // Synchronous guest calls are nested on one host thread. Reusing the frame
+    // object, its local slots and its evaluation-stack storage removes the
+    // allocation churn common to every IL call, independent of the callee type.
+    private readonly ThreadLocal<Stack<InterpreterFrame>> _framePool =
+        new(static () => new Stack<InterpreterFrame>());
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ExecutionState, byte> _executionStates = new();
     private readonly VmExecutionCoordinator _coordinator = new();
     private long _instructionCount;
@@ -86,16 +98,85 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
     public long InstructionCount => Interlocked.Read(ref _instructionCount);
     internal bool InstructionChargingEnabled => _memory.InstructionChargingEnabled;
+    internal bool HasUnboundedInstructionQuota => _memory.InstructionQuota == long.MaxValue;
+    internal bool IsInsideGuestInstruction => _coordinator.IsInsideGuestInstruction;
     internal bool HasInstructionBudget => !InstructionChargingEnabled ||
         CurrentState.InstructionChargeRemaining > 0 ||
         Interlocked.Read(ref _instructionCount) < _memory.InstructionQuota;
 
     internal long CurrentThreadInstructionCount => CurrentState.InstructionCount;
 
+    // A compiled method must not re-enter an already active frame through the
+    // nested JIT path. Recursive calls fall back to the normal interpreter
+    // entry, which preserves the existing recursion and tail-call semantics.
+    internal bool IsMethodActive(VmMethod method) {
+        var frames = CurrentState.Frames;
+        for (var i = frames.Count - 1; i >= 0; i--)
+            if (ReferenceEquals(frames[i].Method, method))
+                return true;
+        var activeJit = CurrentState.ActiveJitMethods;
+        for (var i = activeJit.Count - 1; i >= 0; i--)
+            if (ReferenceEquals(activeJit[i], method))
+                return true;
+        return false;
+    }
+
     internal bool IsJitCompiled(VmMethod method) => EnginesFor(method).Jit.IsCompiled(method);
     internal int JitInvocationCount(VmMethod method) => EnginesFor(method).Jit.InvocationCount(method);
 
     internal IDisposable EnterHostOperation() => _coordinator.EnterRead();
+
+    internal InterpreterFrame RentFrame(VmMethod method, StackSlot[] arguments,
+        PreparedMethod prepared, int maxStack) {
+        var pool = _framePool.Value!;
+        if (pool.Count != 0) {
+            var frame = pool.Pop();
+            frame.Reinitialize(method, arguments, prepared, maxStack);
+            return frame;
+        }
+        return InterpreterFrame.Create(method, arguments, prepared, maxStack);
+    }
+
+    internal InterpreterFrame RentAliasedFrame(VmMethod method, StackSlot[] argumentStorage,
+        int argumentOffset, int argumentCount, PreparedMethod prepared, int maxStack) {
+        var pool = _framePool.Value!;
+        if (pool.Count != 0) {
+            var frame = pool.Pop();
+            frame.ReinitializeAliased(method, argumentStorage, argumentOffset, argumentCount,
+                prepared, maxStack);
+            return frame;
+        }
+        var created = InterpreterFrame.Create(method, argumentStorage, prepared, maxStack);
+        created.ReinitializeAliased(method, argumentStorage, argumentOffset, argumentCount,
+            prepared, maxStack);
+        return created;
+    }
+
+    internal void ReturnFrame(InterpreterFrame frame) {
+        frame.ResetForPool();
+        _framePool.Value!.Push(frame);
+    }
+
+    internal void ReturnAliasedFrame(InterpreterFrame frame) {
+        frame.ResetForAliasedPool();
+        _framePool.Value!.Push(frame);
+    }
+
+    private void AddFrameRoot(ExecutionState state, InterpreterFrame frame) {
+        if (_coordinator.IsInsideGuestInstruction)
+            state.Frames.Add(frame);
+        else
+            lock (state.Gate)
+                state.Frames.Add(frame);
+    }
+
+    private void RemoveFrameRoot(ExecutionState state, InterpreterFrame frame) {
+        if (_coordinator.IsInsideGuestInstruction)
+            state.Frames.Remove(frame);
+        else
+            lock (state.Gate)
+                state.Frames.Remove(frame);
+    }
 
     private ExecutionState CurrentState => _currentExecution.Value!;
     internal ExecutionState CurrentExecutionState => CurrentState;
@@ -124,12 +205,30 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     private void ConsumeInstruction(ExecutionState state, int cost) {
         if (cost < 1)
             throw new ArgumentOutOfRangeException(nameof(cost));
-        _shared.ThrowIfDisposed();
+        // A guest batch checks disposal at its boundary. Host-side gate calls
+        // outside a batch retain the immediate check.
+        if (!_coordinator.IsInsideGuestInstruction)
+            _shared.ThrowIfDisposed();
         if (!InstructionChargingEnabled) {
             // Keep periodic cancellation/GC observation without maintaining a
             // quota counter in the no-charge execution mode.
             if (++state.UnchargedInstructions >= SafepointInterval) {
                 state.UnchargedInstructions = 0;
+                CheckSafepoint();
+            }
+            return;
+        }
+        if (_memory.InstructionQuota == long.MaxValue) {
+            // An unlimited VM cannot exhaust the shared quota. Preserve the
+            // observable instruction count and batch safepoint cadence while
+            // avoiding an interlocked reservation for every IL operation.
+            state.InstructionCount += cost;
+            state.UnboundedInstructionCount += cost;
+            state.ChargedSinceSafepoint += cost;
+            if (state.ChargedSinceSafepoint >= SafepointInterval) {
+                Interlocked.Add(ref _instructionCount, state.UnboundedInstructionCount);
+                state.UnboundedInstructionCount = 0;
+                state.ChargedSinceSafepoint %= SafepointInterval;
                 CheckSafepoint();
             }
             return;
@@ -183,6 +282,12 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     }
 
     internal void ReleaseInstructionCharge(ExecutionState state) {
+        if (_memory.InstructionQuota == long.MaxValue) {
+            var unbounded = Interlocked.Exchange(ref state.UnboundedInstructionCount, 0);
+            if (unbounded > 0)
+                Interlocked.Add(ref _instructionCount, unbounded);
+            return;
+        }
         var reserved = Interlocked.Exchange(ref state.InstructionChargeRemaining, 0);
         if (reserved > 0)
             Interlocked.Add(ref _instructionCount, -reserved);
@@ -191,18 +296,23 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
     /// <summary>セーフポイント。命令境界 = 全ゲスト状態がフレームに含まれる時点なので、ここでのみ GC を起動してよい
     /// (newobj 処理中のオブジェクトがホストローカルにのみ保持される瞬間があり、そこで回収すると誤 sweep する)。</summary>
     private void CheckSafepoint() {
+        // The interpreter/JIT holds an instruction-batch read lease and marks
+        // the whole bounded batch as inside guest execution. No host-side
+        // operation can make a collection safe in the middle of that batch;
+        // defer all boundary checks to its end instead of repeating deadline,
+        // cancellation, and disposal reads for every IL instruction/call.
+        if (_coordinator.IsInsideGuestInstruction)
+            return;
         var deadline = CurrentState.DeadlineTimestamp;
         if (deadline != 0 && Stopwatch.GetTimestamp() >= deadline)
             throw new ExecutionTimeoutException("ゲスト実行が設定された実時間上限を超過しました。");
         _shared.ShutdownToken.ThrowIfCancellationRequested();
         _shared.ThrowIfDisposed();
-        // IL 命令またはその intrinsic 呼出中は共有 read lease を保持している。
-        // その場で GC せず、RunFrameCore の次の命令境界で stop-the-world 回収する。
         // Most instruction boundaries have no pending collection. Avoid taking
         // the world write lock (and allocating a boundary lease) in that case.
-        // A concurrent allocation publishes its request for the next boundary;
-        // instruction batches still release their read lock every 1024 instructions.
-        if (!_heap.IsCollectionDue || _coordinator.IsInsideGuestInstruction)
+        // A concurrent allocation publishes its request for the next batch
+        // boundary; batches release the read lock every 1024 instructions.
+        if (!_heap.IsCollectionDue)
             return;
         using (_coordinator.StopTheWorldAtBoundary())
             _services.Heap.CollectIfDue();
@@ -283,9 +393,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     instructionBatch = _coordinator.EnterInstructionBatch();
                     batchInstructions = 0;
                 }
-                CheckSafepoint();
                 batchInstructions++;
-                using var instructionLease = _coordinator.EnterInstructionInBatch();
                 var instruction = frame.Code[frame.Ip];
                 ConsumeInstruction(state, instruction.InstructionCost);
                 ObserveInstruction(frame, instruction);
@@ -312,6 +420,27 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
             }
             if (volatileAccess)
                 Thread.MemoryBarrier();
+            // Generic CoreLib equality/hash helpers often box a value only to
+            // test the boxed result with the immediately following branch.
+            // A value-type box is guaranteed non-null; for a reference value,
+            // boxing preserves the original nullness. Consume both IL costs
+            // and retain both trace events while avoiding the dead allocation.
+            if (instruction.Op == ILOp.Box && frame.Ip + 1 < frame.Code.Length) {
+                var boxBranch = frame.Code[frame.Ip + 1];
+                if (boxBranch.Op is ILOp.BrTrue or ILOp.BrTrue_S or ILOp.BrFalse or ILOp.BrFalse_S) {
+                    ConsumeInstruction(state, boxBranch.InstructionCost);
+                    ObserveInstruction(frame, boxBranch);
+                    batchInstructions++;
+                    var boxedValue = frame.Stack.Pop();
+                    var nonNull = boxedValue.Kind != StackKind.Object || boxedValue.ObjectValue is not null;
+                    var branchTarget = boxBranch.BranchTargetIndex >= 0
+                        ? boxBranch.BranchTargetIndex
+                        : prepared.OffsetMap[boxBranch.IntOperand];
+                    var branchIfTrue = boxBranch.Op is ILOp.BrTrue or ILOp.BrTrue_S;
+                    frame.Ip = nonNull == branchIfTrue ? branchTarget : frame.Ip + 2;
+                    continue;
+                }
+            }
             switch (instruction.Op) {
                 case ILOp.Nop or ILOp.Break:
                 case ILOp.Unaligned: // VM の仮想メモリではアラインメント制約なし
@@ -335,19 +464,19 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
 
                 // ---- 引数 ----
                 case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
-                    frame.Stack.Push(frame.Arguments[instruction.Op - ILOp.Ldarg_0]);
+                    frame.Stack.Push(frame.ArgumentAt(instruction.Op - ILOp.Ldarg_0));
                     break;
                 case ILOp.Ldarg_S or ILOp.Ldarg:
                     CheckArgIndex(frame, instruction.IntOperand);
-                    frame.Stack.Push(frame.Arguments[instruction.IntOperand]);
+                    frame.Stack.Push(frame.ArgumentAt(instruction.IntOperand));
                     break;
                 case ILOp.Ldarga_S or ILOp.Ldarga:
                     CheckArgIndex(frame, instruction.IntOperand);
-                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(frame.Arguments, instruction.IntOperand)));
+                    frame.Stack.Push(StackSlot.OfByRef(frame.ArgumentByRef(instruction.IntOperand)));
                     break;
                 case ILOp.Starg_S or ILOp.Starg:
                     CheckArgIndex(frame, instruction.IntOperand);
-                    frame.Arguments[instruction.IntOperand] = frame.Stack.Pop();
+                    frame.SetArgument(instruction.IntOperand, frame.Stack.Pop());
                     break;
 
                 // ---- ローカル変数 ----
@@ -361,7 +490,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     break;
                 case ILOp.Ldloca_S or ILOp.Ldloca:
                     CheckLocalIndex(frame, instruction.IntOperand);
-                    frame.Stack.Push(StackSlot.OfByRef(VmByRef.Frame(frame.Locals, instruction.IntOperand)));
+                    frame.Stack.Push(StackSlot.OfByRef(frame.LocalByRef(instruction.IntOperand)));
                     break;
                 case ILOp.Stloc_0 or ILOp.Stloc_1 or ILOp.Stloc_2 or ILOp.Stloc_3:
                     CheckLocalIndex(frame, instruction.Op - ILOp.Stloc_0);
@@ -956,9 +1085,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                             $"jmp: intrinsic 面 {target.DeclaringType}::{target.Name} への尾呼び移行は対応していません。");
                     if (frame.Stack.Count != 0)
                         throw new BadImageFormatException("jmp の実行スタックは空でなければなりません。");
-                    if (frame.Arguments.Length != target.Arity)
+                    if (frame.ArgumentCount != target.Arity)
                         throw new BadImageFormatException("jmp の呼出先シグネチャが現在の引数数と一致しません。");
-                    var args = frame.Arguments.ToArray();
+                    var args = frame.CopyArguments();
                     var method = target.Method!;
                     var context = calls.BuildCallContext(target, method, method.Signature.HasThis ? args[0] : default);
                     if (!IsInProtectedRegion(frame.Ip, prepared.Clauses) &&
@@ -993,7 +1122,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                     if (value.ObjectValue is not VmTypedReference typed)
                         throw new UnhandledGuestException("System.InvalidCastException",
                             $"refanytype の被演算子が TypedReference ではありません: {SlotOps.Describe(value)}");
-                    frame.Stack.Push(StackSlot.OfObject(_services.Heap.Allocate(new VmTypeHandle { Target = typed.RefType })));
+                    frame.Stack.Push(StackSlot.OfObject(_objectEngine.GetCachedDynamicTypeHandle(typed.RefType)));
                     break;
                 }
                 case ILOp.Arglist:
@@ -1044,7 +1173,7 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
                         switch (dynamicReference) {
                             case VmType dynamicType:
                                 frame.Stack.Push(StackSlot.OfObject(
-                                    _services.Heap.Allocate(new VmTypeHandle { Target = dynamicType })));
+                                    _objectEngine.GetCachedDynamicTypeHandle(dynamicType)));
                                 break;
                             case VmMethod dynamicMethod:
                                 frame.Stack.Push(StackSlot.OfObject(
@@ -1178,9 +1307,9 @@ public sealed partial class Interpreter : IGuestInvoker, IExecutionGate, IFrameR
         ILOp.Stind_I8 or ILOp.Stind_I or ILOp.Stind_R4 or ILOp.Stind_R8;
 
     private static void CheckArgIndex(InterpreterFrame frame, int index) {
-        if ((uint)index >= (uint)frame.Arguments.Length)
+        if ((uint)index >= (uint)frame.ArgumentCount)
             throw new BadImageFormatException(
-                $"引数インデックス {index} が範囲外です ({frame.Method} は引数 {frame.Arguments.Length} 個)。");
+                $"引数インデックス {index} が範囲外です ({frame.Method} は引数 {frame.ArgumentCount} 個)。");
     }
 
     private static void CheckLocalIndex(InterpreterFrame frame, int index) {

@@ -96,6 +96,10 @@ public sealed class VmSharedState : IDisposable {
     internal System.Collections.Concurrent.ConcurrentDictionary<VmType, VmObject> DefaultEqualityComparers { get; } =
         new(GuestTaskRuntime.VmTypeIdentityComparer.Instance);
 
+    /// <summary>同一メタデータ属性の再取得で再構築しない VM 内属性インスタンスキャッシュ。</summary>
+    internal System.Collections.Concurrent.ConcurrentDictionary<CustomAttributeInstanceKey, VmObject> CustomAttributeInstances { get; } = new();
+    internal System.Collections.Concurrent.ConcurrentDictionary<MetadataAttributeArrayKey, VmArray> MetadataAttributeArrays { get; } = new();
+
     /// <summary>VM ごとの仮想環境変数ストア (OrdinalIgnoreCase)。
     /// Kernel32.GetEnvironmentVariable 面は host の Environment を直接呼ばずここだけを読む。</summary>
     public readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> VirtualEnvironment =
@@ -139,7 +143,8 @@ public sealed class VmSharedState : IDisposable {
     }
 
     /// <summary>RuntimeType ファサードを GC の直接ルートとして列挙する。</summary>
-    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values.Concat(DefaultEqualityComparers.Values).Concat(RuntimeMetadata.Roots());
+    internal IEnumerable<VmObject> EnumerateRoots() => TypeFacades.Values.Concat(DefaultEqualityComparers.Values)
+        .Concat(CustomAttributeInstances.Values).Concat(RuntimeMetadata.Roots());
 
     /// <summary>ALC 由来の VM-wide 型初期化状態と RuntimeType ファサードを解放する。</summary>
     internal void RemoveAssemblyContextCaches(VmAssemblyContext context) {
@@ -164,8 +169,16 @@ public sealed class VmSharedState : IDisposable {
         GuestThreads.Dispose();
         RuntimeMetadata.Clear();
         DefaultEqualityComparers.Clear();
+        CustomAttributeInstances.Clear();
+        MetadataAttributeArrays.Clear();
         _workerBudget.Dispose();
         _lastSystemError.Dispose();
         _shutdown.Dispose();
     }
 }
+
+internal readonly record struct CustomAttributeInstanceKey(VmMethod Constructor,
+    VmMethod Target, VmType AttributeType, byte[] Blob, int Offset);
+
+internal readonly record struct MetadataAttributeArrayKey(VmObject Receiver,
+    VmObject AttributeType, bool Inherit);

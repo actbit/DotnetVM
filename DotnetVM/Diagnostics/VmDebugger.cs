@@ -284,6 +284,8 @@ public sealed class VmDebugger : IDisposable {
 
     /// <summary>フレーム終了時に、次のフレームへ持ち越せないステップ計画を破棄する。</summary>
     internal void FrameExited(int threadId, int depth) {
+        if (Volatile.Read(ref _active) == 0)
+            return;
         lock (_gate) {
             if (_stepPlan.Kind != StepKind.None && _stepPlan.ThreadId == threadId &&
                 _stepPlan.Depth >= depth) {

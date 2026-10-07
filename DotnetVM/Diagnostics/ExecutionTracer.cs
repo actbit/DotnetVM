@@ -21,6 +21,7 @@ public sealed class ExecutionTracer {
     private long _droppedFrameCount;
     private long _sequence;
     private int _capturesInstructions;
+    private int _enabledFast;
 
     public ExecutionTracer(int maxEvents = 100_000) {
         if (maxEvents < 1)
@@ -67,6 +68,7 @@ public sealed class ExecutionTracer {
             _sequence = 0;
             _options = options;
             _enabled = true;
+            Volatile.Write(ref _enabledFast, 1);
             Volatile.Write(ref _capturesInstructions, options.CaptureInstructions ? 1 : 0);
         }
     }
@@ -75,6 +77,7 @@ public sealed class ExecutionTracer {
     public void Stop() {
         lock (_gate) {
             _enabled = false;
+            Volatile.Write(ref _enabledFast, 0);
             Volatile.Write(ref _capturesInstructions, 0);
         }
     }
@@ -88,6 +91,8 @@ public sealed class ExecutionTracer {
 
     /// <summary>Interpreter がフレーム開始時に呼ぶ (internal: VM 本体からの記録のみ)。</summary>
     internal void Record(string assemblyName, string typeFullName, string methodName) {
+        if (Volatile.Read(ref _enabledFast) == 0)
+            return;
         lock (_gate) {
             if (!_enabled)
                 return;
@@ -101,6 +106,8 @@ public sealed class ExecutionTracer {
 
     /// <summary>Interpreter が命令境界で呼ぶ (internal: VM 本体からの記録のみ)。</summary>
     internal ExecutionTraceEvent RecordInstruction(ExecutionTraceEvent trace) {
+        if (Volatile.Read(ref _enabledFast) == 0 || Volatile.Read(ref _capturesInstructions) == 0)
+            return trace;
         lock (_gate) {
             if (!_enabled || !_options.CaptureInstructions)
                 return trace;

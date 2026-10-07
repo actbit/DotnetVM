@@ -1,6 +1,7 @@
 using DotnetVM.IL;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -24,8 +25,14 @@ internal static class ScalarIntJit {
 
     internal static JitScalar? TryCreate(VmMethod method, PreparedMethod prepared,
         DecodedInstruction[] code, MethodPreparer preparer) {
-        if (!IsScalarMethodEligible(method, prepared, code, out var hasCalls))
+        var scalarEligible = IsScalarMethodEligible(method, prepared, code, out var hasCalls);
+        if (!scalarEligible) {
+            if (ScalarIntArrayExpressionJit.TryCreate(method, prepared, code) is { } arrayExpression)
+                return arrayExpression;
+            if (TryCreateArray(method, prepared, code, out var arrayScalar))
+                return arrayScalar;
             return null;
+        }
 
         foreach (var instruction in code) {
             if (instruction.Op == ILOp.Call) {
@@ -36,8 +43,9 @@ internal static class ScalarIntJit {
                 (!IsScalarOperation(instruction.Fusion.OperationA) ||
                  instruction.Fusion.Kind is IlFusionKind.LocalTwoConstantsOperationStore or
                  IlFusionKind.LocalLocalConstantOperationStore &&
-                 !IsScalarOperation(instruction.Fusion.OperationB)))
+                 !IsScalarOperation(instruction.Fusion.OperationB))) {
                 return null;
+            }
         }
 
         if (code.Length > Interpreter.SafepointInterval)
@@ -51,6 +59,199 @@ internal static class ScalarIntJit {
             return null;
         return (interpreter, _, frame) => Execute(interpreter, frame, code, returnsValue,
             blockCosts, blockEnds);
+    }
+
+    private static bool TryCreateArray(VmMethod method, PreparedMethod prepared,
+        DecodedInstruction[] code, out JitScalar? scalar) {
+        scalar = null;
+        if (method.Signature.HasThis || method.Signature.ReturnType.Kind != SigKind.I4 ||
+            method.Signature.ParamTypes.Any(type => !IsInt32Like(type)) ||
+            prepared.Clauses is { Length: > 0 } || code.Length == 0 ||
+            prepared.LocalTypes.Any(type => type.Kind is not (SigKind.Boolean or SigKind.I1 or SigKind.U1 or
+                SigKind.I2 or SigKind.U2 or SigKind.I4 or SigKind.U4 or SigKind.SzArray)) ||
+            prepared.LocalTypes.Any(type => type.Kind == SigKind.SzArray &&
+                (type.Inner is null || type.Inner.Kind is not (SigKind.I4 or SigKind.TypeToken))))
+            return false;
+
+        foreach (var instruction in code) {
+            if (instruction.Op == ILOp.Call || instruction.Fusion.Kind != IlFusionKind.None &&
+                (!IsScalarOperation(instruction.Fusion.OperationA) ||
+                 instruction.Fusion.Kind is IlFusionKind.LocalTwoConstantsOperationStore or
+                 IlFusionKind.LocalLocalConstantOperationStore &&
+                 !IsScalarOperation(instruction.Fusion.OperationB)))
+                return false;
+            if (!IsArraySupported(instruction.Op) ||
+                instruction.Fusion.Kind != IlFusionKind.None &&
+                !IlFusionValidation.IsValid(instruction.Fusion, prepared.LocalTypes.Length, out _)) {
+                return false;
+            }
+        }
+        if (code.Length > Interpreter.SafepointInterval)
+            return false;
+
+        var (blockCosts, blockEnds) = BuildBlocks(code, prepared.OffsetMap);
+        scalar = (interpreter, services, frame) => ExecuteArray(interpreter, services, frame,
+            code, blockCosts, blockEnds);
+        return true;
+    }
+
+    private static StackSlot ExecuteArray(Interpreter interpreter, InterpreterServices services,
+        InterpreterFrame frame, DecodedInstruction[] code, int[] blockCosts, int[] blockEnds) {
+        var stack = frame.Stack.RootSlots;
+        var sp = 0;
+        var batchInstructions = 0;
+        var state = interpreter.CurrentExecutionState;
+        var budget = new ScalarInstructionBudget(interpreter, state);
+        var batch = default(VmExecutionCoordinator.InstructionBatchLease);
+        var instruction = default(VmExecutionCoordinator.InstructionLease);
+        try {
+            interpreter.CheckJitSafepoint();
+            batch = interpreter.EnterJitInstructionBatch();
+            instruction = interpreter.EnterJitInstructionInBatch();
+            while (true) {
+                if (batchInstructions >= Interpreter.SafepointInterval) {
+                    instruction.Dispose();
+                    instruction = default;
+                    batch.Dispose();
+                    batch = default;
+                    interpreter.CheckJitSafepoint();
+                    batch = interpreter.EnterJitInstructionBatch();
+                    instruction = interpreter.EnterJitInstructionInBatch();
+                    batchInstructions = 0;
+                }
+
+                var blockEnd = blockEnds[frame.Ip];
+                budget.Take(blockCosts[frame.Ip]);
+                while (frame.Ip < blockEnd) {
+                    var current = code[frame.Ip];
+                    var ip = frame.Ip;
+                    frame.Ip = ip;
+                    batchInstructions++;
+                    if (current.Fusion.Kind != IlFusionKind.None) {
+                        ExecuteFusion(frame.Locals, current.Fusion);
+                        frame.Ip = ip + 1;
+                        continue;
+                    }
+
+                    switch (current.Op) {
+                        case ILOp.Nop or ILOp.Break:
+                            frame.Ip = ip + 1; break;
+                        case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
+                            PushSlot(ref sp, stack, frame.ArgumentAt((int)(current.Op - ILOp.Ldarg_0))); frame.Ip = ip + 1; break;
+                        case ILOp.Ldarg_S or ILOp.Ldarg:
+                            PushSlot(ref sp, stack, frame.ArgumentAt(current.IntOperand)); frame.Ip = ip + 1; break;
+                        case ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3:
+                            PushSlot(ref sp, stack, frame.Locals[(int)(current.Op - ILOp.Ldloc_0)]); frame.Ip = ip + 1; break;
+                        case ILOp.Ldloc_S or ILOp.Ldloc:
+                            PushSlot(ref sp, stack, frame.Locals[current.IntOperand]); frame.Ip = ip + 1; break;
+                        case ILOp.Stloc_0 or ILOp.Stloc_1 or ILOp.Stloc_2 or ILOp.Stloc_3:
+                            frame.Locals[(int)(current.Op - ILOp.Stloc_0)] = PopSlot(ref sp, stack); frame.Ip = ip + 1; break;
+                        case ILOp.Stloc_S or ILOp.Stloc:
+                            frame.Locals[current.IntOperand] = PopSlot(ref sp, stack); frame.Ip = ip + 1; break;
+                        case ILOp.Ldc_I4_M1:
+                            PushSlot(ref sp, stack, StackSlot.OfInt32(-1)); frame.Ip = ip + 1; break;
+                        case >= ILOp.Ldc_I4_0 and <= ILOp.Ldc_I4_8:
+                            PushSlot(ref sp, stack, StackSlot.OfInt32((int)(current.Op - ILOp.Ldc_I4_0))); frame.Ip = ip + 1; break;
+                        case ILOp.Ldc_I4_S or ILOp.Ldc_I4:
+                            PushSlot(ref sp, stack, StackSlot.OfInt32(current.IntOperand)); frame.Ip = ip + 1; break;
+                        case ILOp.Dup:
+                            PushSlot(ref sp, stack, stack[sp - 1]); frame.Ip = ip + 1; break;
+                        case ILOp.Pop:
+                            _ = PopSlot(ref sp, stack); frame.Ip = ip + 1; break;
+                        case ILOp.Newarr: {
+                            var count = PopSlot(ref sp, stack).AsInt32;
+                            if (count < 0) throw new UnhandledGuestException("System.OverflowException", null);
+                            var elementType = services.Loader.ResolveToken(new SigType(SigKind.TypeToken,
+                                Token: unchecked((uint)current.IntOperand)));
+                            var elements = new StackSlot[count];
+                            for (var i = 0; i < count; i++)
+                                elements[i] = services.Objects.DefaultForType(elementType, services.Loader);
+                            using var reservation = services.Heap.ReserveArray(count);
+                            PushSlot(ref sp, stack, StackSlot.OfObject(reservation.Commit(new VmArray(
+                                new VmArrayType { ElementType = elementType }, elements))));
+                            frame.Ip = ip + 1;
+                            break;
+                        }
+                        case ILOp.Ldlen: {
+                            var array = MemoryOps.GetArray(PopSlot(ref sp, stack));
+                            PushSlot(ref sp, stack, StackSlot.OfNativeInt(array.Length));
+                            frame.Ip = ip + 1;
+                            break;
+                        }
+                        case ILOp.Ldelem_I4: {
+                            var index = PopSlot(ref sp, stack).AsInt32;
+                            var array = MemoryOps.GetArray(PopSlot(ref sp, stack));
+                            MemoryOps.CheckArrayBounds(array, index);
+                            PushSlot(ref sp, stack, StackSlot.OfInt32(array.Elements[index].AsInt32));
+                            frame.Ip = ip + 1;
+                            break;
+                        }
+                        case ILOp.Stelem_I4: {
+                            var value = PopSlot(ref sp, stack);
+                            var index = PopSlot(ref sp, stack).AsInt32;
+                            var array = MemoryOps.GetArray(PopSlot(ref sp, stack));
+                            MemoryOps.CheckArrayBounds(array, index);
+                            array.Elements[index] = StackSlot.OfInt32(value.AsInt32);
+                            frame.Ip = ip + 1;
+                            break;
+                        }
+                        case ILOp.Conv_I4:
+                            stack[sp - 1] = StackSlot.OfInt32(stack[sp - 1].AsInt32); frame.Ip = ip + 1; break;
+                        case ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Rem or ILOp.Rem_Un or
+                            ILOp.And or ILOp.Or or ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un: {
+                            var right = PopSlot(ref sp, stack).AsInt32;
+                            var left = PopSlot(ref sp, stack).AsInt32;
+                            PushSlot(ref sp, stack, StackSlot.OfInt32(Apply(current.Op, left, right)));
+                            frame.Ip = ip + 1; break;
+                        }
+                        case ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un: {
+                            var right = PopSlot(ref sp, stack).AsInt32;
+                            var left = PopSlot(ref sp, stack).AsInt32;
+                            PushSlot(ref sp, stack, StackSlot.OfInt32(Compare(current.Op, left, right) ? 1 : 0));
+                            frame.Ip = ip + 1; break;
+                        }
+                        case ILOp.Br or ILOp.Br_S:
+                            frame.Ip = Target(current, frame); break;
+                        case ILOp.BrTrue or ILOp.BrTrue_S:
+                            frame.Ip = PopSlot(ref sp, stack).AsInt32 != 0 ? Target(current, frame) : ip + 1; break;
+                        case ILOp.BrFalse or ILOp.BrFalse_S:
+                            frame.Ip = PopSlot(ref sp, stack).AsInt32 == 0 ? Target(current, frame) : ip + 1; break;
+                        case ILOp.Beq or ILOp.Beq_S or ILOp.Bne_Un or ILOp.Bne_Un_S or
+                            ILOp.Bge or ILOp.Bge_S or ILOp.Bge_Un or ILOp.Bge_Un_S or
+                            ILOp.Bgt or ILOp.Bgt_S or ILOp.Bgt_Un or ILOp.Bgt_Un_S or
+                            ILOp.Ble or ILOp.Ble_S or ILOp.Ble_Un or ILOp.Ble_Un_S or
+                            ILOp.Blt or ILOp.Blt_S or ILOp.Blt_Un or ILOp.Blt_Un_S: {
+                            var right = PopSlot(ref sp, stack).AsInt32;
+                            var left = PopSlot(ref sp, stack).AsInt32;
+                            frame.Ip = CompareBranch(current.Op, left, right) ? Target(current, frame) : ip + 1;
+                            break;
+                        }
+                        case ILOp.Ret:
+                            return PopSlot(ref sp, stack);
+                        default:
+                            throw new InvalidOperationException($"未対応の配列スカラー JIT 命令です: {current.Op}");
+                    }
+                    if (IsControlFlow(current)) break;
+                }
+            }
+        } finally {
+            instruction.Dispose();
+            batch.Dispose();
+            budget.Dispose();
+            frame.Stack.Clear();
+        }
+    }
+
+    private static bool IsArraySupported(ILOp op) => IsSupported(new DecodedInstruction(
+        0, op, default, 1, 0, 0, 0, null)) || op is ILOp.Newarr or ILOp.Ldlen or
+        ILOp.Ldelem_I4 or ILOp.Stelem_I4 or ILOp.Conv_I4;
+
+    private static void PushSlot(ref int sp, StackSlot[] stack, in StackSlot value) => stack[sp++] = value;
+    private static StackSlot PopSlot(ref int sp, StackSlot[] stack) {
+        var index = --sp;
+        var value = stack[index];
+        stack[index] = default;
+        return value;
     }
 
     private static bool IsScalarMethodEligible(VmMethod method, PreparedMethod prepared,
@@ -112,15 +313,15 @@ internal static class ScalarIntJit {
                         ip++;
                         break;
                     case ILOp.Ldarg_0 or ILOp.Ldarg_1 or ILOp.Ldarg_2 or ILOp.Ldarg_3:
-                        Push(ref sp, stack, frame.Arguments[(int)(current.Op - ILOp.Ldarg_0)].AsInt32);
+                        Push(ref sp, stack, frame.ArgumentAt((int)(current.Op - ILOp.Ldarg_0)).AsInt32);
                         ip++;
                         break;
                     case ILOp.Ldarg_S or ILOp.Ldarg:
-                        Push(ref sp, stack, frame.Arguments[current.IntOperand].AsInt32);
+                        Push(ref sp, stack, frame.ArgumentAt(current.IntOperand).AsInt32);
                         ip++;
                         break;
                     case ILOp.Starg_S or ILOp.Starg:
-                        frame.Arguments[current.IntOperand] = StackSlot.OfInt32(Pop(ref sp, stack));
+                        frame.SetArgument(current.IntOperand, StackSlot.OfInt32(Pop(ref sp, stack)));
                         ip++;
                         break;
                     case ILOp.Ldloc_0 or ILOp.Ldloc_1 or ILOp.Ldloc_2 or ILOp.Ldloc_3:
@@ -247,14 +448,14 @@ internal static class ScalarIntJit {
         var left = locals[fusion.LocalA].AsInt32;
         var result = fusion.Kind switch {
             IlFusionKind.LocalConstantOperationStore =>
-                Apply(fusion.OperationA, left, fusion.ValueA),
+                ApplyScalarOperation(fusion.OperationA, left, fusion.ValueA),
             IlFusionKind.LocalLocalOperationStore =>
-                Apply(fusion.OperationA, left, locals[fusion.LocalB].AsInt32),
+                ApplyScalarOperation(fusion.OperationA, left, locals[fusion.LocalB].AsInt32),
             IlFusionKind.LocalTwoConstantsOperationStore =>
-                Apply(fusion.OperationB, Apply(fusion.OperationA, left, fusion.ValueA), fusion.ValueB),
+                ApplyScalarOperation(fusion.OperationB, ApplyScalarOperation(fusion.OperationA, left, fusion.ValueA), fusion.ValueB),
             IlFusionKind.LocalLocalConstantOperationStore =>
-                Apply(fusion.OperationB, left,
-                    Apply(fusion.OperationA, locals[fusion.LocalB].AsInt32, fusion.ValueA)),
+                ApplyScalarOperation(fusion.OperationB, left,
+                    ApplyScalarOperation(fusion.OperationA, locals[fusion.LocalB].AsInt32, fusion.ValueA)),
             _ => throw new InvalidOperationException($"未知の IL 融合種別です: {fusion.Kind}"),
         };
         locals[fusion.LocalC] = StackSlot.OfInt32(result);
@@ -396,7 +597,13 @@ internal static class ScalarIntJit {
 
     private static bool IsScalarOperation(ILOp op) => op is
         ILOp.Add or ILOp.Sub or ILOp.Mul or ILOp.Rem or ILOp.Rem_Un or ILOp.And or ILOp.Or or
-        ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un;
+        ILOp.Xor or ILOp.Shl or ILOp.Shr or ILOp.Shr_Un or ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or
+        ILOp.Clt or ILOp.Clt_Un;
+
+    private static int ApplyScalarOperation(ILOp op, int left, int right) =>
+        op is ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un
+            ? Compare(op, left, right) ? 1 : 0
+            : Apply(op, left, right);
 
     private static bool IsControlFlow(DecodedInstruction instruction) => instruction.Op is
         ILOp.Br or ILOp.Br_S or ILOp.BrTrue or ILOp.BrTrue_S or ILOp.BrFalse or ILOp.BrFalse_S or

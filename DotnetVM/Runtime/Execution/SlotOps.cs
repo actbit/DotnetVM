@@ -65,6 +65,62 @@ internal static class SlotOps {
         };
     }
 
+    private static bool CompareManagedPointer(ILOp op, in StackSlot left, in StackSlot right) {
+        var leftRef = left.ObjectValue as VmByRef;
+        var rightRef = right.ObjectValue as VmByRef;
+        var leftIsNull = leftRef is not null && leftRef.Container.Length == 0 && leftRef.Index == 0;
+        var rightIsNull = rightRef is not null && rightRef.Container.Length == 0 && rightRef.Index == 0;
+
+        // CoreLib's Unsafe.IsNullRef compares a managed pointer with native
+        // zero.  VmByRef is the VM representation of that pointer, so handle
+        // the zero form before the ordinary reference-slot path.
+        if (leftRef is not null && right.Kind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt) {
+            if (right.Int64Value != 0) {
+                throw new InvalidOperationException($"マネージ参照と null 以外の整数の比較は対応していません: op={op}, value={right.Int64Value}");
+            }
+            return CompareNullManagedPointer(op, leftIsNull, leftIsNull: false);
+        }
+        if (rightRef is not null && left.Kind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt) {
+            if (left.Int64Value != 0)
+                throw new InvalidOperationException($"マネージ参照と null 以外の整数の比較は対応していません: op={op}, value={left.Int64Value}");
+            return CompareNullManagedPointer(op, rightIsNull, leftIsNull: true);
+        }
+        if (leftRef is null || rightRef is null)
+            return op == ILOp.Ceq && ReferenceEquals(left.ObjectValue, right.ObjectValue);
+        if (op == ILOp.Ceq)
+            return ReferenceEquals(leftRef.Container, rightRef.Container) && leftRef.Index == rightRef.Index;
+        if (!ReferenceEquals(leftRef.Container, rightRef.Container))
+            throw new InvalidOperationException("別のメモリブロックを指すマネージ参照同士の順序比較は未定義動作のため対応していません。");
+        return op switch {
+            ILOp.Cgt or ILOp.Cgt_Un => leftRef.Index > rightRef.Index,
+            ILOp.Clt or ILOp.Clt_Un => leftRef.Index < rightRef.Index,
+            CgeShim or CgeUnShim => leftRef.Index >= rightRef.Index,
+            CleShim or CleUnShim => leftRef.Index <= rightRef.Index,
+            _ => throw new InvalidOperationException($"比較命令 {op} はマネージ参照に対応しません。"),
+        };
+    }
+
+    private static bool CompareNullManagedPointer(ILOp op, bool isNull, bool leftIsNull) {
+        if (op == ILOp.Ceq)
+            return isNull;
+        if (op is ILOp.Cgt_Un or ILOp.Clt_Un or CgeUnShim or CleUnShim) {
+            if (leftIsNull)
+                return op switch {
+                    ILOp.Cgt_Un => false,
+                    ILOp.Clt_Un => !isNull,
+                    CgeUnShim => isNull,
+                    _ => true,
+                };
+            return op switch {
+                ILOp.Cgt_Un => !isNull,
+                ILOp.Clt_Un => false,
+                CgeUnShim => true,
+                _ => isNull,
+            };
+        }
+        throw new InvalidOperationException($"比較命令 {op} はマネージ参照に対応しません。");
+    }
+
     public static bool CompareBranch(ILOp op, in StackSlot left, in StackSlot right) => op switch {
         ILOp.Beq or ILOp.Beq_S => Compare(ILOp.Ceq, left, right),
         ILOp.Bne_Un or ILOp.Bne_Un_S => !Compare(ILOp.Ceq, left, right),
@@ -90,6 +146,8 @@ internal static class SlotOps {
         // unmanaged ポインタの比較 (C# の p != null は cgt.un、p == q は ceq にコンパイルされる)
         if (left.ObjectValue is VmNativePointer || right.ObjectValue is VmNativePointer)
             return CompareNativePointer(op, left, right);
+        if (left.ObjectValue is VmByRef || right.ObjectValue is VmByRef)
+            return CompareManagedPointer(op, left, right);
         if (op == ILOp.Ceq) {
             if (left.Kind is StackKind.Object or StackKind.ByRef || right.Kind is StackKind.Object or StackKind.ByRef)
                 return ReferenceEquals(left.ObjectValue, right.ObjectValue);

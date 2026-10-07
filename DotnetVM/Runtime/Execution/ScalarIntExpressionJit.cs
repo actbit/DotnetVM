@@ -5,6 +5,7 @@ using DotnetVM.IL;
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Policy;
+using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
@@ -248,6 +249,11 @@ internal static class ScalarIntExpressionJit {
         ILOp.Shl => left << (right & 31),
         ILOp.Shr => left >> (right & 31),
         ILOp.Shr_Un => (int)((uint)left >> (right & 31)),
+        ILOp.Ceq => left == right ? 1 : 0,
+        ILOp.Cgt => left > right ? 1 : 0,
+        ILOp.Cgt_Un => (uint)left > (uint)right ? 1 : 0,
+        ILOp.Clt => left < right ? 1 : 0,
+        ILOp.Clt_Un => (uint)left < (uint)right ? 1 : 0,
         _ => throw new InvalidOperationException($"スカラー式 JIT に適用できない演算です: {op}"),
     };
 
@@ -368,21 +374,26 @@ internal static class ScalarIntExpressionJit {
     private static Expression FusionExpression(IlFusion fusion, ParameterExpression[] locals) {
         var left = locals[fusion.LocalA];
         return fusion.Kind switch {
-            IlFusionKind.LocalConstantOperationStore => BinaryExpression(
+            IlFusionKind.LocalConstantOperationStore => ScalarExpression(
                 fusion.OperationA, left, Expression.Constant(fusion.ValueA)),
-            IlFusionKind.LocalLocalOperationStore => BinaryExpression(
+            IlFusionKind.LocalLocalOperationStore => ScalarExpression(
                 fusion.OperationA, left, locals[fusion.LocalB]),
-            IlFusionKind.LocalTwoConstantsOperationStore => BinaryExpression(
+            IlFusionKind.LocalTwoConstantsOperationStore => ScalarExpression(
                 fusion.OperationB,
-                BinaryExpression(fusion.OperationA, left, Expression.Constant(fusion.ValueA)),
+                ScalarExpression(fusion.OperationA, left, Expression.Constant(fusion.ValueA)),
                 Expression.Constant(fusion.ValueB)),
-            IlFusionKind.LocalLocalConstantOperationStore => BinaryExpression(
+            IlFusionKind.LocalLocalConstantOperationStore => ScalarExpression(
                 fusion.OperationB, left,
-                BinaryExpression(fusion.OperationA, locals[fusion.LocalB],
+                ScalarExpression(fusion.OperationA, locals[fusion.LocalB],
                     Expression.Constant(fusion.ValueA))),
             _ => throw new InvalidOperationException($"未知の IL 融合種別です: {fusion.Kind}"),
         };
     }
+
+    private static Expression ScalarExpression(ILOp op, Expression left, Expression right) =>
+        op is ILOp.Ceq or ILOp.Cgt or ILOp.Cgt_Un or ILOp.Clt or ILOp.Clt_Un
+            ? BoolToInt(CompareExpression(op, left, right))
+            : BinaryExpression(op, left, right);
 
     private static Expression BinaryExpression(ILOp op, Expression left, Expression right) => op switch {
         ILOp.Add => Expression.Add(left, right),
@@ -563,6 +574,14 @@ internal sealed class ScalarIntJitContext : IDisposable {
     private readonly Interpreter.ExecutionState _state;
     private readonly StackSlot[] _arguments;
     private readonly InterpreterFrame? _frame;
+    private readonly ObjectEngine? _objects;
+    private readonly CallEngine? _calls;
+    private readonly Dictionary<int, CallTarget> _callTargets = [];
+    private readonly StackSlot[] _argumentScratch = new StackSlot[3];
+    private VmField? _cachedField;
+    private int _cachedFieldToken;
+    private VmClassType? _cachedFieldOwner;
+    private int _cachedFieldIndex;
     private VmExecutionCoordinator.InstructionBatchLease _batch;
     private VmExecutionCoordinator.InstructionLease _instruction;
     private int _batchInstructions;
@@ -574,6 +593,8 @@ internal sealed class ScalarIntJitContext : IDisposable {
         _interpreter = interpreter;
         _state = interpreter.CurrentExecutionState;
         _frame = frame;
+        _objects = interpreter.JitObjectsFor(frame.Method);
+        _calls = interpreter.JitCallsFor(frame.Method);
         _arguments = frame.Arguments;
         _interpreter.CheckJitSafepoint();
         _batch = _interpreter.EnterJitInstructionBatch();
@@ -591,6 +612,159 @@ internal sealed class ScalarIntJitContext : IDisposable {
 
     public int ReadArgument(int index) => _arguments[index].AsInt32;
     public int ReadLocal(int index) => _frame?.Locals[index].AsInt32 ?? 0;
+    public StackSlot ReadSlotArgument(int index) => _arguments[index];
+    public StackSlot ReadSlotLocal(int index) => _frame?.Locals[index] ?? default;
+
+    public StackSlot StoreLocal(int index, StackSlot value) {
+        var frame = _frame ?? throw new InvalidOperationException("式JITにフレームがありません。");
+        frame.Locals[index] = SlotOps.StoreCopyOfValue(value);
+        return value;
+    }
+
+    public StackSlot NewArray(StackSlot length, int token) {
+        var count = length.AsInt32;
+        if (count < 0)
+            throw new UnhandledGuestException("System.OverflowException", null);
+        var frame = _frame ?? throw new InvalidOperationException("配列式JITにフレームがありません。");
+        var elementType = frame.Method.Loader!.ResolveToken(new SigType(SigKind.TypeToken,
+            Token: unchecked((uint)token)));
+        var elements = new StackSlot[count];
+        for (var i = 0; i < count; i++)
+            elements[i] = _interpreter.Services.Objects.DefaultForType(elementType, frame.Method.Loader);
+        using var reservation = _interpreter.Services.Heap.ReserveArray(count);
+        return StackSlot.OfObject(reservation.Commit(new VmArray(
+            new VmArrayType { ElementType = elementType }, elements)));
+    }
+
+    public StackSlot NewObject0(int token) {
+        var frame = _frame ?? throw new InvalidOperationException("オブジェクト式JITにフレームがありません。");
+        return _objects!.NewObject(token, frame)
+            ?? throw new InvalidOperationException("オブジェクトを生成できません。");
+    }
+
+    public StackSlot NewObject1(StackSlot argument, int token) {
+        var frame = _frame ?? throw new InvalidOperationException("オブジェクト式JITにフレームがありません。");
+        var count = frame.Stack.Count;
+        frame.Stack.Push(argument);
+        try {
+            return _objects!.NewObject(token, frame)
+                ?? throw new InvalidOperationException("オブジェクトを生成できません。");
+        } finally {
+            frame.Stack.SetCountForJit(count);
+        }
+    }
+
+    public StackSlot NewObject2(StackSlot first, StackSlot second, int token) {
+        var frame = _frame ?? throw new InvalidOperationException("オブジェクト式JITにフレームがありません。");
+        var count = frame.Stack.Count;
+        frame.Stack.Push(first);
+        frame.Stack.Push(second);
+        try {
+            return _objects!.NewObject(token, frame)
+                ?? throw new InvalidOperationException("オブジェクトを生成できません。");
+        } finally {
+            frame.Stack.SetCountForJit(count);
+        }
+    }
+
+    public StackSlot Invoke0(int token, bool callvirt) => InvokeCore(token, callvirt,
+        ReadOnlySpan<StackSlot>.Empty);
+    public StackSlot Invoke1(int token, bool callvirt, StackSlot argument) {
+        _argumentScratch[0] = argument;
+        return InvokeCore(token, callvirt, _argumentScratch.AsSpan(0, 1));
+    }
+    public StackSlot Invoke2(int token, bool callvirt, StackSlot first, StackSlot second) {
+        _argumentScratch[0] = first;
+        _argumentScratch[1] = second;
+        return InvokeCore(token, callvirt, _argumentScratch.AsSpan(0, 2));
+    }
+    public StackSlot Invoke3(int token, bool callvirt, StackSlot first, StackSlot second,
+        StackSlot third) {
+        _argumentScratch[0] = first;
+        _argumentScratch[1] = second;
+        _argumentScratch[2] = third;
+        return InvokeCore(token, callvirt, _argumentScratch.AsSpan(0, 3));
+    }
+
+    public void DisposeLocal(int localIndex, int disposeToken) {
+        var frame = _frame ?? throw new InvalidOperationException("式JITにフレームがありません。");
+        var value = frame.Locals[localIndex];
+        if (value.ObjectValue is not null)
+            _ = Invoke1(disposeToken, callvirt: true, value);
+    }
+
+    private StackSlot InvokeCore(int token, bool callvirt, ReadOnlySpan<StackSlot> arguments) {
+        var frame = _frame ?? throw new InvalidOperationException("呼出し式JITにフレームがありません。");
+        var calls = _calls ?? throw new InvalidOperationException("呼出し式JITにCallEngineがありません。");
+        if (!_callTargets.TryGetValue(token, out var target)) {
+            target = calls.ResolveCallTargetForFrame(frame, token);
+            _callTargets[token] = target;
+        }
+        var count = frame.Stack.Count;
+        foreach (ref readonly var argument in arguments)
+            frame.Stack.Push(argument);
+        try {
+            return calls.Call(token, frame, callvirt, constrainedToken: 0,
+                tailCallAllowed: false, out _, validateArguments: false,
+                resolvedTarget: target) ?? default;
+        } finally {
+            frame.Stack.SetCountForJit(count);
+        }
+    }
+
+    public StackSlot LoadField(StackSlot receiver, int token) {
+        var frame = _frame ?? throw new InvalidOperationException("フィールド式JITにフレームがありません。");
+        var field = CachedField(frame, token);
+        if (receiver.ObjectValue is VmClassInstance instance)
+            return instance.Fields[CachedFieldIndex(instance.ClassType, field)];
+        return _objects!.ReadField(receiver, field);
+    }
+
+    public void StoreField(StackSlot receiver, StackSlot value, int token) {
+        var frame = _frame ?? throw new InvalidOperationException("フィールド式JITにフレームがありません。");
+        var field = CachedField(frame, token);
+        if (!frame.Method.CanWriteInitOnly(field))
+            throw new UnhandledGuestException("System.FieldAccessException", $"readonly フィールド {field} はコンストラクター外から書き込めません。");
+        if (receiver.ObjectValue is VmClassInstance instance)
+            instance.Fields[CachedFieldIndex(instance.ClassType, field)] = SlotOps.StoreCopyOfValue(value);
+        else
+            _objects!.WriteField(receiver, field, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private VmField CachedField(InterpreterFrame frame, int token) {
+        if (_cachedField is not null && _cachedFieldToken == token)
+            return _cachedField;
+        _cachedFieldToken = token;
+        return _cachedField = _objects!.ResolveFieldToken(token, frame.Context, frame.Method.DynamicTokens);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CachedFieldIndex(VmClassType owner, VmField field) {
+        if (ReferenceEquals(_cachedFieldOwner, owner))
+            return _cachedFieldIndex;
+        _cachedFieldOwner = owner;
+        return _cachedFieldIndex = new ObjectModel().GetLayout(owner)[field];
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public StackSlot ArrayLength(StackSlot array) => StackSlot.OfNativeInt(MemoryOps.GetArray(array).Length);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public StackSlot LoadArrayElementI4(StackSlot arraySlot, StackSlot indexSlot) {
+        var array = MemoryOps.GetArray(arraySlot);
+        var index = indexSlot.AsInt32;
+        MemoryOps.CheckArrayBounds(array, index);
+        return StackSlot.OfInt32(array.Elements[index].AsInt32);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void StoreArrayElementI4(StackSlot arraySlot, StackSlot indexSlot, StackSlot valueSlot) {
+        var array = MemoryOps.GetArray(arraySlot);
+        var index = indexSlot.AsInt32;
+        MemoryOps.CheckArrayBounds(array, index);
+        array.Elements[index] = StackSlot.OfInt32(valueSlot.AsInt32);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Charge(int cost, int instructionCount) {

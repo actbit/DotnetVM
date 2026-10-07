@@ -22,13 +22,15 @@ public sealed class VmString {
     /// <summary>char データ開始のバイトオフセット (= CoreLib の _firstChar の位置)。</summary>
     internal const int CharDataByteOffset = HeaderByteCount;
 
-    private readonly byte[] _bytes;
+    internal readonly byte[] _bytes;
     private VmLocallocMemory? _pointerMemory;
     /// <summary>ホスト文字列のキャッシュ (Value の呼び出しごとのデコードを避ける、タスク 2)。
     /// 文字列は不変というゲスト規約の下で安全 (CoreLib IL による length / first-char 書込後の
     /// 再キャッシュは WriteStringLength / WriteFirstChar の呼び出し側で削除される)。</summary>
-    private string? _cachedValue;
-    private int _cachedForLength = -1;
+    internal string? _cachedValue;
+    internal int _cachedForLength = -1;
+    private int _cachedInt32State;
+    private int _cachedInt32Value;
 
     /// <summary>ホスト文字列から作る (ldstr / intrinsic 境界からの正規化用)。</summary>
     public VmString(string value) {
@@ -55,6 +57,49 @@ public sealed class VmString {
         (HeaderByteCount + 2L * (length + 1L) + 3) & ~3L;
 
     internal static int BufferByteCount(int length) => checked((int)StorageByteCount(length));
+
+    internal bool TryParseInt32(out int value) {
+        if (_cachedInt32State != 0) {
+            value = _cachedInt32Value;
+            return _cachedInt32State > 0;
+        }
+        value = 0;
+        var length = Length;
+        if (length == 0) {
+            _cachedInt32State = -1;
+            return false;
+        }
+        var index = 0;
+        var negative = false;
+        var first = (char)BinaryPrimitives.ReadUInt16LittleEndian(_bytes.AsSpan(CharDataByteOffset, 2));
+        if (first is '-' or '+') {
+            negative = first == '-';
+            index = 1;
+            if (index == length) {
+                _cachedInt32State = -1;
+                return false;
+            }
+        }
+        var limit = negative ? 2147483648L : 2147483647L;
+        long result = 0;
+        for (; index < length; index++) {
+            var character = (char)BinaryPrimitives.ReadUInt16LittleEndian(
+                _bytes.AsSpan(CharDataByteOffset + index * 2, 2));
+            if (character is < '0' or > '9') {
+                _cachedInt32State = -1;
+                return false;
+            }
+            result = result * 10 + character - '0';
+            if (result > limit) {
+                _cachedInt32State = -1;
+                return false;
+            }
+        }
+        value = negative ? (int)-result : (int)result;
+        _cachedInt32Value = value;
+        _cachedInt32State = 1;
+        return true;
+    }
 
     /// <summary>char 数 (CoreLib IL が ldfld する _stringLength と同一の値)。</summary>
     public int Length => BinaryPrimitives.ReadInt32LittleEndian(_bytes);
@@ -105,6 +150,7 @@ public sealed class VmString {
     internal void WriteStringLength(int value) {
         BinaryPrimitives.WriteInt32LittleEndian(_bytes, value);
         _cachedValue = null; // バッファ書込後は誤キャッシュを無効化
+        _cachedInt32State = 0;
     }
 
     /// <summary>_firstChar への書込 (stfld 相当)。先頭 char の 2 バイトに書く。</summary>
@@ -114,6 +160,7 @@ public sealed class VmString {
             _bytes[CharDataByteOffset + 1] = (byte)((ushort)value >> 8);
         }
         _cachedValue = null;
+        _cachedInt32State = 0;
     }
 
     public override string ToString() => Value;
@@ -153,6 +200,29 @@ public sealed class VmStringPool {
     public VmString GetOrNew(string value) {
         _heap?.ChargeString(value.Length);
         return new VmString(value);
+    }
+
+    internal VmString FormatInt32(int value) {
+        Span<char> chars = stackalloc char[11];
+        var negative = value < 0;
+        var magnitude = negative ? -(long)value : value;
+        var end = chars.Length;
+        do {
+            chars[--end] = (char)('0' + magnitude % 10);
+            magnitude /= 10;
+        } while (magnitude != 0);
+        if (negative)
+            chars[--end] = '-';
+        var result = Allocate(chars.Length - end);
+        if (BitConverter.IsLittleEndian)
+            MemoryMarshal.AsBytes(chars[end..]).CopyTo(result._bytes.AsSpan(VmString.CharDataByteOffset));
+        else
+            for (var i = end; i < chars.Length; i++)
+                BinaryPrimitives.WriteUInt16LittleEndian(result._bytes.AsSpan(
+                    VmString.CharDataByteOffset + (i - end) * 2, 2), chars[i]);
+        result._cachedForLength = chars.Length - end;
+        result._cachedValue = null;
+        return result;
     }
 
     /// <summary>リテラル (ldstr / 例外文言) 用のインタニング入口。既存の「同一内容は

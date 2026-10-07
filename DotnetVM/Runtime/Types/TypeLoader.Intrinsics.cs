@@ -103,6 +103,7 @@ public sealed partial class TypeLoader {
         Add(argumentException);
         Add(new VmIntrinsicType { Namespace = "System", Name = "ArgumentOutOfRangeException", IsValue = false, Parent = argumentException });
         Add(new VmIntrinsicType { Namespace = "System", Name = "ArgumentNullException", IsValue = false, Parent = argumentException });
+        Add(new VmIntrinsicType { Namespace = "System.Collections.Generic", Name = "KeyNotFoundException", IsValue = false, Parent = systemException });
         Add(new VmIntrinsicType { Namespace = "System.Globalization", Name = "CultureNotFoundException", IsValue = false, Parent = argumentException });
         foreach (var name in new[] { "EncoderFallbackException", "DecoderFallbackException" })
             Add(new VmIntrinsicType { Namespace = "System.Text", Name = name, IsValue = false, Parent = argumentException });

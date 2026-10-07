@@ -91,20 +91,34 @@ public sealed partial class Interpreter {
                 arguments[i] = StackSlot.OfValueType(sv.Clone());
     }
 
+    private static void CloneStructArgs(VmMethod method, Span<StackSlot> arguments) {
+        var start = method.Signature.HasThis ? 1 : 0;
+        for (var i = start; i < arguments.Length; i++)
+            if (arguments[i].Kind == StackKind.ValueType && arguments[i].ObjectValue is VmStructValue sv)
+                arguments[i] = StackSlot.OfValueType(sv.Clone());
+    }
+
     /// <summary>値型ローカルの既定値を VmStructValue で実体化する (InterpreterFrame はローダ無しで null を置くため)。
     /// !n / !!n ローカルは frame.Context の実引数で置換してから判定する。</summary>
     private void FixupStructLocals(InterpreterFrame frame) {
         var engines = EnginesFor(frame.Method);
+        if (!frame.TryGetCachedLocalResolution(frame.Method, frame.Context, out var resolvedTypes)) {
+            resolvedTypes = new VmType?[frame.LocalTypes.Length];
+            for (var i = 0; i < frame.LocalTypes.Length; i++) {
+                var sigType = frame.LocalTypes[i];
+                if (sigType.Kind is not (SigKind.TypeToken or SigKind.GenericInst
+                    or SigKind.GenericVar or SigKind.GenericMethodVar))
+                    continue;
+                resolvedTypes[i] = engines.Services.Loader.ResolveToken(sigType, frame.Context);
+            }
+            frame.CacheLocalResolution(frame.Method, frame.Context, resolvedTypes);
+        }
         for (var i = 0; i < frame.Locals.Length; i++) {
             ref var slot = ref frame.Locals[i];
             if (slot.Kind != StackKind.Object || slot.ObjectValue is not null)
                 continue;
-            var sigType = frame.LocalTypes[i];
-            if (sigType.Kind is not (SigKind.TypeToken or SigKind.GenericInst
-                or SigKind.GenericVar or SigKind.GenericMethodVar))
-                continue;
-            var type = engines.Services.Loader.ResolveToken(sigType, frame.Context);
-            if (type.IsValueType)
+            var type = resolvedTypes[i];
+            if (type is { IsValueType: true })
                 slot = engines.Services.Objects.DefaultForType(type, engines.Services.Loader);
         }
     }

@@ -10,6 +10,13 @@ internal sealed class VmExecutionCoordinator {
     [ThreadStatic] private static Dictionary<VmExecutionCoordinator, int>? s_instructionDepth;
     [ThreadStatic] private static VmExecutionCoordinator? s_fastInstructionOwner;
     [ThreadStatic] private static int s_fastInstructionDepth;
+    [ThreadStatic] private static int s_guestInstructionDepth;
+
+    // A guest instruction already runs under the coordinator's shared lease.
+    // VmByRef uses this marker to avoid taking a second monitor around a VM
+    // storage slot on the same hot path. It is thread-local so independent
+    // guest workers never observe one another's execution state.
+    internal static bool IsGuestExecutionActive => s_guestInstructionDepth > 0;
 
     public bool IsExecutingOnCurrentThread => _world.IsReadLockHeld;
     public bool IsInsideGuestInstruction => ReferenceEquals(s_fastInstructionOwner, this)
@@ -29,7 +36,17 @@ internal sealed class VmExecutionCoordinator {
     /// </summary>
     public InstructionBatchLease EnterInstructionBatch() {
         _world.EnterReadLock();
-        return new InstructionBatchLease(_world);
+        try {
+            // The batch is the guest-instruction critical section. Keeping the
+            // depth marker for the whole bounded batch preserves the rule that
+            // nested host calls cannot collect halfway through an instruction,
+            // while avoiding two ThreadStatic operations per instruction.
+            EnterInstructionDepth();
+            return new InstructionBatchLease(this, _world);
+        } catch {
+            _world.ExitReadLock();
+            throw;
+        }
     }
 
     // This is deliberately a value lease.  Guest instructions are the hottest
@@ -53,6 +70,7 @@ internal sealed class VmExecutionCoordinator {
     }
 
     private void ExitInstruction(bool ownsReadLock) {
+        s_guestInstructionDepth--;
         if (ReferenceEquals(s_fastInstructionOwner, this)) {
             if (--s_fastInstructionDepth == 0)
                 s_fastInstructionOwner = null;
@@ -70,6 +88,7 @@ internal sealed class VmExecutionCoordinator {
     }
 
     private void EnterInstructionDepth() {
+        s_guestInstructionDepth++;
         if (ReferenceEquals(s_fastInstructionOwner, this)) {
             s_fastInstructionDepth++;
             return;
@@ -113,6 +132,7 @@ internal sealed class VmExecutionCoordinator {
         for (var i = 0; i < readDepth; i++)
             _world.ExitReadLock();
         if (instructionDepth > 0) {
+            s_guestInstructionDepth -= instructionDepth;
             if (ReferenceEquals(s_fastInstructionOwner, this)) {
                 s_fastInstructionOwner = null;
                 s_fastInstructionDepth = 0;
@@ -137,11 +157,22 @@ internal sealed class VmExecutionCoordinator {
     }
 
     internal struct InstructionBatchLease : IDisposable {
+        private VmExecutionCoordinator? _owner;
         private ReaderWriterLockSlim? _world;
 
-        internal InstructionBatchLease(ReaderWriterLockSlim world) => _world = world;
+        internal InstructionBatchLease(VmExecutionCoordinator owner, ReaderWriterLockSlim world) {
+            _owner = owner;
+            _world = world;
+        }
 
-        public void Dispose() => Interlocked.Exchange(ref _world, null)?.ExitReadLock();
+        public void Dispose() {
+            var world = Interlocked.Exchange(ref _world, null);
+            if (world is null)
+                return;
+            _owner!.ExitInstruction(ownsReadLock: false);
+            world.ExitReadLock();
+            _owner = null;
+        }
     }
 
     internal struct InstructionLease : IDisposable {
@@ -191,10 +222,11 @@ internal sealed class VmExecutionCoordinator {
                     s_fastInstructionOwner = owner;
                     s_fastInstructionDepth = instructionDepth;
                 } else {
-                    var depths = s_instructionDepth ??= new Dictionary<VmExecutionCoordinator, int>();
-                    depths[owner] = depths.GetValueOrDefault(owner) + instructionDepth;
-                }
+                var depths = s_instructionDepth ??= new Dictionary<VmExecutionCoordinator, int>();
+                depths[owner] = depths.GetValueOrDefault(owner) + instructionDepth;
             }
+            s_guestInstructionDepth += instructionDepth;
+        }
         }
     }
 

@@ -10,6 +10,7 @@ internal sealed partial class CallEngine {
         _targetCache.Clear();
         _methodDefTargets.Clear();
         _memberRefIntrinsicTargets.Clear();
+        _callContexts.Clear();
         lock (_virtualTargetGate) {
             Interlocked.Increment(ref _virtualTargetVersion);
             _virtualTargets.Clear();

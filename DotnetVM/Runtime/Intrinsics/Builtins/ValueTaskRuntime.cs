@@ -34,10 +34,7 @@ internal static class ValueTaskRuntime {
             ? "System.Threading.Tasks.ValueTask`1" : "System.Threading.Tasks.ValueTask")
             ?? throw new InvalidOperationException("ValueTask facade が見つかりません。");
         VmType constructed = generic
-            ? new VmConstructedType {
-                Definition = valueTaskType,
-                TypeArguments = [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!],
-            }
+            ? ctx.ConstructedType(valueTaskType, resultType ?? ctx.Types.FindIntrinsicType("System.Object")!)
             : valueTaskType;
         return StackSlot.OfValueType(new VmStructValue(constructed,
             [source, StackSlot.OfInt32(token)],
@@ -108,10 +105,7 @@ internal static class ValueTaskRuntime {
             ? "System.Threading.Tasks.Task`1" : "System.Threading.Tasks.Task")
             ?? throw new InvalidOperationException("Task facade が見つかりません。");
         VmType taskType = generic
-            ? new VmConstructedType {
-                Definition = taskDefinition,
-                TypeArguments = [resultType ?? ctx.Types.FindIntrinsicType("System.Object")!],
-            }
+            ? ctx.ConstructedType(taskDefinition, resultType ?? ctx.Types.FindIntrinsicType("System.Object")!)
             : taskDefinition;
         var task = ctx.Heap.Allocate(ctx.Shared.GuestTasks.Create(taskType));
         var sourceValue = Read(source);
@@ -145,10 +139,7 @@ internal static class ValueTaskRuntime {
         bool generic, short token, int flags) {
         var actionDefinition = ctx.Types.FindIntrinsicType("System.Action`1")
             ?? throw new InvalidOperationException("Action<T> facade が見つかりません。");
-        var actionType = new VmConstructedType {
-            Definition = actionDefinition,
-            TypeArguments = [ctx.Types.FindIntrinsicType("System.Object")!],
-        };
+        var actionType = ctx.ConstructedType(actionDefinition, ctx.Types.FindIntrinsicType("System.Object")!);
         GuestTaskRuntime.ExternalContinuation? registration = null;
         var callback = ctx.Heap.Allocate(new VmDelegate {
             DeclaredType = actionType,

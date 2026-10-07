@@ -30,6 +30,7 @@ internal sealed class InterpreterServices(
     public IntrinsicContext IntrinsicContext { get; } = intrinsicContext;
     public ExecutionTracer? Tracer { get; } = tracer;
     public VmCoreLibSurfaces? CoreLibSurfaces { get; } = coreLibSurfaces;
+    public VmSharedState Shared => IntrinsicContext.Shared;
 
     /// <summary>オブジェクトモデル (レイアウト/静的ストレージ)。VM インスタンスごとの状態。</summary>
     public ObjectModel Objects { get; } = new(heap.ChargeInlineValueStorage);

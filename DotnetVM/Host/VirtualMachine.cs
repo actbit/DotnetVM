@@ -29,6 +29,8 @@ public sealed class VirtualMachine : IDisposable {
     private readonly HashSet<TypeLoader> _hostImageChargedLoaders = [];
     private readonly HashSet<VmAssemblyContext> _assemblyContexts = [];
     private readonly object _assemblyGate = new();
+    private readonly object _invokeMethodCacheGate = new();
+    private readonly Dictionary<InvokeMethodCacheKey, VmMethod> _invokeMethodCache = [];
     private readonly VmAssemblyContext _context;
     private readonly VmAssemblyLoadContext _defaultAssemblyLoadContext;
     private readonly VmSharedState _sharedState;
@@ -42,6 +44,8 @@ public sealed class VirtualMachine : IDisposable {
     private readonly Func<IEnumerable<VmObject?>> _guestThreadRoots;
     private readonly Func<IEnumerable<StackSlot[]>> _guestTaskRoots;
     private int _disposed;
+
+    private readonly record struct InvokeMethodCacheKey(string TypeFullName, string MethodName, int ArgumentCount);
 
     /// <summary>命令ブレークポイントとステップ実行を提供するデバッガ。</summary>
     public VmDebugger Debugger { get; }
@@ -266,6 +270,7 @@ public sealed class VirtualMachine : IDisposable {
             foreach (var loader in loaders)
                 context.Unregister(loader);
             _assemblyContexts.Remove(context);
+            ClearInvokeMethodCache();
         }
     }
 
@@ -287,7 +292,11 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>GC を起動し統計を返す (通常はアロケーション間隔で自動起動。明示起動はホスト用)。</summary>
     public GcStatistics CollectGarbage() {
         ThrowIfDisposed();
-        return RunGuest(() => GetInterpreter().CollectGarbage());
+        try {
+            return GetInterpreter().CollectGarbage();
+        } catch (VmGuestThrow guest) {
+            throw new UnhandledGuestException(guest.ExceptionTypeName, guest.MessageText);
+        }
     }
 
     /// <summary>ロード済みアセンブリの型ローダ。</summary>
@@ -411,6 +420,7 @@ public sealed class VirtualMachine : IDisposable {
         lock (_assemblyGate) {
             context.Register(loader);
             _loaders.Add(loader);
+            ClearInvokeMethodCache();
         }
         try {
             loader.CompletePendingTypes();
@@ -502,6 +512,11 @@ public sealed class VirtualMachine : IDisposable {
 
     /// <summary>静的メソッドを解決する (名前 + 引数個数 + 変換可能性で最良の候補を選ぶ)。</summary>
     private VmMethod FindMethod(string typeFullName, string methodName, object?[] args) {
+        var cacheKey = new InvokeMethodCacheKey(typeFullName, methodName, args.Length);
+        lock (_invokeMethodCacheGate)
+            if (_invokeMethodCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+
         var type = FindType(typeFullName);
 
         var candidates = type.Methods
@@ -514,7 +529,17 @@ public sealed class VirtualMachine : IDisposable {
         if (candidates.Count == 0)
             throw new ArgumentException(
                 $"メソッド '{typeFullName}::{methodName}' (引数 {args.Length} 個) の静的な候補が見つかりません。");
+        // Cache only an unambiguous name/arity. Overloaded methods continue to
+        // use the existing conversion/exactness selection for every call.
+        if (candidates.Count == 1)
+            lock (_invokeMethodCacheGate)
+                _invokeMethodCache[cacheKey] = candidates[0];
         return candidates[0];
+    }
+
+    private void ClearInvokeMethodCache() {
+        lock (_invokeMethodCacheGate)
+            _invokeMethodCache.Clear();
     }
 
     private VmClassType FindType(string typeFullName) {

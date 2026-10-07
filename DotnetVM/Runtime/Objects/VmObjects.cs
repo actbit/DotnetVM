@@ -23,6 +23,8 @@ internal sealed class VmBclObject(VmType type) : VmObject {
 /// <summary>クラスのインスタンス。フィールドは宣言順 (基底型フィールドが先頭) のスロット配列。</summary>
 public sealed class VmClassInstance : VmObject {
     private readonly VmClassType _classType;
+    private VmType? _runtimeType;
+    private GenericContext? _classGenericContext;
     public readonly StackSlot[] Fields;
     /// <summary>AssemblyLoadContext 派生ゲストクラスの base .ctor が接続する VM ハンドル。</summary>
     internal VmAssemblyLoadContext? AssemblyLoadContextHandle { get; set; }
@@ -40,10 +42,19 @@ public sealed class VmClassInstance : VmObject {
     public VmType[] TypeArguments { get; }
 
     /// <summary>実行時型 (ジェネリック型なら構築型、それ以外は ClassType)。</summary>
-    public VmType RuntimeType =>
-        TypeArguments.Length > 0
-            ? new VmConstructedType { Definition = _classType, TypeArguments = TypeArguments }
-            : _classType;
+    public VmType RuntimeType => _runtimeType ??= (TypeArguments.Length > 0
+        ? new VmConstructedType { Definition = _classType, TypeArguments = TypeArguments }
+        : _classType);
+
+    /// <summary>
+    /// このインスタンスの型引数だけを持つ呼出コンテキスト。
+    /// ジェネリック型自身に宣言された非ジェネリックメソッドの呼出しでは、
+    /// 引数配列が変わらないためフレーム間で安全に共有できる。
+    /// </summary>
+    internal GenericContext? ClassGenericContext =>
+        TypeArguments.Length == 0
+            ? null
+            : _classGenericContext ??= GenericContext.Of(TypeArguments, null);
 }
 
 /// <summary>ボックス化された値 (ヒープオブジェクト)。Fields[0] に値を保持 (構造体は展開済みフィールド列)。</summary>
@@ -333,6 +344,10 @@ public sealed class VmArray : VmObject {
     public override VmType Type => _arrayType;
     public VmArrayType ArrayType => _arrayType;
     public int Length => Elements.Length;
+
+
+    internal VmByRef ElementReference(int index, bool isReadOnly) =>
+        new(Elements, index, isReadOnly, this, _arrayType.ElementType);
 }
 
 /// <summary>
@@ -344,15 +359,37 @@ public sealed class VmStructValue {
 
     /// <summary>ジェネリック構造体の実引数 (非ジェネリック型は空)。Clone 時に引き継ぐ。</summary>
     public VmType[] TypeArguments { get; }
+    private readonly bool _canShareCopy;
 
     public VmStructValue(VmType structType, StackSlot[] fields, VmType[]? typeArguments = null) {
         StructType = structType;
         Fields = fields;
         TypeArguments = typeArguments ?? [];
+        _canShareCopy = IsShareableReferenceLengthType(structType, fields.Length);
+    }
+
+    private static bool IsShareableReferenceLengthType(VmType structType, int fieldCount) {
+        var definition = structType is VmConstructedType constructed
+            ? constructed.Definition as VmClassType
+            : structType as VmClassType;
+        if (definition?.Loader?.IsTrustedCoreLib != true || fieldCount != 2)
+            return false;
+        VmField? reference = null;
+        VmField? length = null;
+        foreach (var field in definition.Fields) {
+            if (field.IsStatic || field.IsLiteral)
+                continue;
+            if (field.Name == "_reference") reference = field;
+            else if (field.Name == "_length") length = field;
+        }
+        return reference?.FieldType is VmByRefType &&
+            string.Equals(length?.FieldType?.FullName, "System.Int32", StringComparison.Ordinal);
     }
 
     /// <summary>値型コピー意味論: フィールドを深コピーする (ネストした構造体は再帰コピー、参照は共有)。</summary>
     public VmStructValue Clone() {
+        if (_canShareCopy)
+            return this;
         var copy = new StackSlot[Fields.Length];
         for (var i = 0; i < Fields.Length; i++)
             copy[i] = Fields[i].ObjectValue is VmStructValue nested ? StackSlot.OfValueType(nested.Clone()) : Fields[i];
@@ -439,6 +476,13 @@ public sealed class VmRuntimeMethod : VmObject {
     public required VmMethod Target { get; init; }
     public VmType? ReflectedType { get; init; }
     public VmType[] MethodArguments { get; init; } = [];
+
+    // Reflection metadata is immutable for a VmRuntimeMethod. Cache the
+    // resolved signature once so repeated Invoke calls do not rebuild the
+    // same generic context and token-resolved parameter types.
+    internal VmType[]? InvocationParameterTypes { get; set; }
+    internal VmType? InvocationReturnType { get; set; }
+    internal GenericContext? InvocationContext { get; set; }
 
     public override VmType Type => ManagedInstance?.Type ?? MethodBaseFacade;
 }

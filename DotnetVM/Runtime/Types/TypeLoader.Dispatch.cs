@@ -20,6 +20,9 @@ public sealed partial class TypeLoader {
     /// <summary>スロットキー用にパラメータ型列 (SigType) を VmType 列へ解決する。
     /// 1 つでも解決できない型があれば null (呼出側はパラメータ数照合にフォールバック)。</summary>
     internal VmType[]? TryResolveSlotParams(SigType[] paramTypes) {
+        if (_resolvedSlotParams.TryGetValue(paramTypes, out var cached))
+            return cached;
+
         var result = new VmType[paramTypes.Length];
         for (var i = 0; i < paramTypes.Length; i++) {
             try {
@@ -28,6 +31,15 @@ public sealed partial class TypeLoader {
                 or InvalidOperationException or KeyNotFoundException or AssemblyDependencyNotFoundException) {
                 return null;
             }
+        }
+
+        // CWT itself is thread-safe, but Add can race with another resolver.
+        // Serialize only the cold insertion path; every repeated dispatch lookup
+        // stays on the lock-free TryGetValue path above.
+        lock (_resolvedSlotParams) {
+            if (_resolvedSlotParams.TryGetValue(paramTypes, out cached))
+                return cached;
+            _resolvedSlotParams.Add(paramTypes, result);
         }
         return result;
     }

@@ -1,4 +1,6 @@
 using System.Runtime.CompilerServices;
+using System.Buffers;
+using DotnetVM.Runtime.Types;
 
 namespace DotnetVM.Runtime.Execution;
 
@@ -32,6 +34,12 @@ public enum StackKind : byte {
 /// </summary>
 public struct StackSlot {
     public StackKind Kind;
+    // A small set of CoreLib value facades can carry a primitive payload
+    // directly in the slot. InlineKind/InlineType are empty for ordinary
+    // slots, so the representation remains compatible with existing VM
+    // values while avoiding a temporary VmStructValue for scalar wrappers.
+    internal StackKind InlineKind;
+    internal VmType? InlineType;
 
     // プリミティブ共用体 (Kind で解釈を決定)
     public long Int64Value;
@@ -52,6 +60,29 @@ public struct StackSlot {
     public static StackSlot OfByRef(object reference) => new() { Kind = StackKind.ByRef, ObjectValue = reference };
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static StackSlot OfValueType(object structValue) => new() { Kind = StackKind.ValueType, ObjectValue = structValue };
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static StackSlot OfInlineValue(VmType type, in StackSlot value) => new() {
+        Kind = StackKind.ValueType,
+        InlineKind = value.Kind,
+        InlineType = type,
+        Int64Value = value.Int64Value,
+        DoubleValue = value.DoubleValue,
+    };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetInlineValue(out StackSlot value) {
+        if (Kind == StackKind.ValueType && InlineType is not null &&
+            InlineKind is StackKind.Int32 or StackKind.Int64 or StackKind.NativeInt or StackKind.IntPtr or StackKind.Float) {
+            value = new StackSlot {
+                Kind = InlineKind,
+                Int64Value = Int64Value,
+                DoubleValue = DoubleValue,
+            };
+            return true;
+        }
+        value = default;
+        return false;
+    }
     public static StackSlot Null => new() { Kind = StackKind.Object, ObjectValue = null };
 
     public int AsInt32 => (int)Int64Value;
@@ -74,9 +105,10 @@ public struct StackSlot {
 /// 深いゲスト再帰でもホストスタックを消費しないようヒープ確保とする。
 /// </summary>
 public sealed class EvaluationStack {
-    private readonly StackSlot[] _slots;
+    private StackSlot[] _slots;
+    private bool _released;
     public int Count { get; private set; }
-    public readonly int MaxStack;
+    public int MaxStack { get; private set; }
     // Pop/Clear erase unused slots, so scanning this buffer at a stopped-world
     // boundary is equivalent to copying the active prefix, without allocation.
     internal StackSlot[] RootSlots => _slots;
@@ -89,13 +121,32 @@ public sealed class EvaluationStack {
         // Keep the actual capacity equal to that proof instead of silently
         // rounding hostile metadata up to eight slots.
         MaxStack = maxStack;
-        _slots = new StackSlot[this.MaxStack];
+        _slots = this.MaxStack == 0 ? [] : ArrayPool<StackSlot>.Shared.Rent(this.MaxStack);
+    }
+
+    /// <summary>
+    /// Rebind this stack to a recycled interpreter frame. Keeping the backing
+    /// storage in the frame pool avoids a rent/return pair and, more
+    /// importantly, avoids retaining guest references between invocations.
+    /// </summary>
+    internal void PrepareForReuse(int maxStack) {
+        if (maxStack < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxStack));
+        if (maxStack > _slots.Length) {
+            if (_slots.Length != 0)
+                ArrayPool<StackSlot>.Shared.Return(_slots);
+            _slots = maxStack == 0 ? [] : ArrayPool<StackSlot>.Shared.Rent(maxStack);
+        }
+        Array.Clear(_slots);
+        MaxStack = maxStack;
+        Count = 0;
+        _released = false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Push(in StackSlot slot) {
         var index = Count;
-        if ((uint)index >= (uint)_slots.Length)
+        if ((uint)index >= (uint)MaxStack)
             throw new BadImageFormatException(
                 $"評価スタックがオーバーフローしました (Count={index}, MaxStack={MaxStack})。");
         _slots[index] = slot;
@@ -151,14 +202,73 @@ public sealed class EvaluationStack {
         return _slots.AsSpan(count - arity, arity);
     }
 
+    /// <summary>
+    /// Copy and remove call arguments without constructing an intermediate
+    /// Span or running the general DropArguments path. The one- and two-slot
+    /// cases dominate ordinary managed calls, so keep those copies explicit.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void TakeArguments(int arity, Span<StackSlot> destination) {
+        var count = Count;
+        if ((uint)arity > (uint)count || destination.Length < arity)
+            throw new BadImageFormatException("評価スタックに呼出引数が足りません。");
+        var start = count - arity;
+        if (arity == 0) {
+            Count = start;
+            return;
+        }
+        if (arity == 1) {
+            destination[0] = _slots[start];
+            _slots[start] = default;
+        } else if (arity == 2) {
+            destination[0] = _slots[start];
+            destination[1] = _slots[start + 1];
+            _slots[start] = default;
+            _slots[start + 1] = default;
+        } else {
+            _slots.AsSpan(start, arity).CopyTo(destination);
+            _slots.AsSpan(start, arity).Clear();
+        }
+        Count = start;
+    }
+
+
     internal void DropArguments(int arity) {
         ArgumentSlots(arity).Clear();
         Count -= arity;
     }
 
+
+    /// <summary>
+    /// Update the active prefix after a generated JIT frame has manipulated
+    /// the backing slots through its verified stack pointer. The JIT keeps
+    /// the pointer in a register between safepoints, while the ordinary
+    /// interpreter continues to use the checked Push/Pop API.
+    /// </summary>
+    internal void SetCountForJit(int count) {
+        if ((uint)count > (uint)MaxStack)
+            throw new BadImageFormatException("JIT 評価スタックの深さが検証済み上限を超えました。");
+        Count = count;
+    }
+
     public void Clear() {
         Array.Clear(_slots, 0, Count);
         Count = 0;
+    }
+
+    /// <summary>
+    /// Return the backing storage after the frame has been removed from the
+    /// VM root set. Pooled arrays are cleared completely so a later frame
+    /// cannot observe or retain guest references from this execution.
+    /// </summary>
+    internal void Release() {
+        if (_released)
+            return;
+        _released = true;
+        if (_slots.Length == 0)
+            return;
+        Array.Clear(_slots);
+        ArrayPool<StackSlot>.Shared.Return(_slots);
     }
 
     /// <summary>現在有効なスロットのコピー (GC ルート走査用。下から順)。</summary>

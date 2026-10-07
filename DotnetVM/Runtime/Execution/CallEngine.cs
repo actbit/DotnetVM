@@ -32,9 +32,28 @@ internal sealed partial class CallEngine(
     // generic caller context.  Cache their target object so a hot guest call
     // does not allocate and populate the same CallTarget on every iteration.
     private readonly ConcurrentDictionary<int, CallTarget> _methodDefTargets = new();
+    // VM-local cache for promoted instance targets reached from compiled call
+    // sites. It avoids repeating the loader/cache lookup on every helper call.
+    private readonly ConcurrentDictionary<VmMethod, JitCompiledMethod> _nestedCompiledMethods = new();
+    // Generic receiver contexts are immutable loader-owned identities once a
+    // call target has been resolved. Reuse them across short-lived JIT frames
+    // so generic CoreLib calls do not allocate a new context and redo
+    // inheritance argument resolution on every helper invocation.
+    private readonly ConcurrentDictionary<CallContextKey, GenericContext> _callContexts = new();
     // Only successful intrinsic MemberRefs are cached, after registry sealing.
     // Entries are loader-local, bounded by the image's MemberRef rows, and
     // invalidated whenever the root context's assembly set changes.
     private readonly ConcurrentDictionary<int, CachedIntrinsicTarget> _memberRefIntrinsicTargets = new();
+    // Binding resolution includes signature token substitution and can be much
+    // more expensive than the actual host callback. Cache only positive,
+    // sealed-registry results, keyed by the exact generic argument arrays and
+    // caller security domain.
+    private readonly ConcurrentDictionary<BindingCacheKey, BindingResolution> _bindingResolutions = new();
     private sealed record CachedIntrinsicTarget(VmAssemblyContext Context, long Version, CallTarget Target);
+
+    private readonly record struct BindingCacheKey(
+        VmMethod Method, VmType[]? MethodArgs, VmType[]? ClassArgs, BindingDomain CallerDomain);
 }
+
+internal readonly record struct CallContextKey(CallTarget Target, VmMethod Method,
+    VmType ReceiverType);

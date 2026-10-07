@@ -60,6 +60,14 @@ public class SpanReaderTests {
         Assert.Equal(-123456, reader.ReadSLEB128());
     }
 
+    [Theory]
+    [InlineData(new byte[] { 0x80, 0x80, 0x80, 0x80, 0x10 })]
+    [InlineData(new byte[] { 0x80, 0x80, 0x80, 0x80, 0x08 })]
+    [InlineData(new byte[] { 0x80, 0x80, 0x80, 0x80, 0xF8 })]
+    public void ReadSLEB128_RejectsNonSignExtendedFifthGroup(byte[] bytes) {
+        Assert.Throws<FormatException>(() => new SpanReader(bytes).ReadSLEB128());
+    }
+
     [Fact]
     public void Overrun_Throws() {
         // SpanReader は ref struct なのでラムダで掴めず、try/catch で検証する

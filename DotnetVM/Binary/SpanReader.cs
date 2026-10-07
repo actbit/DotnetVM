@@ -94,20 +94,36 @@ public ref struct SpanReader {
     /// <summary>sleb128 符号付き可変長整数。</summary>
     public int ReadSLEB128() {
         int result = 0;
-        int shift = 0;
-        byte b;
-        do {
-            b = ReadByte();
-            result |= (b & 0x7F) << shift;
-            shift += 7;
-            if (shift > 35)
-                throw new FormatException("sleb128 が長すぎます。");
-        } while ((b & 0x80) != 0);
+        for (var group = 0; group < 5; group++) {
+            var b = ReadByte();
+            var payload = b & 0x7F;
 
-        // 符号拡張 (7の倍数ビット幅)
-        if (shift < 32 && (b & 0x40) != 0)
-            result |= -1 << shift;
-        return result;
+            // Int32 has only four payload bits left in the fifth group. The
+            // remaining bits must be a sign extension; otherwise malformed
+            // values would be silently truncated to a different Int32.
+            if (group == 4) {
+                var negative = (payload & 0x08) != 0;
+                var extension = payload & 0x70;
+                if (negative ? extension != 0x70 : extension != 0)
+                    throw new FormatException("sleb128 の 5 バイト目が Int32 の符号拡張になっていません。");
+                if ((b & 0x80) != 0)
+                    throw new FormatException("sleb128 が長すぎます。");
+                result |= payload << 28;
+                return result;
+            }
+
+            result |= payload << (group * 7);
+            if ((b & 0x80) == 0) {
+                var shift = (group + 1) * 7;
+                // 符号拡張 (7の倍数ビット幅)
+                if ((b & 0x40) != 0)
+                    result |= -1 << shift;
+                return result;
+            }
+        }
+
+        // The fifth group always returns or throws, so this is unreachable.
+        throw new FormatException("sleb128 が長すぎます。");
     }
 
     /// <summary>ECMA-335 II.23.2 の圧縮符号なし整数。1/2/4バイト可変。</summary>

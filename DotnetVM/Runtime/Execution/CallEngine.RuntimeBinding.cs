@@ -7,6 +7,7 @@ using DotnetVM.Runtime.Heap;
 using DotnetVM.Runtime.Intrinsics;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
+using DotnetVM.Runtime;
 
 namespace DotnetVM.Runtime.Execution;
 
@@ -74,10 +75,22 @@ internal sealed partial class CallEngine {
     /// </summary>
     private static bool IsAllowedRuntimeBindingType(VmType? type) => type switch {
         VmIntrinsicType => true,
-        VmClassType cls => cls.Loader?.IsTrustedCoreLib == true || cls.Loader?.IsTrustedVmCoreLib == true || cls.Loader?.IsTrustedBcl == true,
+        VmClassType cls => cls.Loader?.IsTrustedCoreLib == true || cls.Loader?.IsTrustedVmCoreLib == true ||
+            cls.Loader?.IsTrustedBcl == true || cls.Loader?.IsAbiImported == true,
         VmConstructedType constructed => IsAllowedRuntimeBindingType(constructed.Definition),
         _ => false,
     };
+
+    /// <summary>ABI 取り込み画像で managed IL を明示的に優先するか。</summary>
+    private static bool PrefersManagedIl(VmType? type) => type switch {
+        VmClassType cls => cls.Loader?.AbiExecutionMode == AbiExecutionMode.ManagedIl,
+        VmConstructedType constructed => PrefersManagedIl(constructed.Definition),
+        _ => false,
+    };
+
+    /// <summary>ABI 取り込み画像でホストブリッジを必須にするか。</summary>
+    private static bool RequiresHostBridge(VmMethod method) =>
+        method.Loader?.AbiExecutionMode == AbiExecutionMode.HostBridge;
 
     /// <summary>
     /// Runtime binding は型の provenance が確認できた場合だけ試行する。以前は同じ FullName
@@ -187,15 +200,51 @@ internal sealed partial class CallEngine {
         }
     }
 
-    /// <summary>caller domain を考慮したバインド照合。trusted caller は特権面を優先し、
-    /// 汎用面にも到達できる。guest caller は汎用面のみ (特権面は遮断)。</summary>
-    private bool TryGetBindingWithCaller(BindingKey guestKey, BindingDomain callerDomain, out IntrinsicImpl impl) {
-        if (callerDomain == BindingDomain.TrustedCoreLib) {
-            var trustedKey = guestKey.WithDomain(BindingDomain.TrustedCoreLib);
-            if (_intrinsics.TryGetBinding(trustedKey, out impl, out _, callerDomain))
+    /// <summary>ABI 画像にスコープした面を先に照合し、既存のグローバル面へ後退する。</summary>
+    private bool TryGetBindingForType(VmType? resolvedType, BindingKey guestKey,
+        BindingDomain callerDomain, out IntrinsicImpl impl) {
+        if (TryGetBindingForType(resolvedType, guestKey, callerDomain, out impl, out _))
+            return true;
+        impl = null!;
+        return false;
+    }
+
+    private bool TryGetBindingForType(VmType? resolvedType, BindingKey guestKey,
+        BindingDomain callerDomain, out IntrinsicImpl impl, out BindingOrigin origin) {
+        if (resolvedType is not null && TryGetAbiIdentity(resolvedType, out var identity)) {
+            if (callerDomain == BindingDomain.TrustedCoreLib) {
+                var trustedKey = guestKey.WithDomain(BindingDomain.TrustedCoreLib);
+                if (_intrinsics.TryGetAbiBinding(identity, trustedKey, out impl, out origin, callerDomain))
+                    return true;
+            }
+            if (_intrinsics.TryGetAbiBinding(identity, guestKey, out impl, out origin, callerDomain))
                 return true;
         }
-        return _intrinsics.TryGetBinding(guestKey, out impl, out _, callerDomain);
+        if (callerDomain == BindingDomain.TrustedCoreLib) {
+            var trustedKey = guestKey.WithDomain(BindingDomain.TrustedCoreLib);
+            if (_intrinsics.TryGetBinding(trustedKey, out impl, out origin, callerDomain))
+                return true;
+        }
+        return _intrinsics.TryGetBinding(guestKey, out impl, out origin, callerDomain);
+    }
+
+    private static bool TryGetAbiIdentity(VmType type, out AssemblyIdentity identity) {
+        switch (type) {
+            case VmClassType cls when cls.Loader?.IsAbiImported == true:
+                identity = cls.Loader.Image.Identity;
+                return true;
+            case VmConstructedType constructed:
+                return TryGetAbiIdentity(constructed.Definition, out identity);
+            default:
+                identity = default;
+                return false;
+        }
+    }
+
+    private bool HasBindingForType(VmType type) {
+        return TryGetAbiIdentity(type, out var identity) &&
+            _intrinsics.HasAbiBindingForType(identity, type.FullName) ||
+            _intrinsics.HasBindingForType(type.FullName);
     }
 
     /// <summary>呼出解決地点 (TypeRef / 構築ファサード親) でのランタイムバインド照合。
@@ -203,15 +252,15 @@ internal sealed partial class CallEngine {
     /// 型名が解決できていないパラメータ (空文字列) が混ざる場合は照合しない。
     /// callerDomain は呼出元 loader から明示的に渡す (callee 基準にしない)。</summary>
     private bool TryGetResolvedBinding(string typeName, string name, bool hasThis, string[] paramTypeNames,
-        BindingDomain callerDomain, out IntrinsicImpl impl) {
+        BindingDomain callerDomain, out IntrinsicImpl impl, VmType? resolvedType = null) {
         impl = null!;
         if (paramTypeNames.Any(string.IsNullOrEmpty))
-            return TryGetBindingWithCaller(hasThis
+            return TryGetBindingForType(resolvedType, hasThis
                 ? BindingKey.InstanceAnyParams(typeName, name)
                 : BindingKey.StaticAnyParams(typeName, name), callerDomain, out impl);
         var key = hasThis ? BindingKey.Instance(typeName, name, paramTypeNames)
                           : BindingKey.Static(typeName, name, paramTypeNames);
-        return TryGetBindingWithCaller(key, callerDomain, out impl);
+        return TryGetBindingForType(resolvedType, key, callerDomain, out impl);
     }
 
     /// <summary>解決済みメソッドをランタイムバインド (署名キー) で呼び出す (優先順位 ①)。
@@ -232,8 +281,13 @@ internal sealed partial class CallEngine {
     private bool TryResolveBinding(VmMethod method, VmType[]? methodArgs, StackSlot[] args,
         BindingDomain callerDomain, VmType[]? classArgs, out BindingResolution resolution) {
         resolution = null!;
+        // ManagedIl is a method-level preference: methods with a body are
+        // re-executed in the VM, while native/no-body declarations may still
+        // use an explicitly registered bridge.
+        if (method.Body is not null && method.Loader?.AbiExecutionMode == AbiExecutionMode.ManagedIl)
+            return false;
         if (!CanAttemptRuntimeBinding(method.DeclaringType) ||
-            !_intrinsics.HasBindingForType(method.DeclaringType.FullName))
+            !HasBindingForType(method.DeclaringType))
             return false;
         var names = ParamTypeNamesOf(method, methodArgs, classArgs);
         if (names is null || names.Any(string.IsNullOrEmpty)) {
@@ -244,7 +298,7 @@ internal sealed partial class CallEngine {
             var anyKey = method.Signature.HasThis
                 ? BindingKey.InstanceAnyParams(method.DeclaringType.FullName, method.Name)
                 : BindingKey.StaticAnyParams(method.DeclaringType.FullName, method.Name);
-            if (!TryGetBindingWithCaller(anyKey, callerDomain, out var anyImpl))
+            if (!TryGetBindingForType(method.DeclaringType, anyKey, callerDomain, out var anyImpl))
                 return false;
             resolution = new BindingResolution(anyImpl, [], UseMethodDelegated: false);
             return true;
@@ -260,9 +314,9 @@ internal sealed partial class CallEngine {
             : BindingKey.StaticWithReturn(declaringName, method.Name, returnName, names);
         // callerDomain は呼出元フレーム基準 (引数で明示)。trusted caller は特権面を優先し、
         // 汎用面にも到達できる。guest caller は汎用面のみ。
-        var hasBinding = TryGetBindingWithCaller(key, callerDomain, out var impl);
+        var hasBinding = TryGetBindingForType(method.DeclaringType, key, callerDomain, out var impl);
         if (!hasBinding && returnName.Length != 0)
-            hasBinding = TryGetBindingWithCaller(key.WithAnyReturn(), callerDomain, out impl);
+            hasBinding = TryGetBindingForType(method.DeclaringType, key.WithAnyReturn(), callerDomain, out impl);
         // Existing managed compatibility bindings on a BCL virtual declaration
         // also cover its trusted BCL overrides. Guest overrides always run their
         // own IL. Remove the declaration binding when migrating that API to IL.
@@ -272,14 +326,14 @@ internal sealed partial class CallEngine {
             for (var parent = method.DeclaringType.BaseType; parent is not null; parent = parent.BaseType) {
                 if (!IsAllowedRuntimeBindingType(parent)) break;
                 var inherited = BindingKey.InstanceWithReturn(parent.FullName, method.Name, returnName, names).WithAnyReturn();
-                if (_intrinsics.TryGetBinding(inherited, out var existing, out var origin, callerDomain) && origin == BindingOrigin.Managed) {
+                if (TryGetBindingForType(parent, inherited, callerDomain, out var existing, out var origin) && origin == BindingOrigin.Managed) {
                     impl = existing; hasBinding = true; break;
                 }
             }
         }
         if (!hasBinding)
             hasBinding = TryInvokeOpenGenericBinding(method, methodArgs, names, returnName, callerDomain, args, out impl);
-        if (!hasBinding && TryGetBindingWithCaller(method.Signature.HasThis
+        if (!hasBinding && TryGetBindingForType(method.DeclaringType, method.Signature.HasThis
                 ? BindingKey.InstanceAnyParams(declaringName, method.Name)
                 : BindingKey.StaticAnyParams(declaringName, method.Name), callerDomain, out impl)) {
             resolution = new BindingResolution(impl, names, UseMethodDelegated: true);
@@ -322,10 +376,10 @@ internal sealed partial class CallEngine {
         var key = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(declaringName, method.Name, concreteReturn, concreteNames)
             : BindingKey.StaticWithReturn(declaringName, method.Name, concreteReturn, concreteNames);
-        if (_intrinsics.TryGetBinding(key.WithDomain(trustedDomain), out _, out _, trustedDomain))
+        if (TryGetBindingForType(method.DeclaringType, key.WithDomain(trustedDomain), trustedDomain, out _, out _))
             return true;
         if (concreteReturn.Length != 0 &&
-            _intrinsics.TryGetBinding(key.WithAnyReturn().WithDomain(trustedDomain), out _, out _, trustedDomain))
+            TryGetBindingForType(method.DeclaringType, key.WithAnyReturn().WithDomain(trustedDomain), trustedDomain, out _, out _))
             return true;
         // 開いたジェネリック面の特権有無も確認する
         var loader = method.Loader;
@@ -342,10 +396,10 @@ internal sealed partial class CallEngine {
         var openKey = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(declaringName, method.Name, openReturn, openNames)
             : BindingKey.StaticWithReturn(declaringName, method.Name, openReturn, openNames);
-        if (_intrinsics.TryGetBinding(openKey.WithDomain(trustedDomain), out _, out _, trustedDomain))
+        if (TryGetBindingForType(method.DeclaringType, openKey.WithDomain(trustedDomain), trustedDomain, out _, out _))
             return true;
         return openReturn.Length != 0 &&
-            _intrinsics.TryGetBinding(openKey.WithAnyReturn().WithDomain(trustedDomain), out _, out _, trustedDomain);
+            TryGetBindingForType(method.DeclaringType, openKey.WithAnyReturn().WithDomain(trustedDomain), trustedDomain, out _, out _);
     }
 
     /// <summary>開いたジェネリックキー (!!0 / !0) へのフォールバック照合 (優先順位 ① の救済)。
@@ -377,8 +431,8 @@ internal sealed partial class CallEngine {
         var openKey = method.Signature.HasThis
             ? BindingKey.InstanceWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames)
             : BindingKey.StaticWithReturn(method.DeclaringType.FullName, method.Name, openReturn, openNames);
-        if (!TryGetBindingWithCaller(openKey, callerDomain, out impl) &&
-            (openReturn.Length == 0 || !TryGetBindingWithCaller(openKey.WithAnyReturn(), callerDomain, out impl)))
+        if (!TryGetBindingForType(method.DeclaringType, openKey, callerDomain, out impl) &&
+            (openReturn.Length == 0 || !TryGetBindingForType(method.DeclaringType, openKey.WithAnyReturn(), callerDomain, out impl)))
             return false;
         return true;
     }

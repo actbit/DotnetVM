@@ -9,6 +9,8 @@ using DotnetVM.Runtime.Intrinsics;
 using DotnetVM.Runtime.Intrinsics.Builtins;
 using DotnetVM.Runtime.Objects;
 using DotnetVM.Runtime.Types;
+using DotnetVM.Runtime;
+using System.Reflection;
 
 namespace DotnetVM.Host;
 
@@ -117,10 +119,7 @@ public sealed class VirtualMachine : IDisposable {
     /// <summary>ホスト実行環境の本物の System.Private.CoreLib.dll をロードする
     /// (VmHostOptions.LoadHostCoreLib = true 時に VM 構築時に呼ぶ)。</summary>
     private void LoadHostCoreLib() {
-        var coreLibPath = typeof(object).Assembly.Location;
-        if (string.IsNullOrEmpty(coreLibPath))
-            throw new InvalidOperationException("ホストの System.Private.CoreLib.dll の場所を特定できません (Single-file 発行等)。");
-        LoadAssembly(coreLibPath);
+        ImportAssemblyAbi(typeof(object).Assembly);
         TypeLoader coreLibLoader;
         lock (_assemblyGate)
             coreLibLoader = _loaders.First(l => l.Image.Identity.Name == "System.Private.CoreLib");
@@ -172,7 +171,7 @@ public sealed class VirtualMachine : IDisposable {
             typeof(System.Security.Cryptography.SHA256).Assembly,
             typeof(System.Text.Encodings.Web.JavaScriptEncoder).Assembly,
         }.Distinct()) {
-            LoadAssembly(assembly.Location);
+            ImportAssemblyAbi(assembly);
             lock (_assemblyGate)
                 _loaders.Single(l => l.Image.Identity.Name == assembly.GetName().Name).IsTrustedBcl = true;
         }
@@ -323,8 +322,30 @@ public sealed class VirtualMachine : IDisposable {
         _intrinsics.RegisterBinding(key, impl, origin);
     }
 
+    /// <summary>
+    /// ABI とホストブリッジを AssemblyIdentity 単位で結び付ける。
+    /// <paramref name="abiAssembly"/> はこの VM から ABI として取り込んだ画像でなければならない。
+    /// 同じ型名・署名を持つ別 ABI 画像とは衝突しない。
+    /// </summary>
+    public void RegisterAbiBridge(AssemblyImage abiAssembly, BindingKey key, IntrinsicImpl impl,
+        BindingOrigin origin) {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(abiAssembly);
+        ArgumentNullException.ThrowIfNull(impl);
+        lock (_assemblyGate) {
+            if (!_loaders.Any(loader => ReferenceEquals(loader.Image, abiAssembly) && loader.IsAbiImported))
+                throw new InvalidOperationException(
+                    "ABI ブリッジの対象画像は、この VM に ImportAssemblyAbi で取り込まれている必要があります。");
+        }
+        _intrinsics.RegisterAbiBinding(abiAssembly.Identity, key, impl, origin);
+    }
+
     /// <summary>登録済みランタイムバインドの監査面 (キーと由来。監査テスト / 診断用)。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings => _intrinsics.Bindings;
+
+    /// <summary>ABI 画像ごとの登録済みブリッジの監査面。</summary>
+    public IReadOnlyList<(AssemblyIdentity Assembly, BindingKey Key, BindingOrigin Origin)> AbiBindings =>
+        _intrinsics.AbiBindings;
 
     /// <summary>登録済み legacy intrinsic キーの列挙 (監査テスト / 診断用)。</summary>
     public IEnumerable<IntrinsicKey> IntrinsicKeys => _intrinsics.Keys;
@@ -335,6 +356,83 @@ public sealed class VirtualMachine : IDisposable {
         ThrowIfDisposed();
         using var stream = File.OpenRead(path);
         return LoadAssemblyLoader(stream, Path.GetFullPath(path)).Image;
+    }
+
+    /// <summary>
+    /// ホストの CLR アセンブリを VM の ABI として取り込む。
+    /// アセンブリの ECMA-335 メタデータと managed IL は VM の型/呼出しモデルへ
+    /// 登録され、参照元と同じディレクトリにある依存 DLL は通常の AssemblyRef 解決で
+    /// 取り込まれる。CLR の Type/MethodInfo をそのまま実行する API ではない。
+    /// </summary>
+    /// <remarks>
+    /// この API は BCL と外部 managed ライブラリの取り込み入口を統一する。
+    /// InternalCall や P/Invoke は ABI が取り込まれただけでは実行可能にならず、
+    /// 対応する VM バインドまたはブリッジが必要である。未登録の native boundary は
+    /// 従来どおり fail-closed で拒否される。
+    /// </remarks>
+    public AssemblyImage ImportAssemblyAbi(Assembly assembly) =>
+        ImportAssemblyAbi(assembly, AbiExecutionMode.Auto);
+
+    /// <summary>ホストの CLR アセンブリを指定した ABI 実行方針で取り込む。</summary>
+    public AssemblyImage ImportAssemblyAbi(Assembly assembly, AbiExecutionMode executionMode) {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(assembly);
+        var path = assembly.Location;
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException(
+                $"アセンブリ '{assembly.FullName}' のファイル位置を特定できません。" +
+                "動的/単一ファイルのアセンブリは ImportAssemblyAbi(Stream, sourcePath) を使用してください。");
+        return ImportAssemblyAbi(path, executionMode);
+    }
+
+    /// <summary>
+    /// DLL の ECMA-335 ABI と managed IL をファイルから VM に取り込む。
+    /// <see cref="LoadAssembly(string)"/> と同じ安全なローダー経路を使用する、
+    /// ABI-first の明示的な入口である。
+    /// </summary>
+    public AssemblyImage ImportAssemblyAbi(string path) =>
+        ImportAssemblyAbi(path, AbiExecutionMode.Auto);
+
+    /// <summary>DLL を指定した ABI 実行方針でファイルから取り込む。</summary>
+    public AssemblyImage ImportAssemblyAbi(string path, AbiExecutionMode executionMode) {
+        ThrowIfDisposed();
+        ValidateAbiExecutionMode(executionMode);
+        using var stream = File.OpenRead(path);
+        var loader = LoadAssemblyLoader(stream, Path.GetFullPath(path));
+        ConfigureAbiImport(loader, executionMode);
+        return loader.Image;
+    }
+
+    /// <summary>
+    /// DLL の ECMA-335 ABI と managed IL をストリームから VM に取り込む。
+    /// 依存 DLL の自動探索が必要な場合は sourcePath を指定する。
+    /// </summary>
+    public AssemblyImage ImportAssemblyAbi(Stream peStream, string? sourcePath = null) =>
+        ImportAssemblyAbi(peStream, sourcePath, AbiExecutionMode.Auto);
+
+    /// <summary>DLL を指定した ABI 実行方針で、依存探索ヒントなしに取り込む。</summary>
+    public AssemblyImage ImportAssemblyAbi(Stream peStream, AbiExecutionMode executionMode) =>
+        ImportAssemblyAbi(peStream, null, executionMode);
+
+    /// <summary>DLL を指定した ABI 実行方針でストリームから取り込む。</summary>
+    public AssemblyImage ImportAssemblyAbi(Stream peStream, string? sourcePath,
+        AbiExecutionMode executionMode) {
+        ValidateAbiExecutionMode(executionMode);
+        var loader = LoadAssemblyLoader(peStream, sourcePath);
+        ConfigureAbiImport(loader, executionMode);
+        return loader.Image;
+    }
+
+    private static void ConfigureAbiImport(TypeLoader loader, AbiExecutionMode executionMode) {
+        ValidateAbiExecutionMode(executionMode);
+        loader.IsAbiImported = true;
+        loader.AbiExecutionMode = executionMode;
+    }
+
+    private static void ValidateAbiExecutionMode(AbiExecutionMode executionMode) {
+        if (!Enum.IsDefined(executionMode))
+            throw new ArgumentOutOfRangeException(nameof(executionMode), executionMode,
+                "未知の ABI 実行方針です。");
     }
 
     /// <summary>DLL アセンブリをストリームからロードする。

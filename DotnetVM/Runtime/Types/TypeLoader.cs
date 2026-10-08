@@ -1,6 +1,7 @@
 using DotnetVM.Metadata;
 using DotnetVM.Metadata.Signatures;
 using DotnetVM.Runtime.Objects;
+using DotnetVM.Runtime;
 using System.Runtime.CompilerServices;
 
 namespace DotnetVM.Runtime.Types;
@@ -70,6 +71,15 @@ public sealed partial class TypeLoader {
     // Host-selected BCL images may use explicit normalized runtime bindings, but
     // do not receive the privileged CoreLib caller domain.
     internal bool IsTrustedBcl { get; set; }
+
+    /// <summary>
+    /// ホストが ABI として明示的に取り込んだ画像か。
+    /// この印がある画像だけ、ホストが登録した外部バインドの対象になれる。
+    /// </summary>
+    internal bool IsAbiImported { get; set; }
+
+    /// <summary>ABI 取り込み時に選択された実行経路。</summary>
+    public AbiExecutionMode AbiExecutionMode { get; internal set; } = AbiExecutionMode.Auto;
 
     public TypeLoader(AssemblyImage image) {
         _image = image;

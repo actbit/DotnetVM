@@ -99,8 +99,17 @@ internal sealed partial class CallEngine {
                     var callerDomain = CallerDomainOfLoader();
                     var bindingType = TryResolveTypeRefForBinding(parent.Rid);
                     var bindingAllowed = CanAttemptRuntimeBinding(typeName, parent.Rid, bindingType);
-                    if (bindingAllowed &&
-                        TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound)) {
+                    // An ABI imported as ManagedIl must resolve a real method
+                    // before considering a bridge. Native/no-body declarations
+                    // still fall through to the bridge path.
+                    var managedIlMethod = PrefersManagedIl(bindingType) && bindingType is VmClassType managedIlType
+                        ? FindMethodThroughChain(managedIlType, name, signature.ParamTypes,
+                            genericParameterCount: signature.GenericParamCount)
+                        : null;
+                    var bindingAllowedForMode = bindingAllowed && managedIlMethod?.Body is null;
+                    if (bindingAllowedForMode &&
+                        TryGetResolvedBinding(typeName, name, signature.HasThis, paramNames, callerDomain, out var bound,
+                            bindingType)) {
                         return new CallTarget {
                             Arity = arity,
                     ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
@@ -117,10 +126,10 @@ internal sealed partial class CallEngine {
                     //  legacy の名前 + 引数個数照合は CoreLib の新しいため (ReadOnlySpan を取る
                     //  Concat 合成等) 誤経由する恐れがあり、IL 優先面では ② を先に見る。
                     //  IlPreferredFaces は型単位でなく面単位 (パラメータ型名一致) の IL 優先)
-                    if ((DelegateContinuingSurfaces.PrefersIl(typeName) ||
+                    if ((managedIlMethod is { Body: not null } || DelegateContinuingSurfaces.PrefersIl(typeName) ||
                          DelegateContinuingSurfaces.PrefersIlFace(typeName, name, paramNames)) &&
                         _loader.ResolveTypeRefType(parent.Rid) is VmClassType preferred) {
-                        var ilFirst = FindMethodThroughChain(preferred, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
+                        var ilFirst = managedIlMethod ?? FindMethodThroughChain(preferred, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
                         if (ilFirst is { Body: not null })
                             return new CallTarget {
                                 Arity = arity,
@@ -148,7 +157,7 @@ internal sealed partial class CallEngine {
                                 HasThis = faceMethod.Signature.HasThis,
                             };
                     }
-                    if (bindingAllowed &&
+                    if (bindingAllowedForMode &&
                         _intrinsics.TryGet(new IntrinsicKey(typeName, name, arity, signature.HasThis), out var impl))
                         return new CallTarget {
                             Arity = arity,
@@ -162,7 +171,7 @@ internal sealed partial class CallEngine {
                         };
                     // 継承面のフォールバック: 派生ファサード型から基底連鎖を辿って解決する
                     // (例: InvalidOperationException::get_Message → System.Exception に登録された面)
-                    if (bindingAllowed &&
+                    if (bindingAllowedForMode &&
                         _objectEngine.TryGetIntrinsicThroughHierarchy(typeName, name, arity, signature.HasThis, out var inherited)) {
                         return new CallTarget {
                             Arity = arity,
@@ -265,10 +274,10 @@ internal sealed partial class CallEngine {
             // 優先順位 ①: ランタイムバインド (署名照合。callerDomain は呼出元 loader 基準)
             if (bindingAllowed &&
                 (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, facadeParamNames,
-                    CallerDomainOfLoader(), out var boundImpl) ||
+                    CallerDomainOfLoader(), out var boundImpl, facade) ||
                  TryGetResolvedBinding(facade.FullName, name, signature.HasThis,
                     signature.ParamTypes.Select(t => ParamTypeName(t, null)).ToArray(),
-                    CallerDomainOfLoader(), out boundImpl))) {
+                    CallerDomainOfLoader(), out boundImpl, facade))) {
                 return new CallTarget {
                     Arity = arity,
                     ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
@@ -315,13 +324,18 @@ internal sealed partial class CallEngine {
         }
 
         var definition = (VmClassType)constructed.Definition;
+        var managedIlMethod = PrefersManagedIl(definition)
+            ? FindMethodThroughChain(definition, name, signature.ParamTypes,
+                genericParameterCount: signature.GenericParamCount)
+            : null;
         if (CanAttemptRuntimeBinding(definition)) {
             var realParamNames = signature.ParamTypes.Select(t => ParamTypeName(t, signatureContext)).ToArray();
-            if (TryGetResolvedBinding(definition.FullName, name, signature.HasThis, realParamNames,
-                    CallerDomainOfLoader(), out var realBound) ||
+            if (managedIlMethod?.Body is null &&
+                (TryGetResolvedBinding(definition.FullName, name, signature.HasThis, realParamNames,
+                    CallerDomainOfLoader(), out var realBound, definition) ||
                 TryGetResolvedBinding(definition.FullName, name, signature.HasThis,
                     signature.ParamTypes.Select(t => ParamTypeName(t, null)).ToArray(),
-                    CallerDomainOfLoader(), out realBound))
+                    CallerDomainOfLoader(), out realBound, definition)))
                 return new CallTarget {
                     Arity = arity,
                     ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
@@ -334,7 +348,7 @@ internal sealed partial class CallEngine {
                     ClassArgs = constructed.TypeArguments,
                 };
         }
-        var method = FindMethodThroughChain(definition, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
+        var method = managedIlMethod ?? FindMethodThroughChain(definition, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount)
             ?? throw new BadImageFormatException(
                 $"MemberRef 0x{token:X8} の解決先メソッド {definition.FullName}::{name} が見つかりません。");
         return new CallTarget {
@@ -396,9 +410,17 @@ internal sealed partial class CallEngine {
                 var methodSpecCaller = CallerDomainOfLoader();
                 var methodSpecBindingType = TryResolveTypeRefForBinding(parent.Rid);
                 var bindingAllowed = CanAttemptRuntimeBinding(typeName, parent.Rid, methodSpecBindingType);
-                if (bindingAllowed &&
-                    (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, methodSpecCaller, out var boundImpl) ||
-                     TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl))) {
+                var managedIlMethod = PrefersManagedIl(methodSpecBindingType) && methodSpecBindingType is VmClassType managedIlType &&
+                    !DelegateContinuingSurfaces.Contains(managedIlType.FullName) &&
+                    !PreservesByRefReceiver(managedIlType.FullName)
+                    ? FindMethodThroughChain(managedIlType, name, signature.ParamTypes,
+                        genericParameterCount: signature.GenericParamCount)
+                    : null;
+                if (bindingAllowed && managedIlMethod?.Body is null &&
+                    (TryGetResolvedBinding(typeName, name, signature.HasThis, concreteParams, methodSpecCaller, out var boundImpl,
+                         methodSpecBindingType) ||
+                     TryGetResolvedBinding(typeName, name, signature.HasThis, openParams, methodSpecCaller, out boundImpl,
+                         methodSpecBindingType))) {
                     return new CallTarget {
                         Arity = specArity,
                         ReturnsValue = signature.ReturnType.Kind != SigKind.Void,
@@ -420,9 +442,9 @@ internal sealed partial class CallEngine {
                 // 無いため対象外。表現境界の型・可変状態をローカルに持つ構造体ファサード
                 // (DefaultInterpolatedStringHandler 等) は legacy を維持する)。
                 // legacy (③) は実体の無い面の救済として残す
-                VmMethod? realMethodEarly = null;
+                VmMethod? realMethodEarly = managedIlMethod;
                 try {
-                    if (_loader.ResolveTypeRefType(parent.Rid) is VmClassType realClassEarly &&
+                    if (realMethodEarly is null && _loader.ResolveTypeRefType(parent.Rid) is VmClassType realClassEarly &&
                         !DelegateContinuingSurfaces.Contains(realClassEarly.FullName) &&
                         !PreservesByRefReceiver(realClassEarly.FullName))
                         realMethodEarly = FindMethodThroughChain(realClassEarly, name, signature.ParamTypes, genericParameterCount: signature.GenericParamCount);
@@ -505,9 +527,9 @@ internal sealed partial class CallEngine {
                         .Select(t => DescribeBindingType(t, null, null, _loader) ?? "").ToArray();
                     if (bindingAllowed &&
                         (TryGetResolvedBinding(facade.FullName, name, signature.HasThis, concreteParams,
-                             CallerDomainOfLoader(), out var facadeImpl) ||
+                             CallerDomainOfLoader(), out var facadeImpl, facade) ||
                         TryGetResolvedBinding(facade.FullName, name, signature.HasThis, openParams,
-                            CallerDomainOfLoader(), out facadeImpl))) {
+                            CallerDomainOfLoader(), out facadeImpl, facade))) {
                         return new CallTarget {
                             Arity = arity,
                     ReturnsValue = signature.ReturnType.Kind != SigKind.Void,

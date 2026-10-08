@@ -908,6 +908,7 @@ internal sealed partial class CallEngine {
         if (invoker is not Interpreter interpreter || target.Intrinsic is not null ||
             target.Method is not { Body: not null } method ||
             isCallvirt && method.IsVirtual ||
+            RequiresHostBridge(method) ||
             HasRuntimeBinding(method.DeclaringType) ||
             _services.CoreLibSurfaces?.Substitute(method) is not null ||
             DelegateContinuingSurfaces.Contains(method.DeclaringType.FullName))
@@ -1178,6 +1179,7 @@ internal sealed partial class CallEngine {
             }
             if (resolvedVirtual.Body is not null &&
                 !HasRuntimeBinding(resolvedVirtual.DeclaringType) &&
+                !RequiresHostBridge(resolvedVirtual) &&
                 !DelegateContinuingSurfaces.Contains(resolvedVirtual.DeclaringType.FullName)) {
                 var virtualContext = BuildCallContext(caller, target, resolvedVirtual, args[0]);
                 if (tailCallAllowed && invoker.TryCreateTailCall(caller, resolvedVirtual, args,
@@ -1197,6 +1199,7 @@ internal sealed partial class CallEngine {
         if (!isCallvirt && constrainedToken == 0 && target.Intrinsic is null &&
             target.Method is { Body: not null } directMethod &&
             !HasRuntimeBinding(directMethod.DeclaringType) &&
+            !RequiresHostBridge(directMethod) &&
             !DelegateContinuingSurfaces.Contains(directMethod.DeclaringType.FullName)) {
             var directContext = BuildCallContext(caller, target, directMethod,
                 directMethod.Signature.HasThis ? args[0] : default);
@@ -1384,6 +1387,13 @@ internal sealed partial class CallEngine {
         if (TryInvokeBinding(method, target.MethodArgs, args, out var bound, callerDomain,
                 staticImplementationArgs ?? target.ClassArgs, target))
             return bound;
+
+        // HostBridge is an explicit ABI policy. A managed method body is not
+        // an implicit fallback in this mode; the host must register a bridge
+        // for the imported ABI surface.
+        if (RequiresHostBridge(method) && method.Body is not null)
+            throw new OperationNotAllowedException(
+                $"ABI 面 {method.DeclaringType.FullName}::{method.Name} は HostBridge に指定されていますが、対応するブリッジが登録されていません。");
 
         // callvirt で宣言どおりに着地した (実行時型で override が見つからなかった) 場合、
         // レシーバが VM ランタイムオブジェクト (typeof() 結果等) なら実行時型は intrinsic 面

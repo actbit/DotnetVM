@@ -78,10 +78,31 @@ var value = vm.Invoke("MyGuest.Program", "Compute", 42);
 
 - `LoadAssembly(string path)`: DLL とその依存 DLL を、参照元と同じディレクトリから解決します
 - `LoadAssembly(Stream, string? sourcePath = null)`: ストリームからロードします。`sourcePath` を省略した場合、カレントディレクトリへの暗黙フォールバックはありません
+- `ImportAssemblyAbi(Assembly)`: ホストで既に解決した BCL / 外部 managed DLL を ABI と managed IL として取り込みます
+- `ImportAssemblyAbi(Assembly, AbiExecutionMode)`: 取り込み時の実行経路を選択します
+- `ImportAssemblyAbi(string)` / `ImportAssemblyAbi(Stream, string?)`: パスまたはストリームから同じ ABI-first 経路で取り込みます
+- `ImportAssemblyAbi(string, AbiExecutionMode)` / `ImportAssemblyAbi(Stream, AbiExecutionMode)`: パス／ストリームに実行経路を指定します
+- `RegisterAbiBridge(AssemblyImage, BindingKey, IntrinsicImpl, BindingOrigin)`: 取り込み元の `AssemblyIdentity` と署名キーを、ホストブリッジへ明示的に対応付けます
 - ゲストの `Assembly.Load` / `AssemblyLoadContext` は VM のローダーへ接続されます。パスロードは `StorageBridge` 経由に限定されます
 
 入力は読み込み中にも `MemoryPolicy.MaxAssemblyBytes` で制限されます。参照先が解決できない場合や、
 P/Invoke を含む画像は fail-closed で拒否されます。
+
+`ImportAssemblyAbi` は CLR の `Type` や `MethodInfo` を VM の呼出しへ転送する API ではありません。
+取り込んだ managed IL は VM 内で実行され、InternalCall / P/Invoke は対応するランタイムバインドまたは
+capability bridge が必要です。動的アセンブリや single-file 環境で `Assembly.Location` が空の場合は、
+`ImportAssemblyAbi(Stream, sourcePath)` を使って明示的にバイト列と依存探索ヒントを渡してください。
+
+ABI ブリッジのマッピングは次の形です。
+
+```csharp
+var image = vm.ImportAssemblyAbi("plugins/NativeLikeLibrary.dll", AbiExecutionMode.HostBridge);
+var key = BindingKey.Static("External.Calculator", "Compute", "System.Int32");
+vm.RegisterAbiBridge(image, key, bridge, BindingOrigin.Device);
+```
+
+つまり `image.Identity + key` が、指定した `bridge` (`IntrinsicImpl`) に解決されます。
+同じ `External.Calculator::Compute(int)` が別アセンブリに存在しても、`image` が異なれば別の面です。
 
 ### インスタンスメソッドとホスト値
 
@@ -414,7 +435,7 @@ guest Thread と Task worker は VM の共有予算で管理されます。ゲ�
 - [ ] `NetworkBridge` / `StorageBridge` は必要な場合だけ設定し、allowlist と入力検証を実装した
 - [ ] HTTP の独自 transport は redirect / cookie / auto-decompression を無効化し、DNS 解決後の private / loopback / link-local IP を拒否する
 - [ ] ブリッジは `MaxResponseBytes` / `maxBytes` を取得前に適用する
-- [ ] `RegisterIntrinsic`、`RegisterBinding`、`CoreLibBindingProviders` に信頼済みコードだけを渡した
+- [ ] `RegisterIntrinsic`、`RegisterBinding`、`RegisterAbiBridge`、`CoreLibBindingProviders` に信頼済みコードだけを渡した
 - [ ] P/Invoke、ネイティブ依存、未登録面をエラーとして監視している
 - [ ] ゲストのログ、例外型、クォータ違反、命令数を監査できる
 - [ ] VM の `Dispose` と worker の終了をジョブの finally で保証している
@@ -423,3 +444,4 @@ guest Thread と Task worker は VM の共有予算で管理されます。ゲ�
 DotnetVM はゲストコードを CLR の安全な AppDomain に隔離するものではありません。ホストの
 特権コード（特にブリッジ、intrinsic、バインド）を最小化し、実行対象の入力を信頼しない
 運用では OS レベルの防御を重ねてください。
+同じ `External.Calculator::Compute(int)` が別アセンブリに存在しても、`image` が異なれば別の面です。

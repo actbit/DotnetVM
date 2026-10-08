@@ -229,6 +229,44 @@ intrinsic は VM が登録した実装、ランタイムバインドはメソッ
 CLR との差分テストで数値書式・解析・変換や文字列操作を検証し、VM では設定したカルチャを内部ブリッジで渡します。
 `LoadHostCoreLib` を使う配布では、`DotnetVM.CoreLib.dll` を `DotnetVM.dll` と同じディレクトリに配置してください。
 
+### BCL / 外部ライブラリの ABI 取り込み
+
+BCL や外部の managed DLL は、`ImportAssemblyAbi` を共通の取り込み入口として使えます。
+ホストの `Assembly`、DLL パス、または DLL ストリームから ECMA-335 メタデータと managed IL を
+VM の型・呼出しモデルへ登録します。パスから取り込む場合は、参照元 DLL と同じディレクトリの
+依存 DLL も通常の `AssemblyRef` 解決で扱われます。
+
+```csharp
+using System.Text.Json;
+
+using var vm = new VirtualMachine();
+vm.ImportAssemblyAbi(typeof(JsonSerializer).Assembly);
+vm.ImportAssemblyAbi("plugins/MyLibrary.dll");
+```
+
+実装経路は ABI ごとに選択できます。既定の `Auto` は従来の解決順、`ManagedIl` は本体を持つ
+managed IL の VM 内再実行を優先し、`HostBridge` は登録済みランタイムバインドを必須にします。
+
+```csharp
+using DotnetVM.Runtime;
+using DotnetVM.Runtime.Intrinsics;
+
+var ilAssembly = vm.ImportAssemblyAbi("plugins/IlLibrary.dll", AbiExecutionMode.ManagedIl);
+var nativeAssembly = vm.ImportAssemblyAbi("plugins/NativeLikeLibrary.dll", AbiExecutionMode.HostBridge);
+vm.RegisterAbiBridge(nativeAssembly, key, bridge, BindingOrigin.Device);
+```
+
+ABI の取り込みは CLR の `MethodInfo.Invoke` を許可するものではありません。managed IL は VM 内で
+実行され、InternalCall / P/Invoke は対応するランタイムバインドや capability bridge が登録されている
+場合だけ実行できます。未対応の native boundary は fail-closed で拒否されます。
+
+ブリッジの対応関係は `AssemblyIdentity + BindingKey` → `IntrinsicImpl` です。
+`RegisterAbiBridge` の第一引数には `ImportAssemblyAbi` が返した同じ `AssemblyImage` を渡すため、
+同じ完全修飾型名・メソッドシグネチャを持つ別 DLL のブリッジが衝突しません。
+既存の `RegisterBinding` は CoreLib や互換用のグローバル面として残っています。
+`HostBridge` を選んだアセンブリの managed メソッドは、対応する ABI ブリッジまたは互換用バインドが無ければ拒否されます。
+`ManagedIl` では本体のあるメソッドを再実行し、本体のない宣言だけが登録済みブリッジへ進みます。
+
 ### 委譲先の監査
 
 `CoreLibSurfaceAudit` は、CoreLib API の実行経路と委譲理由を分類する監査表です。

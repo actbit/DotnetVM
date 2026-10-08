@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using DotnetVM.Devices;
 using DotnetVM.Host;
+using DotnetVM.Metadata;
 using DotnetVM.Policy;
 using DotnetVM.Runtime.Execution;
 using DotnetVM.Runtime.Heap;
@@ -316,6 +317,8 @@ public sealed class IntrinsicRegistry {
     private readonly Dictionary<IntrinsicKey, IntrinsicImpl> _impls = [];
     private readonly Dictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)> _bindings = [];
     private readonly HashSet<string> _bindingTypes = new(StringComparer.Ordinal);
+    private readonly Dictionary<AssemblyIdentity, Dictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)>> _abiBindings = [];
+    private readonly HashSet<(AssemblyIdentity Assembly, string TypeFullName)> _abiBindingTypes = [];
     private readonly Dictionary<(string TypeFullName, string FieldName), Func<IntrinsicContext, StackSlot>> _staticFields = [];
     private bool _sealed;
 
@@ -341,6 +344,23 @@ public sealed class IntrinsicRegistry {
         if (!_bindings.TryAdd(key, (impl, origin)))
             throw new InvalidOperationException($"ランタイムバインド {key} は既に登録されています。");
         _bindingTypes.Add(key.TypeFullName);
+        }
+    }
+
+    /// <summary>
+    /// ABI 画像にスコープしたランタイムバインドを登録する (起動時のみ。Seal 後は拒否)。
+    /// 同じ型名・署名でも AssemblyIdentity が異なる ABI 画像は別の面として扱う。
+    /// </summary>
+    public void RegisterAbiBinding(AssemblyIdentity assembly, BindingKey key, IntrinsicImpl impl,
+        BindingOrigin origin) {
+        lock (_gate) {
+            if (_sealed)
+                throw new OperationNotAllowedException("VM 実行開始後の ABI バインド登録は許可されていません。");
+            if (!_abiBindings.TryGetValue(assembly, out var bindings))
+                _abiBindings[assembly] = bindings = [];
+            if (!bindings.TryAdd(key, (impl, origin)))
+                throw new InvalidOperationException($"ABI {assembly} のランタイムバインド {key} は既に登録されています。");
+            _abiBindingTypes.Add((assembly, key.TypeFullName));
         }
     }
 
@@ -398,10 +418,28 @@ public sealed class IntrinsicRegistry {
             return TryGetBindingCore(key, out impl, out origin, callerDomain);
     }
 
+    /// <summary>AssemblyIdentity と署名キーの組み合わせで ABI バインドを解決する。</summary>
+    public bool TryGetAbiBinding(AssemblyIdentity assembly, BindingKey key, out IntrinsicImpl impl,
+        out BindingOrigin origin, BindingDomain callerDomain = BindingDomain.Guest) {
+        impl = null!;
+        origin = default;
+        if (IsSealed)
+            return _abiBindings.TryGetValue(assembly, out var bindings) &&
+                TryGetBindingCore(bindings, key, out impl, out origin, callerDomain);
+        lock (_gate)
+            return _abiBindings.TryGetValue(assembly, out var bindings) &&
+                TryGetBindingCore(bindings, key, out impl, out origin, callerDomain);
+    }
+
     private bool TryGetBindingCore(BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin,
-        BindingDomain callerDomain) {
+        BindingDomain callerDomain) =>
+        TryGetBindingCore(_bindings, key, out impl, out origin, callerDomain);
+
+    private static bool TryGetBindingCore(
+        IReadOnlyDictionary<BindingKey, (IntrinsicImpl Impl, BindingOrigin Origin)> bindings,
+        BindingKey key, out IntrinsicImpl impl, out BindingOrigin origin, BindingDomain callerDomain) {
         // 完全一致 (domain も含めて照合)
-        if (_bindings.TryGetValue(key, out var entry) &&
+        if (bindings.TryGetValue(key, out var entry) &&
             (key.Domain != BindingDomain.TrustedCoreLib || callerDomain == BindingDomain.TrustedCoreLib ||
              key.Domain == callerDomain)) {
             impl = entry.Impl;
@@ -410,14 +448,14 @@ public sealed class IntrinsicRegistry {
         }
         // 型名を実行時に確定できる面でも、宣言引数個数だけを固定した登録を許可する。
         // AnyParams (= 引数個数も無制限) とは別キーなので、監査上の無制限 wildcard にはならない。
-        if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParamTypes(), out entry) &&
+        if (!key.IsAnyParams && bindings.TryGetValue(key.WithAnyParamTypes(), out entry) &&
             key.Domain != BindingDomain.TrustedCoreLib) {
             impl = entry.Impl;
             origin = entry.Origin;
             return true;
         }
         // 全引数一致面 (AnyParams) へのフォールバック: 同一 domain の面のみ照合する
-        if (!key.IsAnyParams && _bindings.TryGetValue(key.WithAnyParams(), out entry) &&
+        if (!key.IsAnyParams && bindings.TryGetValue(key.WithAnyParams(), out entry) &&
             key.Domain != BindingDomain.TrustedCoreLib) {
             impl = entry.Impl;
             origin = entry.Origin;
@@ -442,12 +480,29 @@ public sealed class IntrinsicRegistry {
                 StringComparison.Ordinal) && pair.Value.Origin == origin);
     }
 
+    /// <summary>指定 ABI 画像の指定型に署名バインドが登録されているか。</summary>
+    public bool HasAbiBindingForType(AssemblyIdentity assembly, string typeFullName) {
+        if (IsSealed)
+            return _abiBindingTypes.Contains((assembly, typeFullName));
+        lock (_gate)
+            return _abiBindingTypes.Contains((assembly, typeFullName));
+    }
+
     /// <summary>登録済みバインドの監査面 (キーと由来の列挙。監査テスト / デバッグ用)。
     /// domain は BindingKey 側に保持されるためここでは origin のみを返す。</summary>
     public IReadOnlyList<(BindingKey Key, BindingOrigin Origin)> Bindings {
         get {
             lock (_gate)
                 return [.. _bindings.Select(kv => (kv.Key, kv.Value.Origin))];
+        }
+    }
+
+    /// <summary>ABI 画像ごとの登録済みバインドの監査面。</summary>
+    public IReadOnlyList<(AssemblyIdentity Assembly, BindingKey Key, BindingOrigin Origin)> AbiBindings {
+        get {
+            lock (_gate)
+                return [.. _abiBindings.SelectMany(pair =>
+                    pair.Value.Select(binding => (pair.Key, binding.Key, binding.Value.Origin)))];
         }
     }
 
